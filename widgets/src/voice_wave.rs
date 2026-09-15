@@ -6,6 +6,8 @@ use crate::{
     window_voice_input::{VoiceInjectEvent, WindowVoiceInput},
 };
 
+pub use crate::window_voice_input::PhraseMode;
+
 const VOICE_TARGET_SAMPLE_RATE: usize = 16_000;
 const VOICE_LOOP_SECONDS: usize = 1;
 const WAVE_SAMPLES_PER_TEXEL: usize = 160; // 10ms @ 16k
@@ -492,6 +494,15 @@ impl VoiceWave {
         }
     }
 
+    /// Prefer short confirm phrases ("OK", "one"): flush after a briefer pause.
+    fn set_quick_phrase(&mut self, _cx: &mut Cx, on: bool) {
+        self.voice_input.set_quick_phrase(on);
+    }
+
+    fn set_phrase_mode(&mut self, _cx: &mut Cx, mode: PhraseMode) {
+        self.voice_input.set_phrase_mode(mode);
+    }
+
     fn set_enabled(&mut self, cx: &mut Cx, enabled: bool) {
         self.ensure_voice_initialized(cx);
         self.voice_input.set_enabled(cx, enabled);
@@ -598,7 +609,9 @@ impl Widget for VoiceWave {
                 cx.set_cursor(MouseCursor::Hand);
             }
             Hit::FingerUp(fe) => {
-                if fe.is_over {
+                // Require a real tap so move+down+up (and accidental double
+                // deliveries) cannot arm then immediately disarm.
+                if fe.is_over && fe.was_tap() {
                     let enabled = !self.voice_input.is_enabled();
                     self.set_enabled(cx, enabled);
                     cx.widget_action(uid, VoiceWaveAction::RecordVoice(enabled));
@@ -678,6 +691,18 @@ impl VoiceWaveRef {
     pub fn set_echo_cancellation(&self, cx: &mut Cx, on: bool) {
         if let Some(mut inner) = self.borrow_mut() {
             inner.set_echo_cancellation(cx, on);
+        }
+    }
+
+    pub fn set_quick_phrase(&self, cx: &mut Cx, on: bool) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.set_quick_phrase(cx, on);
+        }
+    }
+
+    pub fn set_phrase_mode(&self, cx: &mut Cx, mode: PhraseMode) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.set_phrase_mode(cx, mode);
         }
     }
 

@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Etsy search fixture — funny birthday card</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 24px; background: #faf9f5; color: #222; }
+    h1 { font-size: 18px; }
+    .wt-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; max-width: 960px; }
+    .etsy-fixture-card {
+      background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 12px;
+    }
+    .etsy-fixture-title { font-size: 14px; margin: 8px 0; }
+    .etsy-fixture-price { font-weight: 700; }
+    .etsy-fixture-postage { font-size: 12px; color: #555; }
+    .etsy-fixture-shop { font-size: 12px; color: #2f4666; }
+    .etsy-fixture-reviews { font-size: 12px; color: #666; }
+    img { width: 100%; height: 140px; object-fit: cover; background: #eee; }
+  </style>
+</head>
+<body>
+  <h1>Search results fixture (not live Etsy)</h1>
+  <p>Query: funny birthday card — open this file and run the bookmarklet to test extraction.</p>
+  <div class="wt-grid">
+    <!-- Live-shaped: star-rating aria MUST NOT become the review count. -->
+    <div class="etsy-fixture-card" data-listing-id="1001">
+      <img class="etsy-fixture-image" src="https://example.com/img/1001.jpg" alt="" />
+      <a class="listing-link" href="https://www.etsy.com/uk/listing/1001/funny-birthday-card">
+        <h3 class="etsy-fixture-title" data-listing-title>Funny Birthday Card for Friend</h3>
+      </a>
+      <div><span class="currency-symbol">£</span><span class="etsy-fixture-price currency-value">3.50</span></div>
+      <div class="etsy-fixture-postage">FREE delivery</div>
+      <span aria-label="4.8 out of 5 stars">★★★★★</span>
+      <a class="etsy-fixture-shop" href="https://www.etsy.com/uk/shop/CardCraftUK">CardCraftUK</a>
+      <span class="etsy-fixture-reviews" aria-label="1,284 Reviews">(1,284)</span>
+    </div>
+    <div class="etsy-fixture-card" data-listing-id="1002">
+      <img class="etsy-fixture-image" src="https://example.com/img/1002.jpg" alt="" />
+      <a class="listing-link" href="https://www.etsy.com/uk/listing/1002/dad-joke-birthday-card">
+        <h3 class="etsy-fixture-title">Dad Joke Birthday Card</h3>
+      </a>
+      <div><span class="currency-symbol">£</span><span class="etsy-fixture-price currency-value">2.95</span></div>
+      <div class="etsy-fixture-postage">£1.80</div>
+      <span aria-label="Rating: 1 out of 5 stars">★</span>
+      <a class="etsy-fixture-shop" href="https://www.etsy.com/uk/shop/PunnyPrints">PunnyPrints</a>
+      <span class="etsy-fixture-reviews" aria-label="412 reviews">(412)</span>
+    </div>
+    <div class="etsy-fixture-card" data-listing-id="1003">
+      <img class="etsy-fixture-image" src="https://example.com/img/1003.jpg" alt="" />
+      <a class="listing-link" href="https://www.etsy.com/uk/listing/1003/pack-of-4-funny-cards">
+        <h3 class="etsy-fixture-title">Pack of 4 Funny Birthday Cards</h3>
+      </a>
+      <div><span class="currency-symbol">£</span><span class="etsy-fixture-price currency-value">9.95</span></div>
+      <div class="etsy-fixture-postage">FREE UK delivery</div>
+      <a class="etsy-fixture-shop" href="https://www.etsy.com/uk/shop/BundleCards">BundleCards</a>
+      <span class="etsy-fixture-reviews" aria-label="88 reviews">(88)</span>
+      <div data-listing-id="1003" style="display:none">
+        <a href="https://www.etsy.com/uk/listing/1003/pack-of-4-funny-cards">Pack of 4 Funny Birthday Cards</a>
+      </div>
+    </div>
+  </div>
+
+  <div class="etsy-fixture-card" data-listing-id="9999" style="display:none" aria-hidden="true">
+    <a class="listing-link" href="https://www.etsy.com/uk/listing/9999/hidden-card"
+       title="Funny Birthday Card For Him: Blowing Out the Birthday Candles">
+      <h3 class="etsy-fixture-title">Funny Birthday Card For Him: Blowing Out the Birthday Candles</h3>
+    </a>
+    <div><span class="currency-symbol">£</span><span class="etsy-fixture-price currency-value">3.00</span></div>
+  </div>
+
+  <div class="etsy-fixture-card" data-listing-id="4374963854" style="width:200px;height:120px">
+    <a class="listing-link" href="https://www.etsy.com/listing/4374963854/ad-card">
+      <h3 class="etsy-fixture-title">Funny Birthday Card For Him: Blowing Out the Birthday Candles</h3>
+    </a>
+    <div>Ad・By CheekyLegends Ad from shop CheekyLegends</div>
+    <div><span class="currency-symbol">£</span><span class="etsy-fixture-price currency-value">3.37</span></div>
+    <div class="etsy-fixture-postage">Free UK delivery</div>
+  </div>
+</body>
+</html>

@@ -1,0 +1,58 @@
+{
+  "cases": [
+    {
+      "name": "star rating must not become count",
+      "text": "Funny Birthday Card £3.50 FREE delivery CardCraftUK Rated 4.8 out of 5 stars (1,284)",
+      "shop": "CardCraftUK",
+      "expect": 1284
+    },
+    {
+      "name": "1 out of 5 stars must not become 1",
+      "text": "Dad Joke Card £2.95 PunnyPrints Rating: 1 out of 5 stars (412)",
+      "shop": "PunnyPrints",
+      "expect": 412
+    },
+    {
+      "name": "capital Reviews in aria",
+      "text": "4.8 out of 5 stars, 1,284 Reviews",
+      "shop": "",
+      "expect": 1284
+    },
+    {
+      "name": "from N reviews in aria",
+      "text": "Rated 4.9 out of 5 stars from 15.4k reviews",
+      "shop": "",
+      "expect": 15400
+    },
+    {
+      "name": "aria-style N reviews",
+      "text": "1284 reviews",
+      "shop": "",
+      "expect": 1284
+    },
+    {
+      "name": "k suffix",
+      "text": "ShopName (1.2k)",
+      "shop": "ShopName",
+      "expect": 1200
+    },
+    {
+      "name": "bare (1) pack noise ignored",
+      "text": "Pack of (1) greeting card £3.00 QuietPaper",
+      "shop": "QuietPaper",
+      "expect": null
+    },
+    {
+      "name": "star seller alone is not a count",
+      "text": "Star seller CardCraftUK Free delivery",
+      "shop": "CardCraftUK",
+      "expect": null
+    },
+    {
+      "name": "shop-adjacent paren",
+      "text": "£3.50 FREE delivery BundleCards (88)",
+      "shop": "BundleCards",
+      "expect": 88
+    }
+  ]
+}

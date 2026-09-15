@@ -648,36 +648,47 @@ impl MacosApp {
             self.startup_focus_hack_ran = true;
             return;
         }
-        return unsafe {
-            if !self.startup_focus_hack_ran {
-                self.startup_focus_hack_ran = true;
-                let ns_app: ObjcId = msg_send![class!(NSApplication), sharedApplication];
-                let active: bool = msg_send![ns_app, isActive];
-                if !active {
-                    let dock_bundle_id: ObjcId = str_to_nsstring("com.apple.dock");
-                    let dock_array: ObjcId = msg_send![
-                        class!(NSRunningApplication),
-                        runningApplicationsWithBundleIdentifier: dock_bundle_id
-                    ];
-                    let dock_array_len: u64 = msg_send![dock_array, count];
-                    if dock_array_len == 0 {
-                        panic!("Dock not running");
-                    } else {
-                        let dock: ObjcId = msg_send![dock_array, objectAtIndex: 0];
-                        let _status: BOOL = msg_send![
-                            dock,
-                            activateWithOptions: NSApplicationActivationOptions::NSApplicationActivateIgnoringOtherApps
-                        ];
-                        let ns_running_app: ObjcId =
-                            msg_send![class!(NSRunningApplication), currentApplication];
-                        let () = msg_send![
-                            ns_running_app,
-                            activateWithOptions: NSApplicationActivationOptions::NSApplicationActivateIgnoringOtherApps
-                        ];
-                    }
+        if self.startup_focus_hack_ran {
+            return;
+        }
+        self.startup_focus_hack_ran = true;
+        unsafe {
+            let ns_app: ObjcId = msg_send![class!(NSApplication), sharedApplication];
+            let active: bool = msg_send![ns_app, isActive];
+            if !active {
+                // Unsigned CLI binaries launched from Terminal/Cursor often
+                // show a window without becoming the active app. Activating
+                // Dock briefly then ourselves is the classic workaround so
+                // Cmd-Tab MRU and keyboard focus land on us immediately.
+                let dock_bundle_id: ObjcId = str_to_nsstring("com.apple.dock");
+                let dock_array: ObjcId = msg_send![
+                    class!(NSRunningApplication),
+                    runningApplicationsWithBundleIdentifier: dock_bundle_id
+                ];
+                let dock_array_len: u64 = msg_send![dock_array, count];
+                if dock_array_len == 0 {
+                    panic!("Dock not running");
+                }
+                let dock: ObjcId = msg_send![dock_array, objectAtIndex: 0];
+                let _status: BOOL = msg_send![
+                    dock,
+                    activateWithOptions: NSApplicationActivationOptions::NSApplicationActivateIgnoringOtherApps
+                ];
+                let ns_running_app: ObjcId =
+                    msg_send![class!(NSRunningApplication), currentApplication];
+                let () = msg_send![
+                    ns_running_app,
+                    activateWithOptions: NSApplicationActivationOptions::NSApplicationActivateIgnoringOtherApps
+                ];
+            }
+            // makeKeyAndOrderFront before activation often no-ops for focus;
+            // raise again now that we are (or already were) the active app.
+            if std::env::var_os("MAKEPAD_HIDE_WINDOWS").is_none() {
+                for (window, _) in &self.cocoa_windows {
+                    let () = msg_send![*window, makeKeyAndOrderFront: nil];
                 }
             }
-        };
+        }
     }
 
     pub fn time_now(&self) -> f64 {

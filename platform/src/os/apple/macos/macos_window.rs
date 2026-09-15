@@ -342,6 +342,10 @@ impl MacosWindow {
                     let () = msg_send![self.window, orderFront: nil];
                 } else {
                     let () = msg_send![self.window, makeKeyAndOrderFront: nil];
+                    // Activate now (not on first mouse-move): unsigned CLI
+                    // launches otherwise stay behind the previous app in
+                    // Cmd-Tab / keyboard focus until the pointer enters.
+                    with_macos_app(|app| app.startup_focus_hack());
                 }
             }
             crate::startup_trace("NSWindow ordered front");

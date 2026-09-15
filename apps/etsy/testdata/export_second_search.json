@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "source": "etsy",
+  "source_url": "https://www.etsy.com/uk/search?q=cute%20birthday%20card",
+  "query": "cute birthday card",
+  "exported_at": "2026-09-06T12:05:00.000Z",
+  "listings": [
+    {
+      "title": "Funny Birthday Card for Friend",
+      "url": "https://www.etsy.com/uk/listing/1001/funny-birthday-card",
+      "price_text": "£3.50",
+      "price": 3.5,
+      "currency": "GBP",
+      "postage_text": "FREE delivery",
+      "review_count": 1300,
+      "shop_name": "CardCraftUK",
+      "image_url": "https://example.com/img/1001.jpg",
+      "raw_text": "Funny Birthday Card for Friend £3.50 FREE delivery CardCraftUK (1,300)"
+    },
+    {
+      "title": "Cute Puppy Birthday Card",
+      "url": "https://www.etsy.com/uk/listing/2001/cute-puppy-card",
+      "price_text": "£3.25",
+      "price": 3.25,
+      "currency": "GBP",
+      "postage_text": "£1.80",
+      "review_count": 77,
+      "shop_name": "SoftPaws",
+      "image_url": "https://example.com/img/2001.jpg",
+      "raw_text": "Cute Puppy Birthday Card £3.25 £1.80 SoftPaws (77)"
+    }
+  ]
+}

@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "source": "etsy",
+  "source_url": "https://www.etsy.com/uk/search?q=funny%20birthday%20card",
+  "query": "funny birthday card",
+  "exported_at": "2026-09-06T12:00:00.000Z",
+  "listings": [
+    {
+      "title": "Funny Birthday Card for Friend",
+      "url": "https://www.etsy.com/uk/listing/1001/funny-birthday-card",
+      "price_text": "£3.50",
+      "price": 3.5,
+      "currency": "GBP",
+      "postage_text": "FREE delivery",
+      "review_count": 1284,
+      "shop_name": "CardCraftUK",
+      "image_url": "https://example.com/img/1001.jpg",
+      "raw_text": "Funny Birthday Card for Friend £3.50 FREE delivery CardCraftUK (1,284)"
+    },
+    {
+      "title": "Dad Joke Birthday Card",
+      "url": "https://www.etsy.com/uk/listing/1002/dad-joke-birthday-card",
+      "price_text": "£2.95",
+      "price": 2.95,
+      "currency": "GBP",
+      "postage_text": "£1.80",
+      "review_count": 412,
+      "shop_name": "PunnyPrints",
+      "image_url": "https://example.com/img/1002.jpg",
+      "raw_text": "Dad Joke Birthday Card £2.95 £1.80 PunnyPrints (412)"
+    },
+    {
+      "title": "Pack of 4 Funny Birthday Cards",
+      "url": "https://www.etsy.com/uk/listing/1003/pack-of-4-funny-cards",
+      "price_text": "£9.95",
+      "price": 9.95,
+      "currency": "GBP",
+      "postage_text": "FREE UK delivery",
+      "review_count": 88,
+      "shop_name": "BundleCards",
+      "image_url": "https://example.com/img/1003.jpg",
+      "raw_text": "Pack of 4 Funny Birthday Cards £9.95 FREE UK delivery BundleCards (88)"
+    },
+    {
+      "title": "Personalised Birthday Card Wife Name",
+      "url": "https://www.etsy.com/uk/listing/1004/personalised-wife-card",
+      "price_text": "£4.50",
+      "price": 4.5,
+      "currency": "GBP",
+      "postage_text": "£1.50",
+      "review_count": 56,
+      "shop_name": "NameItCards",
+      "image_url": "https://example.com/img/1004.jpg",
+      "raw_text": "Personalised Birthday Card Wife Name £4.50 £1.50 NameItCards (56)"
+    },
+    {
+      "title": "Minimal Birthday Card",
+      "url": "https://www.etsy.com/uk/listing/1005/minimal-birthday-card",
+      "price_text": "£3.00",
+      "price": 3.0,
+      "currency": "GBP",
+      "postage_text": "",
+      "shop_name": "QuietPaper",
+      "image_url": "https://example.com/img/1005.jpg",
+      "raw_text": "Minimal Birthday Card £3.00 QuietPaper"
+    },
+    {
+      "title": "Cute Cat Birthday Card",
+      "url": "https://www.etsy.com/listing/1006/cute-cat-card",
+      "price_text": "$4.99",
+      "price": 4.99,
+      "currency": "USD",
+      "postage_text": "Free shipping",
+      "review_count": 20,
+      "shop_name": "USPaperCo",
+      "image_url": "https://example.com/img/1006.jpg",
+      "raw_text": "Cute Cat Birthday Card $4.99 Free shipping USPaperCo (20)"
+    }
+  ]
+}

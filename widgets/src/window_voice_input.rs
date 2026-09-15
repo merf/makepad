@@ -27,6 +27,14 @@ const VOICE_VAD_PAUSE_PROB: f32 = 0.35;
 const VOICE_PAUSE_PACKETS_TO_FLUSH: usize = 24; // ~480ms
 const VOICE_IDLE_TIMEOUT_TICKS_TO_FLUSH: usize = 40; // ~400ms at 10ms poll
 const VOICE_MIN_VOICED_SAMPLES_FOR_EARLY_FLUSH: usize = 16_000 / 2; // ~0.50s
+/// Confirm-mode shorts ("OK", "one"): flush sooner after a brief pause.
+const VOICE_QUICK_PAUSE_PACKETS: usize = 10; // ~200ms
+const VOICE_QUICK_IDLE_TIMEOUT_TICKS: usize = 18; // ~180ms
+const VOICE_QUICK_MIN_VOICED_SAMPLES: usize = 16_000 / 5; // ~0.20s
+const VOICE_QUICK_TRANSCRIBE_MIN_SAMPLES: usize = 16_000 / 4; // ~0.25s
+/// Armed record dictation: tolerate field pauses (artist / title / label).
+const VOICE_DICTATION_PAUSE_PACKETS: usize = 70; // ~1.4s
+const VOICE_DICTATION_IDLE_TIMEOUT_TICKS: usize = 100; // ~1.0s
 const VOICE_NORM_TARGET_RMS: f32 = 0.10; // ~ -20 dBFS RMS
 const VOICE_NORM_MAX_GAIN: f32 = 10.0;
 const VOICE_NORM_MIN_GAIN: f32 = 0.35;
@@ -42,7 +50,20 @@ enum VoiceControlMessage {
     Start,
     /// Capture stopped: a mic-owning engine stops listening.
     Stop,
+    /// How aggressively to end an utterance on silence.
+    SetPhraseMode(PhraseMode),
     Shutdown,
+}
+
+/// Silence / flush profile for the voice gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PhraseMode {
+    /// Default (~480ms pause).
+    Normal,
+    /// Confirm OK / 1 / skip (~200ms).
+    Quick,
+    /// Armed record dictation — wait through field pauses (~1.4s).
+    Dictation,
 }
 
 pub enum VoiceWaveEvent {
@@ -225,6 +246,10 @@ impl WindowVoiceInput {
             PermissionStatus::DeniedCanRetry
             | PermissionStatus::DeniedPermanent
             | PermissionStatus::NotDetermined => {
+                crate::log!(
+                    "voice: mic permission {:?} — capture off",
+                    result.status
+                );
                 self.desired_enabled = false;
                 self.stop_capture_and_reset(cx);
             }
@@ -287,6 +312,16 @@ impl WindowVoiceInput {
             self.capture_enabled.store(false, Ordering::Relaxed);
             cx.use_audio_inputs(&[]);
         }
+    }
+
+    /// Prefer short confirm phrases ("OK", "one"): flush after a briefer pause.
+    pub fn set_quick_phrase(&mut self, on: bool) {
+        self.set_phrase_mode(if on { PhraseMode::Quick } else { PhraseMode::Normal });
+    }
+
+    /// Dictation / quick / normal silence profile for the VAD flush gate.
+    pub fn set_phrase_mode(&mut self, mode: PhraseMode) {
+        let _ = self.control_tx.send(VoiceControlMessage::SetPhraseMode(mode));
     }
 
     /// Half-duplex echo control: the app arms the OS voice-processing path
@@ -686,6 +721,7 @@ fn spawn_voice_worker(
         let mut pending_samples = VecDeque::<f32>::new();
         let mut chunk = Vec::with_capacity(VOICE_MAX_PENDING_SAMPLES);
         let mut silence_packet_run = 0usize;
+        let mut phrase_mode = PhraseMode::Normal;
         let mut saw_speech_since_flush = false;
         let mut voiced_samples_since_flush = 0usize;
         let mut idle_timeout_ticks = 0usize;
@@ -773,9 +809,34 @@ fn spawn_voice_worker(
                             session.stop_listening();
                         }
                     }
+                    VoiceControlMessage::SetPhraseMode(mode) => {
+                        phrase_mode = mode;
+                        crate::log!("voice: phrase_mode={mode:?}");
+                    }
                     VoiceControlMessage::Shutdown => break 'worker,
                 }
             }
+
+            let (pause_packets, idle_ticks, min_voiced, min_transcribe) = match phrase_mode {
+                PhraseMode::Quick => (
+                    VOICE_QUICK_PAUSE_PACKETS,
+                    VOICE_QUICK_IDLE_TIMEOUT_TICKS,
+                    VOICE_QUICK_MIN_VOICED_SAMPLES,
+                    VOICE_QUICK_TRANSCRIBE_MIN_SAMPLES,
+                ),
+                PhraseMode::Dictation => (
+                    VOICE_DICTATION_PAUSE_PACKETS,
+                    VOICE_DICTATION_IDLE_TIMEOUT_TICKS,
+                    VOICE_MIN_VOICED_SAMPLES_FOR_EARLY_FLUSH,
+                    VOICE_TRANSCRIBE_MIN_SAMPLES,
+                ),
+                PhraseMode::Normal => (
+                    VOICE_PAUSE_PACKETS_TO_FLUSH,
+                    VOICE_IDLE_TIMEOUT_TICKS_TO_FLUSH,
+                    VOICE_MIN_VOICED_SAMPLES_FOR_EARLY_FLUSH,
+                    VOICE_TRANSCRIBE_MIN_SAMPLES,
+                ),
+            };
 
             match audio_rx.try_recv() {
                 Ok(audio_chunk) => {
@@ -847,14 +908,14 @@ fn spawn_voice_worker(
 
             loop {
                 let flush_on_pause = saw_speech_since_flush
-                    && silence_packet_run >= VOICE_PAUSE_PACKETS_TO_FLUSH
-                    && voiced_samples_since_flush >= VOICE_MIN_VOICED_SAMPLES_FOR_EARLY_FLUSH
-                    && pending_samples.len() >= VOICE_TRANSCRIBE_MIN_SAMPLES;
+                    && silence_packet_run >= pause_packets
+                    && voiced_samples_since_flush >= min_voiced
+                    && pending_samples.len() >= min_transcribe;
                 let flush_on_idle = !flush_on_pause
                     && saw_speech_since_flush
-                    && voiced_samples_since_flush >= VOICE_MIN_VOICED_SAMPLES_FOR_EARLY_FLUSH
-                    && idle_timeout_ticks >= VOICE_IDLE_TIMEOUT_TICKS_TO_FLUSH
-                    && pending_samples.len() >= VOICE_TRANSCRIBE_MIN_SAMPLES;
+                    && voiced_samples_since_flush >= min_voiced
+                    && idle_timeout_ticks >= idle_ticks
+                    && pending_samples.len() >= min_transcribe;
                 if !flush_on_pause && !flush_on_idle {
                     break;
                 }
@@ -869,13 +930,13 @@ fn spawn_voice_worker(
                     }
                 }
 
-                trim_trailing_silence(&mut chunk);
+                trim_trailing_silence(&mut chunk, min_transcribe);
                 silence_packet_run = 0;
                 saw_speech_since_flush = false;
                 voiced_samples_since_flush = 0;
                 idle_timeout_ticks = 0;
 
-                if chunk.len() < VOICE_TRANSCRIBE_MIN_SAMPLES {
+                if chunk.len() < min_transcribe {
                     continue;
                 }
                 let chunk_rms = rms(&chunk);
@@ -884,11 +945,12 @@ fn spawn_voice_worker(
                 }
 
                 crate::log!(
-                    "voice: submit chunk reason={} len={} rms={:.5} pending_after={}",
+                    "voice: submit chunk reason={} len={} rms={:.5} pending_after={} mode={:?}",
                     flush_reason,
                     chunk.len(),
                     chunk_rms,
-                    pending_samples.len()
+                    pending_samples.len(),
+                    phrase_mode
                 );
                 let normalized_chunk = normalize_for_whisper(&chunk);
                 let _ = wave_tx.try_send(VoiceWaveEvent::Submitted(normalized_chunk.clone()));
@@ -915,7 +977,7 @@ fn trim_pending_to_recent(samples: &mut VecDeque<f32>, keep: usize) {
     }
 }
 
-fn trim_trailing_silence(samples: &mut Vec<f32>) {
+fn trim_trailing_silence(samples: &mut Vec<f32>, min_keep: usize) {
     let mut keep = samples.len();
     while keep >= VOICE_AUDIO_PACKET_SAMPLES {
         let start = keep - VOICE_AUDIO_PACKET_SAMPLES;
@@ -925,7 +987,7 @@ fn trim_trailing_silence(samples: &mut Vec<f32>) {
         keep = start;
     }
     keep = (keep + VOICE_TRIM_TAIL_PAD_SAMPLES).min(samples.len());
-    let keep = keep.max(VOICE_TRANSCRIBE_MIN_SAMPLES).min(samples.len());
+    let keep = keep.max(min_keep).min(samples.len());
     samples.truncate(keep);
 }
 

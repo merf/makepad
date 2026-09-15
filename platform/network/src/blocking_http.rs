@@ -144,6 +144,7 @@ pub struct Request {
     limits: Limits,
     cancel: CancelToken,
     body_progress: Option<Arc<dyn Fn(u64, Option<u64>) + Send + Sync>>,
+    user_agent: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -212,7 +213,22 @@ impl Request {
             limits: Limits::default(),
             cancel: CancelToken::new(),
             body_progress: None,
+            user_agent: None,
         }
+    }
+
+    /// Override the default `makepad-network/1.0` User-Agent. Discogs (and
+    /// a few other catalogues) refuse a generic product string.
+    pub fn user_agent(mut self, value: &str) -> Result<Request, Error> {
+        if value.is_empty() || value.bytes().any(is_forbidden_header_byte) {
+            return Err(Error::InvalidHeader);
+        }
+        self.user_agent = Some(value.to_string());
+        Ok(self)
+    }
+
+    fn ua(&self) -> &str {
+        self.user_agent.as_deref().unwrap_or(USER_AGENT)
     }
 
     pub fn header(mut self, name: &str, value: &str) -> Result<Request, Error> {
@@ -1451,7 +1467,7 @@ fn write_request(
     head.push_str(" HTTP/1.1\r\nHost: ");
     head.push_str(&host_header(url));
     head.push_str("\r\nUser-Agent: ");
-    head.push_str(USER_AGENT);
+    head.push_str(req.ua());
     head.push_str("\r\nAccept-Encoding: identity\r\nConnection: close\r\n");
     if !header_names_contain(&req.headers, "accept") {
         head.push_str("Accept: */*\r\n");
@@ -2120,7 +2136,7 @@ fn winhttp_fetch(req: &Request, url: &ParsedUrl, deadline: Instant) -> Result<Re
     if !url.https && !is_literal_loopback_host(&url.host) {
         return Err(Error::CleartextForbidden);
     }
-    let user_agent = wide_null(USER_AGENT);
+    let user_agent = wide_null(req.ua());
     let session = unsafe {
         WinHttpOpen(
             user_agent.as_ptr(),
