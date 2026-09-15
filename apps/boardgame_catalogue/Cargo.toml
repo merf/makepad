@@ -1,0 +1,18 @@
+# Local board-game catalogue: BGG metadata, ownership, what-to-play.
+
+[package]
+name = "makepad-app-boardgames"
+version = "0.1.0"
+edition = "2021"
+description = "Board game catalogue: BGG ratings, owners, what to play tonight"
+license = "MIT OR Apache-2.0"
+default-run = "boardgames"
+
+[[bin]]
+name = "boardgames"
+path = "src/main.rs"
+
+[dependencies]
+makepad-widgets = { path = "../../widgets" }
+makepad-wm-theme = { path = "../../libs/wm_theme" }
+makepad-sqlite = { path = "../../libs/sqlite_query" }

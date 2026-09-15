@@ -116,6 +116,26 @@ fn post_json_serializes_request_without_reserved_caller_headers() {
     assert!(raw.contains("{\"model\":\"gpt-5.6\"}"), "{raw}");
 }
 
+#[test]
+fn custom_user_agent_is_sent_instead_of_the_default() {
+    let (listener, port) = listen();
+    let handle = serve_one(
+        listener,
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec(),
+    );
+    let req = Request::get(url(port, "/"))
+        .user_agent("MakePadVinyl/0.1 +https://example.invalid")
+        .unwrap();
+    let resp = request_no_redirect(req).expect("get");
+    assert_eq!(resp.status, 200);
+    let raw = String::from_utf8(handle.join().unwrap()).unwrap();
+    assert!(
+        raw.contains("User-Agent: MakePadVinyl/0.1 +https://example.invalid"),
+        "{raw}"
+    );
+    assert!(!raw.contains("User-Agent: makepad-network/1.0"), "{raw}");
+}
+
 fn expect_header_err(result: Result<Request, Error>, want: Error) {
     match result {
         Err(e) => assert_eq!(e, want),

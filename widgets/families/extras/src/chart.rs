@@ -532,10 +532,18 @@ pub struct ChartView {
 
     #[live]
     pub plot_margin: Inset,
+
+    /// When false, skip pan/zoom so parent scroll views receive the wheel.
+    /// Auto-fit from `set_data` / `fit_*` still applies.
+    #[live(true)]
+    pub interactive: bool,
 }
 
 impl Widget for ChartView {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, _scope: &mut Scope) {
+        if !self.interactive {
+            return;
+        }
         // Who owns this pointer? The hit below is taken with
         // `capture_overload`, so this chart co-captures EVERY press landing
         // inside it, one a child control already holds included — the answer

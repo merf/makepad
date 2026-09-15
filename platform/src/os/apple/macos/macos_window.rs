@@ -327,6 +327,10 @@ impl MacosWindow {
                         let ns_app: ObjcId = msg_send![class!(NSApplication), sharedApplication];
                         let () = msg_send![ns_app, activateIgnoringOtherApps: YES];
                     }
+                    // Activate now (not on first mouse-move): unsigned CLI
+                    // launches otherwise stay behind the previous app in
+                    // Cmd-Tab / keyboard focus until the pointer enters.
+                    with_macos_app(|app| app.startup_focus_hack());
                 }
             }
             crate::startup_trace("NSWindow ordered front");

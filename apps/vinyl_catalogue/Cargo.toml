@@ -1,0 +1,24 @@
+[package]
+name = "makepad-app-vinyl"
+version = "0.1.0"
+edition = "2021"
+description = "Local-first vinyl catalogue: speak records, structure them, keep a SQLite file"
+license = "MIT OR Apache-2.0"
+default-run = "vinyl"
+
+[[bin]]
+name = "vinyl"
+path = "src/main.rs"
+
+[features]
+default = ["native"]
+native = ["makepad-widgets/voice", "dep:makepad-ai-hub", "dep:makepad-sqlite", "dep:makepad-strict-json", "dep:makepad-network"]
+demo = []
+
+[dependencies]
+makepad-widgets = { path = "../../widgets" }
+makepad-wm-theme = { path = "../../libs/wm_theme" }
+makepad-ai-hub = { path = "../../libs/ai/hub", default-features = false, features = ["llm", "stt"], optional = true }
+makepad-sqlite = { path = "../../libs/sqlite_query", optional = true }
+makepad-strict-json = { path = "../../libs/strict_json", optional = true }
+makepad-network = { path = "../../platform/network", optional = true }

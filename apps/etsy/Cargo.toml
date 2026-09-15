@@ -1,0 +1,20 @@
+# Local Etsy greeting-card market research: bookmarklet import + SQLite store.
+
+[package]
+name = "makepad-app-etsy"
+version = "0.1.0"
+edition = "2021"
+description = "Etsy greeting-card market research: paste exports, store listings, analyse prices"
+license = "MIT OR Apache-2.0"
+default-run = "etsy"
+
+[[bin]]
+name = "etsy"
+path = "src/main.rs"
+
+[dependencies]
+makepad-widgets = { path = "../../widgets" }
+makepad-wm-theme = { path = "../../libs/wm_theme" }
+makepad-sqlite = { path = "../../libs/sqlite_query" }
+makepad-strict-json = { path = "../../libs/strict_json" }
+makepad-ai-hub = { path = "../../libs/ai/hub", default-features = false, features = ["llm"] }

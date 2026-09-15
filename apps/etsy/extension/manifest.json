@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "Export Etsy Results",
+  "version": "1.0.0",
+  "description": "Copy the current Etsy search-results page to the clipboard as JSON for MakePad.",
+  "action": {
+    "default_title": "Export Etsy Results",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": ["activeTab", "scripting"],
+  "host_permissions": [
+    "https://www.etsy.com/*",
+    "https://*.etsy.com/*"
+  ]
+}
