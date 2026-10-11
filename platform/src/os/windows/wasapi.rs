@@ -9,7 +9,7 @@ use {
             core::PCWSTR,
             Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName,
             Win32::Foundation::PROPERTYKEY,
-            Win32::Foundation::{HANDLE, WAIT_OBJECT_0},
+            Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
             Win32::Media::Audio::{
                 eAll,
                 eCapture,
@@ -902,8 +902,20 @@ impl WasapiLoopback {
 
     pub fn wait_for_buffer(&mut self) -> Result<AudioBuffer, ()> {
         unsafe {
+            // WASAPI signals no loopback packets while nothing renders to the device, so a
+            // timeout means silence, not failure: hand back one period of zeros. That keeps
+            // the capture thread alive (and checking for termination) until audio resumes.
+            let period_ms =
+                ((self.base.frames as f64 * 1000.0 / self.base.sample_rate).ceil() as u32).max(1);
             loop {
-                if WaitForSingleObject(self.base.event, 2000) != WAIT_OBJECT_0 {
+                let wait = WaitForSingleObject(self.base.event, period_ms);
+                if wait == WAIT_TIMEOUT {
+                    let mut audio_buffer = self.base.audio_buffer.take().unwrap();
+                    audio_buffer.resize(self.base.frames as usize, self.base.channel_count);
+                    audio_buffer.zero();
+                    return Ok(audio_buffer);
+                }
+                if wait != WAIT_OBJECT_0 {
                     println!("Loopback: Wait for object error");
                     return Err(());
                 };
