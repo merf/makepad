@@ -115,9 +115,9 @@ script_mod! {
 
 /// One container's frame in the exploded view.
 ///
-/// Field-ordering law (CLAUDE.md item 16): only `#[live]` instance fields may
-/// follow `#[deref]`, because `DrawVars::as_slice` reads straight past the end
-/// of the base struct into them. There is no `#[deref]` here — this draw class
+/// Field-ordering law (AGENTS.md, checked by the Script derive): only `#[live]`
+/// instance fields may follow `#[deref]`, because `DrawVars::as_slice` reads
+/// straight past the end of the base struct into them. There is no `#[deref]` here — this draw class
 /// owns its own geometry rather than inheriting DrawQuad's — so the whole
 /// struct after `draw_vars` is instance data.
 #[derive(Script, ScriptHook, Debug)]

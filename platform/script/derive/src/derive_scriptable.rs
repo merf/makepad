@@ -8,6 +8,104 @@ fn script_name(name: &str) -> &str {
     name.strip_prefix("r#").unwrap_or(name)
 }
 
+/// The instance layout law for `#[repr(C)]` draw types, checked at compile
+/// time. A draw call uploads the tail of `DrawVars::dyn_instances` followed
+/// directly by the `#[live]` fields after the `#[deref]` base, read from the
+/// struct's memory as contiguous f32s (`DrawVars::as_slice`). So a struct's
+/// own `#[live]` fields after its `#[deref]` must start exactly where the
+/// base's instance fields end and follow each other with no gap. `DrawVars`
+/// holds `usize`s, so draw types are 8-byte aligned: a base whose instance
+/// fields end on an odd number of floats gets 4 bytes of tail padding, and
+/// every value of a type extending it would be read one lane late. Pad such a
+/// base with a trailing `#[live] pad: f32` (as `DrawQuad` does).
+///
+/// Emits `SCRIPT_INSTANCE_END`, the byte offset where the struct's instance
+/// fields end: the end of its last `#[live]` field after `#[deref]`, the
+/// base's end when it adds none, or the end of its last field when it has no
+/// `#[deref]` (`DrawVars`, whose instance data is its trailing array).
+fn derive_instance_layout_check(tb: &mut TokenBuilder, struct_name: &str, fields: &[StructField]) {
+    fn is_live(field: &StructField) -> bool {
+        field
+            .attrs
+            .iter()
+            .any(|a| a.name == "live" || a.name == "apply_default")
+    }
+    fn field_end(tb: &mut TokenBuilder, struct_name: &str, field: &StructField) {
+        tb.add("(core::mem::offset_of!(")
+            .ident(struct_name)
+            .add(",")
+            .ident(&field.name)
+            .add(") + core::mem::size_of::<")
+            .stream(Some(field.ty.clone()))
+            .add(">())");
+    }
+    fn deref_end(tb: &mut TokenBuilder, struct_name: &str, deref: &StructField) {
+        tb.add("(core::mem::offset_of!(")
+            .ident(struct_name)
+            .add(",")
+            .ident(&deref.name)
+            .add(") + <")
+            .stream(Some(deref.ty.clone()))
+            .add(">::SCRIPT_INSTANCE_END)");
+    }
+
+    let deref_index = fields
+        .iter()
+        .position(|field| field.attrs.iter().any(|a| a.name == "deref"));
+    let own_live: Vec<&StructField> = match deref_index {
+        Some(i) => fields[i + 1..].iter().filter(|f| is_live(f)).collect(),
+        None => Vec::new(),
+    };
+
+    tb.add("impl").ident(struct_name).add("{");
+    tb.add("    #[doc(hidden)]");
+    tb.add("    #[doc = \"Byte offset where this draw type's instance fields end; see the Script derive.\"]");
+    tb.add("    pub const SCRIPT_INSTANCE_END: usize = ");
+    if let Some(last) = own_live.last() {
+        field_end(tb, struct_name, last);
+    } else if let Some(i) = deref_index {
+        deref_end(tb, struct_name, &fields[i]);
+    } else if let Some(last) = fields.last() {
+        field_end(tb, struct_name, last);
+    } else {
+        tb.add("0");
+    }
+    tb.add(";");
+    tb.add("}");
+
+    let Some(deref_index) = deref_index else {
+        return;
+    };
+    let deref = &fields[deref_index];
+    let deref_ty = deref.ty.to_string().replace(' ', "");
+    let mut prev: Option<&StructField> = None;
+    for field in own_live {
+        tb.add("const _: () = assert!(core::mem::offset_of!(")
+            .ident(struct_name)
+            .add(",")
+            .ident(&field.name)
+            .add(") == ");
+        let message = match prev {
+            None => {
+                deref_end(tb, struct_name, deref);
+                format!(
+                    "{struct_name}.{field}: the first #[live] field after #[deref] must start where the instance fields of {deref_ty} end, or the shader reads every value after it one lane late. {deref_ty} has tail padding: give it an even number of f32 instance lanes by ending it with a `#[live] pad: f32` field (see DrawQuad).",
+                    field = script_name(&field.name),
+                )
+            }
+            Some(prev) => {
+                field_end(tb, struct_name, prev);
+                format!(
+                    "{struct_name}.{field}: #[live] fields after #[deref] must follow each other with no gap (the shader reads them as contiguous f32s); move any #[rust] field between them after the last #[live] field.",
+                    field = script_name(&field.name),
+                )
+            }
+        };
+        tb.add(",").string(&message).add(");");
+        prev = Some(field);
+    }
+}
+
 pub fn derive_script_impl(input: TokenStream) -> TokenStream {
     let mut parser = TokenParser::new(input);
     let mut tb = TokenBuilder::new();
@@ -76,6 +174,18 @@ fn derive_script_impl_inner(
                 .ident(&deref_field.name)
                 .add("}");
             tb.add("}");
+        }
+
+        let is_repr_c = main_attribs.iter().any(|attr| {
+            attr.name == "repr"
+                && attr
+                    .args
+                    .as_ref()
+                    .map_or(false, |args| args.to_string().split(',').any(|a| a.trim() == "C"))
+        });
+        let is_generic = generic.as_ref().map_or(false, |g| !g.is_empty());
+        if is_repr_c && !is_generic {
+            derive_instance_layout_check(tb, &struct_name, &fields);
         }
 
         // marker

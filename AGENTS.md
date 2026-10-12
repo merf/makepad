@@ -369,6 +369,11 @@ tab drag is the reference):
 - Custom draw shaders need `#[repr(C)]`. Put non-instance fields BEFORE
   the `#[deref]` draw base, and only shader instance fields AFTER it.
   The instance buffer is read contiguously; incorrect order corrupts it.
+  Draw types are 8-byte aligned, so a type used as a `#[deref]` base must
+  end its instance fields on an even number of f32s (pad with a trailing
+  `#[live] pad: f32`, as `DrawQuad` does), or every field of a type
+  extending it is read one lane late. The Script derive checks both rules
+  at compile time for `#[repr(C)]` types (`SCRIPT_INSTANCE_END`).
 - Prefer enum `match` with a catch-all in shaders. If supported enum
   matching fails, add a compiler regression case and fix the compiler
   instead of replacing it with integer-like `if/else` chains.

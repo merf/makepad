@@ -46,6 +46,30 @@ pub const DRAW_CALL_DYN_INSTANCES: usize = 32;
 /// assert below names a layout change that does).
 const DRAW_VARS_TAIL_PAD: usize = 0;
 
+/// The start of every draw type's instance data. A draw type's `#[live]`
+/// fields after its `#[deref]` follow its base's instance fields directly
+/// (see `as_slice`), and the Script derive checks that at compile time for
+/// `#[repr(C)]` types. Draw types are 8-byte aligned, so a base whose instance
+/// fields end on an odd number of f32s gets tail padding; extending it is
+/// rejected until the base ends with a pad lane, as `DrawQuad` does:
+///
+/// ```compile_fail,E0080
+/// use makepad_platform::*;
+///
+/// #[derive(Script, ScriptHook)]
+/// #[repr(C)]
+/// pub struct DrawOdd {
+///     #[deref] pub draw_vars: DrawVars,
+///     #[live] pub a: f32, // one lane: odd, add `#[live] pad: f32`
+/// }
+///
+/// #[derive(Script, ScriptHook)]
+/// #[repr(C)]
+/// pub struct DrawOddExt {
+///     #[deref] pub draw_super: DrawOdd,
+///     #[live] pub b: f32, // would be read one lane late
+/// }
+/// ```
 #[derive(Clone, Script, Debug)]
 #[repr(C)]
 pub struct DrawVars {
