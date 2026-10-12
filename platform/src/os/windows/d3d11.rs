@@ -3232,6 +3232,93 @@ impl CxTexture {
                 return;
             }
 
+            // A block-compressed mip chain (levels concatenated, level 0 first) is uploaded whole,
+            // as the texture's initial data: rows of 4x4 blocks, 16 bytes each.
+            if let TextureFormat::VecMipCompressed {
+                width,
+                height,
+                format,
+                data,
+                max_level,
+                ..
+            } = &self.format
+            {
+                let Some(data) = data.as_ref() else {
+                    // Out on loan, as for the other Vec formats: upload when it comes back.
+                    self.set_updated(updated);
+                    return;
+                };
+                let dxgi_format = match format {
+                    crate::texture::CompressedTextureFormat::Bc7 => DXGI_FORMAT(98), // BC7_UNORM
+                    crate::texture::CompressedTextureFormat::Bc5 => DXGI_FORMAT(83), // BC5_UNORM
+                    crate::texture::CompressedTextureFormat::Astc4x4 => {
+                        crate::error!("ASTC textures cannot be sampled on D3D11; GpuInfo does not offer them here");
+                        return;
+                    }
+                };
+                let mut sub_data = Vec::new();
+                let mut offset = 0usize;
+                for level in 0..=max_level.unwrap_or(0) {
+                    let (w, h) = ((*width >> level).max(1), (*height >> level).max(1));
+                    let bytes = crate::texture::CompressedTextureFormat::level_bytes(w, h);
+                    if offset + bytes > data.len() {
+                        break;
+                    }
+                    sub_data.push(D3D11_SUBRESOURCE_DATA {
+                        pSysMem: unsafe { data.as_ptr().add(offset) } as *const _,
+                        SysMemPitch: (w.div_ceil(4) * 16) as u32,
+                        SysMemSlicePitch: bytes as u32,
+                    });
+                    offset += bytes;
+                }
+                if sub_data.is_empty() {
+                    crate::error!("compressed texture {}x{}: {} bytes is less than one level", width, height, data.len());
+                    return;
+                }
+                let texture_desc = D3D11_TEXTURE2D_DESC {
+                    Width: *width as u32,
+                    Height: *height as u32,
+                    MipLevels: sub_data.len() as u32,
+                    ArraySize: 1,
+                    Format: dxgi_format,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Usage: D3D11_USAGE_DEFAULT,
+                    BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                    CPUAccessFlags: 0,
+                    MiscFlags: 0,
+                };
+                let mut texture = None;
+                if let Err(e) = unsafe {
+                    d3d11_cx
+                        .device
+                        .CreateTexture2D(&texture_desc, Some(sub_data.as_ptr()), Some(&mut texture))
+                } {
+                    d3d11_cx.note_error("CreateTexture2D(compressed)", &e);
+                    return;
+                }
+                let Some(resource) = texture
+                    .as_ref()
+                    .and_then(|t: &ID3D11Texture2D| t.cast::<ID3D11Resource>().ok())
+                else {
+                    return;
+                };
+                let mut shader_resource_view = None;
+                if let Err(e) = unsafe {
+                    d3d11_cx
+                        .device
+                        .CreateShaderResourceView(&resource, None, Some(&mut shader_resource_view))
+                } {
+                    d3d11_cx.note_error("CreateShaderResourceView(compressed)", &e);
+                    return;
+                }
+                self.os.texture = texture;
+                self.os.shader_resource_view = shader_resource_view;
+                return;
+            }
+
             // Resolve the pixel format, dimensions, bytes-per-pixel and source data pointer for the
             // general (non-cube) Vec* texture formats.
             let (dxgi_format, width, height, bpp, data_ptr): (

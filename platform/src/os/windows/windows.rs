@@ -42,6 +42,9 @@ impl Cx {
         cx.borrow_mut().os_type = OsType::Windows;
 
         let d3d11_cx = Rc::new(RefCell::new(D3d11Cx::new()));
+        // The device is created at feature level 11_0 only, where BC7 (and BC5) sampling is
+        // required, so block-compressed BC7 textures are always available here.
+        cx.borrow_mut().gpu_info.texture_bc7 = true;
 
         // hack: store ID3D11Device in CxOs, so texture-related operations become possible on the makepad/studio side, yet don't completely destroy the code there
         cx.borrow_mut().os.d3d11_device = Some(d3d11_cx.borrow().device.clone());
