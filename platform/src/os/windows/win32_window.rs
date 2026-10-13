@@ -84,7 +84,7 @@ use {
                         HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT,
                         HTSYSMENU, HTTOP, HTTOPLEFT, HTTOPRIGHT, HWND_NOTOPMOST, HWND_TOPMOST,
                         LWA_ALPHA, NCCALCSIZE_PARAMS, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
-                        SWP_NOSIZE, SWP_NOZORDER, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW,
+                        SWP_NOSIZE, SWP_NOZORDER, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, SHOW_WINDOW_CMD,
                         WA_ACTIVE, WM_ACTIVATE, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED,
                         WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_IME_COMPOSITION,
                         WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP,
@@ -1423,9 +1423,22 @@ impl Win32Window {
         }
     }
 
+    /// Shows the window. A no-focus process (see [`focus_allowed`]) shows it without
+    /// activating it and behind the other windows: Windows never gives such a process the
+    /// focus anyway, but would still lay its new window over whatever the user is working in,
+    /// so an agent-driven `--remote` launch kept popping up over the user's work. A grab
+    /// reads the app's own frames, so it works behind other windows too.
     pub fn show(&self) {
+        windows_core::link!("user32.dll" "system" fn SetWindowPos(hwnd: HWND, after: HWND, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> crate::windows::core::BOOL);
         unsafe {
-            let _ = ShowWindow(self.hwnd, SW_SHOW);
+            if focus_allowed() {
+                let _ = ShowWindow(self.hwnd, SW_SHOW);
+                return;
+            }
+            // SW_SHOWNOACTIVATE, then to the bottom of the stack (HWND_BOTTOM is 1;
+            // SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE), neither in the vendored bindings.
+            let _ = ShowWindow(self.hwnd, SHOW_WINDOW_CMD(4));
+            let _ = SetWindowPos(self.hwnd, HWND(1 as _), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010);
         }
     }
 
@@ -1440,6 +1453,9 @@ impl Win32Window {
     /// (a relaunch hands its own over with `AllowSetForegroundWindow`);
     /// otherwise the taskbar button flashes.
     pub fn bring_to_front(&self) {
+        if !focus_allowed() {
+            return;
+        }
         windows_core::link!("user32.dll" "system" fn SetForegroundWindow(hwnd: HWND) -> crate::windows::core::BOOL);
         if std::env::var_os("MAKEPAD_HIDE_WINDOWS").is_some() {
             return;
@@ -2124,4 +2140,20 @@ impl Win32Window {
             _ => KeyCode::Unknown,
         }
     }
+}
+
+/// Whether this process may take the keyboard focus, as on macOS (`macos_app::focus_allowed`):
+/// not when launched with `--remote` (an agent drives it, and its window must not pop over what
+/// the user is typing in) or with `MAKEPAD_NO_FOCUS=1`; `MAKEPAD_FOCUS=1` allows it regardless.
+pub fn focus_allowed() -> bool {
+    static ALLOWED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ALLOWED.get_or_init(|| {
+        if std::env::var_os("MAKEPAD_FOCUS").is_some() {
+            return true;
+        }
+        if std::env::var_os("MAKEPAD_NO_FOCUS").is_some() {
+            return false;
+        }
+        !crate::remote::requested()
+    })
 }
