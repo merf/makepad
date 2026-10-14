@@ -1134,6 +1134,29 @@ impl Cx {
                         window.win32_window.set_position(pos);
                     }
                 }
+                CxOsOp::FullscreenWindow(window_id) => {
+                    if let Some(window) =
+                        d3d11_windows.iter_mut().find(|w| w.window_id == window_id)
+                    {
+                        // See MaximizeWindow: echo a WindowGeomChange on a no-op.
+                        let gen = window.win32_window.geom_event_gen.get();
+                        window.win32_window.enter_fullscreen();
+                        if window.win32_window.geom_event_gen.get() == gen {
+                            window.win32_window.send_change_event();
+                        }
+                    }
+                }
+                CxOsOp::NormalizeWindow(window_id) => {
+                    if let Some(window) =
+                        d3d11_windows.iter_mut().find(|w| w.window_id == window_id)
+                    {
+                        let gen = window.win32_window.geom_event_gen.get();
+                        window.win32_window.exit_fullscreen();
+                        if window.win32_window.geom_event_gen.get() == gen {
+                            window.win32_window.send_change_event();
+                        }
+                    }
+                }
                 CxOsOp::RestoreWindow(window_id) => {
                     if let Some(window) =
                         d3d11_windows.iter_mut().find(|w| w.window_id == window_id)

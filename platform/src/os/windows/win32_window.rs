@@ -239,6 +239,9 @@ pub struct Win32Window {
     /// otherwise keep, so a maximized window is a clean fullscreen client
     /// area rather than a decorated window pinned to the work area.
     pub chromeless_when_maximized: bool,
+    /// While in borderless fullscreen (`CxOsOp::FullscreenWindow`): the style, outer rect and
+    /// maximized state to go back to on `CxOsOp::NormalizeWindow`.
+    fullscreen_restore: Option<(WINDOW_STYLE, RECT, bool)>,
     ime_saved_himc: HIMC,
 }
 
@@ -429,7 +432,7 @@ impl Win32Window {
     /// when the cursor is outside the resize band, over caption buttons, or
     /// when maximized.
     fn hit_test_client_resize_edge(&self, lparam: LPARAM) -> Option<LRESULT> {
-        if self.get_is_maximized() {
+        if self.get_is_maximized() || self.fullscreen_restore.is_some() {
             return None;
         }
         let dpi = self.get_dpi_factor();
@@ -619,6 +622,7 @@ impl Win32Window {
             is_fullscreen,
             is_popup: false,
             chromeless_when_maximized: false,
+            fullscreen_restore: None,
             ime_saved_himc: HIMC::default(),
         }
     }
@@ -683,6 +687,7 @@ impl Win32Window {
             is_fullscreen: false,
             is_popup: true,
             chromeless_when_maximized: false,
+            fullscreen_restore: None,
             ime_saved_himc: HIMC::default(),
         }
     }
@@ -1414,6 +1419,71 @@ impl Win32Window {
         }
     }
 
+    /// Borderless fullscreen: the window drops its frame styles and covers the whole of the
+    /// display it is mostly on, taskbar included (the shell hides the taskbar for a window
+    /// that covers its monitor). `exit_fullscreen` puts back the style, rect and maximized
+    /// state it had.
+    pub fn enter_fullscreen(&mut self) {
+        if std::env::var_os("MAKEPAD_HIDE_WINDOWS").is_some() || self.fullscreen_restore.is_some() {
+            return;
+        }
+        let was_maximized = self.get_is_maximized();
+        unsafe {
+            if was_maximized {
+                let _ = ShowWindow(self.hwnd, SW_RESTORE);
+            }
+            let mut rect = RECT::default();
+            if GetWindowRect(self.hwnd, &mut rect).is_err() {
+                return;
+            }
+            let centre = dvec2((rect.left + rect.right) as f64 * 0.5, (rect.top + rect.bottom) as f64 * 0.5);
+            let screens = win32_screens();
+            let Some(screen) = screens
+                .iter()
+                .find(|s| s.bounds.contains(centre))
+                .or_else(|| screens.iter().find(|s| s.is_primary))
+                .or(screens.first())
+            else {
+                return;
+            };
+            let style = self.get_style();
+            self.fullscreen_restore = Some((style, rect, was_maximized));
+            SetWindowLongPtrW(self.hwnd, GWL_STYLE, (style.0 & !WS_OVERLAPPEDWINDOW.0) as isize);
+            let b = screen.bounds;
+            let _ = SetWindowPos(
+                self.hwnd,
+                None,
+                b.pos.x as i32,
+                b.pos.y as i32,
+                b.size.x as i32,
+                b.size.y as i32,
+                SWP_NOZORDER | SWP_FRAMECHANGED,
+            );
+        }
+    }
+
+    /// Leaves borderless fullscreen (see `enter_fullscreen`); a no-op when not in it.
+    pub fn exit_fullscreen(&mut self) {
+        let Some((style, rect, was_maximized)) = self.fullscreen_restore.take() else {
+            return;
+        };
+        unsafe {
+            SetWindowLongPtrW(self.hwnd, GWL_STYLE, style.0 as isize);
+            let _ = SetWindowPos(
+                self.hwnd,
+                None,
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                SWP_NOZORDER | SWP_FRAMECHANGED,
+            );
+            if was_maximized {
+                let _ = ShowWindow(self.hwnd, SW_MAXIMIZE);
+            }
+        }
+    }
+
     pub fn close_window(&self) {
         // Lets the WM_ACTIVATE arm suppress a redundant popup dismissal.
         self.is_closing.set(true);
@@ -1533,9 +1603,9 @@ impl Win32Window {
         let inner_size = self.get_inner_size();
         WindowGeom {
             xr_is_presenting: false,
-            can_fullscreen: false,
+            can_fullscreen: true,
             is_topmost: self.get_is_topmost(),
-            is_fullscreen: self.get_is_maximized(),
+            is_fullscreen: self.get_is_maximized() || self.fullscreen_restore.is_some(),
             inner_size,
             outer_size: self.get_outer_size(),
             dpi_factor: self.get_dpi_factor(),
