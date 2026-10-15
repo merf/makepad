@@ -107,6 +107,15 @@ const CROSSING_COST: f64 = 400.0;
 const BEND_COST: f64 = 120.0;
 const LOOP_COST: f64 = 300.0;
 
+/// A port disc's size and the shape of its cable side (see `FlowCanvas::port_radius_x`).
+#[derive(Clone, Copy, Debug)]
+struct PortShape {
+    rx: f64,
+    ry: f64,
+    tip: f64,
+    dent: f64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct CardOutlineGeometry {
     outer_rect: Rect,
@@ -377,6 +386,15 @@ script_mod! {
         color_state_idle: theme.flow_state_idle
         color_port_label_connected: theme.flow_text_port_connected
         color_port_label_open: theme.flow_text_port_open
+
+        port_radius_x: 13.0
+        port_radius_y: 11.0
+        port_tip: 4.5
+        port_dent: 3.0
+        port_icons: true
+        card_radius: 16.0
+        header_band: 0.0
+        header_text_color: theme.flow_text
 
         icon_check: KindIcon{ color: theme.flow_success svg: crate_resource("self:resources/icons/check.svg") }
         icon_alert: KindIcon{ color: theme.flow_error svg: crate_resource("self:resources/icons/alert.svg") }
@@ -1008,6 +1026,30 @@ pub struct FlowCanvas {
     draw_chip: DrawText,
     #[live]
     draw_error: DrawText,
+    /// A port's disc: half its width and half its height, how far an output's point reaches
+    /// past it and how deep an input's notch goes into it (both 0: a plain oval).
+    #[live]
+    port_radius_x: f64,
+    #[live]
+    port_radius_y: f64,
+    #[live]
+    port_tip: f64,
+    #[live]
+    port_dent: f64,
+    /// Whether each port shows its kind's icon inside its disc.
+    #[live]
+    port_icons: bool,
+    #[live]
+    card_radius: f32,
+    /// When above 0, the row of each card's title is a band this tall in its kind's colour,
+    /// joined to the card, the title written over it in `header_text_color`.
+    #[live]
+    header_band: f64,
+    #[live]
+    header_text_color: Vec4f,
+    /// Colours by node kind, set by the host, before the styles' and the built-in kinds'.
+    #[rust]
+    kind_colors: HashMap<String, Vec4f>,
     #[live]
     card_color: Vec4f,
     #[live]
@@ -2178,6 +2220,16 @@ impl FlowCanvas {
         self.target_scale
     }
 
+    /// Colours nodes by kind (header bands, progress), ahead of the styles' colours.
+    pub fn set_kind_colors(&mut self, cx: &mut Cx, colors: HashMap<String, Vec4f>) {
+        self.kind_colors = colors;
+        self.redraw(cx);
+    }
+
+    fn port_shape(&self) -> PortShape {
+        PortShape { rx: self.port_radius_x, ry: self.port_radius_y, tip: self.port_tip, dent: self.port_dent }
+    }
+
     pub fn set_fit_insets(&mut self, insets: Inset) {
         self.fit_insets = insets;
     }
@@ -2426,9 +2478,9 @@ impl FlowCanvas {
             -1.0
         };
         let offset = if output {
-            direction * (PORT_RX + PORT_TIP)
+            direction * (self.port_radius_x + self.port_tip)
         } else {
-            -direction * (PORT_RX - PORT_DENT)
+            -direction * (self.port_radius_x - self.port_dent)
         };
         dvec2(p.x + offset, p.y)
     }
@@ -2600,6 +2652,9 @@ impl FlowCanvas {
     }
 
     fn kind_color(&self, kind: &str) -> Vec4f {
+        if let Some(color) = self.kind_colors.get(kind) {
+            return *color;
+        }
         if let Some(color) = self.styles.node_color(kind) {
             return color;
         }
@@ -2692,14 +2747,14 @@ impl FlowCanvas {
     /// ends in a sharp `>` point, an input has a small `>` notch the point
     /// would fit into. `grow` widens the oval (hover, the selected halo);
     /// `direction` is the card's flow direction (+1 left-to-right).
-    fn shaped_port(v: &mut DrawVector, centre: Point, grow: f64, direction: f64, input: bool) {
-        let rx = PORT_RX + grow;
-        let ry = PORT_R + grow;
+    fn shaped_port(v: &mut DrawVector, shape: PortShape, centre: Point, grow: f64, direction: f64, input: bool) {
+        let rx = (shape.rx + grow).max(0.5);
+        let ry = (shape.ry + grow).max(0.5);
         let cable_side = if input { -direction } else { direction };
         let (apex_r, half_angle) = if input {
-            (rx - PORT_DENT, PORT_NOTCH_HALF_ANGLE)
+            (rx - shape.dent, if shape.dent > 0.0 { PORT_NOTCH_HALF_ANGLE } else { 0.0 })
         } else {
-            (rx + PORT_TIP, PORT_TIP_HALF_ANGLE)
+            (rx + shape.tip, if shape.tip > 0.0 { PORT_TIP_HALF_ANGLE } else { 0.0 })
         };
         let base = if cable_side < 0.0 {
             std::f64::consts::PI
@@ -3670,7 +3725,7 @@ impl FlowCanvas {
                 self.card_edge_color
             };
             self.draw_card.border_size = if highlighted || waiting { 2.0 } else { 1.0 };
-            self.draw_card.border_radius = outline.radius;
+            self.draw_card.border_radius = outline.radius.min(self.card_radius);
             let outline_alpha = if selected == Some(node.id.as_str()) {
                 1.0
             } else if hover == Some(index) {
@@ -3690,6 +3745,17 @@ impl FlowCanvas {
                 0.0
             };
             self.draw_card.draw_abs(cx, rect);
+            // The title's row as a band in the node's kind colour, joined to the card.
+            if self.header_band > 0.0 {
+                let band = self.header_band.min(LABEL_H);
+                self.draw_card.color = self.kind_color(&node.kind);
+                self.draw_card.border_color = self.draw_card.color;
+                self.draw_card.border_size = 0.0;
+                self.draw_card.outline_size = 0.0;
+                self.draw_card.shadow_radius = 0.0;
+                self.draw_card.draw_abs(cx, Rect { pos: dvec2(rect.pos.x, rect.pos.y - band), size: dvec2(rect.size.x, band) });
+                self.draw_card.shadow_radius = (12.0 / self.camera.scale.max(0.01)) as f32;
+            }
         }
     }
 
@@ -3753,10 +3819,18 @@ impl FlowCanvas {
                 icon.draw_abs(cx, icon_rect);
             }
             let id_w = self.text_width(cx, &self.draw_title, &node.title);
+            // Over a header band, the title and type in the band's text colour.
+            let (title_color, meta_color) = (self.draw_title.color, self.draw_meta.color);
+            if self.header_band > 0.0 {
+                self.draw_title.color = self.header_text_color;
+                self.draw_meta.color = self.header_text_color;
+            }
             self.draw_title
                 .draw_abs(cx, dvec2(r.pos.x + 23.0, label_y + 6.0), &node.title);
             self.draw_meta
                 .draw_abs(cx, dvec2(r.pos.x + 29.0 + id_w, label_y + 7.0), &node.type_name);
+            self.draw_title.color = title_color;
+            self.draw_meta.color = meta_color;
             // State chip at the right of the label row.
             if let Some(status) = self.statuses.get(&node.id) {
                 let state = status.state.as_str();
@@ -3800,8 +3874,8 @@ impl FlowCanvas {
                     };
                     let w = self.text_width(cx, &self.draw_port, &input.name);
                     let x = match self.port_side(graph, index, false) {
-                        PortSide::Left => p.x + PORT_RX + PORT_LABEL_GAP,
-                        PortSide::Right => p.x - PORT_RX - PORT_LABEL_GAP - w,
+                        PortSide::Left => p.x + self.port_radius_x + PORT_LABEL_GAP,
+                        PortSide::Right => p.x - self.port_radius_x - PORT_LABEL_GAP - w,
                     };
                     self.draw_port.draw_abs(cx, dvec2(x, p.y - 6.0), &input.name);
                 }
@@ -3810,8 +3884,8 @@ impl FlowCanvas {
                     let w = self.text_width(cx, &self.draw_port, &output.name);
                     self.draw_port.color = self.color_port_label_connected;
                     let x = match self.port_side(graph, index, true) {
-                        PortSide::Left => p.x + PORT_RX + PORT_LABEL_GAP,
-                        PortSide::Right => p.x - PORT_RX - PORT_LABEL_GAP - w,
+                        PortSide::Left => p.x + self.port_radius_x + PORT_LABEL_GAP,
+                        PortSide::Right => p.x - self.port_radius_x - PORT_LABEL_GAP - w,
                     };
                     self.draw_port.draw_abs(cx, dvec2(x, p.y - 6.0), &output.name);
                 }
@@ -4034,6 +4108,7 @@ impl FlowCanvas {
             }
             // Ports: a dark disc with a ring in the port-type colour. The
             // disc's cable side is shaped: outputs point, inputs are dimpled.
+            let shape = self.port_shape();
             let direction = if self.port_side(graph, index, true) == PortSide::Right {
                 1.0
             } else {
@@ -4047,21 +4122,21 @@ impl FlowCanvas {
                 let grow = if hot { 3.0 } else { 0.0 };
                 if selected_edge.is_some_and(|edge| edge.to == index && edge.to_port == port) {
                     Self::set_color(&mut self.draw_over, self.accent_color, 1.0);
-                    Self::shaped_port(&mut self.draw_over, centre, 4.0, direction, true);
+                    Self::shaped_port(&mut self.draw_over, shape, centre, 4.0, direction, true);
                     self.draw_over.stroke(2.0);
                 }
                 Self::set_color(&mut self.draw_over, self.card_color, 1.0);
-                Self::shaped_port(&mut self.draw_over, centre, grow, direction, true);
+                Self::shaped_port(&mut self.draw_over, shape, centre, grow, direction, true);
                 self.draw_over.fill();
                 let color = self.port_color(Self::input_kind(node, port));
                 Self::set_color(&mut self.draw_over, color, if ok { 1.0 } else { 0.25 });
-                Self::shaped_port(&mut self.draw_over, centre, grow - 1.0, direction, true);
+                Self::shaped_port(&mut self.draw_over, shape, centre, grow - 1.0, direction, true);
                 self.draw_over.stroke(if hot { 3.0 } else { 2.0 });
                 if let Some((_, accent)) = boundary_links.iter().find(|(link, _)| {
                     !link.output && link.node == node.inputs[port].name
                 }) {
                     Self::set_color(&mut self.draw_over, *accent, if ok { 1.0 } else { 0.25 });
-                    Self::shaped_port(&mut self.draw_over, centre, grow - 3.5, direction, true);
+                    Self::shaped_port(&mut self.draw_over, shape, centre, grow - 3.5, direction, true);
                     self.draw_over.stroke(1.5);
                 }
             }
@@ -4070,28 +4145,29 @@ impl FlowCanvas {
                 let centre = Point::new(p.x, p.y);
                 if selected_edge.is_some_and(|edge| edge.from == index && edge.from_port == port) {
                     Self::set_color(&mut self.draw_over, self.accent_color, 1.0);
-                    Self::shaped_port(&mut self.draw_over, centre, 4.0, direction, false);
+                    Self::shaped_port(&mut self.draw_over, shape, centre, 4.0, direction, false);
                     self.draw_over.stroke(2.0);
                 }
                 Self::set_color(&mut self.draw_over, self.card_color, 1.0);
-                Self::shaped_port(&mut self.draw_over, centre, 0.0, direction, false);
+                Self::shaped_port(&mut self.draw_over, shape, centre, 0.0, direction, false);
                 self.draw_over.fill();
                 let color = self.port_color(&output.kind);
                 Self::set_color(&mut self.draw_over, color, 1.0);
-                Self::shaped_port(&mut self.draw_over, centre, -1.0, direction, false);
+                Self::shaped_port(&mut self.draw_over, shape, centre, -1.0, direction, false);
                 self.draw_over.stroke(2.0);
                 if let Some((_, accent)) = boundary_links.iter().find(|(link, _)| {
                     link.output && link.node == output.name
                 }) {
                     Self::set_color(&mut self.draw_over, *accent, 1.0);
-                    Self::shaped_port(&mut self.draw_over, centre, -3.5, direction, false);
+                    Self::shaped_port(&mut self.draw_over, shape, centre, -3.5, direction, false);
                     self.draw_over.stroke(1.5);
                 }
             }
         }
         self.draw_over.end(cx);
         // The port-type icons inside the discs.
-        for index in indices.iter().copied() {
+        let icons = self.port_icons;
+        for index in indices.iter().copied().filter(|_| icons) {
             let node = &graph.nodes[index];
             let direction = if self.port_side(graph, index, true) == PortSide::Right {
                 1.0
