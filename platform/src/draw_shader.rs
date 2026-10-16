@@ -108,6 +108,9 @@ pub struct CxDrawShaders {
     /// Explicit const-table mode override; None = decide from the
     /// environment / remote bridge (see `Cx::shader_const_table_mode`).
     pub const_table_mode: Option<bool>,
+    /// Never compile a new shader on the UI thread, even after startup; see
+    /// `Cx::set_shader_compiles_in_background`.
+    pub compile_in_background: bool,
 
     pub cache_object_reuse_epoch_seen: u64,
     /// Keyed by (heap key, object): an isolate's objects share index space
@@ -135,6 +138,25 @@ impl CxDrawShaders {
 }
 
 impl Cx {
+    /// Compile every new draw shader on the task pool, after startup too, instead of up to a
+    /// second's worth of them on the UI thread before the frame that first draws them (D3D11;
+    /// the other backends compile as before). Their draws are skipped until they are ready, so
+    /// an app that creates shaders while it runs (from documents, say) never stalls on a cold
+    /// cache: what they draw appears a little later instead.
+    pub fn set_shader_compiles_in_background(&mut self, on: bool) {
+        self.draw_shaders.compile_in_background = on;
+    }
+
+    /// How many draw shaders are queued or compiling: draws using them are skipped until they
+    /// are ready.
+    pub fn shader_compiles_waiting(&self) -> usize {
+        #[cfg(all(not(gpusim), target_os = "windows"))]
+        let compiling = self.hlsl_compiles_pending();
+        #[cfg(not(all(not(gpusim), target_os = "windows")))]
+        let compiling = 0;
+        self.draw_shaders.compile_set.len() + compiling
+    }
+
     /// Whether draw shaders compile with the constant table: annotated float
     /// literals in fn bodies become hot-patchable scope-uniform slots
     /// instead of folded code. Explicit `set_shader_const_table_mode` wins;

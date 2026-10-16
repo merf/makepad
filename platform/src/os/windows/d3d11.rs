@@ -1091,7 +1091,9 @@ impl Cx {
     /// frame renders, as Metal does, so it draws complete with at most a one-time hitch instead
     /// of an empty panel that waits behind whatever the app has queued on the heavy lane. A
     /// cached shader costs a file read and the device objects. `INLINE_BUDGET` bounds the hitch;
-    /// what is left over goes to the pool.
+    /// what is left over goes to the pool. An app that creates shaders as it runs can ask for
+    /// none inline (`Cx::set_shader_compiles_in_background`): one cold D3DCompile of a heavy
+    /// shader alone can take seconds, which the budget cannot bound.
     pub(crate) fn hlsl_compile_shaders(&mut self, d3d11_cx: &D3d11Cx) {
         const INLINE_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
         if self.os.async_hlsl_compile.pending.is_empty()
@@ -1099,10 +1101,8 @@ impl Cx {
         {
             self.os.async_hlsl_compile.startup_installed = true;
         }
-        let inline_until = self
-            .os
-            .async_hlsl_compile
-            .startup_installed
+        let inline_until = (self.os.async_hlsl_compile.startup_installed
+            && !self.draw_shaders.compile_in_background)
             .then(|| std::time::Instant::now() + INLINE_BUDGET);
         let pool = self.task_pool();
         let compile_set = std::mem::take(&mut self.draw_shaders.compile_set);
@@ -1147,6 +1147,11 @@ impl Cx {
     pub(crate) fn hlsl_compiles_waiting(&self) -> bool {
         !self.draw_shaders.compile_set.is_empty()
             || !self.os.async_hlsl_compile.pending.is_empty()
+    }
+
+    /// How many shaders are compiling on workers.
+    pub(crate) fn hlsl_compiles_pending(&self) -> usize {
+        self.os.async_hlsl_compile.pending.len()
     }
 
     /// Installs one compile's outcome; true when the shader can now draw.
@@ -4720,7 +4725,8 @@ pub struct AsyncHlslCompile {
         ),
     >,
     /// Set once the shaders created at startup are all installed; from then on new
-    /// shaders compile inline (see `hlsl_compile_shaders`).
+    /// shaders compile inline (see `hlsl_compile_shaders`), unless the app asked for
+    /// `compile_in_background`.
     startup_installed: bool,
 }
 
