@@ -498,6 +498,10 @@ impl IrFnCompiler {
             let n = self.nop();
             return self.push(ShaderType::Pod(pods.pod_void), n);
         };
+        if self.refuse_image_read(output, instance) {
+            let n = self.nop();
+            return self.push(ShaderType::Pod(pods.pod_void), n);
+        }
         self.check_index_type(vm, &index_ty);
         self.check_writable(output, instance);
         let place = self.index_expr(vm, output, instance, pod_ty, &index_ty, index, ret_ty);

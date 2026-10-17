@@ -40,11 +40,12 @@ pub(crate) fn io_kind_for(mode: ShaderMode, io_type: ShaderIoType) -> Result<Sha
         }
         SHADER_IO_SAMPLER => ShaderIoKind::Sampler(ShaderSamplerOptions::default()),
         SHADER_IO_SCOPE_UNIFORM => ShaderIoKind::ScopeUniform,
-        SHADER_IO_BUFFER_R | SHADER_IO_BUFFER_RW | SHADER_IO_WORKGROUP if mode != ShaderMode::Compute => {
-            return Err("device buffers and workgroup arrays exist only in compute kernels".to_string());
+        SHADER_IO_BUFFER_R | SHADER_IO_BUFFER_RW | SHADER_IO_WORKGROUP | SHADER_IO_STORAGE_2D if mode != ShaderMode::Compute => {
+            return Err("device buffers, storage images and workgroup arrays exist only in compute kernels".to_string());
         }
         SHADER_IO_BUFFER_R => ShaderIoKind::storage_buffer(true, false),
         SHADER_IO_BUFFER_RW => ShaderIoKind::storage_buffer(true, true),
+        SHADER_IO_STORAGE_2D => ShaderIoKind::storage_image(),
         SHADER_IO_WORKGROUP => ShaderIoKind::Workgroup,
         _ => return Err(format!("no lowering for io type {:?} in {:?} stage", io_type, mode)),
     })
@@ -204,6 +205,35 @@ impl IrFnCompiler {
             self.expr(ExprKind::Builtin(Builtin::Clamp, vec![i, lo, hi]), TY_I32)
         };
         self.expr(ExprKind::Index(instance, clamped), ret)
+    }
+
+    /// Whether `instance` is a kernel's storage image (`shader.storage_2d`).
+    pub(crate) fn is_storage_image(&self, output: &ShaderOutput, instance: ExprId) -> bool {
+        instance != NO_EXPR
+            && matches!(self.f.exprs[instance as usize].kind,
+                ExprKind::Global(g) if output.compiled.ir.globals[g as usize].kind == IrGlobalKind::Io(IrIo::StorageImage))
+    }
+
+    /// A storage image is written (`img[coord] = value`), never read or updated in place: D3D11
+    /// loads typed texels of few formats, and a texture is how a kernel reads an image.
+    pub(crate) fn refuse_image_read(&mut self, output: &mut ShaderOutput, instance: ExprId) -> bool {
+        if !self.is_storage_image(output, instance) {
+            return false;
+        }
+        let message = "storage images are write-only: write a texel with `self.img[coord] = value`, read an image through a texture";
+        output.push_error(format!("shader: {}", message));
+        script_err_shader!(self.trap, "{}", message);
+        true
+    }
+
+    /// A storage image's texel coordinate: a vec2u or vec2i.
+    fn check_image_coord(&mut self, vm: &ScriptVm, output: &mut ShaderOutput, coord_ty: &ShaderType) {
+        let b = &vm.bx.code.builtins.pod;
+        if !matches!(coord_ty, ShaderType::Pod(t) if *t == b.pod_vec2u || *t == b.pod_vec2i) {
+            let message = "a storage image is written at a vec2u or vec2i texel coordinate";
+            output.push_error(format!("shader: {}", message));
+            script_err_shader!(self.trap, "{}", message);
+        }
     }
 
     /// A write into a kernel's read-only buffer (`shader.buffer`) is refused.
@@ -404,6 +434,9 @@ impl IrFnCompiler {
             script_err_shader!(self.trap, "type is not indexable");
             return self.void_nop(vm);
         };
+        if self.refuse_image_read(output, instance) {
+            return self.void_nop(vm);
+        }
         self.check_index_type(vm, &index_ty);
         let e = self.index_expr(vm, output, instance, pod_ty, &index_ty, index, ret_ty);
         self.push(ShaderType::Pod(ret_ty), e);
@@ -423,7 +456,11 @@ impl IrFnCompiler {
             script_err_immutable!(self.trap, "index assign not supported for this type");
             return self.void_nop(vm);
         };
-        self.check_index_type(vm, &index_ty);
+        if self.is_storage_image(output, instance) {
+            self.check_image_coord(vm, output, &index_ty);
+        } else {
+            self.check_index_type(vm, &index_ty);
+        }
         self.check_writable(output, instance);
         let val_ty = if matches!(value_ty, ShaderType::AbstractInt) && (ret_ty == pods.pod_u32 || ret_ty == pods.pod_f32 || ret_ty == pods.pod_f16) {
             ret_ty
@@ -703,6 +740,16 @@ impl IrFnCompiler {
                     script_err_shader!(self.trap, "kernel array `{}` needs an element type (f32, u32, vec4f ...)", field_id);
                     return self.void_nop(vm);
                 };
+                if matches!(&kind, ShaderIoKind::StorageBuffer(flags) if flags.is_image()) {
+                    let p = &vm.bx.code.builtins.pod;
+                    let texel = [p.pod_f32, p.pod_vec2f, p.pod_vec4f, p.pod_u32, p.pod_vec2u, p.pod_vec4u, p.pod_i32, p.pod_vec2i, p.pod_vec4i];
+                    if !texel.contains(&elem) {
+                        let message = format!("storage image `{}` needs a texel type of 1, 2 or 4 lanes of f32, u32 or i32", field_id);
+                        output.push_error(format!("shader: {}", message));
+                        script_err_shader!(self.trap, "{}", message);
+                        return self.void_nop(vm);
+                    }
+                }
                 let elem_inline = ScriptPodTypeInline { self_ref: elem, data: vm.bx.heap.pod_types[elem.index as usize].clone() };
                 let align_of = elem_inline.data.ty.align_of();
                 let arr = if matches!(kind, ShaderIoKind::Workgroup) {

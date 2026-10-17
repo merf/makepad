@@ -548,7 +548,7 @@ impl<'a> RustPrinter<'a> {
                 IrIo::FragmentOutput(i) => format!("rcx.frag_fb{}", i),
                 IrIo::Texture(_) => format!("rcx.tex_{}", n),
                 // Compute kernels print only to SPIR-V.
-                IrIo::Storage(_) | IrIo::Workgroup => format!("rcx.kernel_{}", n),
+                IrIo::Storage(_) | IrIo::Workgroup | IrIo::StorageImage => format!("rcx.kernel_{}", n),
             },
             IrGlobalKind::VertexPosition => "rcx.vtx_pos".to_string(),
             IrGlobalKind::IterCounter => "rcx._mp_iter".to_string(),

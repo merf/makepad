@@ -47,6 +47,8 @@ pub const SHADER_IO_FRAGMENT_OUTPUT_MAX: ShaderIoType =
 pub const SHADER_IO_WORKGROUP: ShaderIoType = ShaderIoType(31);
 /// A compute-only type descriptor, never an IO global.
 pub const SHADER_COOPERATIVE_MATRIX: ShaderIoType = ShaderIoType(32);
+/// A compute kernel's write-only 2D storage image (`shader.storage_2d(vec4f)`).
+pub const SHADER_IO_STORAGE_2D: ShaderIoType = ShaderIoType(33);
 
 pub fn define_shader_module(heap: &mut ScriptHeap, native: &mut ScriptNative) {
     let shader = heap.new_module(id!(shader));
@@ -149,6 +151,21 @@ pub fn define_shader_module(heap: &mut ScriptHeap, native: &mut ScriptNative) {
             let value = script_value!(vm, args.value);
             let obj = vm.bx.heap.new_with_proto(value);
             vm.bx.heap.set_shader_io(obj, SHADER_IO_BUFFER_RW);
+            obj.into()
+        },
+    );
+
+    // A 2D image a kernel writes texel by texel (`self.img[coord] = value`); `value` is its
+    // texel type (f32, vec2f, vec4f, u32, vec4u ...), matching the texture's format.
+    native.add_method(
+        heap,
+        shader,
+        id_lut!(storage_2d),
+        script_args!(value = NIL),
+        |vm, args| {
+            let value = script_value!(vm, args.value);
+            let obj = vm.bx.heap.new_with_proto(value);
+            vm.bx.heap.set_shader_io(obj, SHADER_IO_STORAGE_2D);
             obj.into()
         },
     );

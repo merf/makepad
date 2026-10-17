@@ -48,6 +48,11 @@ pub struct TextCx<'a> {
     /// global, bit); their samples also read the twin.
     /// Pick variants (Metal, HLSL): each sampled 2D texture global and its bit in the twin mask.
     pub pick_twins: Vec<(GlobalId, u32)>,
+    /// HLSL compute: the kernel reads the dispatch's group count (`_mp_groups` at b13).
+    pub needs_group_count: bool,
+    /// What the dialect cannot express (an HLSL kernel's subgroup operations ...): the module
+    /// printer refuses the shader with these.
+    pub errors: Vec<String>,
 }
 
 pub fn lid(id: LiveId) -> String {
@@ -97,6 +102,8 @@ impl<'a> TextCx<'a> {
             glsl_oes_video: false,
             hlsl_ctors: Vec::new(),
             pick_twins: Vec::new(),
+            needs_group_count: false,
+            errors: Vec::new(),
         }
     }
 
@@ -305,8 +312,8 @@ impl<'a> TextCx<'a> {
                 IrIo::Varying => format!("var_{}", n),
                 IrIo::FragmentOutput(i) => format!("frag_fb{}", i),
                 IrIo::Texture(_) => format!("tex_{}", n),
-                // Compute kernels print only to SPIR-V.
-                IrIo::Storage(_) | IrIo::Workgroup => format!("kernel_{}", n),
+                // Compute kernels: SPIR-V and HLSL (shader_ir_hlsl::hlsl_compute).
+                IrIo::Storage(_) | IrIo::Workgroup | IrIo::StorageImage => format!("kernel_{}", n),
             },
             IrGlobalKind::VertexPosition => "vtx_pos".to_string(),
             IrGlobalKind::IterCounter => "_mp_iter".to_string(),
@@ -1209,6 +1216,23 @@ impl<'a> TextCx<'a> {
         }
     }
 
+    /// `atomic_add(place, v)` as HLSL's InterlockedAdd statement, its old value into `old` (a
+    /// local's declaration or a place); false when `e` is no atomic.
+    fn hlsl_atomic_stmt(&mut self, f: &IrFunction, e: ExprId, old: Option<(String, Option<TyId>)>, indent: usize, out: &mut String) -> bool {
+        let ExprKind::Builtin(Builtin::AtomicAdd, args) = &f.exprs[e as usize].kind else { return false };
+        let pt = f.exprs[args[0] as usize].ty;
+        let place = self.expr(f, args[0]);
+        let v = self.arg_as(f, args[1], pt);
+        Self::pad(out, indent);
+        match old {
+            None => writeln!(out, "InterlockedAdd({}, {});", place, v).ok(),
+            // a local: declared, then written by the atomic
+            Some((name, Some(ty))) => writeln!(out, "{}; InterlockedAdd({}, {}, {});", self.decl(ty, &name), place, v, name).ok(),
+            Some((target, None)) => writeln!(out, "{{ {} _mp_old; InterlockedAdd({}, {}, _mp_old); {} = _mp_old; }}", self.ty_name(pt), place, v, target).ok(),
+        };
+        true
+    }
+
     /// Assignments HLSL cannot write as one: an array from its elements.
     fn hlsl_assign(&mut self, f: &IrFunction, p: ExprId, v: ExprId, indent: usize, out: &mut String) -> bool {
         let IrTy::Array(..) = self.m.get(f.exprs[p as usize].ty) else { return false };
@@ -1268,6 +1292,34 @@ impl<'a> TextCx<'a> {
             Builtin::Unpack2x16Snorm => "_mp_unpack_snorm2x16",
             Builtin::Unpack4x8Unorm => "_mp_unpack_unorm4x8",
             Builtin::Unpack4x8Snorm => "_mp_unpack_snorm4x8",
+            // ---- compute kernels (shader_ir_hlsl::hlsl_compute: the entry copies the system
+            // values into these statics)
+            Builtin::GlobalId => return Some("_mp_gid".to_string()),
+            Builtin::LocalId => return Some("_mp_lid".to_string()),
+            Builtin::GroupId => return Some("_mp_grp".to_string()),
+            Builtin::LocalIndex => return Some("_mp_lindex".to_string()),
+            Builtin::GroupCount => {
+                self.needs_group_count = true;
+                return Some("_mp_groups.xyz".to_string());
+            }
+            Builtin::Barrier => return Some("GroupMemoryBarrierWithGroupSync()".to_string()),
+            Builtin::PackHalf2 => "_mp_pack_half2",
+            Builtin::ExtractBits => "_mp_extract_bits",
+            Builtin::Dot4U8 => "_mp_dot4_u8",
+            Builtin::SubgroupSize | Builtin::SubgroupLane | Builtin::SubgroupId | Builtin::SubgroupAdd | Builtin::SubgroupMin
+            | Builtin::SubgroupMax | Builtin::SubgroupShuffle | Builtin::SubgroupShuffleXor | Builtin::SubgroupFirst => {
+                self.errors.push("subgroup operations need shader model 6 wave intrinsics; D3D11 compiles shader model 5".to_string());
+                return Some("0".to_string());
+            }
+            Builtin::CooperativeLoad | Builtin::CooperativeStore | Builtin::CooperativeMulAdd | Builtin::CooperativeScale => {
+                self.errors.push("cooperative matrices exist only in SPIR-V kernels".to_string());
+                return Some("0".to_string());
+            }
+            Builtin::AtomicAdd => {
+                // HLSL's InterlockedAdd is a statement (hlsl_atomic_stmt)
+                self.errors.push("HLSL: use atomic_add as a statement or bind its result with `let`".to_string());
+                return Some("0".to_string());
+            }
             _ => return None,
         };
         let componentwise = matches!(op, Builtin::Mix | Builtin::Atan2 | Builtin::Fma);
@@ -1497,6 +1549,9 @@ impl<'a> TextCx<'a> {
                     return;
                 }
                 let name = self.local_name(f, *l);
+                if self.hlsl() && *init != NO_EXPR && self.hlsl_atomic_stmt(f, *init, Some((name.clone(), Some(local.ty))), indent, out) {
+                    return;
+                }
                 Self::pad(out, indent);
                 let missing = *init == NO_EXPR || matches!(f.exprs[*init as usize].kind, ExprKind::Error);
                 if glsl {
@@ -1532,6 +1587,11 @@ impl<'a> TextCx<'a> {
             }
             Stmt::Assign(p, v) => {
                 if self.hlsl() && self.hlsl_assign(f, *p, *v, indent, out) {
+                    return;
+                }
+                if self.hlsl() && matches!(f.exprs[*v as usize].kind, ExprKind::Builtin(Builtin::AtomicAdd, _)) {
+                    let target = self.expr(f, *p);
+                    self.hlsl_atomic_stmt(f, *v, Some((target, None)), indent, out);
                     return;
                 }
                 if !glsl {
@@ -1585,6 +1645,9 @@ impl<'a> TextCx<'a> {
             }
             Stmt::Expr(e) => {
                 if matches!(f.exprs[*e as usize].kind, ExprKind::Nop | ExprKind::Error) {
+                    return;
+                }
+                if self.hlsl() && self.hlsl_atomic_stmt(f, *e, None, indent, out) {
                     return;
                 }
                 let ty = f.exprs[*e as usize].ty;

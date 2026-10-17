@@ -101,7 +101,7 @@ fn arrays_and_blobs_round_trip() {
     assert_eq!((p.desc.shader, p.desc.name, p.desc.instance_stride, p.desc.varyings), (9, 3, 12, 5));
     assert!(PipelineBlob::parse(&blob[..20]).is_none());
     // a compute pipeline: its kind and binding table come back
-    let table = [compute_binding::NONE, 1, 1, 2, 1, compute_binding::WRITABLE];
+    let table = [compute_binding::NONE, 1, 1, 2, 1, 16, compute_binding::WRITABLE, 4];
     let blob = CmdWriter::pipeline_blob(PipelineDesc { kind: pipeline_kind::COMPUTE, ..Default::default() }, b"kernel", &table, &[]);
     let p = PipelineBlob::parse(&blob).unwrap();
     assert_eq!((p.desc.kind, p.bindings.as_slice(), p.vertex_layout.len()), (pipeline_kind::COMPUTE, &table[..], 0));

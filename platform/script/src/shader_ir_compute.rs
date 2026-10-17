@@ -1,4 +1,4 @@
-//! Splash compute kernels, compiled to SPIR-V.
+//! Splash compute kernels, compiled to SPIR-V (Vulkan) or HLSL (D3D11).
 //!
 //! A kernel is a Splash object with a `main: fn() { ... }` body:
 //!
@@ -18,13 +18,19 @@
 //!
 //! Variants are prototypes: `Scale{workgroup_size: 128}` compiles the same
 //! body with another constant. `workgroup_size_y` / `workgroup_size_z`
-//! default to 1. Buffers are reached by device address, so the host binds a
-//! kernel only through its push constants (`ComputeLayout`).
+//! default to 1. In SPIR-V buffers are reached by device address, so the
+//! host binds a kernel only through its push constants (`ComputeLayout`); in
+//! HLSL they are bound to slots and the params ride in a constant buffer
+//! (`KernelBindings`).
+//!
+//! A kernel writes a 2D image through `shader.storage_2d(vec4f)` (HLSL
+//! only for now), texel by texel: `self.out[global_id().xy] = color`.
 
 pub use makepad_shader::shader_ir_compute::*;
 use makepad_shader::shader_ir::CooperativeMatrix;
 use crate::{
     shader::{ShaderMode, ShaderType},
+    shader_backend::ShaderBackend,
     shader_lower::IrFnCompiler,
     shader_output::ShaderOutput,
     trap::NoTrap,
@@ -105,13 +111,49 @@ fn size_field(vm: &ScriptVm, kernel: ScriptObject, name: LiveId) -> Result<u32, 
 
 /// Compiles `kernel` (an object with a `main` fn) to SPIR-V for Vulkan.
 pub fn compile_compute_kernel(vm: &mut ScriptVm, kernel: ScriptObject) -> Result<CompiledKernel, String> {
+    let (mut output, entry) = lower_compute_kernel(vm, kernel, true)?;
+    let ir = &mut output.compiled.ir;
+    let layout = compute_layout(ir)?;
+    let spirv = makepad_shader::shader_ir_spirv::ir_to_spirv(ir, entry, false)?;
+    Ok(CompiledKernel { spirv, layout })
+}
+
+/// Compiles `kernel` to HLSL for D3D11 (`cs_5_0`, entry `kernel_main`), with the slots and the
+/// constant-buffer layout its host binds it by.
+pub fn compile_compute_kernel_hlsl(vm: &mut ScriptVm, kernel: ScriptObject) -> Result<HlslKernel, String> {
+    let (output, entry) = lower_compute_kernel(vm, kernel, false)?;
+    makepad_shader::shader_ir_hlsl::hlsl_compute(&output.compiled, entry)
+}
+
+/// A kernel in the dialect a backend takes.
+#[derive(Clone, Debug)]
+pub enum KernelCode {
+    Spirv(CompiledKernel),
+    Hlsl(HlslKernel),
+}
+
+/// Compiles `kernel` for the shader backend a HAL asked for: SPIR-V for Vulkan
+/// (`ShaderBackend::Glsl` with `vulkan`), HLSL for D3D11. The others are refused with the reason.
+pub fn compile_compute_kernel_for(vm: &mut ScriptVm, kernel: ScriptObject, backend: ShaderBackend, vulkan: bool) -> Result<KernelCode, String> {
+    match backend {
+        ShaderBackend::Glsl if vulkan => compile_compute_kernel(vm, kernel).map(KernelCode::Spirv),
+        ShaderBackend::Hlsl => compile_compute_kernel_hlsl(vm, kernel).map(KernelCode::Hlsl),
+        ShaderBackend::Glsl => Err("compute kernels: GL ES 3.0 has no compute stage".to_string()),
+        ShaderBackend::Wgsl => Err("compute kernels: WGSL kernels are not built yet".to_string()),
+        ShaderBackend::Metal => Err("compute kernels: Metal kernels are not built yet".to_string()),
+        ShaderBackend::Rust => Err("compute kernels: the Rust shader backend runs no kernels".to_string()),
+    }
+}
+
+/// The kernel's IR with its compute entry (`kernel_main`), the same for every dialect.
+fn lower_compute_kernel(vm: &mut ScriptVm, kernel: ScriptObject, vulkan: bool) -> Result<(ShaderOutput, makepad_shader::shader_ir::FuncId), String> {
     let workgroup = [
         size_field(vm, kernel, id!(workgroup_size))?,
         size_field(vm, kernel, id!(workgroup_size_y))?,
         size_field(vm, kernel, id!(workgroup_size_z))?,
     ];
     let mut output = ShaderOutput::default();
-    output.compiled.use_vulkan = true;
+    output.compiled.use_vulkan = vulkan;
     output.mode = ShaderMode::Compute;
     let main = vm
         .bx
@@ -128,7 +170,5 @@ pub fn compile_compute_kernel(vm: &mut ScriptVm, kernel: ScriptObject) -> Result
     let ir = &mut output.compiled.ir;
     ir.workgroup = workgroup;
     let entry = build_compute_entry(ir, main);
-    let layout = compute_layout(ir)?;
-    let spirv = makepad_shader::shader_ir_spirv::ir_to_spirv(ir, entry, false)?;
-    Ok(CompiledKernel { spirv, layout })
+    Ok((output, entry))
 }

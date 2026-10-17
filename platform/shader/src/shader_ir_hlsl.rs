@@ -1,5 +1,6 @@
 //! HLSL (shader model 5) from the shader IR: the one source D3D11 compiles
-//! twice, `vertex_main` with `vs_5_0` and `pixel_main` with `ps_5_0`.
+//! twice, `vertex_main` with `vs_5_0` and `pixel_main` with `ps_5_0`; and a
+//! compute kernel's source for `cs_5_0` (`hlsl_compute`).
 //!
 //! Registers: uniform buffers at `b<buffer_index>`, the dyn uniforms at b2,
 //! the scope uniforms after the uniform buffers, the draw's first instance at
@@ -9,6 +10,7 @@
 //! (`GEOM<letter><chunk>`).
 
 use crate::shader_ir::*;
+use crate::shader_ir_compute::{ComputeSlot, ComputeSlotKind, HlslKernel, KernelBindings, KernelBuffer, KernelImage};
 use crate::shader_ir_draw::{build_hlsl_entries, HlslDrawInfo};
 use crate::shader_ir_text::*;
 use crate::shader_output::*;
@@ -361,6 +363,216 @@ const HLSL_INVERSE4: &str = "float4x4 _mp_inverse4(float4x4 m) {
         float4(a10 * b10 - a11 * b08 + a13 * b06, a01 * b08 - a00 * b10 - a03 * b06, a30 * b04 - a31 * b02 + a33 * b00, a21 * b02 - a20 * b04 - a23 * b00) * inv,
         float4(a11 * b07 - a10 * b09 - a12 * b06, a00 * b09 - a01 * b07 + a02 * b06, a31 * b01 - a30 * b03 - a32 * b00, a20 * b03 - a21 * b01 + a22 * b00) * inv);
 }
+";
+
+/// The register of a kernel's parameter block.
+pub const HLSL_KERNEL_PARAMS_REGISTER: u32 = 0;
+/// The register the host binds the dispatch's group count at (`uint4`, x y z), as draws bind
+/// their first instance there.
+pub const HLSL_KERNEL_GROUPS_REGISTER: u32 = 13;
+
+/// A compute kernel (`entry`, made by `build_compute_entry`) as HLSL for `cs_5_0`, entry
+/// `kernel_main`, and what the host binds it by.
+///
+/// Registers, each kind counting from 0 in the IR's global order (the order a kernel first uses
+/// its resources): sampled textures `t0..`, then the read-only buffers (`StructuredBuffer`);
+/// storage images (`RWTexture2D`) `u0..`, then the written buffers (`RWStructuredBuffer`); the
+/// params in one constant buffer at b0 (`packoffset`s at their natural alignment); the dispatch's
+/// group count at b13 when the kernel reads it; samplers at `s0..`. Workgroup arrays are
+/// `groupshared`.
+///
+/// Refused, with every reason: subgroup operations (shader model 6), cooperative matrices, f16
+/// and bool in buffers or params, and buffer elements whose HLSL packing differs from the
+/// layout the other dialects use (a vec3 or a mat3 in a buffer: pad to vec4).
+pub fn hlsl_compute(output: &ShaderOutput, entry: FuncId) -> Result<HlslKernel, String> {
+    let ir = &output.ir;
+    let mut errors = Vec::new();
+    let funcs = callees_first(ir, &[entry]);
+    let mut cx = TextCx::new(ir, Dialect::Hlsl, false);
+
+    let mut bodies = String::new();
+    for f in &funcs {
+        if *f != entry {
+            cx.function(*f, &mut bodies);
+        }
+    }
+    let mut main = String::new();
+    let wg = ir.workgroup;
+    writeln!(main, "[numthreads({}, {}, {})]", wg[0].max(1), wg[1].max(1), wg[2].max(1)).ok();
+    main.push_str("void kernel_main(uint3 _mp_gid_in : SV_DispatchThreadID, uint3 _mp_lid_in : SV_GroupThreadID, uint3 _mp_grp_in : SV_GroupID, uint _mp_lindex_in : SV_GroupIndex) {
+");
+    main.push_str("    _mp_gid = _mp_gid_in; _mp_lid = _mp_lid_in; _mp_grp = _mp_grp_in; _mp_lindex = _mp_lindex_in;
+");
+    let f = &ir.functions[entry as usize];
+    cx.stmts(f, &f.body, 1, &mut main);
+    main.push_str("}
+");
+    errors.append(&mut cx.errors);
+
+    let mut out = String::new();
+    out.push_str("#pragma pack_matrix(row_major)
+");
+    let mut done = vec![false; ir.structs.len()];
+    for s in 0..ir.structs.len() {
+        struct_def(&cx, s as u32, &mut done, &mut out);
+    }
+    for s in cx.hlsl_ctors.clone() {
+        let name = cx.struct_name(s);
+        let sty = ir.types.iter().position(|t| *t == IrTy::Struct(s)).unwrap_or(0) as TyId;
+        let mut params = Vec::new();
+        let mut sets = String::new();
+        for (i, fd) in ir.structs[s as usize].fields.iter().enumerate() {
+            params.push(cx.decl(fd.ty, &format!("p{}", i)));
+            write!(sets, " r.{} = p{};", cx.field_name(sty, i as u32), i).ok();
+        }
+        writeln!(out, "{0} _mp_make_{0}({1}) {{ {0} r;{2} return r; }}", name, params.join(", "), sets).ok();
+    }
+
+    let mut b = KernelBindings { workgroup: wg, samplers: output.samplers.clone(), ..Default::default() };
+    // the parameter block
+    let mut offset = 0u32;
+    let mut params = String::new();
+    for (i, g) in ir.globals.iter().enumerate() {
+        if g.kind != IrGlobalKind::Io(IrIo::Uniform) {
+            continue;
+        }
+        let (scalar, lanes) = match ir.get(g.ty) {
+            IrTy::Scalar(s) => (*s, 1),
+            IrTy::Vec(n, s) => (*s, *n as u32),
+            other => {
+                errors.push(format!("kernel param {} must be a scalar or a vector, not {:?}", g.name, other));
+                continue;
+            }
+        };
+        if matches!(scalar, IrScalar::Bool | IrScalar::F16) {
+            errors.push(format!("kernel param {} cannot be a bool or an f16 (use u32 / f32)", g.name));
+            continue;
+        }
+        let (size, align) = ir_layout(ir, g.ty);
+        offset = round_up(offset, align);
+        let name = cx.global_name(i as GlobalId);
+        writeln!(params, "    {} : packoffset(c{}.{});", cx.decl(g.ty, &name), offset / 16, ['x', 'y', 'z', 'w'][(offset % 16 / 4) as usize]).ok();
+        b.params.push(ComputeSlot { name: g.name, global: i as GlobalId, kind: ComputeSlotKind::Param { scalar, lanes }, offset, size });
+        offset += size;
+    }
+    if !b.params.is_empty() {
+        b.params_size = round_up(offset, 16);
+        writeln!(out, "cbuffer _mp_params : register(b{}) {{
+{}}};", HLSL_KERNEL_PARAMS_REGISTER, params).ok();
+    }
+    if cx.needs_group_count {
+        writeln!(out, "cbuffer _mp_dispatch : register(b{}) {{ uint4 _mp_groups; }};", HLSL_KERNEL_GROUPS_REGISTER).ok();
+    }
+    // textures, images, buffers, workgroup arrays
+    let (mut t, mut u) = (0u32, 0u32);
+    for (i, g) in ir.globals.iter().enumerate() {
+        if let IrGlobalKind::Io(IrIo::Texture(tt)) = g.kind {
+            writeln!(out, "{} {} : register(t{});", hlsl_texture_type(tt), cx.global_name(i as GlobalId), t).ok();
+            b.textures.push((g.name, tt));
+            t += 1;
+        }
+    }
+    for (i, g) in ir.globals.iter().enumerate() {
+        if g.kind != IrGlobalKind::Io(IrIo::StorageImage) {
+            continue;
+        }
+        let IrTy::Array(texel, _) = *ir.get(g.ty) else { continue };
+        let (scalar, lanes) = match ir.get(texel) {
+            IrTy::Scalar(s) => (*s, 1),
+            IrTy::Vec(n, s) => (*s, *n as u32),
+            _ => (IrScalar::Bool, 0),
+        };
+        if !matches!(scalar, IrScalar::F32 | IrScalar::U32 | IrScalar::I32) || lanes == 3 {
+            errors.push(format!("storage image {}: a texel of 1, 2 or 4 lanes of f32, u32 or i32", g.name));
+        }
+        writeln!(out, "RWTexture2D<{}> {} : register(u{});", cx.ty_name(texel), cx.global_name(i as GlobalId), u).ok();
+        b.images.push(KernelImage { name: g.name, scalar, lanes });
+        u += 1;
+    }
+    for writable in [false, true] {
+        for (i, g) in ir.globals.iter().enumerate() {
+            if g.kind != IrGlobalKind::Io(IrIo::Storage(writable)) {
+                continue;
+            }
+            let IrTy::Array(elem, _) = *ir.get(g.ty) else { continue };
+            let stride = match hlsl_buffer_size(ir, elem) {
+                Some(size) if size == ir_array_stride(ir, elem) => size,
+                _ => {
+                    errors.push(format!(
+                        "buffer {}: its element packs differently in HLSL (a vec3, a mat3, an f16 or a bool, or padding after a field); use vec4s or pad it", g.name));
+                    0
+                }
+            };
+            let (kind, reg) = if writable { ("RWStructuredBuffer", &mut u) } else { ("StructuredBuffer", &mut t) };
+            writeln!(out, "{}<{}> {} : register({}{});", kind, cx.ty_name(elem), cx.global_name(i as GlobalId), if writable { 'u' } else { 't' }, *reg).ok();
+            b.buffers.push(KernelBuffer { name: g.name, writable, register: *reg, stride });
+            *reg += 1;
+        }
+    }
+    // the dispatch's buffers in global order, as the bindings list them
+    b.buffers.sort_by_key(|kb| ir.globals.iter().position(|g| g.name == kb.name && matches!(g.kind, IrGlobalKind::Io(IrIo::Storage(_)))));
+    for (i, g) in ir.globals.iter().enumerate() {
+        if g.kind == IrGlobalKind::Io(IrIo::Workgroup) {
+            writeln!(out, "groupshared {};", cx.decl(g.ty, &cx.global_name(i as GlobalId))).ok();
+        }
+    }
+    for (i, s) in output.samplers.iter().enumerate() {
+        let ty = if s.compare { "SamplerComparisonState" } else { "SamplerState" };
+        writeln!(out, "{} _s{} : register(s{});", ty, i, i).ok();
+    }
+    out.push_str("static uint _mp_iter = 0;
+static uint3 _mp_gid;
+static uint3 _mp_lid;
+static uint3 _mp_grp;
+static uint _mp_lindex;
+");
+    out.push_str(HLSL_HELPERS);
+    out.push_str(HLSL_KERNEL_HELPERS);
+    if cx.needs_inverse {
+        out.push_str(HLSL_INVERSE4);
+    }
+    out.push_str(&bodies);
+    out.push_str(&main);
+    if !errors.is_empty() {
+        errors.dedup();
+        return Err(errors.join("\n"));
+    }
+    Ok(HlslKernel { source: out, bindings: b })
+}
+
+/// The bytes an element takes in an HLSL structured buffer (tightly packed), when it lays out
+/// as `ir_layout` has it (field offsets and size alike); None otherwise.
+fn hlsl_buffer_size(m: &IrModule, ty: TyId) -> Option<u32> {
+    match m.get(ty) {
+        IrTy::Scalar(IrScalar::F16 | IrScalar::Bool) | IrTy::Vec(_, IrScalar::F16 | IrScalar::Bool) => None,
+        IrTy::Scalar(_) => Some(4),
+        IrTy::Vec(n, _) => Some(4 * *n as u32),
+        IrTy::Mat(c, r) => Some(4 * *c as u32 * *r as u32).filter(|s| *s == ir_layout(m, ty).0),
+        IrTy::Array(e, n) if *n > 0 => {
+            let es = hlsl_buffer_size(m, *e)?;
+            (es == ir_array_stride(m, *e)).then_some(es * n)
+        }
+        IrTy::Struct(s) => {
+            let (mut tight, mut natural) = (0u32, 0u32);
+            for f in &m.structs[*s as usize].fields {
+                let size = hlsl_buffer_size(m, f.ty)?;
+                let (ir_size, align) = ir_layout(m, f.ty);
+                natural = round_up(natural, align);
+                if natural != tight || ir_size != size {
+                    return None;
+                }
+                tight += size;
+                natural += ir_size;
+            }
+            Some(tight)
+        }
+        _ => None,
+    }
+}
+
+const HLSL_KERNEL_HELPERS: &str = "uint _mp_pack_half2(float2 v) { return f32tof16(v.x) | (f32tof16(v.y) << 16); }
+uint _mp_extract_bits(uint x, uint o, uint c) { return c == 0u ? 0u : (x >> o) & (0xffffffffu >> (32u - c)); }
+uint _mp_dot4_u8(uint a, uint b) { return (a & 255u) * (b & 255u) + ((a >> 8) & 255u) * ((b >> 8) & 255u) + ((a >> 16) & 255u) * ((b >> 16) & 255u) + (a >> 24) * (b >> 24); }
 ";
 
 pub fn hlsl_draw_source_into(output: &ShaderOutput, types: &impl crate::shader_types::ShaderTypes, out: &mut String) {

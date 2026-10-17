@@ -82,6 +82,13 @@ impl ShaderStorageFlags {
     pub fn is_write(&self) -> bool {
         self.0 & 2 != 0
     }
+    /// A 2D storage image rather than a buffer (`shader.storage_2d`).
+    pub fn set_image(&mut self) {
+        self.0 |= 4
+    }
+    pub fn is_image(&self) -> bool {
+        self.0 & 4 != 0
+    }
 }
 
 #[relax_api(plain)]
@@ -454,6 +461,13 @@ impl ShaderIoKind {
         if write { flags.set_write(); }
         Self::StorageBuffer(flags)
     }
+    /// A compute kernel's write-only 2D storage image.
+    pub fn storage_image() -> Self {
+        let mut flags = ShaderStorageFlags::default();
+        flags.set_write();
+        flags.set_image();
+        Self::StorageBuffer(flags)
+    }
     pub fn sampler() -> Self { Self::Sampler(ShaderSamplerOptions::default()) }
     pub fn texture(ty: TextureType) -> Self { Self::Texture(ty) }
     pub fn fragment(index: u8) -> Self { Self::FragmentOutput(index) }
@@ -497,6 +511,7 @@ pub fn global_kind_of(kind: &ShaderIoKind) -> Option<IrGlobalKind> {
         ShaderIoKind::FragmentOutput(i) => IrGlobalKind::Io(IrIo::FragmentOutput(*i)),
         ShaderIoKind::Texture(t) => IrGlobalKind::Io(IrIo::Texture(*t)),
         ShaderIoKind::VertexPosition => IrGlobalKind::VertexPosition,
+        ShaderIoKind::StorageBuffer(flags) if flags.is_image() => IrGlobalKind::Io(IrIo::StorageImage),
         ShaderIoKind::StorageBuffer(flags) => IrGlobalKind::Io(IrIo::Storage(flags.is_write())),
         ShaderIoKind::Workgroup => IrGlobalKind::Io(IrIo::Workgroup),
         _ => return None,

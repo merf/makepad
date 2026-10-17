@@ -28,9 +28,41 @@ use crate::{
     uniform_buffer::UniformBufferId,
 };
 use makepad_hal::{
-    format, pass_load as load, pipeline_binding as binding, pipeline_blend, usage, Attr, CmdWriter, Draw, FrameMeta, HalInfo, Id, Inst, Pass, PipelineDesc, Slice, StrId,
+    compute_binding, format, pass_load as load, pipeline_binding as binding, pipeline_blend, pipeline_kind, usage, Attr, CmdWriter, Draw, FrameMeta, HalInfo, Id,
+    Inst, Pass, PipelineDesc, Slice, StrId,
 };
+use makepad_script::shader_ir_compute::HlslKernel;
 use std::collections::HashMap;
+
+/// A compute kernel's `PipelineCreate` blob for D3D11 (`dialect::HLSL`): the HLSL payload (its
+/// textures' shapes and its samplers) and the binding table (`compute_binding`) its dispatches are
+/// bound by: the parameter block's register, the counts of textures, images and buffers, then each
+/// buffer's register, access and element size, in the order a dispatch names them.
+pub fn hlsl_kernel_pipeline_blob(kernel: &HlslKernel, name: StrId, source: StrId) -> Result<Vec<u8>, String> {
+    use makepad_script::shader::{SamplerAddress, SamplerFilter, TextureType};
+    let b = &kernel.bindings;
+    let textures = b.textures.iter().map(|(n, t)| match t {
+        TextureType::Texture2d | TextureType::TextureVideo => Ok(0), TextureType::TextureCube => Ok(1),
+        TextureType::Texture2dArray => Ok(2), TextureType::TextureDepth => Ok(3), TextureType::TextureDepthArray => Ok(4),
+        _ => Err(format!("kernel texture {n}: D3D11 kernels sample 2D, cube, array and depth textures")),
+    }).collect::<Result<Vec<u32>, String>>()?;
+    let samplers = b.samplers.iter().map(|s| makepad_hal::spirv::SpirvSampler {
+        filter: if s.filter == SamplerFilter::Nearest { 0 } else { 1 },
+        address: match s.address { SamplerAddress::Repeat => 0, SamplerAddress::ClampToEdge => 1, SamplerAddress::ClampToZero => 2, SamplerAddress::MirroredRepeat => 3 },
+        compare: s.compare, pixel: false,
+    }).collect();
+    let code = makepad_hal::hlsl::HlslPipeline { source: kernel.source.clone(), textures, samplers }.encode();
+    let mut table = vec![compute_binding::NONE; compute_binding::BUFFER_WORDS];
+    table[compute_binding::PARAMS] = if b.params_size > 0 { makepad_script::shader_ir_hlsl::HLSL_KERNEL_PARAMS_REGISTER } else { compute_binding::NONE };
+    table[compute_binding::TEXTURES] = b.textures.len() as u32;
+    table[compute_binding::IMAGES] = b.images.len() as u32;
+    table[compute_binding::BUFFERS] = b.buffers.len() as u32;
+    for buf in &b.buffers {
+        table.extend([buf.register | if buf.writable { compute_binding::WRITABLE } else { 0 }, buf.stride]);
+    }
+    let desc = PipelineDesc { kind: pipeline_kind::COMPUTE, name, source, ..Default::default() };
+    Ok(CmdWriter::pipeline_blob(desc, &code, &table, &[]))
+}
 
 struct TexRec {
     id: Id,

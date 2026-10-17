@@ -761,14 +761,15 @@ pub mod pipeline_binding {
 }
 
 /// Layout of a compute pipeline's binding table (`PipelineDesc::bindings`, `pipeline_kind::COMPUTE`):
-/// the slot of the parameter block, the counts of what a dispatch binds, then one word per storage
+/// the slot of the parameter block, the counts of what a dispatch binds, then two words per storage
 /// buffer. A dispatch names its textures, images and buffers in this order (`Dispatch::tex`,
 /// `images`, `buffers`).
 ///
 /// Registers (HLSL; Metal uses the same numbers for its texture and buffer indices): sampled
 /// textures `t0..`, then the read-only buffers in the `t` registers after them; storage images
 /// `u0..`, then the writable buffers in the `u` registers after them; the parameter block at
-/// `b<PARAMS>`. Each buffer's word gives its register and whether it is written.
+/// `b<PARAMS>`, the dispatch's group count (`uint4`) at `b13`. Each buffer's words give its
+/// register, whether it is written, and its element size.
 pub mod compute_binding {
     /// the constant-buffer slot of the parameter block (`Dispatch::uniforms`); NONE: no params
     pub const PARAMS: usize = 0;
@@ -776,9 +777,10 @@ pub mod compute_binding {
     pub const TEXTURES: usize = 1;
     /// storage images (`Dispatch::images`), 2D, written
     pub const IMAGES: usize = 2;
-    /// storage buffers (`Dispatch::buffers`); one word each follows
+    /// storage buffers (`Dispatch::buffers`); two words each follow
     pub const BUFFERS: usize = 3;
-    /// the first buffer's word: `register | WRITABLE` when the kernel writes it
+    /// the first buffer's words: `register | WRITABLE` when the kernel writes it, then the bytes
+    /// of one element (the bound buffer's `BufferCreate::stride` must be the same)
     pub const BUFFER_WORDS: usize = 4;
     pub const WRITABLE: u32 = 1 << 31;
     pub const NONE: u32 = u32::MAX;

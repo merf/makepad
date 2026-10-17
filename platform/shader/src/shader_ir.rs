@@ -152,6 +152,10 @@ pub enum IrIo {
     Storage(bool),
     /// A compute kernel's workgroup-shared array (`shader.workgroup`).
     Workgroup,
+    /// A compute kernel's 2D storage image (`shader.storage_2d`): written texel by texel
+    /// (`self.img[coord] = value`, coord a vec2u / vec2i), never read. Typed as the runtime array
+    /// of its texel type.
+    StorageImage,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
