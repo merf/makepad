@@ -1,5 +1,6 @@
 //! Pipelines: the HLSL of a `PipelineCreate` compiled with D3DCompile on the compile worker
-//! (DXBC cached on disk), its shaders, input layout and sampler states. Moved from
+//! (DXBC cached on disk), its shaders, input layout and sampler states; a compute pipeline is one
+//! `cs_5_0` kernel (`kernel_main`) and its samplers. Moved from
 //! os/windows/d3d11.rs (`CxOsDrawShader::new`, `get_or_compile_shader_bytes`,
 //! `d3d_compile_hlsl`, the DXBC cache); Cx's shader compiler made the HLSL, nothing is composed
 //! or parsed here: the texture shapes and sampler states come with the payload.
@@ -14,16 +15,26 @@ use makepad_windows_sys::Win32::Graphics::Dxgi::Common::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-/// A compiled pipeline: everything a draw binds besides its resources.
+/// A pipeline's shaders: a draw's stages or a kernel.
+pub enum Shaders {
+    Draw {
+        vs: ID3D11VertexShader,
+        ps: ID3D11PixelShader,
+        /// none for a shader without geometry inputs
+        layout: Option<ID3D11InputLayout>,
+    },
+    Kernel {
+        cs: ID3D11ComputeShader,
+    },
+}
+
+/// A compiled pipeline: everything a draw or a dispatch binds besides its resources.
 pub struct Program {
-    pub vs: ID3D11VertexShader,
-    pub ps: ID3D11PixelShader,
-    /// none for a shader without geometry inputs
-    pub layout: Option<ID3D11InputLayout>,
+    pub shaders: Shaders,
     pub samplers: Vec<Option<ID3D11SamplerState>>,
     /// texture shapes in register order
     pub textures: Vec<u32>,
-    /// `PipelineDesc::bindings`
+    /// `PipelineDesc::bindings` (`pipeline_binding`, or `compute_binding` for a kernel)
     pub bindings: Vec<u32>,
     /// geometry vertex stride in bytes
     pub stride: u32,
@@ -55,7 +66,7 @@ impl PipeSrc {
         self.code == o.code
             && self.bindings == o.bindings
             && self.layout == o.layout
-            && (self.desc.blend, self.desc.instance_stride, self.desc.outputs) == (o.desc.blend, o.desc.instance_stride, o.desc.outputs)
+            && (self.desc.blend, self.desc.instance_stride, self.desc.outputs, self.desc.kind) == (o.desc.blend, o.desc.instance_stride, o.desc.outputs, o.desc.kind)
     }
     /// The program map's key (collisions are told apart by `same_program`).
     pub fn hash_key(&self) -> u64 {
@@ -64,7 +75,7 @@ impl PipeSrc {
         self.code.hash(&mut h);
         self.bindings.hash(&mut h);
         self.layout.hash(&mut h);
-        (self.desc.blend, self.desc.instance_stride, self.desc.outputs).hash(&mut h);
+        (self.desc.blend, self.desc.instance_stride, self.desc.outputs, self.desc.kind).hash(&mut h);
         h.finish()
     }
 }
@@ -243,8 +254,107 @@ fn numbered(src: &str) -> String {
 /// E_OUTOFMEMORY
 const E_OUTOFMEMORY: makepad_windows_sys::core::HRESULT = makepad_windows_sys::core::HRESULT(0x8007000Eu32 as i32);
 
+/// The sampler states of a payload, in register order.
+fn samplers(dev: &Device, code: &HlslPipeline) -> Result<Vec<Option<ID3D11SamplerState>>, String> {
+    let mut samplers = Vec::new();
+    for s in &code.samplers {
+        let address = match s.address {
+            0 => D3D11_TEXTURE_ADDRESS_WRAP,
+            1 => D3D11_TEXTURE_ADDRESS_CLAMP,
+            2 => D3D11_TEXTURE_ADDRESS_BORDER,
+            _ => D3D11_TEXTURE_ADDRESS_MIRROR,
+        };
+        let filter = match (s.filter, s.compare) {
+            (0, false) => D3D11_FILTER_MIN_MAG_MIP_POINT,
+            (_, false) => D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+            (0, true) => D3D11_FILTER_COMPARISON_MIN_MAG_MIP_POINT,
+            (_, true) => D3D11_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR,
+        };
+        let d = D3D11_SAMPLER_DESC {
+            Filter: filter,
+            AddressU: address,
+            AddressV: address,
+            AddressW: address,
+            MipLODBias: 0.0,
+            MaxAnisotropy: 1,
+            ComparisonFunc: if s.compare { D3D11_COMPARISON_LESS_EQUAL } else { D3D11_COMPARISON_NEVER },
+            BorderColor: [0.0; 4],
+            MinLOD: 0.0,
+            MaxLOD: f32::MAX,
+        };
+        let mut out = None;
+        unsafe { dev.device.CreateSamplerState(&d, Some(&mut out)) }.map_err(|e| hr("CreateSamplerState", e))?;
+        samplers.push(out);
+    }
+    if samplers.len() > D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT as usize {
+        return Err(format!("declares {} samplers; D3D11 has {}", samplers.len(), D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT));
+    }
+    Ok(samplers)
+}
+
+/// The unordered-access slots a compute shader has on every D3D11 device (feature level 11.0).
+pub const KERNEL_UAV_SLOTS: u32 = 8;
+
+/// A kernel: `kernel_main` through `cs_5_0`, checked against its binding table
+/// (`compute_binding`): the counts its payload states, the registers in range.
+fn build_kernel(dev: &Device, code: &HlslPipeline, desc: PipelineDesc, bindings: Vec<u32>, name: &str) -> Result<Arc<Program>, String> {
+    let hlsl = &code.source;
+    let words = |i: usize| bindings.get(i).copied().ok_or_else(|| format!("kernel `{name}`: a binding table of {} words", bindings.len()));
+    let (ntex, nimg, nbuf) = (words(compute_binding::TEXTURES)?, words(compute_binding::IMAGES)?, words(compute_binding::BUFFERS)?);
+    if bindings.len() != compute_binding::BUFFER_WORDS + 2 * nbuf as usize || ntex as usize != code.textures.len() {
+        return Err(format!("kernel `{name}`: its binding table and payload disagree"));
+    }
+    let mut uavs = nimg;
+    for k in 0..nbuf as usize {
+        let word = bindings[compute_binding::BUFFER_WORDS + 2 * k];
+        let register = word & !compute_binding::WRITABLE;
+        if word & compute_binding::WRITABLE != 0 {
+            uavs = uavs.max(register + 1);
+        } else if register >= D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT {
+            return Err(format!("kernel `{name}` reads a buffer at t{register}; D3D11 has {} shader-resource slots", D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT));
+        }
+    }
+    if uavs > KERNEL_UAV_SLOTS {
+        return Err(format!("kernel `{name}` writes {uavs} images and buffers; a D3D11 kernel has {KERNEL_UAV_SLOTS} unordered-access slots"));
+    }
+    let key = cache_key(hlsl);
+    if let Some(dir) = std::env::var_os("MAKEPAD_HLSL_DUMP") {
+        let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{key:016x}.hlsl")), hlsl);
+    }
+    let failed = |e: String| format!("compute shader `{name}`:\n{e}\n{}", numbered(hlsl));
+    let mut cs_bytes = stage_bytes(key, "_cs", "cs_5_0", "kernel_main", hlsl).map_err(failed)?;
+    let create = |bytes: &[u8]| unsafe {
+        let mut cs = None;
+        dev.device.CreateComputeShader(bytes, None, Some(&mut cs)).map(|_| cs)
+    };
+    let cs = match create(&cs_bytes) {
+        Ok(cs) => cs,
+        Err(e) if dev.check_lost() || e == E_OUTOFMEMORY => return Err(hr("CreateComputeShader", e)),
+        Err(e) => {
+            eprintln!("[hal-d3d11] the device rejected cached bytecode of `{name}` ({e}); recompiling");
+            if let Some(dir) = cache_dir() {
+                let _ = std::fs::remove_file(dir.join(format!("{key:016x}_cs.dxbc")));
+            }
+            cs_bytes = compile_stage("cs_5_0", "kernel_main", hlsl).map_err(failed)?;
+            create(&cs_bytes).map_err(|e| hr("CreateComputeShader of freshly compiled bytecode", e))?
+        }
+    };
+    let samplers = samplers(dev, code).map_err(|e| format!("`{name}` {e}"))?;
+    Ok(Arc::new(Program {
+        shaders: Shaders::Kernel { cs: cs.ok_or("CreateComputeShader returned nothing")? },
+        samplers,
+        textures: code.textures.clone(),
+        bindings,
+        stride: 0,
+        desc,
+    }))
+}
+
 /// Compiles and creates a pipeline (any thread: no immediate-context work).
 pub fn build(dev: &Device, code: &HlslPipeline, desc: PipelineDesc, bindings: Vec<u32>, vertex_layout: Vec<u32>, name: &str) -> Result<Arc<Program>, String> {
+    if desc.kind == pipeline_kind::COMPUTE {
+        return build_kernel(dev, code, desc, bindings, name);
+    }
     let hlsl = &code.source;
     let key = cache_key(hlsl);
     // `MAKEPAD_HLSL_DUMP=<dir>`: every pipeline's source, by its cache key (compile diagnosis)
@@ -309,46 +419,16 @@ pub fn build(dev: &Device, code: &HlslPipeline, desc: PipelineDesc, bindings: Ve
             .map_err(|e| format!("CreateInputLayout `{name}` ({} elements, stride {stride}): {e}", layout_desc.len()))?;
         out
     };
-    let mut samplers = Vec::new();
-    for s in &code.samplers {
-        let address = match s.address {
-            0 => D3D11_TEXTURE_ADDRESS_WRAP,
-            1 => D3D11_TEXTURE_ADDRESS_CLAMP,
-            2 => D3D11_TEXTURE_ADDRESS_BORDER,
-            _ => D3D11_TEXTURE_ADDRESS_MIRROR,
-        };
-        let filter = match (s.filter, s.compare) {
-            (0, false) => D3D11_FILTER_MIN_MAG_MIP_POINT,
-            (_, false) => D3D11_FILTER_MIN_MAG_MIP_LINEAR,
-            (0, true) => D3D11_FILTER_COMPARISON_MIN_MAG_MIP_POINT,
-            (_, true) => D3D11_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR,
-        };
-        let d = D3D11_SAMPLER_DESC {
-            Filter: filter,
-            AddressU: address,
-            AddressV: address,
-            AddressW: address,
-            MipLODBias: 0.0,
-            MaxAnisotropy: 1,
-            ComparisonFunc: if s.compare { D3D11_COMPARISON_LESS_EQUAL } else { D3D11_COMPARISON_NEVER },
-            BorderColor: [0.0; 4],
-            MinLOD: 0.0,
-            MaxLOD: f32::MAX,
-        };
-        let mut out = None;
-        unsafe { dev.device.CreateSamplerState(&d, Some(&mut out)) }.map_err(|e| hr("CreateSamplerState", e))?;
-        samplers.push(out);
-    }
+    let samplers = samplers(dev, code).map_err(|e| format!("`{name}` {e}"))?;
     if code.textures.len() + desc.instance_stride.min(1) as usize > D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT as usize {
         return Err(format!("`{name}` binds {} textures; D3D11 has {} shader-resource slots", code.textures.len(), D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT));
     }
-    if samplers.len() > D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT as usize {
-        return Err(format!("`{name}` declares {} samplers; D3D11 has {}", samplers.len(), D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT));
-    }
     Ok(Arc::new(Program {
-        vs: vs.ok_or("CreateVertexShader returned nothing")?,
-        ps: ps.ok_or("CreatePixelShader returned nothing")?,
-        layout,
+        shaders: Shaders::Draw {
+            vs: vs.ok_or("CreateVertexShader returned nothing")?,
+            ps: ps.ok_or("CreatePixelShader returned nothing")?,
+            layout,
+        },
         samplers,
         textures: code.textures.clone(),
         bindings,

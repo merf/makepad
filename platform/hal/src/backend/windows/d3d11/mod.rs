@@ -483,7 +483,7 @@ impl Gpu for D3d11 {
         Some(desc)
     }
     fn buffer_create(&mut self, s: &mut Session, id: Id, b: &mut BufferObj) -> Result<(), String> {
-        let buf = Buffer::new(self.dev.clone(), b.kind, b.size)?;
+        let buf = Buffer::new(self.dev.clone(), b.kind, b.size, b.stride)?;
         b.bytes = buf.bytes;
         self.buf.insert((s.id, id.index), Buf { gen: id.gen, buf, evictable: b.evictable });
         Ok(())
@@ -513,9 +513,6 @@ impl Gpu for D3d11 {
     fn pipeline_create(&mut self, s: &mut Session, id: Id, dialect: u32, blob: &PipelineBlob, _: Attr) -> PipeStatus {
         if dialect != self::dialect::HLSL {
             return PipeStatus::Failed("D3D11 takes the HLSL payload".into());
-        }
-        if blob.desc.kind != pipeline_kind::RENDER {
-            return PipeStatus::Failed("the D3D11 backend does not make compute pipelines yet".into());
         }
         let code = match HlslPipeline::decode(blob.code) {
             Ok(c) => c,

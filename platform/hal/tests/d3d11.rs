@@ -265,6 +265,145 @@ fn pick_frame_answers_the_draw_id() {
     assert!(hal.close(sid));
 }
 
+const IMAGE: Id = Id::new(3, 1);
+const COLORS: Id = Id::new(3, 1);
+const COUNT: Id = Id::new(4, 1);
+const QUAD: Id = Id::new(5, 1);
+const QUAD_INDEX: Id = Id::new(6, 1);
+const BANDS: Id = Id::new(3, 1);
+const PATCH: Id = Id::new(4, 1);
+const SAMPLE: Id = Id::new(5, 1);
+
+/// Four vertical bands from a read-only buffer, scaled by the params, into a storage image; each
+/// invocation counts itself into a written buffer. The shape the shader compiler prints
+/// (shader_ir_hlsl::hlsl_compute): params at b0, the group count at b13.
+const BANDS_HLSL: &str = "cbuffer _mp_params : register(b0) { float4 tint : packoffset(c0.x); };
+StructuredBuffer<float4> colors : register(t0);
+RWTexture2D<float4> image : register(u0);
+RWStructuredBuffer<uint> count : register(u1);
+[numthreads(8, 8, 1)]
+void kernel_main(uint3 id : SV_DispatchThreadID) {
+    uint w, h; image.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+    image[id.xy] = colors[id.x * 4 / w] * tint;
+    InterlockedAdd(count[0], 1u);
+}
+";
+
+/// Reads the count the first kernel wrote (now bound to read) and marks texel (0, 0): blue when
+/// every invocation counted and this dispatch is one group.
+const PATCH_HLSL: &str = "cbuffer _mp_dispatch : register(b13) { uint4 _mp_groups; };
+StructuredBuffer<uint> count : register(t0);
+RWTexture2D<float4> image : register(u0);
+[numthreads(1, 1, 1)]
+void kernel_main() {
+    image[uint2(0, 0)] = count[0] == 1024u && _mp_groups.x == 1u ? float4(0.0, 0.0, 1.0, 1.0) : float4(1.0, 0.0, 1.0, 1.0);
+}
+";
+
+/// A full-target quad sampling texture t0 texel for texel (point, clamped).
+const SAMPLE_HLSL: &str = "Texture2D tex : register(t0);
+SamplerState s0 : register(s0);
+struct VertexIn { float4 g : GEOMA0; };
+struct VertexOut { float4 p : SV_POSITION; float2 uv : TEXCOORD0; };
+VertexOut vertex_main(VertexIn i) { VertexOut o; o.p = i.g; o.uv = i.g.xy * float2(0.5, -0.5) + 0.5; return o; }
+float4 pixel_main(VertexOut v) : SV_TARGET0 { return tex.SampleLevel(s0, v.uv, 0.0); }
+";
+
+fn kernel_blob(source: &str, table: &[u32]) -> Vec<u8> {
+    let code = HlslPipeline { source: source.into(), textures: Vec::new(), samplers: Vec::new() }.encode();
+    CmdWriter::pipeline_blob(PipelineDesc { kind: pipeline_kind::COMPUTE, ..Default::default() }, &code, table, &[])
+}
+
+/// The kernels, the image they write, the buffers, and the draw that samples the image.
+fn compute_resources(hal: &Hal, sid: u32) {
+    let mut w = CmdWriter::new(sid);
+    w.texture_create(IMAGE, usage::STORAGE | usage::SAMPLED, format::RGBA8, 32, 32, [1, 1], Attr::default());
+    w.texture_create(TEX, usage::RENDER_TARGET | usage::SAMPLED, format::RGBA8, 32, 32, [1, 1], Attr::default());
+    let colors: Vec<u8> = [[1.0f32, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0], [1.0; 4]].into_iter().flatten().flat_map(f32::to_le_bytes).collect();
+    w.buffer_create(COLORS, buffer_kind::STORAGE, colors.len() as u64, 16, Attr::default());
+    w.buffer_update(COLORS, 0, &colors);
+    w.buffer_create(COUNT, buffer_kind::STORAGE, 16, 4, Attr::default());
+    let quad: Vec<u8> = [-1.0f32, -1.0, 0.0, 1.0, 1.0, -1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, -1.0, 1.0, 0.0, 1.0].into_iter().flat_map(f32::to_le_bytes).collect();
+    w.buffer_create(QUAD, buffer_kind::VERTEX, quad.len() as u64, 0, Attr::default());
+    w.buffer_update(QUAD, 0, &quad);
+    w.buffer_create(QUAD_INDEX, buffer_kind::INDEX, 12, 0, Attr::default());
+    w.buffer_update(QUAD_INDEX, 0, &[0, 0, 1, 0, 2, 0, 0, 0, 2, 0, 3, 0]);
+    let none = compute_binding::NONE;
+    w.pipeline_create(BANDS, dialect::HLSL, Attr::default(), &kernel_blob(BANDS_HLSL, &[0, 0, 1, 2, 0, 16, 1 | compute_binding::WRITABLE, 4]));
+    w.pipeline_create(PATCH, dialect::HLSL, Attr::default(), &kernel_blob(PATCH_HLSL, &[none, 0, 1, 1, 0, 4]));
+    let point = makepad_hal::spirv::SpirvSampler { filter: 0, address: 1, compare: false, pixel: false };
+    let code = HlslPipeline { source: SAMPLE_HLSL.into(), textures: vec![0], samplers: vec![point] }.encode();
+    let none = pipeline_binding::NONE;
+    w.pipeline_create(SAMPLE, dialect::HLSL, Attr::default(), &CmdWriter::pipeline_blob(PipelineDesc { outputs: 1, ..Default::default() }, &code, &[none, none, none, none, none, 1], &[16, 0, 3, 4]));
+    hal.submit(&w.buf());
+    let mut ready = Vec::new();
+    until(hal, sid, |e| {
+        if let HalEvent::PipelineReady { pipeline } = e {
+            ready.push(pipeline);
+        }
+        [BANDS, PATCH, SAMPLE].iter().all(|p| ready.contains(p))
+    });
+    assert_eq!(hal.with_world(|w| w.session(sid).unwrap().stats.bad_args), 0);
+}
+
+/// One frame: the counter cleared, the two dispatches, then the pass that samples the image.
+/// `matching`: the second dispatch reads the counter, else a buffer of other elements.
+fn compute_then_draw(hal: &Hal, sid: u32, frame: u64, matching: bool) {
+    let mut w = CmdWriter::new(sid);
+    w.buffer_update(COUNT, 0, &[0; 16]);
+    let images = w.put_ids(&[IMAGE]);
+    let bands_buffers = w.put_ids(&[COLORS, COUNT]);
+    let patch_buffers = w.put_ids(&[if matching { COUNT } else { COLORS }]);
+    let tex = w.put_ids(&[IMAGE]);
+    let tint = [1.0f32, 1.0, 0.5, 1.0];
+    w.frame_begin(frame, FrameMeta::default());
+    w.pass(Pass::compute(0));
+    w.dispatch(Dispatch { pipeline: BANDS, groups: [4, 4, 1], uniforms: Slice::of(&tint), images, buffers: bands_buffers, ..Default::default() });
+    w.dispatch(Dispatch { pipeline: PATCH, groups: [1, 1, 1], images, buffers: patch_buffers, ..Default::default() });
+    w.pass(pass(TEX, 32, 32, [0.0; 4]));
+    w.draw(Draw { pipeline: SAMPLE, vb: QUAD, ib: QUAD_INDEX, index: [0, 6], inst: Inst::inline(Slice::EMPTY, 1), tex, scissor: [f32::NAN; 4], ..Default::default() });
+    w.frame_end(TEX, target::TEXTURE);
+    hal.submit(&w.buf());
+    frame_done(hal, sid, frame);
+}
+
+/// Milestone 16's first proof on D3D11: a kernel writes a texture that a draw in a later pass of
+/// the same frame samples. On the way: a read-only structured buffer, params in the constant
+/// buffer, an atomic count into a written buffer that the next dispatch reads (so the backend
+/// must unbind it as written before binding it to read), and the group count at b13.
+#[test]
+fn a_kernel_writes_an_image_a_draw_then_samples() {
+    let (hal, info) = open();
+    let sid = info.session;
+    compute_resources(&hal, sid);
+    for frame in 1..=2 {
+        compute_then_draw(&hal, sid, frame, true);
+        let st = hal.with_world(|w| w.session(sid).unwrap().stats);
+        assert_eq!((st.dispatches, st.skipped_dispatches, st.bad_args, st.stale_ids, st.skipped_draws), (2 * frame, 0, 0, 0, 0));
+    }
+    let mut w = CmdWriter::new(sid);
+    w.texture_readback(TEX, 1, [0, 0, 32, 32]);
+    hal.submit(&w.buf());
+    let image = pixels(&hal, sid, 1);
+    let at = |x: usize, y: usize| image[(y * 32 + x) * 4..][..4].to_vec();
+    // the bands, the blue channel through the params' half
+    let half = at(20, 31)[2];
+    assert!((127..=128).contains(&half), "{:?}", at(20, 31));
+    assert_eq!(at(4, 9), [255, 0, 0, 255]);
+    assert_eq!(at(12, 20), [0, 255, 0, 255]);
+    assert_eq!(at(20, 31), [0, 0, half, 255]);
+    assert_eq!(at(28, 0), [255, 255, half, 255]);
+    // the second dispatch saw all 1024 counts, in a dispatch of one group
+    assert_eq!(at(0, 0), [0, 0, 255, 255]);
+
+    // a buffer whose elements are not the kernel's is refused, not bound (D3D11 would read garbage)
+    compute_then_draw(&hal, sid, 3, false);
+    let st = hal.with_world(|w| w.session(sid).unwrap().stats);
+    assert_eq!((st.dispatches, st.skipped_dispatches, st.bad_args), (5, 1, 1));
+    assert!(hal.close(sid));
+}
+
 /// A device loss (simulated: the device is dropped and a new one made, as on a removal) keeps
 /// every id: the session hears `DeviceLost { 1 }` then `DeviceReset { 2 }`, the pipelines answer
 /// ready again, the buffers take their contents again under the same ids and the same frame

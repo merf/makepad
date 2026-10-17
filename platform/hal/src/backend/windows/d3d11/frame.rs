@@ -5,9 +5,15 @@
 //! Per frame, the transient bytes (inline instances, uniform blocks, the per-draw instance base)
 //! are laid out first and written with one discard map each; the draws then bind windows into
 //! them (`VSSetConstantBuffers1` offsets, word offsets through `_mp_inst_base`).
+//!
+//! A compute pass runs its dispatches in order on the same context: each binds its kernel's
+//! textures and read-only buffers (`t`), storage images and written buffers (`u`), its parameter
+//! block and group count (windows of the same constant buffer), dispatches, and unbinds every
+//! view again, so the next dispatch or pass can read what it wrote (D3D11 never binds a resource
+//! to read and write at once: it would silently unbind one side).
 
 use super::complete::Ticket;
-use super::pipeline::Program;
+use super::pipeline::{Program, Shaders, KERNEL_UAV_SLOTS};
 use super::resources::{shape, Texture};
 use super::{D3d11, Tex};
 use crate::backend::exec::{self, LentState};
@@ -29,6 +35,11 @@ const INST_BASE_SLOT: u32 = 13;
 const PICK_SLOT: u32 = 12;
 /// One constant-buffer window: 16 constants.
 const WINDOW_CONSTANTS: u32 = 16;
+/// The register of a dispatch's group count (shader_ir_hlsl: `_mp_groups`).
+const KERNEL_GROUPS_SLOT: u32 = 13;
+const NO_UAV: Option<ID3D11UnorderedAccessView> = None;
+/// Unbinds every unordered-access slot a kernel can use after its dispatch.
+const NO_UAVS: [Option<ID3D11UnorderedAccessView>; KERNEL_UAV_SLOTS as usize] = [NO_UAV; KERNEL_UAV_SLOTS as usize];
 const NO_SRV: Option<ID3D11ShaderResourceView> = None;
 /// Unbinds every texture slot a pipeline can use before a pass binds its targets.
 const NO_SRVS: [Option<ID3D11ShaderResourceView>; D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT as usize] =
@@ -37,6 +48,14 @@ const NO_SRVS: [Option<ID3D11ShaderResourceView>; D3D11_COMMONSHADER_INPUT_RESOU
 fn slice(range: Range, len: usize) -> Option<std::ops::Range<usize>> {
     let start = range.off as usize;
     start.checked_add(range.len as usize).filter(|end| *end <= len).map(|end| start..end)
+}
+
+/// Puts a view at `slot` of a list bound from its start, the slots before it empty when unset.
+fn place<T: Clone>(views: &mut Vec<Option<T>>, slot: usize, view: T) {
+    if views.len() <= slot {
+        views.resize(slot + 1, None);
+    }
+    views[slot] = Some(view);
 }
 
 /// The frame's transient bytes, laid out before any draw is encoded.
@@ -78,6 +97,9 @@ pub(super) struct PassScratch {
     srvs: Vec<Option<ID3D11ShaderResourceView>>,
     /// per instance range: (first instance in the bound words, count, the base's cb window)
     ranges: Vec<(u32, u32, u32)>,
+    /// a compute pass: its dispatches and the unordered-access views they bind
+    dispatches: Vec<PreparedDispatch>,
+    uavs: Vec<Option<ID3D11UnorderedAccessView>>,
 }
 
 impl PassScratch {
@@ -89,7 +111,20 @@ impl PassScratch {
         self.ubufs.clear();
         self.srvs.clear();
         self.ranges.clear();
+        self.dispatches.clear();
+        self.uavs.clear();
     }
+}
+
+/// One dispatch, resolved; its lists are windows of the pass's `PassScratch`, the views from slot
+/// 0 in register order.
+struct PreparedDispatch {
+    program: Arc<Program>,
+    srvs: std::ops::Range<usize>,
+    uavs: std::ops::Range<usize>,
+    /// the parameter block and the group count: (slot, first constant, constant count)
+    cbs: std::ops::Range<usize>,
+    groups: [u32; 3],
 }
 
 /// One draw, resolved and laid out; its lists are windows of the pass's `PassScratch`.
@@ -291,7 +326,14 @@ impl D3d11 {
         }
         for pass in &view.passes[pr] {
             if pass.is_compute() {
-                exec::compute_unsupported(s, pass, "D3D11");
+                // a pick replay draws ids: kernels and their writes are not run again
+                if !pick {
+                    if let Err(e) = self.encode_compute(s, pass, view, now, &mut deps) {
+                        eprintln!("[hal-d3d11] compute pass: {e}");
+                        s.bad();
+                    }
+                    self.give_back_shared();
+                }
                 continue;
             }
             let draws = &view.draws[slice(pass.draws, view.draws.len()).unwrap()];
@@ -472,9 +514,11 @@ impl D3d11 {
             unsafe {
                 if shaders_bound != Some(Arc::as_ptr(&p.program)) {
                     shaders_bound = Some(Arc::as_ptr(&p.program));
-                    ctx.VSSetShader(Some(&p.program.vs), None);
-                    ctx.PSSetShader(Some(&p.program.ps), None);
-                    ctx.IASetInputLayout(p.program.layout.as_ref());
+                    if let Shaders::Draw { vs, ps, layout } = &p.program.shaders {
+                        ctx.VSSetShader(Some(vs), None);
+                        ctx.PSSetShader(Some(ps), None);
+                        ctx.IASetInputLayout(layout.as_ref());
+                    }
                     if !p.program.samplers.is_empty() {
                         ctx.VSSetSamplers(0, Some(&p.program.samplers));
                         ctx.PSSetSamplers(0, Some(&p.program.samplers));
@@ -536,6 +580,167 @@ impl D3d11 {
         Ok(window)
     }
 
+    /// A compute pass: its dispatches in order (see the module notes).
+    fn encode_compute(&mut self, s: &mut Session, pass: &Pass, view: &CmdView, now: u64, deps: &mut Vec<LentRef>) -> Result<(), String> {
+        let dr = slice(pass.dispatches, view.dispatches.len()).ok_or("a dispatch range outside the batch")?;
+        s.stats.passes += 1;
+        let mut sc = std::mem::take(&mut self.scratch);
+        sc.clear();
+        for d in &view.dispatches[dr] {
+            if let Err(why) = exec::check_dispatch(s, s.id, d, view.arena, now) {
+                exec::skip_dispatch(s, why);
+                continue;
+            }
+            match self.prepare_dispatch(s, d, view.arena, &mut sc, deps) {
+                Ok(Some(p)) => {
+                    s.stats.dispatches += 1;
+                    if p.groups.iter().all(|g| *g > 0) {
+                        sc.dispatches.push(p);
+                    }
+                }
+                Ok(None) => s.stats.skipped_dispatches += 1,
+                Err(e) => {
+                    eprintln!("[hal-d3d11] dispatch: {e}");
+                    s.bad();
+                    s.stats.skipped_dispatches += 1;
+                }
+            }
+        }
+        if let Err(e) = self.cb_arena.fill(&self.dev, &sc.bytes.cb) {
+            self.scratch = sc;
+            return Err(e);
+        }
+        let ctx = self.dev.ctx.clone();
+        let ctx1 = self.dev.ctx1.clone();
+        let arena = Some(self.cb_arena.buf.clone());
+        unsafe {
+            // what the render passes left bound for sampling may be written here
+            ctx.PSSetShaderResources(0, Some(&NO_SRVS));
+            ctx.VSSetShaderResources(0, Some(&NO_SRVS));
+        }
+        for p in &sc.dispatches {
+            let Shaders::Kernel { cs } = &p.program.shaders else { continue };
+            let srvs = &sc.srvs[p.srvs.clone()];
+            let uavs = &sc.uavs[p.uavs.clone()];
+            unsafe {
+                ctx.CSSetShader(Some(cs), None);
+                if !p.program.samplers.is_empty() {
+                    ctx.CSSetSamplers(0, Some(&p.program.samplers));
+                }
+                if !srvs.is_empty() {
+                    ctx.CSSetShaderResources(0, Some(srvs));
+                }
+                if !uavs.is_empty() {
+                    ctx.CSSetUnorderedAccessViews(0, uavs.len() as u32, Some(uavs.as_ptr()), None);
+                }
+                for (slot, first, count) in &sc.cbs[p.cbs.clone()] {
+                    ctx1.CSSetConstantBuffers1(*slot, 1, Some(&arena as *const _), Some(first as *const u32), Some(count as *const u32));
+                }
+                ctx.Dispatch(p.groups[0], p.groups[1], p.groups[2]);
+                // nothing stays bound: the next dispatch or pass may read what this one wrote
+                if !uavs.is_empty() {
+                    ctx.CSSetUnorderedAccessViews(0, KERNEL_UAV_SLOTS, Some(NO_UAVS.as_ptr()), None);
+                }
+                if !srvs.is_empty() {
+                    ctx.CSSetShaderResources(0, Some(&NO_SRVS[..srvs.len()]));
+                }
+            }
+        }
+        self.scratch = sc;
+        Ok(())
+    }
+
+    /// One dispatch's kernel and views, by its binding table (`compute_binding`); `None`: the
+    /// kernel is still compiling or a resource is not there yet (counted as skipped).
+    fn prepare_dispatch(&mut self, s: &mut Session, d: &Dispatch, arena: &[u8], sc: &mut PassScratch, deps: &mut Vec<LentRef>) -> Result<Option<PreparedDispatch>, String> {
+        for id in read_ids(arena, d.tex) {
+            match exec::lent_state(s, s.id, id) {
+                LentState::Own => {}
+                LentState::Lent(l) => {
+                    if !deps.contains(&l) {
+                        deps.push(l);
+                    }
+                }
+                LentState::Dead => {
+                    s.stale();
+                    return Ok(None);
+                }
+            }
+        }
+        let Some(state) = self.pipe.get(&(s.id, d.pipeline.index)).filter(|p| p.gen == d.pipeline.gen).map(|p| p.state.clone()) else {
+            s.stale();
+            return Ok(None);
+        };
+        let Some(program) = state.ready().cloned() else { return Ok(None) };
+        if !matches!(program.shaders, Shaders::Kernel { .. }) {
+            return Err("a dispatch names a draw pipeline".into());
+        }
+        let table = &program.bindings;
+        let (ntex, nimg, nbuf) = (program.textures.len(), table[compute_binding::IMAGES] as usize, table[compute_binding::BUFFERS] as usize);
+        // sampled textures at t0.., by the shapes the kernel declares
+        let srvs_at = sc.srvs.len();
+        for (i, shp) in program.textures.iter().enumerate() {
+            let id = id_at(arena, d.tex, i);
+            let tex = if id.is_none() { self.fallback(*shp)? } else { self.resolve(s, id).ok_or("missing sampled texture")? };
+            if !self.take_shared(&tex) {
+                s.stale();
+                return Ok(None);
+            }
+            sc.srvs.push(Some(tex.view(*shp)?));
+        }
+        // storage images at u0..
+        let uavs_at = sc.uavs.len();
+        for i in 0..nimg {
+            let tex = self.resolve(s, id_at(arena, d.images, i)).ok_or("missing storage image")?;
+            sc.uavs.push(Some(tex.uav.clone().ok_or("a storage image without an unordered-access view")?));
+        }
+        // storage buffers at the registers the table gives: read-only ones after the textures,
+        // written ones after the images
+        let (mut read, mut written) = (Vec::new(), Vec::new());
+        for k in 0..nbuf {
+            let (word, stride) = (table[compute_binding::BUFFER_WORDS + 2 * k], table[compute_binding::BUFFER_WORDS + 2 * k + 1]);
+            let id = id_at(arena, d.buffers, k);
+            let buf = self.buf.get(&(s.id, id.index)).filter(|b| b.gen == id.gen).map(|b| b.buf.clone()).ok_or("missing storage buffer")?;
+            if buf.stride != stride {
+                return Err(format!("a buffer of {}-byte elements bound where the kernel reads {stride}-byte elements", buf.stride));
+            }
+            let (srv, uav) = buf.structured.as_ref().ok_or("not a storage buffer")?;
+            let register = (word & !compute_binding::WRITABLE) as usize;
+            let writable = word & compute_binding::WRITABLE != 0;
+            if register < if writable { nimg } else { ntex } {
+                return Err(format!("buffer register {register} overlaps the kernel's textures or images"));
+            }
+            if writable {
+                written.push(id);
+                place(&mut sc.uavs, uavs_at + register, uav.clone());
+            } else {
+                read.push(id);
+                place(&mut sc.srvs, srvs_at + register, srv.clone());
+            }
+        }
+        if written.iter().any(|w| read.contains(w)) {
+            return Err("a dispatch reads and writes one buffer through two bindings (D3D11 would unbind one): bind it once, written".into());
+        }
+        // the parameter block and the group count, windows of the frame constant buffer
+        let cbs_at = sc.cbs.len();
+        if let Some(slot) = table.get(compute_binding::PARAMS).copied().filter(|v| *v != compute_binding::NONE) {
+            // SAFETY: the Slice is the caller's memory, borrowed for this hal_submit call
+            let data = unsafe { d.uniforms.as_bytes() };
+            if data.len() > 4096 * 16 {
+                return Err(format!("a {}-byte parameter block exceeds D3D11's 64 KiB constant buffer", data.len()));
+            }
+            let (at, count) = sc.bytes.put_cb(data);
+            sc.cbs.push((slot, at, count));
+        }
+        let mut groups = [0u8; 16];
+        for (k, g) in d.groups.iter().enumerate() {
+            groups[k * 4..k * 4 + 4].copy_from_slice(&g.to_le_bytes());
+        }
+        let (at, count) = sc.bytes.put_cb(&groups);
+        sc.cbs.push((KERNEL_GROUPS_SLOT, at, count));
+        Ok(Some(PreparedDispatch { program, srvs: srvs_at..sc.srvs.len(), uavs: uavs_at..sc.uavs.len(), cbs: cbs_at..sc.cbs.len(), groups: d.groups }))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn prepare(&mut self, s: &mut Session, pass: &Pass, d: &Draw, arena: &[u8], pick: bool, colors: &[(usize, Arc<Texture>)], depth: &Option<Arc<Texture>>,
         target_size: [u32; 2], sc: &mut PassScratch, now: u64, deps: &mut Vec<LentRef>) -> Result<Option<Prepared>, String> {
@@ -560,6 +765,9 @@ impl D3d11 {
         };
         // still compiling, or failed: the app paints again when it hears PipelineReady
         let Some(program) = state.ready().cloned() else { return Ok(None) };
+        if !matches!(program.shaders, Shaders::Draw { .. }) {
+            return Err("a draw names a compute pipeline".into());
+        }
         let sid = s.id;
         let buffer = |me: &Self, id: Id| me.buf.get(&(sid, id.index)).filter(|b| b.gen == id.gen).map(|b| b.buf.clone());
         let vb = if d.vb.is_none() { None } else { Some(buffer(self, d.vb).ok_or("missing vertex buffer")?) };

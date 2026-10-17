@@ -1253,6 +1253,7 @@ impl ::core::ops::BitXor for D3D11_BIND_FLAG { type Output = Self; fn bitxor(sel
 impl ::core::ops::Not for D3D11_BIND_FLAG { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
 pub const D3D11_BIND_INDEX_BUFFER: crate::Win32::Graphics::Direct3D11::D3D11_BIND_FLAG = crate::Win32::Graphics::Direct3D11::D3D11_BIND_FLAG(2i64 as _);
 pub const D3D11_BIND_RENDER_TARGET: crate::Win32::Graphics::Direct3D11::D3D11_BIND_FLAG = crate::Win32::Graphics::Direct3D11::D3D11_BIND_FLAG(32i64 as _);
+pub const D3D11_BIND_UNORDERED_ACCESS: crate::Win32::Graphics::Direct3D11::D3D11_BIND_FLAG = crate::Win32::Graphics::Direct3D11::D3D11_BIND_FLAG(128i64 as _);
 pub const D3D11_BIND_SHADER_RESOURCE: crate::Win32::Graphics::Direct3D11::D3D11_BIND_FLAG = crate::Win32::Graphics::Direct3D11::D3D11_BIND_FLAG(8i64 as _);
 pub const D3D11_BIND_VERTEX_BUFFER: crate::Win32::Graphics::Direct3D11::D3D11_BIND_FLAG = crate::Win32::Graphics::Direct3D11::D3D11_BIND_FLAG(1i64 as _);
 #[repr(transparent)]
@@ -1919,6 +1920,7 @@ pub const D3D11_RESOURCE_MISC_SHARED: crate::Win32::Graphics::Direct3D11::D3D11_
 pub const D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX: crate::Win32::Graphics::Direct3D11::D3D11_RESOURCE_MISC_FLAG = crate::Win32::Graphics::Direct3D11::D3D11_RESOURCE_MISC_FLAG(256i64 as _);
 pub const D3D11_RESOURCE_MISC_SHARED_NTHANDLE: crate::Win32::Graphics::Direct3D11::D3D11_RESOURCE_MISC_FLAG = crate::Win32::Graphics::Direct3D11::D3D11_RESOURCE_MISC_FLAG(2048i64 as _);
 pub const D3D11_RESOURCE_MISC_TEXTURECUBE: crate::Win32::Graphics::Direct3D11::D3D11_RESOURCE_MISC_FLAG = crate::Win32::Graphics::Direct3D11::D3D11_RESOURCE_MISC_FLAG(4i64 as _);
+pub const D3D11_RESOURCE_MISC_BUFFER_STRUCTURED: crate::Win32::Graphics::Direct3D11::D3D11_RESOURCE_MISC_FLAG = crate::Win32::Graphics::Direct3D11::D3D11_RESOURCE_MISC_FLAG(64i64 as _);
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct D3D11_RTV_DIMENSION(pub i32);
@@ -2336,6 +2338,8 @@ impl ::core::ops::BitOr for D3D11_UAV_DIMENSION { type Output = Self; fn bitor(s
 impl ::core::ops::BitAnd for D3D11_UAV_DIMENSION { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
 impl ::core::ops::BitXor for D3D11_UAV_DIMENSION { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
 impl ::core::ops::Not for D3D11_UAV_DIMENSION { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+pub const D3D11_UAV_DIMENSION_BUFFER: crate::Win32::Graphics::Direct3D11::D3D11_UAV_DIMENSION = crate::Win32::Graphics::Direct3D11::D3D11_UAV_DIMENSION(1i64 as _);
+pub const D3D11_UAV_DIMENSION_TEXTURE2D: crate::Win32::Graphics::Direct3D11::D3D11_UAV_DIMENSION = crate::Win32::Graphics::Direct3D11::D3D11_UAV_DIMENSION(4i64 as _);
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct D3D11_UNORDERED_ACCESS_VIEW_DESC {
