@@ -319,7 +319,7 @@ impl FrameBuilder {
 
     fn buffer_create(&mut self, kind: u16, size: u64, origin: Attr) -> Id {
         let id = self.bufs.alloc();
-        self.w.buffer_create(id, kind, size, origin);
+        self.w.buffer_create(id, kind, size, 0, origin);
         self.stats.buffer_creates += 1;
         id
     }

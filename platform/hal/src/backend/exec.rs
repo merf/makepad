@@ -191,6 +191,86 @@ pub fn lent_state(s: &Session, sid: u32, id: Id) -> LentState {
     }
 }
 
+/// Why a dispatch is left out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DispatchSkip {
+    /// an id that is not live (`stale_ids`)
+    Stale,
+    /// an argument no backend takes (`bad_args`)
+    Bad(&'static str),
+}
+
+/// The most workgroups a dispatch may ask for in one dimension (D3D11's limit; Metal and Vulkan
+/// guarantee at least as many).
+pub const MAX_DISPATCH_GROUPS: u32 = 65535;
+
+/// Checks a dispatch against the session's tables, the same for every backend: a live compute
+/// pipeline, group counts in range, images made with `usage::STORAGE`, buffers of
+/// `buffer_kind::STORAGE`, and no texture both sampled and written by the dispatch (D3D11 would
+/// silently unbind one of the two). Touches what it uses in the ledger.
+pub fn check_dispatch(s: &mut Session, sid: u32, d: &Dispatch, arena: &[u8], now: u64) -> Result<(), DispatchSkip> {
+    use crate::buffers::read_ids;
+    let pipe = s.pipelines.get(sid, d.pipeline).map_err(|_| DispatchSkip::Stale)?;
+    if pipe.val.desc.kind != pipeline_kind::COMPUTE {
+        return Err(DispatchSkip::Bad("a dispatch names a render pipeline"));
+    }
+    if d.groups.iter().any(|g| *g > MAX_DISPATCH_GROUPS) {
+        return Err(DispatchSkip::Bad("a dispatch asks for more than 65535 workgroups in one dimension"));
+    }
+    for id in read_ids(arena, d.images) {
+        let t = s.textures.get(sid, id).map_err(|_| if id.is_none() { DispatchSkip::Bad("a dispatch names no image") } else { DispatchSkip::Stale })?;
+        if t.val.usage & usage::STORAGE == 0 || t.val.lent.is_some() || t.val.imported {
+            return Err(DispatchSkip::Bad("a dispatch writes a texture not made with usage::STORAGE"));
+        }
+        if read_ids(arena, d.tex).any(|sampled| sampled == id) {
+            return Err(DispatchSkip::Bad("a dispatch samples a texture it writes"));
+        }
+    }
+    for id in read_ids(arena, d.tex).filter(|id| !id.is_none()) {
+        if s.textures.get(sid, id).is_err() {
+            return Err(DispatchSkip::Stale);
+        }
+    }
+    for id in read_ids(arena, d.buffers) {
+        let b = s.buffers.get(sid, id).map_err(|_| if id.is_none() { DispatchSkip::Bad("a dispatch names no buffer") } else { DispatchSkip::Stale })?;
+        if b.val.kind != buffer_kind::STORAGE {
+            return Err(DispatchSkip::Bad("a dispatch binds a buffer that is not buffer_kind::STORAGE"));
+        }
+    }
+    let frame = s.frame;
+    s.ledger.touch(Kind::Pipeline, d.pipeline.index, d.pipeline.gen, frame, now);
+    for id in read_ids(arena, d.tex).chain(read_ids(arena, d.images)).filter(|id| !id.is_none()) {
+        s.ledger.touch(Kind::Texture, id.index, id.gen, frame, now);
+    }
+    for id in read_ids(arena, d.buffers) {
+        s.ledger.touch(Kind::Buffer, id.index, id.gen, frame, now);
+    }
+    Ok(())
+}
+
+/// A backend without compute yet: the pass's dispatches are counted as skipped (said once per
+/// process).
+pub fn compute_unsupported(s: &mut Session, pass: &Pass, backend: &str) {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    s.stats.passes += 1;
+    s.stats.skipped_dispatches += pass.dispatches.len as u64;
+    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("[hal] the {backend} backend does not run compute passes yet: their dispatches are skipped");
+    }
+}
+
+/// Counts a skipped dispatch.
+pub fn skip_dispatch(s: &mut Session, why: DispatchSkip) {
+    s.stats.skipped_dispatches += 1;
+    match why {
+        DispatchSkip::Stale => s.stale(),
+        DispatchSkip::Bad(e) => {
+            eprintln!("[hal] dispatch: {e}");
+            s.bad();
+        }
+    }
+}
+
 /// Bytes of a mip chain (`depth` layers, a cube has 6).
 pub fn texture_bytes(format: u32, w: u32, h: u32, depth: u32, mips: u32) -> u64 {
     let (mut w, mut h) = (w.max(1), h.max(1));
@@ -210,6 +290,8 @@ pub fn texture_detail(format: u32, usage: u16) -> &'static str {
         "shared surface"
     } else if usage & usage::RENDER_TARGET != 0 {
         "render target"
+    } else if usage & usage::STORAGE != 0 {
+        "storage image"
     } else {
         "texture"
     }
@@ -219,6 +301,7 @@ pub fn buffer_detail(kind: u16) -> &'static str {
     match kind {
         buffer_kind::INSTANCE => "instance buffers",
         buffer_kind::VERTEX | buffer_kind::INDEX => "geometry",
+        buffer_kind::STORAGE => "storage buffers",
         _ => "uniform buffers",
     }
 }
@@ -1003,8 +1086,13 @@ fn exec(gpu: &mut dyn Gpu, world: &mut World, sid: u32, c: HalCmd, view: &CmdVie
             s.events.texture_imported(id, ok);
         }
         HalCmd::GlFence { sync } => gpu.gl_fence(s, sync),
-        HalCmd::BufferCreate { id, kind, size, attr } => {
-            let obj = BufferObj { kind, size, bytes: size, evictable: false, uploaded: 0 };
+        HalCmd::BufferCreate { id, kind, size, stride, attr } => {
+            // a storage buffer is a whole number of elements of a 4-byte-multiple stride
+            if kind == buffer_kind::STORAGE && (stride == 0 || stride % 4 != 0 || size == 0 || size % stride as u64 != 0) {
+                s.bad();
+                return;
+            }
+            let obj = BufferObj { kind, size, stride, bytes: size, evictable: false, uploaded: 0 };
             let replaced = match s.buffers.insert(sid, id, sid, obj.clone()) {
                 Ok(old) => old.is_some(),
                 Err(_) => {

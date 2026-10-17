@@ -91,7 +91,7 @@ impl Wire for u32 {
 }
 
 impl Wire for PipelineDesc {
-    const SIZE: usize = 72;
+    const SIZE: usize = 76;
     fn write(&self, out: &mut Vec<u8>) {
         for r in [self.code, self.bindings, self.vertex_layout] {
             w32(out, r.off);
@@ -100,7 +100,7 @@ impl Wire for PipelineDesc {
         for f in self.color_formats {
             w32(out, f);
         }
-        for v in [self.blend, self.depth, self.shader, self.name, self.source, self.instance_stride, self.varyings, self.outputs] {
+        for v in [self.blend, self.depth, self.shader, self.name, self.source, self.instance_stride, self.varyings, self.outputs, self.kind] {
             w32(out, v);
         }
     }
@@ -119,6 +119,7 @@ impl Wire for PipelineDesc {
             instance_stride: r32(b, 60),
             varyings: r32(b, 64),
             outputs: r32(b, 68),
+            kind: r32(b, 72),
         }
     }
 }
@@ -325,6 +326,7 @@ pub struct CmdWriter {
     frames: Vec<FramePacket>,
     passes: Vec<Pass>,
     draws: Vec<Draw>,
+    dispatches: Vec<Dispatch>,
     open_frame: Option<OpenFrame>,
 }
 
@@ -333,6 +335,8 @@ struct OpenFrame {
     meta: FrameMeta,
     pass0: u32,
     draw0: u32,
+    dispatch0: u32,
+    /// the open pass's first draw (render) or dispatch (compute)
     pass_draw0: Option<u32>,
 }
 
@@ -439,7 +443,7 @@ impl CmdWriter {
     /// Starts a FramePacket; passes and draws follow, then [`CmdWriter::frame_end`].
     pub fn frame_begin(&mut self, frame: u64, meta: FrameMeta) {
         assert!(self.open_frame.is_none(), "CmdWriter: frame_begin inside a frame");
-        self.open_frame = Some(OpenFrame { frame, meta, pass0: self.passes.len() as u32, draw0: self.draws.len() as u32, pass_draw0: None });
+        self.open_frame = Some(OpenFrame { frame, meta, pass0: self.passes.len() as u32, draw0: self.draws.len() as u32, dispatch0: self.dispatches.len() as u32, pass_draw0: None });
     }
 
     /// Stamps the open frame's `build_end_ns` (the builder knows it only after the walk).
@@ -453,21 +457,37 @@ impl CmdWriter {
         let f = self.open_frame.as_mut().expect("CmdWriter: no open frame");
         if let Some(d0) = f.pass_draw0.take() {
             let last = self.passes.last_mut().expect("open pass");
-            last.draws = Range { off: d0, len: self.draws.len() as u32 - d0 };
+            if last.is_compute() {
+                last.dispatches = Range { off: d0, len: self.dispatches.len() as u32 - d0 };
+                last.draws = Range { off: self.draws.len() as u32, len: 0 };
+            } else {
+                last.draws = Range { off: d0, len: self.draws.len() as u32 - d0 };
+                last.dispatches = Range { off: self.dispatches.len() as u32, len: 0 };
+            }
         }
     }
 
-    /// Starts a pass (its `draws` range is filled in by the writer); the draws that follow belong to it.
+    /// Starts a pass (its `draws` or, for a compute pass, `dispatches` range is filled in by the
+    /// writer); the draws or dispatches that follow belong to it.
     pub fn pass(&mut self, pass: Pass) {
         self.close_pass();
-        let d0 = self.draws.len() as u32;
+        let d0 = if pass.is_compute() { self.dispatches.len() } else { self.draws.len() } as u32;
         self.open_frame.as_mut().expect("CmdWriter: pass outside a frame").pass_draw0 = Some(d0);
         self.passes.push(pass);
     }
 
+    fn open_pass_kind(&self) -> Option<u32> {
+        self.open_frame.as_ref().filter(|f| f.pass_draw0.is_some()).and_then(|_| self.passes.last()).map(|p| p.kind)
+    }
+
     pub fn draw(&mut self, draw: Draw) {
-        assert!(self.open_frame.as_ref().is_some_and(|f| f.pass_draw0.is_some()), "CmdWriter: draw outside a pass");
+        assert_eq!(self.open_pass_kind(), Some(pass_kind::RENDER), "CmdWriter: draw outside a render pass");
         self.draws.push(draw);
+    }
+
+    pub fn dispatch(&mut self, dispatch: Dispatch) {
+        assert_eq!(self.open_pass_kind(), Some(pass_kind::COMPUTE), "CmdWriter: dispatch outside a compute pass");
+        self.dispatches.push(dispatch);
     }
 
     /// Closes the packet and writes the `Frame` command that renders it to `target`
@@ -481,6 +501,7 @@ impl CmdWriter {
             passes: Range { off: f.pass0, len: self.passes.len() as u32 - f.pass0 },
             draws: Range { off: f.draw0, len: self.draws.len() as u32 - f.draw0 },
             meta: f.meta,
+            dispatches: Range { off: f.dispatch0, len: self.dispatches.len() as u32 - f.dispatch0 },
         });
         self.push(Cmd::frame(target_id, target_kind, packet));
     }
@@ -496,6 +517,7 @@ impl CmdWriter {
             frames: Slice::of(&self.frames),
             passes: Slice::of(&self.passes),
             draws: Slice::of(&self.draws),
+            dispatches: Slice::of(&self.dispatches),
         }
     }
 
@@ -506,13 +528,14 @@ impl CmdWriter {
         self.frames.clear();
         self.passes.clear();
         self.draws.clear();
+        self.dispatches.clear();
         self.open_frame = None;
     }
 
-    /// Capacities (cmds, arena bytes, frames, passes, draws): tests use them to show a steady
-    /// state does not grow.
-    pub fn capacities(&self) -> [usize; 5] {
-        [self.cmds.capacity(), self.arena.capacity(), self.frames.capacity(), self.passes.capacity(), self.draws.capacity()]
+    /// Capacities (cmds, arena bytes, frames, passes, draws, dispatches): tests use them to show a
+    /// steady state does not grow.
+    pub fn capacities(&self) -> [usize; 6] {
+        [self.cmds.capacity(), self.arena.capacity(), self.frames.capacity(), self.passes.capacity(), self.draws.capacity(), self.dispatches.capacity()]
     }
 }
 
@@ -532,6 +555,7 @@ pub struct CmdView<'a> {
     pub frames: &'a [FramePacket],
     pub passes: &'a [Pass],
     pub draws: &'a [Draw],
+    pub dispatches: &'a [Dispatch],
 }
 
 impl CmdBuf {
@@ -548,6 +572,7 @@ impl CmdBuf {
             frames: self.frames.as_slice()?,
             passes: self.passes.as_slice()?,
             draws: self.draws.as_slice()?,
+            dispatches: self.dispatches.as_slice()?,
         })
     }
 }

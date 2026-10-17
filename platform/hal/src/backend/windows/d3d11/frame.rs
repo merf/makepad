@@ -290,6 +290,10 @@ impl D3d11 {
             }
         }
         for pass in &view.passes[pr] {
+            if pass.is_compute() {
+                exec::compute_unsupported(s, pass, "D3D11");
+                continue;
+            }
             let draws = &view.draws[slice(pass.draws, view.draws.len()).unwrap()];
             let before = s.stats.skipped_draws;
             let missing = pick && draws.iter().any(|d| read_ids(view.arena, d.pick_tex).any(|t| self.pick_pending.contains(&(sid, t))));

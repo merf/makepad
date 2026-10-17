@@ -597,6 +597,10 @@ impl Metal {
         let pick = kind & target::PICK != 0;
         let mut window_encoded = false;
         for pass in &view.passes[passes] {
+            if pass.is_compute() {
+                exec::compute_unsupported(s, pass, "Metal");
+                continue;
+            }
             let Some(dr) = slice(pass.draws, view.draws.len()) else {
                 s.stats.bad_args += 1;
                 continue;

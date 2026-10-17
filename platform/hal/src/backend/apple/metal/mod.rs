@@ -564,6 +564,9 @@ impl Gpu for Metal {
         if dialect != self::dialect::MSL {
             return PipeStatus::Failed(format!("the Metal backend takes MSL, not dialect {dialect}"));
         }
+        if blob.desc.kind != pipeline_kind::RENDER {
+            return PipeStatus::Failed("the Metal backend does not make compute pipelines yet".into());
+        }
         let Ok(source) = std::str::from_utf8(blob.code) else { return PipeStatus::Failed("the pipeline source is not utf8".into()) };
         let state = pipeline::create(&self.dev, s.id, id, s.font_frames.clone(), source, &blob.desc);
         self.pipe.insert((s.id, id.index), pipeline::Pipe { gen: id.gen, state, desc: blob.desc, bindings: blob.bindings.as_slice().into(), announced: false });

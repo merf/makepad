@@ -117,9 +117,9 @@ fn resources(hal: &Hal, sid: u32) {
     let mut w = CmdWriter::new(sid);
     w.texture_create(TEX, usage::RENDER_TARGET | usage::SAMPLED, format::RGBA8, 32, 32, [1, 1], Attr::default());
     let vertices = floats(&[-1.0, -1.0, 0.0, 1.0, 1.0, -1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
-    w.buffer_create(VERTEX, buffer_kind::VERTEX, vertices.len() as u64, Attr::default());
+    w.buffer_create(VERTEX, buffer_kind::VERTEX, vertices.len() as u64, 0, Attr::default());
     w.buffer_update(VERTEX, 0, &vertices);
-    w.buffer_create(INDEX, buffer_kind::INDEX, 6, Attr::default());
+    w.buffer_create(INDEX, buffer_kind::INDEX, 6, 0, Attr::default());
     w.buffer_update(INDEX, 0, &[0, 0, 1, 0, 2, 0]);
     let blob = CmdWriter::pipeline_blob(PipelineDesc { outputs: 1, ..Default::default() }, &payload(VERTEX_GLSL, WHITE_GLSL, Vec::new(), false),
         &[NONE, NONE, NONE, NONE, NONE, 0], &LAYOUT);
@@ -241,10 +241,10 @@ fn sampled_bgra_upload_round_trips() {
         w.texture_create(id, usage::RENDER_TARGET | usage::SAMPLED, fmt, 2, 2, [1, 1], Attr::default());
     }
     let quad = floats(&[-1.0, -1.0, 0.0, 1.0, 1.0, -1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, -1.0, 1.0, 0.0, 1.0]);
-    w.buffer_create(QUAD, buffer_kind::VERTEX, quad.len() as u64, Attr::default());
+    w.buffer_create(QUAD, buffer_kind::VERTEX, quad.len() as u64, 0, Attr::default());
     w.buffer_update(QUAD, 0, &quad);
     let indices: Vec<u8> = [0u16, 1, 2, 0, 2, 3].iter().flat_map(|i| i.to_le_bytes()).collect();
-    w.buffer_create(QUAD_INDEX, buffer_kind::INDEX, indices.len() as u64, Attr::default());
+    w.buffer_create(QUAD_INDEX, buffer_kind::INDEX, indices.len() as u64, 0, Attr::default());
     w.buffer_update(QUAD_INDEX, 0, &indices);
     let nearest = SpirvSampler { filter: 0, address: 1, compare: false, pixel: false };
     let blob = CmdWriter::pipeline_blob(PipelineDesc { outputs: 1, ..Default::default() },
@@ -393,10 +393,10 @@ fn adopted_app_texture_is_sampled_after_its_fence() {
     w.gl_fence(sync);
     w.texture_create(TEX, usage::RENDER_TARGET | usage::SAMPLED, format::RGBA8, 2, 2, [1, 1], Attr::default());
     let quad = floats(&[-1.0, -1.0, 0.0, 1.0, 1.0, -1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, -1.0, 1.0, 0.0, 1.0]);
-    w.buffer_create(QUAD, buffer_kind::VERTEX, quad.len() as u64, Attr::default());
+    w.buffer_create(QUAD, buffer_kind::VERTEX, quad.len() as u64, 0, Attr::default());
     w.buffer_update(QUAD, 0, &quad);
     let indices: Vec<u8> = [0u16, 1, 2, 0, 2, 3].iter().flat_map(|i| i.to_le_bytes()).collect();
-    w.buffer_create(QUAD_INDEX, buffer_kind::INDEX, indices.len() as u64, Attr::default());
+    w.buffer_create(QUAD_INDEX, buffer_kind::INDEX, indices.len() as u64, 0, Attr::default());
     w.buffer_update(QUAD_INDEX, 0, &indices);
     let linear = SpirvSampler { filter: 1, address: 1, compare: false, pixel: false };
     let blob = CmdWriter::pipeline_blob(PipelineDesc { outputs: 1, ..Default::default() },

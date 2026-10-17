@@ -377,6 +377,7 @@ impl Backend for Vulkan {
             let Some(passes) = frame::slice(packet.passes, view.passes.len()) else { continue };
             let is_window = kind & !target::FLAGS == target::WINDOW;
             'pass: for pass in &view.passes[passes] {
+                if pass.is_compute() { continue; }
                 let mut key = PassKey { colors: [pipeline::ABSENT; 4], depth: pipeline::ABSENT, load: pass.load };
                 for (i, id) in pass.color.iter().enumerate().filter(|(_, id)| !id.is_none()) {
                     let Some(format) = format_of(*id) else { continue 'pass };
@@ -771,6 +772,7 @@ impl Gpu for Vulkan {
     fn buffer_evictable(&mut self, sid: u32, id: Id) { if let Some(b) = self.buf.get_mut(&(sid, id.index)).filter(|b| b.gen == id.gen) { b.evictable = true; } }
     fn pipeline_create(&mut self, s: &mut Session, id: Id, dialect: u32, blob: &PipelineBlob, _: Attr) -> PipeStatus {
         if dialect != self::dialect::SPIRV { return PipeStatus::Failed("Vulkan takes binary SPIR-V".into()); }
+        if blob.desc.kind != pipeline_kind::RENDER { return PipeStatus::Failed("the Vulkan backend does not make compute pipelines yet".into()); }
         let code = match crate::spirv::SpirvPipeline::decode(blob.code) { Ok(c) => c, Err(e) => return PipeStatus::Failed(e) };
         let mut key = blob.code.to_vec();
         key.extend_from_slice(&(blob.bindings.len() as u64).to_le_bytes());

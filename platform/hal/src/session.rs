@@ -168,6 +168,8 @@ pub struct Embedded {
 pub struct BufferObj {
     pub kind: u16,
     pub size: u64,
+    /// bytes per element of a STORAGE buffer (0 otherwise)
+    pub stride: u32,
     /// what the device holds for it (the ledger's number)
     pub bytes: u64,
     pub evictable: bool,
@@ -266,6 +268,9 @@ pub struct Stats {
     pub gpu_ns_max: u64,
     pub passes: u64,
     pub draws: u64,
+    /// compute dispatches encoded, and those skipped (a kernel not ready, a missing resource)
+    pub dispatches: u64,
+    pub skipped_dispatches: u64,
     /// the longest CPU time Cx spent building one frame (`FrameMeta` build start to end), ns
     pub max_frame_ns: u64,
     /// upload arenas (uniforms, inline instances, texture upload staging) the backend had to

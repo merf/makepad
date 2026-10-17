@@ -100,6 +100,159 @@ fn arrays_and_blobs_round_trip() {
     assert_eq!((p.code, p.bindings.as_slice(), p.vertex_layout.as_slice()), (&b"shader code"[..], &[1, 2, 3][..], &[7, 8][..]));
     assert_eq!((p.desc.shader, p.desc.name, p.desc.instance_stride, p.desc.varyings), (9, 3, 12, 5));
     assert!(PipelineBlob::parse(&blob[..20]).is_none());
+    // a compute pipeline: its kind and binding table come back
+    let table = [compute_binding::NONE, 1, 1, 2, 1, compute_binding::WRITABLE];
+    let blob = CmdWriter::pipeline_blob(PipelineDesc { kind: pipeline_kind::COMPUTE, ..Default::default() }, b"kernel", &table, &[]);
+    let p = PipelineBlob::parse(&blob).unwrap();
+    assert_eq!((p.desc.kind, p.bindings.as_slice(), p.vertex_layout.len()), (pipeline_kind::COMPUTE, &table[..], 0));
+}
+
+const KERNEL: Id = Id::new(3, 1);
+const IMAGE: Id = Id::new(4, 1);
+const STORAGE: Id = Id::new(5, 1);
+
+/// A compute pass between two render passes: the writer fills the pass's dispatch range (its draw
+/// range empty, so every backend's draw-range checks hold), the packet's dispatch range, and the
+/// CmdBuf's dispatch array; the headless backend runs and counts them like draws.
+#[test]
+fn a_compute_pass_rides_in_the_frame_packet() {
+    let hal = Hal::new();
+    let s = open(&hal, 0);
+    let mut w = CmdWriter::new(s);
+    let render = Id::new(0, 1);
+    let target_tex = Id::new(6, 1);
+    w.pipeline_create(render, dialect::NONE, Attr::default(), &CmdWriter::pipeline_blob(PipelineDesc::default(), &[], &[], &[]));
+    w.pipeline_create(KERNEL, dialect::NONE, Attr::default(), &CmdWriter::pipeline_blob(PipelineDesc { kind: pipeline_kind::COMPUTE, ..Default::default() }, &[], &[], &[]));
+    w.texture_create(IMAGE, usage::STORAGE | usage::SAMPLED, format::RGBA8, 16, 16, [1, 1], Attr::default());
+    w.texture_create(target_tex, usage::RENDER_TARGET | usage::SAMPLED, format::RGBA8, 16, 16, [1, 1], Attr::default());
+    w.buffer_create(STORAGE, buffer_kind::STORAGE, 64, 16, Attr::default());
+    let images = w.put_ids(&[IMAGE]);
+    let buffers = w.put_ids(&[STORAGE]);
+    let tex = w.put_ids(&[IMAGE]);
+    let params = [1.0f32, 2.0, 3.0, 4.0];
+    let target_pass = Pass { color: [target_tex, Id::NONE, Id::NONE, Id::NONE], depth: Id::NONE, viewport: [0.0, 0.0, 16.0, 16.0], ..Default::default() };
+    w.frame_begin(3, FrameMeta::default());
+    w.pass(target_pass);
+    w.draw(Draw { pipeline: render, ..Default::default() });
+    w.pass(Pass::compute(0));
+    w.dispatch(Dispatch { pipeline: KERNEL, groups: [2, 2, 1], uniforms: Slice::of(&params), images, buffers, ..Default::default() });
+    w.dispatch(Dispatch { pipeline: KERNEL, groups: [1, 1, 1], buffers, ..Default::default() });
+    w.pass(target_pass);
+    w.draw(Draw { pipeline: render, tex, ..Default::default() });
+    w.frame_end(target_tex, target::TEXTURE);
+
+    let buf = w.buf();
+    let view = unsafe { buf.view() }.unwrap();
+    let packet = view.frames[0];
+    assert_eq!((packet.passes.len, packet.draws.len, packet.dispatches.len), (3, 2, 2));
+    let compute = view.passes[1];
+    assert!(compute.is_compute() && !view.passes[0].is_compute());
+    assert_eq!((compute.dispatches.off, compute.dispatches.len, compute.draws.off, compute.draws.len), (0, 2, 1, 0));
+    assert_eq!((view.passes[2].draws.off, view.passes[2].draws.len, view.passes[2].dispatches.len), (1, 1, 0));
+    let d = view.dispatches[0];
+    assert_eq!(d.groups, [2, 2, 1]);
+    assert_eq!(unsafe { d.uniforms.as_slice::<f32>() }.unwrap(), &params[..]);
+    assert_eq!(makepad_hal::buffers::read_ids(view.arena, d.images).collect::<Vec<_>>(), vec![IMAGE]);
+
+    hal.submit(&buf);
+    let st = hal.with_world(|w| w.session(s).unwrap().stats);
+    assert_eq!((st.passes, st.draws, st.dispatches, st.skipped_dispatches, st.bad_args, st.stale_ids), (3, 2, 2, 0, 0, 0));
+    let report = hal.report(s, 30).unwrap();
+    assert_eq!(report.items.iter().find(|i| i.detail == "storage buffers").map(|i| i.last_used_frame), Some(3));
+    assert_eq!(report.items.iter().find(|i| i.detail == "storage image").map(|i| i.last_used_frame), Some(3));
+
+    // steady state: a compute frame allocates nothing more
+    let frame = |w: &mut CmdWriter, f: u64| {
+        w.clear();
+        let images = w.put_ids(&[IMAGE]);
+        w.frame_begin(f, FrameMeta::default());
+        w.pass(Pass::compute(0));
+        w.dispatch(Dispatch { pipeline: KERNEL, groups: [1, 1, 1], images, ..Default::default() });
+        w.frame_end(target_tex, target::TEXTURE);
+        hal.submit(&w.buf());
+    };
+    frame(&mut w, 4);
+    let cap = w.capacities();
+    for f in 5..12 {
+        frame(&mut w, f);
+    }
+    assert_eq!(w.capacities(), cap);
+}
+
+/// What no backend may run is refused the same everywhere (`exec::check_dispatch`): a render
+/// pipeline, a texture written that is not a storage image, an image sampled by the dispatch that
+/// writes it, a buffer that is not a storage buffer, a group count past 65535; and a storage
+/// buffer must be a whole number of elements.
+#[test]
+fn dispatches_no_backend_takes_are_refused() {
+    let hal = Hal::new();
+    let s = open(&hal, 0);
+    let mut w = CmdWriter::new(s);
+    let render = Id::new(0, 1);
+    let target_tex = Id::new(6, 1);
+    let vertex = Id::new(7, 1);
+    w.pipeline_create(render, dialect::NONE, Attr::default(), &CmdWriter::pipeline_blob(PipelineDesc::default(), &[], &[], &[]));
+    w.pipeline_create(KERNEL, dialect::NONE, Attr::default(), &CmdWriter::pipeline_blob(PipelineDesc { kind: pipeline_kind::COMPUTE, ..Default::default() }, &[], &[], &[]));
+    w.texture_create(IMAGE, usage::STORAGE | usage::SAMPLED, format::RGBA8, 16, 16, [1, 1], Attr::default());
+    w.texture_create(target_tex, usage::RENDER_TARGET | usage::SAMPLED, format::RGBA8, 16, 16, [1, 1], Attr::default());
+    w.buffer_create(STORAGE, buffer_kind::STORAGE, 64, 16, Attr::default());
+    w.buffer_create(vertex, buffer_kind::VERTEX, 64, 0, Attr::default());
+    hal.submit(&w.buf());
+    let stats = || hal.with_world(|w| w.session(s).unwrap().stats);
+    let run = |w: &mut CmdWriter, make: &dyn Fn(&mut CmdWriter) -> Dispatch| {
+        w.clear();
+        let d = make(w);
+        w.frame_begin(1, FrameMeta::default());
+        w.pass(Pass::compute(0));
+        w.dispatch(d);
+        w.frame_end(target_tex, target::TEXTURE);
+        hal.submit(&w.buf());
+    };
+    let refused: [&dyn Fn(&mut CmdWriter) -> Dispatch; 6] = [
+        &|_| Dispatch { pipeline: render, groups: [1; 3], ..Default::default() },
+        &|_| Dispatch { pipeline: KERNEL, groups: [65536, 1, 1], ..Default::default() },
+        &|w| Dispatch { pipeline: KERNEL, groups: [1; 3], images: w.put_ids(&[target_tex]), ..Default::default() },
+        &|w| Dispatch { pipeline: KERNEL, groups: [1; 3], images: w.put_ids(&[IMAGE]), tex: w.put_ids(&[IMAGE]), ..Default::default() },
+        &|w| Dispatch { pipeline: KERNEL, groups: [1; 3], buffers: w.put_ids(&[vertex]), ..Default::default() },
+        &|w| Dispatch { pipeline: KERNEL, groups: [1; 3], images: w.put_ids(&[Id::NONE]), ..Default::default() },
+    ];
+    for (i, make) in refused.into_iter().enumerate() {
+        let before = stats();
+        run(&mut w, make);
+        let after = stats();
+        assert_eq!((after.bad_args - before.bad_args, after.skipped_dispatches - before.skipped_dispatches, after.dispatches - before.dispatches), (1, 1, 0), "case {i}");
+    }
+    // a stale kernel is stale, not bad
+    let before = stats();
+    run(&mut w, &|_| Dispatch { pipeline: Id::new(9, 1), groups: [1; 3], ..Default::default() });
+    let after = stats();
+    assert_eq!((after.stale_ids - before.stale_ids, after.bad_args - before.bad_args, after.skipped_dispatches - before.skipped_dispatches), (1, 0, 1));
+    // storage buffers: a stride that divides the size, a multiple of four
+    for (size, stride) in [(64, 0), (64, 6), (60, 16), (0, 16)] {
+        let before = stats().bad_args;
+        w.clear();
+        w.buffer_create(Id::new(8, 1), buffer_kind::STORAGE, size, stride, Attr::default());
+        hal.submit(&w.buf());
+        assert_eq!(stats().bad_args - before, 1, "size {size} stride {stride}");
+    }
+}
+
+#[test]
+#[should_panic(expected = "dispatch outside a compute pass")]
+fn a_dispatch_in_a_render_pass_panics() {
+    let mut w = CmdWriter::new(1);
+    w.frame_begin(1, FrameMeta::default());
+    w.pass(Pass::default());
+    w.dispatch(Dispatch::default());
+}
+
+#[test]
+#[should_panic(expected = "draw outside a render pass")]
+fn a_draw_in_a_compute_pass_panics() {
+    let mut w = CmdWriter::new(1);
+    w.frame_begin(1, FrameMeta::default());
+    w.pass(Pass::compute(0));
+    w.draw(Draw::default());
 }
 
 /// A texture the device cannot hold (no room, past its limits) is reported gone as an
@@ -247,7 +400,7 @@ fn session_close_frees_everything_and_keeps_adoptable_windows() {
     w.window_create(Id::new(0, 1), window_kind::NORMAL, Id::NONE, [0.0, 0.0, 1.0, 1.0], true); // adopts the host window
     w.window_create(Id::new(1, 1), window_kind::NORMAL, Id::NONE, [0.0, 0.0, 100.0, 100.0], false);
     w.texture_create(Id::new(0, 1), usage::RENDER_TARGET, format::RGBA8, 64, 64, [1, 1], Attr::default());
-    w.buffer_create(Id::new(0, 1), buffer_kind::VERTEX, 1024, Attr::default());
+    w.buffer_create(Id::new(0, 1), buffer_kind::VERTEX, 1024, 0, Attr::default());
     w.timer_start(5, 1_000_000, true);
     hal.submit(&w.buf());
     assert_eq!(hal.with_world(|w| w.lent_to(host)), Some(s));
@@ -293,7 +446,7 @@ fn ledger_totals_and_idle() {
     w.texture_create(Id::new(0, 1), usage::RENDER_TARGET, format::RGBA8, 100, 100, [1, 1], a);
     w.texture_create(Id::new(1, 1), usage::RENDER_TARGET, format::RGBA8, 10, 10, [1, 3], Attr { owner: 1, site: 2, label: 4, kind: 0 });
     w.texture_create(Id::new(2, 1), usage::RENDER_TARGET, format::DEPTH32F, 100, 100, [1, 1], Attr { owner: 0, site: 3, label: 0, kind: 0 });
-    w.buffer_create(Id::new(0, 1), buffer_kind::INSTANCE, 5000, a);
+    w.buffer_create(Id::new(0, 1), buffer_kind::INSTANCE, 5000, 0, a);
     hal.submit(&w.buf());
     let r = hal.report(s, 30).unwrap();
     let mip_chain = 10 * 10 * 4 + 5 * 5 * 4 + 2 * 2 * 4;
@@ -336,7 +489,7 @@ fn frame_packet_with_two_passes_three_draws_yields_frame_done() {
     let blob = CmdWriter::pipeline_blob(PipelineDesc { name: 1, ..Default::default() }, b"code", &[], &[]);
     w.pipeline_create(Id::new(0, 1), dialect::MSL, Attr::default(), &blob);
     w.texture_create(Id::new(0, 1), usage::RENDER_TARGET | usage::SAMPLED, format::RGBA8, 64, 64, [1, 1], Attr::default());
-    w.buffer_create(Id::new(0, 1), buffer_kind::VERTEX, 256, Attr::default());
+    w.buffer_create(Id::new(0, 1), buffer_kind::VERTEX, 256, 0, Attr::default());
     let ranges = w.put_items(&[[0u32, 3]]);
     w.frame_begin(7, FrameMeta { input_ns: 1, ..Default::default() });
     w.pass(Pass { color: [Id::new(0, 1), Id::NONE, Id::NONE, Id::NONE], depth: Id::NONE, viewport: [0.0, 0.0, 64.0, 64.0], ..Default::default() });

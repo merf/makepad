@@ -99,7 +99,7 @@ impl Gpu for Headless {
             && view.frames.get(packet as usize).is_some_and(|p| {
                 let start = p.passes.off as usize;
                 start.checked_add(p.passes.len as usize).and_then(|end| view.passes.get(start..end))
-                    .is_some_and(|passes| passes.iter().any(|pass| pass.color.iter().all(|id| id.is_none())))
+                    .is_some_and(|passes| passes.iter().any(|pass| !pass.is_compute() && pass.color.iter().all(|id| id.is_none())))
             });
         frame(s, sid, target, kind, packet, view, now).map(|deps| exec::SubmittedFrame {
             deps, window,
@@ -142,6 +142,19 @@ fn frame(s: &mut Session, sid: u32, _target: Id, _kind: u32, packet: u32, view: 
     s.stats.max_frame_ns = s.stats.max_frame_ns.max(p.meta.build_end_ns.saturating_sub(p.meta.build_start_ns));
     for pass in &view.passes[pr] {
         s.stats.passes += 1;
+        if pass.is_compute() {
+            let Some(dr) = slice(pass.dispatches, view.dispatches.len()) else {
+                s.stats.bad_args += 1;
+                continue;
+            };
+            for d in &view.dispatches[dr] {
+                match exec::check_dispatch(s, sid, d, view.arena, now) {
+                    Ok(()) => s.stats.dispatches += 1,
+                    Err(why) => exec::skip_dispatch(s, why),
+                }
+            }
+            continue;
+        }
         for id in pass.color.iter().chain(std::iter::once(&pass.depth)).filter(|i| !i.is_none()) {
             touch(s, sid, Kind::Texture, *id, frame, now);
         }

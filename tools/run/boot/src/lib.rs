@@ -244,6 +244,7 @@ impl Boot {
             gpu::VERTICES,
             buffer_kind::VERTEX,
             vertices.len() as u64,
+            0,
             Attr::default(),
         );
         writer.buffer_update(gpu::VERTICES, 0, &vertices);
@@ -251,6 +252,7 @@ impl Boot {
             gpu::INDICES,
             buffer_kind::INDEX,
             indices.len() as u64,
+            0,
             Attr::default(),
         );
         writer.buffer_update(gpu::INDICES, 0, &indices);

@@ -70,9 +70,9 @@ fn resources(hal: &Hal, sid: u32) {
     let mut w = CmdWriter::new(sid);
     w.texture_create(TEX, usage::RENDER_TARGET | usage::SAMPLED, format::RGBA8, 32, 32, [1, 1], Attr::default());
     let vertices: Vec<u8> = [-1.0f32, -1.0, 0.0, 1.0, 1.0, -1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0].into_iter().flat_map(f32::to_le_bytes).collect();
-    w.buffer_create(VERTEX, buffer_kind::VERTEX, vertices.len() as u64, Attr::default());
+    w.buffer_create(VERTEX, buffer_kind::VERTEX, vertices.len() as u64, 0, Attr::default());
     w.buffer_update(VERTEX, 0, &vertices);
-    w.buffer_create(INDEX, buffer_kind::INDEX, 6, Attr::default());
+    w.buffer_create(INDEX, buffer_kind::INDEX, 6, 0, Attr::default());
     w.buffer_update(INDEX, 0, &[0, 0, 1, 0, 2, 0]);
     // one geometry input: stride 16, (offset 0, F32x4, 4 lanes)
     let layout = [16, 0, 3, 4];

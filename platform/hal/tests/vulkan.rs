@@ -99,9 +99,9 @@ fn resources(hal: &Hal, sid: u32) {
     w.texture_create(TEX, usage::RENDER_TARGET | usage::SAMPLED, format::RGBA8, 32, 32, [1, 1], Attr::default());
     let vertices: Vec<u8> = [-1.0f32, -1.0, 0.0, 1.0, 1.0, -1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]
         .into_iter().flat_map(f32::to_le_bytes).collect();
-    w.buffer_create(VERTEX, buffer_kind::VERTEX, vertices.len() as u64, Attr::default());
+    w.buffer_create(VERTEX, buffer_kind::VERTEX, vertices.len() as u64, 0, Attr::default());
     w.buffer_update(VERTEX, 0, &vertices);
-    w.buffer_create(INDEX, buffer_kind::INDEX, 6, Attr::default());
+    w.buffer_create(INDEX, buffer_kind::INDEX, 6, 0, Attr::default());
     w.buffer_update(INDEX, 0, &[0, 0, 1, 0, 2, 0]);
     let blob = CmdWriter::pipeline_blob(PipelineDesc { outputs: 1, ..Default::default() }, &shader(),
         &[u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX, 0], &[16]);
@@ -253,9 +253,9 @@ fn dmabuf_export_import_second_session_samples_identical_pixels() {
     w.texture_create(TEX, usage::SAMPLED | usage::RENDER_TARGET, format::RGBA8, 4, 4, [1, 1], Attr::default());
     let vertices: Vec<u8> = [-1.0f32, -1.0, 0.0, 1.0, 3.0, -1.0, 0.0, 1.0, -1.0, 3.0, 0.0, 1.0]
         .into_iter().flat_map(f32::to_le_bytes).collect();
-    w.buffer_create(VERTEX, buffer_kind::VERTEX, vertices.len() as u64, Attr::default());
+    w.buffer_create(VERTEX, buffer_kind::VERTEX, vertices.len() as u64, 0, Attr::default());
     w.buffer_update(VERTEX, 0, &vertices);
-    w.buffer_create(INDEX, buffer_kind::INDEX, 6, Attr::default());
+    w.buffer_create(INDEX, buffer_kind::INDEX, 6, 0, Attr::default());
     w.buffer_update(INDEX, 0, &[0, 0, 1, 0, 2, 0]);
     let blob = CmdWriter::pipeline_blob(PipelineDesc { outputs: 1, ..Default::default() }, &sampled_shader(),
         &[u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX, 1], &[16]);

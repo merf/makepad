@@ -462,6 +462,7 @@ impl Gpu for GlBackend {
     fn buffer_evictable(&mut self, _sid: u32, _id: Id) {}
     fn pipeline_create(&mut self, s: &mut Session, id: Id, dialect: u32, blob: &PipelineBlob, _: Attr) -> PipeStatus {
         if dialect != self::dialect::GLSL { return PipeStatus::Failed("GLES takes the GLSL dialect payload".into()); }
+        if blob.desc.kind != pipeline_kind::RENDER { return PipeStatus::Failed("GLES has no compute pipelines".into()); }
         let code = match GlslPipeline::decode(blob.code) { Ok(c) => c, Err(e) => return PipeStatus::Failed(e) };
         let custom = blob.bindings.len().saturating_sub(pipeline_binding::BUFFERS);
         if blob.bindings.len() < pipeline_binding::BUFFERS || blob.bindings[pipeline_binding::TEXTURES] as usize != code.textures.len()

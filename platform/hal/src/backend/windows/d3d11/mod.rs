@@ -514,6 +514,9 @@ impl Gpu for D3d11 {
         if dialect != self::dialect::HLSL {
             return PipeStatus::Failed("D3D11 takes the HLSL payload".into());
         }
+        if blob.desc.kind != pipeline_kind::RENDER {
+            return PipeStatus::Failed("the D3D11 backend does not make compute pipelines yet".into());
+        }
         let code = match HlslPipeline::decode(blob.code) {
             Ok(c) => c,
             Err(e) => return PipeStatus::Failed(e),

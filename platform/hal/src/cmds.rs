@@ -182,8 +182,9 @@ hal_commands! {
     /// A texture backed by a handle another process / the host owns (`texture_handle`).
     /// Answered by `TextureImported`; failed imports can be retried with the same id.
     TextureImport = 55, texture_import { id: obj, handle: u64, kind: u32 };
-    /// `kind` (flags) is `buffer_kind::*`.
-    BufferCreate = 56, buffer_create { id: obj, kind: flags, size: u64, attr: attr };
+    /// `kind` (flags) is `buffer_kind::*`; `stride` the bytes of one element of a STORAGE buffer
+    /// (0 for the other kinds).
+    BufferCreate = 56, buffer_create { id: obj, kind: flags, size: u64, stride: u32, attr: attr };
     BufferUpdate = 57, buffer_update { id: obj, off: u64, bytes: slice };
     BufferDestroy = 58, buffer_destroy { id: obj };
     /// `desc`: a `PipelineDesc` followed by the parts it names (see `buffers::PipelineSpec`).

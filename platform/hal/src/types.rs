@@ -142,6 +142,8 @@ pub struct CmdBuf {
     /// `[Pass]` and `[Draw]` of every frame in `frames` (element ranges, see [`FramePacket`])
     pub passes: Slice,
     pub draws: Slice,
+    /// `[Dispatch]` of every compute pass in `frames` (element ranges, see [`Pass::dispatches`])
+    pub dispatches: Slice,
 }
 
 /// One fire-and-forget command. `a` is decoded per `tag` by the generated constructors and
@@ -467,6 +469,9 @@ pub mod usage {
     pub const SAMPLED: u16 = 2;
     pub const SHARED: u16 = 4;
     pub const TRANSIENT: u16 = 8;
+    /// Written by compute dispatches (a storage image). A dispatch never samples a texture it
+    /// writes, and a pass never renders into one a dispatch of the same pass writes.
+    pub const STORAGE: u16 = 16;
 }
 
 /// Buffer kinds (`BufferCreate` flags).
@@ -475,6 +480,27 @@ pub mod buffer_kind {
     pub const VERTEX: u16 = 1;
     pub const INDEX: u16 = 2;
     pub const UNIFORM: u16 = 3;
+    /// Read and written by compute dispatches: an array of `BufferCreate::stride`-byte elements
+    /// (`size` a whole number of them).
+    pub const STORAGE: u16 = 4;
+}
+
+/// `Pass::kind` values.
+pub mod pass_kind {
+    /// Draws into attachments (`Pass::draws`).
+    pub const RENDER: u32 = 0;
+    /// Compute dispatches (`Pass::dispatches`); the attachments, viewport and `draws` are unused.
+    /// A pass after it in the packet sees everything its dispatches wrote.
+    pub const COMPUTE: u32 = 1;
+}
+
+/// `PipelineDesc::kind` values.
+pub mod pipeline_kind {
+    /// A vertex and pixel stage; the binding table is [`pipeline_binding`].
+    pub const RENDER: u32 = 0;
+    /// A compute kernel (HLSL entry `kernel_main`); the binding table is [`compute_binding`],
+    /// the vertex layout, formats, blend and depth are unused.
+    pub const COMPUTE: u32 = 1;
 }
 
 /// `Pass::load` values.
@@ -734,6 +760,30 @@ pub mod pipeline_binding {
     pub const NONE: u32 = u32::MAX;
 }
 
+/// Layout of a compute pipeline's binding table (`PipelineDesc::bindings`, `pipeline_kind::COMPUTE`):
+/// the slot of the parameter block, the counts of what a dispatch binds, then one word per storage
+/// buffer. A dispatch names its textures, images and buffers in this order (`Dispatch::tex`,
+/// `images`, `buffers`).
+///
+/// Registers (HLSL; Metal uses the same numbers for its texture and buffer indices): sampled
+/// textures `t0..`, then the read-only buffers in the `t` registers after them; storage images
+/// `u0..`, then the writable buffers in the `u` registers after them; the parameter block at
+/// `b<PARAMS>`. Each buffer's word gives its register and whether it is written.
+pub mod compute_binding {
+    /// the constant-buffer slot of the parameter block (`Dispatch::uniforms`); NONE: no params
+    pub const PARAMS: usize = 0;
+    /// sampled textures (`Dispatch::tex`); their shapes come with the code
+    pub const TEXTURES: usize = 1;
+    /// storage images (`Dispatch::images`), 2D, written
+    pub const IMAGES: usize = 2;
+    /// storage buffers (`Dispatch::buffers`); one word each follows
+    pub const BUFFERS: usize = 3;
+    /// the first buffer's word: `register | WRITABLE` when the kernel writes it
+    pub const BUFFER_WORDS: usize = 4;
+    pub const WRITABLE: u32 = 1 << 31;
+    pub const NONE: u32 = u32::MAX;
+}
+
 /// `Lifecycle` event kinds.
 pub mod lifecycle {
     pub const FOREGROUND: u32 = 0;
@@ -803,7 +853,9 @@ pub struct TouchPoint {
 
 // ------------------------------------------------------------------ frames
 
-/// One render pass of a frame. `draws` is an element range into the packet's draw array.
+/// One pass of a frame: a render pass (`draws`, an element range into the packet's draw array)
+/// or, by `kind`, a compute pass (`dispatches`, an element range into the CmdBuf's dispatch array;
+/// its `draws` is empty). Passes run in packet order.
 #[relax_api(plain)]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -823,9 +875,46 @@ pub struct Pass {
     pub draws: Range,
     pub name: StrId,
     pub owner: StrId,
+    /// [`pass_kind`]
+    pub kind: u32,
+    /// a compute pass's dispatches (element range into `CmdBuf::dispatches`)
+    pub dispatches: Range,
 }
 
 unsafe impl Plain for Pass {}
+
+impl Pass {
+    /// A compute pass; its dispatches follow ([`CmdWriter::dispatch`](crate::buffers::CmdWriter::dispatch)).
+    pub fn compute(name: StrId) -> Pass {
+        Pass { color: [Id::NONE; 4], depth: Id::NONE, kind: pass_kind::COMPUTE, name, ..Default::default() }
+    }
+    pub fn is_compute(&self) -> bool {
+        self.kind == pass_kind::COMPUTE
+    }
+}
+
+/// One compute dispatch: `groups` workgroups of the kernel `pipeline`. The id ranges are element
+/// ranges into the arena's `[u32; 2]` (index, gen) array, as
+/// [`CmdWriter::put_ids`](crate::buffers::CmdWriter::put_ids) writes them, in the order of the
+/// pipeline's binding table ([`compute_binding`]); a slot past a range is [`Id::NONE`].
+#[relax_api(plain)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Dispatch {
+    pub pipeline: Id,
+    pub groups: [u32; 3],
+    /// the parameter block (`compute_binding::PARAMS`), borrowed for the submit call
+    pub uniforms: Slice,
+    /// sampled textures
+    pub tex: Range,
+    /// storage images (textures made with `usage::STORAGE`), written
+    pub images: Range,
+    /// storage buffers (`buffer_kind::STORAGE`), read or written as the pipeline says
+    pub buffers: Range,
+    pub owner: StrId,
+}
+
+unsafe impl Plain for Dispatch {}
 
 /// Where a draw's instances come from: inline floats (a borrowed [`Slice`]) or a retained buffer.
 #[relax_api(plain)]
@@ -934,6 +1023,8 @@ pub struct FramePacket {
     pub passes: Range,
     pub draws: Range,
     pub meta: FrameMeta,
+    /// the dispatches of the packet's compute passes (element range into `CmdBuf::dispatches`)
+    pub dispatches: Range,
 }
 
 unsafe impl Plain for FramePacket {}
@@ -962,6 +1053,8 @@ pub struct PipelineDesc {
     pub varyings: u32,
     /// bit `i` set when the fragment stage writes colour output `i`
     pub outputs: u32,
+    /// [`pipeline_kind`]
+    pub kind: u32,
 }
 
 /// `PipelineDesc::blend` bits.
