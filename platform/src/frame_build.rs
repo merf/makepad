@@ -1775,6 +1775,20 @@ mod tests {
         assert_eq!(fb.pipelines_pending(), 0);
     }
 
+    /// A compute kernel's pipeline is counted with the draw shaders' while it compiles, and when
+    /// it fails it names its kernel, not a draw shader.
+    #[test]
+    fn a_kernels_pipeline_waits_with_the_draw_shaders_and_fails_as_its_own() {
+        let mut fb = FrameBuilder::default();
+        let draw = Id::new(0, 1);
+        let kernel = Id::new(1, 1);
+        fb.pipes.push(PipeRec { id: draw, owner: PipeOwner::Draw(3), ready: false, drawn_unready: false, failed: false, pick: None });
+        fb.pipes.push(PipeRec { id: kernel, owner: PipeOwner::Kernel(0), ready: false, drawn_unready: false, failed: false, pick: None });
+        assert_eq!(fb.pipelines_pending(), 2);
+        assert_eq!(fb.pipeline_failed(kernel), Some((PipeOwner::Kernel(0), false)));
+        assert_eq!(fb.pipelines_pending(), 1, "the draw shader's still compiles");
+    }
+
     #[test]
     fn strings_are_defined_once() {
         let mut fb = FrameBuilder::default();
