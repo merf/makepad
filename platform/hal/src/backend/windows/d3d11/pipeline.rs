@@ -301,7 +301,10 @@ fn build_kernel(dev: &Device, code: &HlslPipeline, desc: PipelineDesc, bindings:
     let hlsl = &code.source;
     let words = |i: usize| bindings.get(i).copied().ok_or_else(|| format!("kernel `{name}`: a binding table of {} words", bindings.len()));
     let (ntex, nimg, nbuf) = (words(compute_binding::TEXTURES)?, words(compute_binding::IMAGES)?, words(compute_binding::BUFFERS)?);
-    if bindings.len() != compute_binding::BUFFER_WORDS + 2 * nbuf as usize || ntex as usize != code.textures.len() {
+    // The table may end with the workgroup size (`compute_binding::workgroup_at`), which Metal
+    // dispatches with; D3D11's is compiled into the kernel, so it is ignored here.
+    let table = compute_binding::workgroup_at(nbuf as usize);
+    if (bindings.len() != table && bindings.len() != table + 3) || ntex as usize != code.textures.len() {
         return Err(format!("kernel `{name}`: its binding table and payload disagree"));
     }
     let mut uavs = nimg;
