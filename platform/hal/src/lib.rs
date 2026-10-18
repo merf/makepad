@@ -42,6 +42,7 @@ pub mod codec;
 pub mod events;
 pub mod font;
 pub mod ledger;
+pub mod gpu_debug;
 pub mod gpu_limits;
 pub mod gpu_pressure;
 #[cfg(not(target_arch = "wasm32"))]

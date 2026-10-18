@@ -1392,21 +1392,31 @@ impl Cx {
                 self.hal.hosted.as_mut().unwrap().submitted(window, index, serial, [tw as u32, th as u32]);
             }
         }
-        if !picking && crate::gpu_frame_timer::enabled() {
-            if let Some(window) = self.get_pass_window_id(pass_id) {
-                let group = (window.id() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ self.repaint_id;
-                let name = match self.passes[pass_id].debug_name.as_str() {
-                    "" if is_window => "window",
-                    "" => "unnamed",
-                    name => name,
-                };
-                fb.timings.insert(serial, (group, name.to_string(), is_window));
-            }
+        if !picking {
+            let name = match self.passes[pass_id].debug_name.as_str() {
+                "" if is_window => "window",
+                "" => "unnamed",
+                name => name,
+            };
+            let name = name.to_string();
+            self.fb_time_packet(fb, pass_id, serial, name, is_window);
         }
         fb.stats.frames += 1;
         fb.stats.passes += 1;
         self.passes[pass_id].painted_serial = self.repaint_id;
         Some(serial)
+    }
+
+    /// The GPU frame timer (when on) records packet `serial`'s time as pass `name` of the frame
+    /// of the window `pass_id` draws into; a window's own packet closes that frame.
+    pub(crate) fn fb_time_packet(&self, fb: &mut FrameBuilder, pass_id: DrawPassId, serial: u64, name: String, closes: bool) {
+        if !crate::gpu_frame_timer::enabled() {
+            return;
+        }
+        if let Some(window) = self.get_pass_window_id(pass_id) {
+            let group = (window.id() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ self.repaint_id;
+            fb.timings.insert(serial, (group, name, closes));
+        }
     }
 
     /// One draw list into the open pass: sub-lists recurse, draw calls become `Draw`s.

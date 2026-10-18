@@ -570,6 +570,7 @@ impl Metal {
             eprintln!("hal-frame {} build_us {:.1}", frame, p.meta.build_end_ns.saturating_sub(p.meta.build_start_ns) as f64 / 1e3);
         }
 
+        self.poll_gpu_capture();
         // The batch's command buffer, or a new one when this frame must be timed alone (no
         // counter sampling), the buffer's samples are full, or it has been encoding for a while.
         let clock = self.dev.pass_clock();
@@ -600,7 +601,9 @@ impl Metal {
             if pass.is_compute() {
                 // a pick replay draws ids: kernels and their writes are not run again
                 if !pick {
-                    self.encode_compute(s, sid, pass, view, cb, seq, frame, now, &mut deps);
+                    if let Some(i) = self.encode_compute(s, sid, pass, view, cb, seq, &samples, frame, now, &mut deps) {
+                        indices.push(i);
+                    }
                 }
                 continue;
             }
@@ -651,6 +654,9 @@ impl Metal {
         if alone {
             self.commit_batch();
         }
+        if window_encoded && !pick && !hosted {
+            self.gpu_capture_frame();
+        }
         Some(exec::SubmittedFrame { deps, window: window_encoded && !pick && !hosted })
     }
 
@@ -698,15 +704,18 @@ impl Metal {
     /// dispatch, and every pass after this one, sees what the dispatches before it wrote. Each
     /// dispatch binds by its kernel's table (`compute_binding`): sampled textures at
     /// `texture(0..)`, the storage images after them, each buffer at its register, the params at
-    /// `buffer(PARAMS)`; the workgroup size is the kernel's.
+    /// `buffer(PARAMS)`; the workgroup size is the kernel's. The encoder is timed like a render
+    /// pass (its sample index is returned) and labelled with the pass's name.
     #[allow(clippy::too_many_arguments)]
-    fn encode_compute(&mut self, s: &mut Session, sid: u32, pass: &Pass, view: &CmdView, cb: ObjcId, seq: u64, frame: u64, now: u64, deps: &mut Vec<LentRef>) {
+    fn encode_compute(&mut self, s: &mut Session, sid: u32, pass: &Pass, view: &CmdView, cb: ObjcId, seq: u64, samples: &Option<Arc<PassSamples>>, frame: u64, now: u64, deps: &mut Vec<LentRef>) -> Option<usize> {
         let Some(dr) = pass.dispatches.off.checked_add(pass.dispatches.len).filter(|e| *e as usize <= view.dispatches.len()).map(|e| pass.dispatches.off as usize..e as usize) else {
             s.stats.bad_args += 1;
-            return;
+            return None;
         };
         s.stats.passes += 1;
         let mut encoder: ObjcId = nil;
+        let mut sample: Option<(usize, bool)> = None;
+        let draw_labels = crate::gpu_debug::draw_labels();
         let mut names: Vec<String> = Vec::new();
         'dispatch: for d in &view.dispatches[dr] {
             if let Err(why) = exec::check_dispatch(s, sid, d, view.arena, now) {
@@ -731,6 +740,7 @@ impl Metal {
             };
             let table = pipe.bindings.clone();
             let name = s.string(pipe.desc.name).unwrap_or("").to_owned();
+            let source = if draw_labels { s.string(pipe.desc.source).unwrap_or("").to_owned() } else { String::new() };
             let (ntex, nimg, nbuf) = (table[compute_binding::TEXTURES] as usize, table[compute_binding::IMAGES] as usize, table[compute_binding::BUFFERS] as usize);
             // a surface lent by a session that is gone (or relaunched) is never sampled
             for id in read_ids(view.arena, d.tex) {
@@ -802,14 +812,23 @@ impl Metal {
                 continue;
             }
             if encoder == nil {
-                encoder = unsafe { msg_send![cb, computeCommandEncoder] };
+                (encoder, sample) = compute_encoder(cb, samples);
                 if encoder == nil {
                     eprintln!("[metal] no compute encoder for pass \"{}\"", s.string(pass.name).unwrap_or(""));
-                    return;
+                    return None;
+                }
+                let label = s.string(pass.name).unwrap_or("");
+                if !label.is_empty() {
+                    unsafe {
+                        let _: () = msg_send![encoder, setLabel: str_to_nsstring(label)];
+                    }
                 }
             }
             let wg = kernel.workgroup;
             unsafe {
+                if draw_labels {
+                    let _: () = msg_send![encoder, pushDebugGroup: str_to_nsstring(&crate::gpu_debug::shader_label(&name, &source))];
+                }
                 let _: () = msg_send![encoder, setComputePipelineState: pso];
                 for (i, t) in textures.iter().enumerate() {
                     let _: () = msg_send![encoder, setTexture: *t atIndex: i as u64];
@@ -823,19 +842,28 @@ impl Metal {
                 let groups = MTLSize { width: d.groups[0] as u64, height: d.groups[1] as u64, depth: d.groups[2] as u64 };
                 let threads = MTLSize { width: wg[0] as u64, height: wg[1] as u64, depth: wg[2] as u64 };
                 let _: () = msg_send![encoder, dispatchThreadgroups: groups threadsPerThreadgroup: threads];
+                if draw_labels {
+                    let _: () = msg_send![encoder, popDebugGroup];
+                }
             }
             if !name.is_empty() && !names.contains(&name) {
                 names.push(name);
             }
         }
-        if encoder != nil {
-            unsafe {
-                let _: () = msg_send![encoder, endEncoding];
-            }
-            if let Some(b) = self.batch.as_mut() {
-                b.passes.push((s.string(pass.name).unwrap_or("").to_string(), names));
-            }
+        if encoder == nil {
+            return None;
         }
+        unsafe {
+            // dispatch boundaries: the last dispatch's end
+            if let (Some((index, false)), Some(buffer)) = (sample, samples.as_ref().and_then(|x| x.buffer.as_ref())) {
+                let _: () = msg_send![encoder, sampleCountersInBuffer: buffer.as_id() atSampleIndex: (index + 3) as u64 withBarrier: true];
+            }
+            let _: () = msg_send![encoder, endEncoding];
+        }
+        if let Some(b) = self.batch.as_mut() {
+            b.passes.push((s.string(pass.name).unwrap_or("").to_string(), names));
+        }
+        sample.map(|(index, _)| index)
     }
 
     /// One pass into one render encoder. `None` when the pass could not be encoded (a missing
@@ -988,7 +1016,14 @@ impl Metal {
             eprintln!("[metal] no render encoder for pass \"{}\"", s.string(pass.name).unwrap_or(""));
             return None;
         }
+        // frame captures and GPU profilers show the pass by its name, and with draw labels on
+        // each draw by its shader's
+        let draw_labels = crate::gpu_debug::draw_labels();
         unsafe {
+            let label = s.string(pass.name).unwrap_or("");
+            if !label.is_empty() {
+                let _: () = msg_send![encoder_id, setLabel: str_to_nsstring(label)];
+            }
             let vp = MTLViewport { originX: viewport[0] as f64, originY: viewport[1] as f64, width: vw as f64, height: vh as f64, znear: 0.0, zfar: 1.0 };
             let _: () = msg_send![encoder_id, setViewport: vp];
             let _: () = msg_send![encoder_id, setFrontFacingWinding: 1u64]; // MTLWindingCounterClockwise
@@ -1199,6 +1234,12 @@ impl Metal {
                 shaders.push(name.to_owned());
             }
             // the draw: the instance ranges (one draw each), or every instance
+            if draw_labels {
+                unsafe {
+                    let label = crate::gpu_debug::shader_label(name, s.string(pipe.desc.source).unwrap_or(""));
+                    let _: () = msg_send![enc.id, pushDebugGroup: str_to_nsstring(&label)];
+                }
+            }
             let (index_type, width) = if d.flags & Draw::INDEX_U32 != 0 { (MTLIndexType::UInt32, 4u64) } else { (MTLIndexType::UInt16, 2u64) };
             let first = d.index[0] as u64 * width;
             let whole = (read_pairs(view.arena, d.inst_ranges).next().is_none()).then_some([0u32, d.inst.count]);
@@ -1220,6 +1261,11 @@ impl Metal {
                         baseVertex: 0u64
                         baseInstance: start
                     ];
+                }
+            }
+            if draw_labels {
+                unsafe {
+                    let _: () = msg_send![enc.id, popDebugGroup];
                 }
             }
         }
@@ -1261,5 +1307,36 @@ impl Metal {
             }
         }
         Some(shaders)
+    }
+}
+
+/// A compute encoder on `cb`, timed when the device can: stage boundaries through the pass
+/// descriptor's sample attachment (the encoder's start and end at the reserved index and the
+/// next), or a sample before the first dispatch (and one after the last, `encode_compute`).
+/// The reserved index, and whether it is stage-sampled.
+fn compute_encoder(cb: ObjcId, samples: &Option<Arc<PassSamples>>) -> (ObjcId, Option<(usize, bool)>) {
+    let timed = samples.as_ref().and_then(|x| Some((x, x.buffer.as_ref()?))).filter(|(x, _)| x.clock.stage || x.clock.dispatch);
+    let Some((samples, buffer)) = timed else {
+        return (unsafe { msg_send![cb, computeCommandEncoder] }, None);
+    };
+    let Some(index) = samples.reserve() else {
+        return (unsafe { msg_send![cb, computeCommandEncoder] }, None);
+    };
+    unsafe {
+        if samples.clock.stage {
+            let desc: ObjcId = msg_send![class!(MTLComputePassDescriptor), computePassDescriptor];
+            let attachments: ObjcId = msg_send![desc, sampleBufferAttachments];
+            let a: ObjcId = msg_send![attachments, objectAtIndexedSubscript: 0u64];
+            let _: () = msg_send![a, setSampleBuffer: buffer.as_id()];
+            let _: () = msg_send![a, setStartOfEncoderSampleIndex: index as u64];
+            let _: () = msg_send![a, setEndOfEncoderSampleIndex: (index + 1) as u64];
+            (msg_send![cb, computeCommandEncoderWithDescriptor: desc], Some((index, true)))
+        } else {
+            let encoder: ObjcId = msg_send![cb, computeCommandEncoder];
+            if encoder != nil {
+                let _: () = msg_send![encoder, sampleCountersInBuffer: buffer.as_id() atSampleIndex: index as u64 withBarrier: true];
+            }
+            (encoder, Some((index, false)))
+        }
     }
 }

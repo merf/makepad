@@ -2779,6 +2779,41 @@ impl ::core::ops::BitAnd for D3D11_VPOV_DIMENSION { type Output = Self; fn bitan
 impl ::core::ops::BitXor for D3D11_VPOV_DIMENSION { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
 impl ::core::ops::Not for D3D11_VPOV_DIMENSION { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
 pub const D3D11_VPOV_DIMENSION_TEXTURE2D: crate::Win32::Graphics::Direct3D11::D3D11_VPOV_DIMENSION = crate::Win32::Graphics::Direct3D11::D3D11_VPOV_DIMENSION(1i64 as _);
+pub const IID_ID3DUserDefinedAnnotation: crate::core::GUID = crate::core::GUID { data1: 3000675723, data2: 980, data3: 19903, data4: [149,235,50,171,75,99,208,171,] };
+#[repr(C)]
+pub struct ID3DUserDefinedAnnotation_Vtbl {
+pub base__: crate::Win32::System::Com::IUnknown_Vtbl,
+pub BeginEvent: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,Name: crate::core::PCWSTR) -> i32,
+pub EndEvent: unsafe extern "system" fn(this: *mut ::core::ffi::c_void) -> i32,
+pub SetMarker: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,Name: crate::core::PCWSTR) -> (),
+pub GetStatus: unsafe extern "system" fn(this: *mut ::core::ffi::c_void) -> crate::core::BOOL,
+}
+#[repr(transparent)]
+pub struct ID3DUserDefinedAnnotation(::core::ptr::NonNull<::core::ffi::c_void>);
+impl ID3DUserDefinedAnnotation {
+pub const IID: crate::core::GUID = IID_ID3DUserDefinedAnnotation;
+pub fn as_raw(&self) -> *mut ::core::ffi::c_void { self.0.as_ptr() }
+pub fn into_raw(self) -> *mut ::core::ffi::c_void { let p = self.as_raw(); ::core::mem::forget(self); p }
+pub unsafe fn from_raw(raw: *mut ::core::ffi::c_void) -> Result<Self, crate::core::HRESULT> { match ::core::ptr::NonNull::new(raw) { Some(p) => Ok(Self(p)), None => Err(crate::core::HRESULT(-2147467261)) } }
+pub unsafe fn query(raw: *mut ::core::ffi::c_void) -> Result<Self, crate::core::HRESULT> { Self::from_raw(crate::core::query(raw, &Self::IID)?) }
+pub fn vtable(&self) -> &ID3DUserDefinedAnnotation_Vtbl { unsafe { &**(self.as_raw() as *const *const ID3DUserDefinedAnnotation_Vtbl) } }
+#[inline]
+pub unsafe fn BeginEvent(&self,Name: crate::core::PCWSTR) -> i32 {
+(self.vtable().BeginEvent)(self.as_raw(),Name)}
+#[inline]
+pub unsafe fn EndEvent(&self) -> i32 {
+(self.vtable().EndEvent)(self.as_raw())}
+#[inline]
+pub unsafe fn SetMarker(&self,Name: crate::core::PCWSTR) -> () {
+(self.vtable().SetMarker)(self.as_raw(),Name)}
+#[inline]
+pub unsafe fn GetStatus(&self) -> crate::core::BOOL {
+(self.vtable().GetStatus)(self.as_raw())}
+}
+impl Clone for ID3DUserDefinedAnnotation { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
+impl Drop for ID3DUserDefinedAnnotation { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
+unsafe impl Send for ID3DUserDefinedAnnotation {}
+unsafe impl Sync for ID3DUserDefinedAnnotation {}
 pub const IID_ID3D11Asynchronous: crate::core::GUID = crate::core::GUID { data1: 1261818061, data2: 7701, data3: 16984, data4: [156,152,27,19,51,246,221,59,] };
 #[repr(C)]
 pub struct ID3D11Asynchronous_Vtbl {

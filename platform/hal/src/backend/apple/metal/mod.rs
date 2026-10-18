@@ -12,6 +12,7 @@
 //! Moved from os/apple/metal.rs (see each module); the tables, ledger and command validation
 //! are `backend::exec`'s.
 
+mod capture;
 mod device;
 mod frame;
 mod media;
@@ -108,6 +109,8 @@ pub struct Metal {
     capture_ns: u64,
     /// `frame::depth_only`'s scratch: the (pipeline, blend) pairs of a pass already asked
     depth_only_seen: Vec<(u32, bool)>,
+    /// a frame capture being taken (`gpu_debug::request_capture`)
+    gpu_capture: Option<capture::GpuCapture>,
 }
 
 impl Metal {
@@ -176,6 +179,7 @@ impl Metal {
             capture: None,
             capture_ns: 0,
             depth_only_seen: Vec::new(),
+            gpu_capture: None,
         })
     }
 

@@ -46,8 +46,12 @@ impl Cx {
             return;
         }
         let serial = self.textures.1.serials.submit();
-        let name = format!("{} compute", self.passes[pass_id].debug_name);
-        let name = fb.intern(&name);
+        // `compute <pass>`: frame captures label it so, and the GPU frame timer reports it so
+        let name = match self.passes[pass_id].debug_name.as_str() {
+            "" => "compute".to_string(),
+            pass => format!("compute {pass}"),
+        };
+        let interned = fb.intern(&name);
         fb.w.frame_begin(serial, FrameMeta::default());
         // a storage image just made holds nothing defined until cleared
         for (image, w, h) in clears {
@@ -55,11 +59,11 @@ impl Cx {
             pass.load = [load::CLEAR, load::DONT_CARE, load::DONT_CARE, load::DONT_CARE, load::DONT_CARE];
             pass.viewport = [0.0, 0.0, w as f32, h as f32];
             pass.dpi = 1.0;
-            pass.name = name;
+            pass.name = interned;
             fb.w.pass(pass);
         }
         if !dispatches.is_empty() {
-            fb.w.pass(Pass::compute(name));
+            fb.w.pass(Pass::compute(interned));
             for dispatch in dispatches {
                 fb.w.dispatch(dispatch);
                 fb.stats.dispatches += 1;
@@ -69,6 +73,7 @@ impl Cx {
         fb.w.frame_end(Id::NONE, makepad_hal::target::TEXTURE);
         fb.stats.frames += 1;
         fb.stats.compute_packets += 1;
+        self.fb_time_packet(fb, pass_id, serial, name, false);
     }
 
     /// Dispatch `d` as the HAL takes it: its pipeline, params at their offsets, and its textures,

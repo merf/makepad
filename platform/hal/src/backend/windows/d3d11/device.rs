@@ -116,6 +116,8 @@ pub struct Device {
     pub ctx: ID3D11DeviceContext,
     /// D3D11.1: constant-buffer windows into the per-frame arena
     pub ctx1: ID3D11DeviceContext1,
+    /// annotation events around passes and draws, which PIX, RenderDoc and Nsight show
+    pub annotation: Option<ID3DUserDefinedAnnotation>,
     pub factory: IDXGIFactory2,
     pub adapter3: Option<IDXGIAdapter3>,
     pub adapter_name: String,
@@ -167,6 +169,7 @@ impl Device {
                 let _ = mt.SetMultithreadProtected(true);
             }
             let adapter3 = IDXGIAdapter3::query(adapter.as_raw()).ok();
+            let annotation = ID3DUserDefinedAnnotation::query(ctx.as_raw()).ok();
 
             let raster = |cull| -> Result<ID3D11RasterizerState, String> {
                 let desc = D3D11_RASTERIZER_DESC {
@@ -229,6 +232,7 @@ impl Device {
                 device,
                 ctx,
                 ctx1,
+                annotation,
                 factory,
                 adapter3,
                 adapter_name,
@@ -297,5 +301,28 @@ impl Device {
         let out = out?;
         cache.insert(key, out.clone());
         Some(out)
+    }
+}
+
+impl Device {
+    /// Whether a capture or profiling tool listens for annotation events (PIX, RenderDoc,
+    /// Nsight); without one, nothing is annotated.
+    pub fn annotating(&self) -> bool {
+        self.annotation.as_ref().is_some_and(|a| unsafe { a.GetStatus() }.0 != 0)
+    }
+
+    /// Opens an annotation event named `name`; [`Device::end_event`] closes it. Only while
+    /// [`Device::annotating`].
+    pub fn begin_event(&self, name: &str) {
+        if let Some(a) = &self.annotation {
+            let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+            unsafe { a.BeginEvent(makepad_windows_sys::core::PCWSTR(wide.as_ptr())) };
+        }
+    }
+
+    pub fn end_event(&self) {
+        if let Some(a) = &self.annotation {
+            unsafe { a.EndEvent() };
+        }
     }
 }

@@ -316,6 +316,9 @@ impl D3d11 {
         let mut deps = Vec::new();
         let mut window_image = None;
         let mut batch = std::mem::take(&mut self.batch);
+        self.poll_gpu_capture();
+        // tools listening (PIX, RenderDoc, Nsight) see each pass as an event named after it
+        let annotating = self.dev.annotating();
         // the frame's GPU span: a disjoint query around two timestamps
         let timer = self.complete.timers.take(&self.dev);
         if let Some(t) = &timer {
@@ -325,51 +328,13 @@ impl D3d11 {
             }
         }
         for pass in &view.passes[pr] {
-            if pass.is_compute() {
-                // a pick replay draws ids: kernels and their writes are not run again
-                if !pick {
-                    if let Err(e) = self.encode_compute(s, pass, view, now, &mut deps) {
-                        eprintln!("[hal-d3d11] compute pass: {e}");
-                        s.bad();
-                    }
-                    self.give_back_shared();
-                }
-                continue;
+            let event = annotating && !pick && s.string(pass.name).is_some_and(|name| !name.is_empty());
+            if event {
+                self.dev.begin_event(s.string(pass.name).unwrap_or(""));
             }
-            let draws = &view.draws[slice(pass.draws, view.draws.len()).unwrap()];
-            let before = s.stats.skipped_draws;
-            let missing = pick && draws.iter().any(|d| read_ids(view.arena, d.pick_tex).any(|t| self.pick_pending.contains(&(sid, t))));
-            let mut failed = false;
-            let encoded = self.encode_pass(s, target, is_window, pick, pass, draws, view, now, &mut deps);
-            // whatever happened, no shared image stays held past its pass
-            self.give_back_shared();
-            match encoded {
-                Ok(image) => {
-                    s.stats.passes += 1;
-                    if image.is_some() {
-                        window_image = image;
-                    }
-                }
-                Err(e) => {
-                    failed = true;
-                    eprintln!("[hal-d3d11] pass: {e}");
-                    s.bad();
-                    s.stats.skipped_draws += draws.len() as u64;
-                }
-            }
-            if pick {
-                // a pick target with a draw left out (a pipeline still compiling) answers nothing
-                let incomplete = failed || missing || before != s.stats.skipped_draws;
-                for id in pass.color.into_iter().filter(|t| !t.is_none()) {
-                    if incomplete {
-                        self.pick_pending.insert((sid, id));
-                    } else {
-                        self.pick_pending.remove(&(sid, id));
-                    }
-                }
-                if !pass.color[0].is_none() {
-                    self.pick_ids.insert((sid, target), pass.color[0]);
-                }
+            self.encode_frame_pass(s, sid, target, is_window, pick, pass, view, now, &mut deps, &mut window_image);
+            if event {
+                self.dev.end_event();
             }
         }
         let mut presented = false;
@@ -397,6 +362,59 @@ impl D3d11 {
         batch.tickets.push(Ticket::Frame { token: Self::token(s), target, kind, frame: packet.frame, window: presented, timer });
         self.complete.submit(batch);
         Some(exec::SubmittedFrame { deps, window: presented })
+    }
+
+    /// One pass of a frame: a compute pass's dispatches, or a render pass (its window image,
+    /// if it drew one, into `window_image`).
+    #[allow(clippy::too_many_arguments)]
+    fn encode_frame_pass(&mut self, s: &mut Session, sid: u32, target: Id, is_window: bool, pick: bool, pass: &Pass, view: &CmdView, now: u64,
+        deps: &mut Vec<LentRef>, window_image: &mut Option<Arc<Texture>>) {
+        if pass.is_compute() {
+            // a pick replay draws ids: kernels and their writes are not run again
+            if !pick {
+                if let Err(e) = self.encode_compute(s, pass, view, now, deps) {
+                    eprintln!("[hal-d3d11] compute pass: {e}");
+                    s.bad();
+                }
+                self.give_back_shared();
+            }
+            return;
+        }
+        let draws = &view.draws[slice(pass.draws, view.draws.len()).unwrap()];
+        let before = s.stats.skipped_draws;
+        let missing = pick && draws.iter().any(|d| read_ids(view.arena, d.pick_tex).any(|t| self.pick_pending.contains(&(sid, t))));
+        let mut failed = false;
+        let encoded = self.encode_pass(s, target, is_window, pick, pass, draws, view, now, deps);
+        // whatever happened, no shared image stays held past its pass
+        self.give_back_shared();
+        match encoded {
+            Ok(image) => {
+                s.stats.passes += 1;
+                if image.is_some() {
+                    *window_image = image;
+                }
+            }
+            Err(e) => {
+                failed = true;
+                eprintln!("[hal-d3d11] pass: {e}");
+                s.bad();
+                s.stats.skipped_draws += draws.len() as u64;
+            }
+        }
+        if pick {
+            // a pick target with a draw left out (a pipeline still compiling) answers nothing
+            let incomplete = failed || missing || before != s.stats.skipped_draws;
+            for id in pass.color.into_iter().filter(|t| !t.is_none()) {
+                if incomplete {
+                    self.pick_pending.insert((sid, id));
+                } else {
+                    self.pick_pending.remove(&(sid, id));
+                }
+            }
+            if !pass.color[0].is_none() {
+                self.pick_ids.insert((sid, target), pass.color[0]);
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -510,7 +528,11 @@ impl D3d11 {
             ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         }
         let mut shaders_bound: Option<*const Program> = None;
+        let draw_events = !pick && crate::gpu_debug::draw_labels() && self.dev.annotating();
         for p in &sc.prepared {
+            if draw_events {
+                self.dev.begin_event(&crate::gpu_debug::shader_label(s.string(p.program.desc.name).unwrap_or(""), s.string(p.program.desc.source).unwrap_or("")));
+            }
             unsafe {
                 if shaders_bound != Some(Arc::as_ptr(&p.program)) {
                     shaders_bound = Some(Arc::as_ptr(&p.program));
@@ -559,6 +581,9 @@ impl D3d11 {
                     }
                     ctx.DrawIndexedInstanced(p.index_count, *count, p.index_first, 0, 0);
                 }
+            }
+            if draw_events {
+                self.dev.end_event();
             }
         }
         unsafe {
@@ -618,8 +643,12 @@ impl D3d11 {
             ctx.PSSetShaderResources(0, Some(&NO_SRVS));
             ctx.VSSetShaderResources(0, Some(&NO_SRVS));
         }
+        let dispatch_events = crate::gpu_debug::draw_labels() && self.dev.annotating();
         for p in &sc.dispatches {
             let Shaders::Kernel { cs } = &p.program.shaders else { continue };
+            if dispatch_events {
+                self.dev.begin_event(&crate::gpu_debug::shader_label(s.string(p.program.desc.name).unwrap_or(""), s.string(p.program.desc.source).unwrap_or("")));
+            }
             let srvs = &sc.srvs[p.srvs.clone()];
             let uavs = &sc.uavs[p.uavs.clone()];
             unsafe {
@@ -644,6 +673,9 @@ impl D3d11 {
                 if !srvs.is_empty() {
                     ctx.CSSetShaderResources(0, Some(&NO_SRVS[..srvs.len()]));
                 }
+            }
+            if dispatch_events {
+                self.dev.end_event();
             }
         }
         self.scratch = sc;

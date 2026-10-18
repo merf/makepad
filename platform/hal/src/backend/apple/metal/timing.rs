@@ -12,13 +12,16 @@ extern "C" {
     static MTLCommonCounterSetTimestamp: ObjcId;
 }
 
-/// Per-pass GPU time inside a shared command buffer: a timestamp where the pass's render encoder
-/// starts and one where it ends, in a counter sample buffer (stage boundaries on Apple GPUs,
-/// encoder samples elsewhere). A device with neither times each frame in a buffer of its own.
+/// Per-pass GPU time inside a shared command buffer: a timestamp where the pass's render or
+/// compute encoder starts and one where it ends, in a counter sample buffer (stage boundaries on
+/// Apple GPUs, encoder samples elsewhere). A device with neither times each frame in a buffer of
+/// its own.
 pub struct PassClock {
     device: RcObjcId,
     descriptor: RcObjcId,
     pub stage: bool,
+    /// samples between dispatches (compute encoders without stage boundaries)
+    pub dispatch: bool,
     pool: Mutex<Vec<RcObjcId>>,
     /// (host seconds, GPU timestamp) sampled together at creation: with a second pair at resolve
     /// time, the GPU clock's rate and offset.
@@ -28,7 +31,9 @@ pub struct PassClock {
 /// hardware: timestamps in one command buffer's sample buffer; a batch with more timed passes
 /// starts another command buffer.
 pub const PASS_CLOCK_SAMPLES: usize = 1024;
-/// Timestamps per pass: vertex start and end, fragment start and end.
+/// Timestamps per pass: vertex start and end, fragment start and end. A compute pass uses the
+/// first two (stage boundaries: the encoder's start and end) or the first and last (dispatch
+/// boundaries), as a render pass with encoder samples does.
 pub const PASS_CLOCK_STRIDE: usize = 4;
 
 impl PassClock {
@@ -41,6 +46,8 @@ impl PassClock {
             // MTLCounterSamplingPointAtStageBoundary = 0, AtDrawBoundary = 1
             let stage: bool = msg_send![device, supportsCounterSampling: 0u64];
             let draw: bool = msg_send![device, supportsCounterSampling: 1u64];
+            // AtDispatchBoundary = 2
+            let dispatch: bool = msg_send![device, supportsCounterSampling: 2u64];
             if !stage && !draw {
                 return None;
             }
@@ -60,6 +67,7 @@ impl PassClock {
                 device: RcObjcId::from_unowned(NonNull::new(device)?),
                 descriptor,
                 stage,
+                dispatch,
                 pool: Mutex::new(Vec::new()),
                 anchor: Self::now(device),
             }))

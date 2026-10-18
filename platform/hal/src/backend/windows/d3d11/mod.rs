@@ -5,6 +5,7 @@
 //! Offscreen windows (`OPEN_FLAGS::OFFSCREEN_WINDOWS`, hidden runs) render into retained images
 //! with no window system at all.
 
+mod capture;
 mod chain;
 mod complete;
 pub(crate) mod device;
