@@ -165,6 +165,11 @@ pub(crate) struct BuildStats {
     /// pass frames not built because a pipeline their draws use was still compiling (the pass
     /// kept its last picture)
     pub(crate) held_for_pipelines: u64,
+    /// compute dispatches sent, the packets they went in, and pass queues kept because a kernel
+    /// still compiled (`frame_build_compute.rs`)
+    pub(crate) dispatches: u64,
+    pub(crate) compute_packets: u64,
+    pub(crate) held_for_kernels: u64,
     pub(crate) bytes_uploaded: u64,
     /// CPU time the walks took (ns), summed over the pass frames
     pub(crate) build_ns: u64,
@@ -221,8 +226,8 @@ pub(crate) struct FrameBuilder {
     pipe_by_hash: HashMap<u64, Vec<usize>>,
     /// storage buffers (`storage_buffer.rs`), by pool slot
     sbuf: HashMap<usize, SbufRec>,
-    /// repacked partial uploads, alive until the submit
-    staging: Vec<Vec<u8>>,
+    /// repacked partial uploads (and dispatches' params), alive until the submit
+    pub(crate) staging: Vec<Vec<u8>>,
     ranges: Vec<[u32; 2]>,
     /// the sampled texture ids of the draw being encoded (reused)
     tex_ids: Vec<Id>,
@@ -289,7 +294,7 @@ impl FrameBuilder {
         id
     }
 
-    fn intern_live(&mut self, id: LiveId) -> StrId {
+    pub(crate) fn intern_live(&mut self, id: LiveId) -> StrId {
         if id.0 == 0 {
             return 0;
         }
@@ -483,6 +488,11 @@ impl FrameBuilder {
         if p.ready || p.failed { return false; }
         p.drawn_unready = true;
         true
+    }
+
+    /// Pipeline `pipe`'s HAL id.
+    pub(crate) fn pipeline_id(&self, pipe: usize) -> Id {
+        self.pipes.get(pipe).map_or(Id::NONE, |p| p.id)
     }
 
     /// Whether the HAL said the pipeline is ready (a draw built for it before is skipped by the HAL).
@@ -801,6 +811,11 @@ impl Cx {
 
     /// The HAL texture a draw samples: a vec texture is brought up to date; a render target is
     /// there once its pass created it; what the HAL cannot hold samples as the fallback (`NONE`).
+    /// A texture as a draw samples it, for a kernel (`frame_build_compute.rs`).
+    pub(crate) fn fb_sampled_pub(&mut self, fb: &mut FrameBuilder, id: TextureId) -> Id {
+        self.fb_sampled(fb, id)
+    }
+
     fn fb_sampled(&mut self, fb: &mut FrameBuilder, id: TextureId) -> Id {
         // a surface lent by a child domain: the HAL's id as it is (it skips the draw once the child's window is gone)
         if let Some((gen, surface)) = fb.lent.get(&id.0) {
@@ -1160,6 +1175,12 @@ impl Cx {
     /// One pass into one FramePacket. None when the pass paints nothing now.
     fn fb_pass(&mut self, fb: &mut FrameBuilder, pass_id: DrawPassId, input_ns: u64) -> Option<u64> {
         let picking = self.pick.paint.is_some();
+        // The pass's compute dispatches go first, in a packet of their own, whether or not the
+        // pass paints now: a simulation keeps time with the frames, not with its picture. Pick
+        // replays never run them.
+        if !picking {
+            self.fb_compute(fb, pass_id);
+        }
         let build_start = makepad_hal::clock_ns();
         let Some(list_id) = self.passes[pass_id].main_draw_list_id else {
             // a frozen texture: its producer detached and dropped its list

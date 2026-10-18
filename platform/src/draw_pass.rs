@@ -714,6 +714,8 @@ pub struct CxDrawPass {
     #[cfg(target_arch = "wasm32")]
     pub os: CxOsPass,
     pub(crate) gpu_time_query: Option<GpuTimeQuery>,
+    /// Compute dispatches to run before this pass draws, in order, once (`Cx::dispatch`).
+    pub(crate) dispatches: Vec<crate::compute::ComputeDispatch>,
 }
 
 impl CxDrawPass {
@@ -784,6 +786,7 @@ impl Default for CxDrawPass {
             #[cfg(target_arch = "wasm32")]
             os: CxOsPass::default(),
             gpu_time_query: None,
+            dispatches: Vec::new(),
         }
     }
 }

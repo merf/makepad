@@ -65,6 +65,7 @@ pub mod draw_shader_layout;
 mod draw_vars;
 #[cfg(not(target_arch = "wasm32"))]
 mod frame_build;
+mod frame_build_compute;
 mod compute;
 pub use frame_build::hlsl_kernel_pipeline_blob;
 pub mod shader_pack;
@@ -429,7 +430,7 @@ pub use {
 /// (`Cx::shader_const_table`, `shader_const_patch`, `shader_const_reset`).
 pub use crate::draw_shader::DrawShaderId;
 /// Compute kernels (`compute.rs`).
-pub use crate::compute::{ComputeKernel, ComputeKernelId};
+pub use crate::compute::{ComputeDispatch, ComputeKernel, ComputeKernelId, DispatchSize, KernelParam};
 pub use crate::storage_buffer::{StorageBuffer, StorageBufferId};
 pub use crate::texture::StorageFormat;
 pub use crate::pick::{PickError, PickImage, PickTicket};

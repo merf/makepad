@@ -148,6 +148,8 @@ impl Cx {
         for draw_pass_id in self.passes.id_iter() {
             if self.passes.0.is_free(draw_pass_id.0) {
                 let pass = &mut self.passes[draw_pass_id];
+                // its waiting dispatches let go of their textures and buffers
+                pass.dispatches.clear();
                 if !pass.color_textures.is_empty() || pass.depth_texture.is_some() {
                     pass.color_textures.clear();
                     pass.depth_texture = None;

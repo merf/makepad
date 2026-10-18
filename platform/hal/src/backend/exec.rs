@@ -640,7 +640,15 @@ fn exec(gpu: &mut dyn Gpu, world: &mut World, sid: u32, c: HalCmd, view: &CmdVie
                 && s.windows.get(sid, target).is_ok_and(|w| w.lent_to != 0 && w.val.borrower_frame && w.val.overlay.is_none()) {
                 return;
             }
-            let live = match kind & !target::FLAGS {
+            // A packet of compute passes (and clears of the images they write) names no target:
+            // what it writes is its textures and buffers.
+            let compute_only = target.is_none() && kind & !target::FLAGS == target::TEXTURE && kind & target::PICK == 0
+                && view.frames.get(packet as usize).and_then(|p| {
+                    let start = p.passes.off as usize;
+                    start.checked_add(p.passes.len as usize).and_then(|end| view.passes.get(start..end))
+                }).is_some_and(|passes| passes.iter().any(|pass| pass.is_compute())
+                    && passes.iter().all(|pass| pass.is_compute() || (pass.draws.len == 0 && !pass.color[0].is_none())));
+            let live = compute_only || match kind & !target::FLAGS {
                 target::WINDOW => s.windows.get(sid, target).is_ok(),
                 target::TEXTURE => s.textures.get(sid, target).is_ok(),
                 _ => false,
