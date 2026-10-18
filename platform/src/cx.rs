@@ -113,6 +113,9 @@ pub struct Cx {
     /// mints ids, charges bytes and hands out receipts over the frame serials.
     pub publications: crate::shared_instances::Publications,
     pub uniform_buffers: CxUniformBufferPool,
+
+    /// Storage buffers for compute kernels (`storage_buffer.rs`).
+    pub storage_buffers: crate::storage_buffer::CxStorageBufferPool,
     pub geometries: CxGeometryPool,
 
     pub draw_shaders: CxDrawShaders,
@@ -1000,6 +1003,8 @@ impl Cx {
             textures,
             publications,
             uniform_buffers: Default::default(),
+
+            storage_buffers: Default::default(),
 
             draw_shaders: Default::default(),
 

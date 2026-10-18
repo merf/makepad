@@ -75,6 +75,16 @@ pub(crate) fn kernel_pipeline_blob(code: &makepad_script::shader_ir_compute::Ker
     }
 }
 
+/// A storage buffer's HAL buffer: what pool slot generation and contents it holds.
+struct SbufRec {
+    slot_gen: u64,
+    gen: u64,
+    id: Id,
+    bytes: u64,
+    stride: u32,
+    uploaded: bool,
+}
+
 struct TexRec {
     id: Id,
     gen: u64,
@@ -209,6 +219,8 @@ pub(crate) struct FrameBuilder {
     retiring: Vec<(u64, PublishReceipt)>,
     pipes: Vec<PipeRec>,
     pipe_by_hash: HashMap<u64, Vec<usize>>,
+    /// storage buffers (`storage_buffer.rs`), by pool slot
+    sbuf: HashMap<usize, SbufRec>,
     /// repacked partial uploads, alive until the submit
     staging: Vec<Vec<u8>>,
     ranges: Vec<[u32; 2]>,
@@ -370,8 +382,13 @@ impl FrameBuilder {
     }
 
     fn buffer_create(&mut self, kind: u16, size: u64, origin: Attr) -> Id {
+        self.buffer_create_strided(kind, size, 0, origin)
+    }
+
+    /// A buffer of `stride`-byte elements (a storage buffer's; 0 for the other kinds).
+    fn buffer_create_strided(&mut self, kind: u16, size: u64, stride: u32, origin: Attr) -> Id {
         let id = self.bufs.alloc();
-        self.w.buffer_create(id, kind, size, 0, origin);
+        self.w.buffer_create(id, kind, size, stride, origin);
         self.stats.buffer_creates += 1;
         id
     }
@@ -413,6 +430,10 @@ impl FrameBuilder {
         }
         for rec in self.ubuf.values_mut() {
             rec.uploaded = 0;
+        }
+        // storage buffers are made again from their CPU copy (what kernels wrote is lost)
+        for (_, rec) in std::mem::take(&mut self.sbuf) {
+            self.buffer_destroy(rec.id);
         }
         for (_, rec) in std::mem::take(&mut self.shared) {
             self.buffer_destroy(rec.id);
@@ -767,6 +788,9 @@ impl Cx {
         if tex.transient {
             flags |= usage::TRANSIENT;
         }
+        if tex.storage {
+            flags |= usage::STORAGE;
+        }
         let known = fb.tex.get(&slot).is_some_and(|r| r.gen == gen);
         if changed || !known {
             let origin = tex.origin.clone();
@@ -860,6 +884,50 @@ impl Cx {
     }
 
     /// A custom uniform buffer, uploaded when its generation moved.
+    /// Storage texture `id`'s HAL texture, made (at its own size) if it is not, and whether it was
+    /// made now (and so is to be cleared before anything reads it).
+    pub(crate) fn fb_storage_image(&mut self, fb: &mut FrameBuilder, id: crate::texture::TextureId) -> (Id, bool) {
+        use crate::texture::TextureSize;
+        let size = match &self.textures[id].format {
+            TextureFormat::RenderRGBAf16 { size, .. } | TextureFormat::RenderRGBAf32 { size, .. } | TextureFormat::RenderRf32 { size, .. }
+            | TextureFormat::RenderRGf16 { size, .. } | TextureFormat::RenderRu32 { size, .. } | TextureFormat::RenderBGRAu8 { size, .. } => size.clone(),
+            _ => return (Id::NONE, false),
+        };
+        let TextureSize::Fixed { width, height } = size else { return (Id::NONE, false) };
+        let before = fb.tex.get(&id.0).map(|r| r.id);
+        let hal = self.fb_attachment(fb, id, width, height, false);
+        (hal, hal != Id::NONE && before != Some(hal))
+    }
+
+    /// Storage buffer `id`'s HAL buffer, made (again, when its length, stride or slot changed)
+    /// and given its contents when they changed or it was just made.
+    pub(crate) fn fb_storage_buffer(&mut self, fb: &mut FrameBuilder, id: crate::storage_buffer::StorageBufferId) -> Id {
+        let slot = id.0;
+        let slot_gen = id.generation();
+        let sb = &self.storage_buffers[id];
+        let (gen, len, stride) = (sb.generation, sb.data.len() as u64, sb.stride as u32);
+        if len == 0 {
+            return Id::NONE;
+        }
+        let stale = fb.sbuf.get(&slot).is_some_and(|r| r.bytes != len || r.stride != stride || r.slot_gen != slot_gen);
+        if stale {
+            let rec = fb.sbuf.remove(&slot).expect("checked");
+            fb.buffer_destroy(rec.id);
+        }
+        if !fb.sbuf.contains_key(&slot) {
+            let bid = fb.buffer_create_strided(makepad_hal::buffer_kind::STORAGE, len, stride, Attr::default());
+            fb.sbuf.insert(slot, SbufRec { slot_gen, gen: 0, id: bid, bytes: len, stride, uploaded: false });
+        }
+        let rec = fb.sbuf.get_mut(&slot).expect("inserted");
+        if rec.gen != gen || !rec.uploaded {
+            fb.w.buffer_update(rec.id, 0, &sb.data);
+            rec.gen = gen;
+            rec.uploaded = true;
+            fb.stats.bytes_uploaded += len;
+        }
+        rec.id
+    }
+
     fn fb_uniform_buffer(&mut self, fb: &mut FrameBuilder, id: UniformBufferId) -> Id {
         let slot = id.0;
         let ub = &self.uniform_buffers[id];
@@ -1709,6 +1777,11 @@ impl Cx {
         }
         while let Some(slot) = self.uniform_buffers.0.take_free_retirement() {
             if let Some(rec) = fb.ubuf.remove(&slot) {
+                fb.buffer_destroy(rec.id);
+            }
+        }
+        while let Some(slot) = self.storage_buffers.0.take_free_retirement() {
+            if let Some(rec) = fb.sbuf.remove(&slot) {
                 fb.buffer_destroy(rec.id);
             }
         }

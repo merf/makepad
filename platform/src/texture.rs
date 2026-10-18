@@ -372,6 +372,20 @@ impl Texture {
     }
 }
 
+/// What a storage texture holds per texel (`Texture::new_storage`), as a kernel writes it:
+/// `vec4f` (RGBA, half or full float, or BGRA bytes where the device can write them), `f32`,
+/// `vec2f` (half floats) or `u32`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StorageFormat {
+    RGBAf16,
+    RGBAf32,
+    Rf32,
+    RGf16,
+    Ru32,
+    /// not every D3D11 device writes BGRA8 from a kernel (feature level 11.0 does not promise it)
+    BGRAu8,
+}
+
 #[derive(Default)]
 pub struct CxTexturePool(pub(crate) IdPool<CxTexture>, pub(crate) TextureLifetime);
 
@@ -1502,6 +1516,29 @@ impl Texture {
     /// contents, so while nothing binds or attaches it for a few seconds the platform gives its
     /// GPU storage back (the handle stays valid; the next render allocates it again). Not for
     /// textures that carry state between frames (feedback, accumulation, caches).
+    /// A texture compute kernels write (`shader.storage_2d`) and draw shaders sample: a render
+    /// target of `format`, `width` by `height`, made with the HAL's storage usage and cleared.
+    /// A pass may render into it too.
+    pub fn new_storage(cx: &mut Cx, format: StorageFormat, width: usize, height: usize) -> Self {
+        let size = TextureSize::Fixed { width, height };
+        let format = match format {
+            StorageFormat::RGBAf16 => TextureFormat::RenderRGBAf16 { size, initial: true },
+            StorageFormat::RGBAf32 => TextureFormat::RenderRGBAf32 { size, initial: true },
+            StorageFormat::Rf32 => TextureFormat::RenderRf32 { size, initial: true },
+            StorageFormat::RGf16 => TextureFormat::RenderRGf16 { size, initial: true },
+            StorageFormat::Ru32 => TextureFormat::RenderRu32 { size, initial: true },
+            StorageFormat::BGRAu8 => TextureFormat::RenderBGRAu8 { size, initial: true },
+        };
+        let texture = Self::new_with_format(cx, format);
+        cx.textures[texture.texture_id()].storage = true;
+        texture
+    }
+
+    /// Whether compute kernels may write it (`Texture::new_storage`).
+    pub fn is_storage(&self, cx: &Cx) -> bool {
+        cx.textures[self.texture_id()].storage
+    }
+
     pub fn set_transient(&self, cx: &mut Cx, transient: bool) {
         cx.textures[self.texture_id()].transient = transient;
     }
@@ -1700,6 +1737,9 @@ pub struct CxTexture {
     /// platform gives its GPU storage back once nothing bound or attached it for a while
     /// (the backend's idle policy); the next pass allocates it again.
     pub(crate) transient: bool,
+    /// Written by compute dispatches too (`Texture::new_storage`): a render target made with the
+    /// HAL's storage usage, cleared when it is made.
+    pub(crate) storage: bool,
 }
 
 #[cfg(test)]

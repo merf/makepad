@@ -108,6 +108,7 @@ pub mod permission;
 mod screen;
 mod texture;
 mod uniform_buffer;
+mod storage_buffer;
 mod window;
 mod xr_tsdf;
 
@@ -429,6 +430,8 @@ pub use {
 pub use crate::draw_shader::DrawShaderId;
 /// Compute kernels (`compute.rs`).
 pub use crate::compute::{ComputeKernel, ComputeKernelId};
+pub use crate::storage_buffer::{StorageBuffer, StorageBufferId};
+pub use crate::texture::StorageFormat;
 pub use crate::pick::{PickError, PickImage, PickTicket};
 /// Edit mode's literal-site map (`Cx::set_live_literals`,
 /// `set_literal_source`, `patch_literal`).
