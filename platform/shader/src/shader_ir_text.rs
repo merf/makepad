@@ -1517,6 +1517,50 @@ impl<'a> TextCx<'a> {
             Builtin::Unpack2x16Snorm => "unpack_snorm2x16_to_float",
             Builtin::Unpack4x8Unorm => "unpack_unorm4x8_to_float",
             Builtin::Unpack4x8Snorm => "unpack_snorm4x8_to_float",
+            // ---- compute kernels (shader_ir_metal::metal_compute: the entry fills these fields
+            // of `_mp` from its thread-position attributes)
+            Builtin::GlobalId => return Some("_mp._mp_gid".to_string()),
+            Builtin::LocalId => return Some("_mp._mp_lid".to_string()),
+            Builtin::GroupId => return Some("_mp._mp_grp".to_string()),
+            Builtin::GroupCount => return Some("_mp._mp_groups".to_string()),
+            Builtin::LocalIndex => return Some("_mp._mp_lindex".to_string()),
+            Builtin::SubgroupSize => return Some("_mp._mp_sg_size".to_string()),
+            Builtin::SubgroupLane => return Some("_mp._mp_sg_lane".to_string()),
+            Builtin::SubgroupId => return Some("_mp._mp_sg_id".to_string()),
+            Builtin::Barrier => return Some("threadgroup_barrier(mem_flags::mem_threadgroup)".to_string()),
+            Builtin::SubgroupAdd => "simd_sum",
+            Builtin::SubgroupMin => "simd_min",
+            Builtin::SubgroupMax => "simd_max",
+            Builtin::SubgroupFirst => "simd_broadcast_first",
+            Builtin::SubgroupShuffle | Builtin::SubgroupShuffleXor => {
+                let x = self.expr(f, args[0]);
+                let lane = self.expr(f, args[1]);
+                let n = if op == Builtin::SubgroupShuffle { "simd_shuffle" } else { "simd_shuffle_xor" };
+                return Some(format!("{}({}, ushort({}))", n, x, lane));
+            }
+            Builtin::PackHalf2 => {
+                let v = self.expr(f, args[0]);
+                return Some(format!("as_type<uint>(half2({}))", v));
+            }
+            Builtin::ExtractBits => "_mp_extract_bits",
+            Builtin::Dot4U8 => "_mp_dot4_u8",
+            Builtin::AtomicAdd => {
+                // the place is a buffer's or a workgroup array's element, reached as an atomic of
+                // its address space
+                let pt = f.exprs[args[0] as usize].ty;
+                let space = match self.root_global(f, args[0]).map(|g| self.m.globals[g as usize].kind) {
+                    Some(IrGlobalKind::Io(IrIo::Workgroup)) => "threadgroup",
+                    _ => "device",
+                };
+                let atomic = if self.m.scalar_of(pt) == Some(IrScalar::I32) { "atomic_int" } else { "atomic_uint" };
+                let place = self.expr(f, args[0]);
+                let v = self.arg_as(f, args[1], pt);
+                return Some(format!("atomic_fetch_add_explicit(({} {}*)&({}), {}, memory_order_relaxed)", space, atomic, place, v));
+            }
+            Builtin::CooperativeLoad | Builtin::CooperativeStore | Builtin::CooperativeMulAdd | Builtin::CooperativeScale => {
+                self.errors.push("cooperative matrices exist only in SPIR-V kernels".to_string());
+                return Some("0".to_string());
+            }
             _ => return None,
         };
         let mut parts = Vec::new();
@@ -1524,6 +1568,40 @@ impl<'a> TextCx<'a> {
             parts.push(self.expr(f, *a));
         }
         Some(format!("{}({})", name, parts.join(", ")))
+    }
+
+    /// The global a place is part of (an element, a field, a lane of it).
+    fn root_global(&self, f: &IrFunction, mut e: ExprId) -> Option<GlobalId> {
+        loop {
+            match &f.exprs[e as usize].kind {
+                ExprKind::Global(g) => return Some(*g),
+                ExprKind::Index(b, _) | ExprKind::Field(b, _) | ExprKind::Swizzle(b, _, _) | ExprKind::Deref(b) | ExprKind::AddrOf(b) => e = *b,
+                _ => return None,
+            }
+        }
+    }
+
+    /// `img[coord] = value` into a kernel's storage image: MSL writes a texture with
+    /// `write(value4, coord)`, the value widened to four lanes. False when `p` is no image texel.
+    fn metal_image_write(&mut self, f: &IrFunction, p: ExprId, v: ExprId, indent: usize, out: &mut String) -> bool {
+        let ExprKind::Index(img, coord) = f.exprs[p as usize].kind else { return false };
+        let ExprKind::Global(g) = f.exprs[img as usize].kind else { return false };
+        if self.m.globals[g as usize].kind != IrGlobalKind::Io(IrIo::StorageImage) {
+            return false;
+        }
+        let vt = f.exprs[v as usize].ty;
+        let scalar = self.scalar_name(self.m.scalar_of(vt).unwrap_or(IrScalar::F32));
+        let val = self.expr(f, v);
+        let wide = match self.m.lanes(vt) {
+            1 => format!("{}4({})", scalar, val),
+            2 => format!("{0}4({1}, {0}(0), {0}(0))", scalar, val),
+            _ => val,
+        };
+        let target = self.expr(f, img);
+        let c = self.expr(f, coord);
+        Self::pad(out, indent);
+        writeln!(out, "{}.write({}, uint2({}));", target, wide, c).ok();
+        true
     }
 
     // ---- statements ----
@@ -1587,6 +1665,9 @@ impl<'a> TextCx<'a> {
             }
             Stmt::Assign(p, v) => {
                 if self.hlsl() && self.hlsl_assign(f, *p, *v, indent, out) {
+                    return;
+                }
+                if self.metal() && self.metal_image_write(f, *p, *v, indent, out) {
                     return;
                 }
                 if self.hlsl() && matches!(f.exprs[*v as usize].kind, ExprKind::Builtin(Builtin::AtomicAdd, _)) {

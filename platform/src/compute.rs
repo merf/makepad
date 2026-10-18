@@ -1,7 +1,7 @@
 //! Compute kernels, the app-facing side (milestone 16 of the fork's compute work): a kernel is
 //! declared in Splash as a draw shader is (`mod.draw.ComputeKernel{ workgroup_size: 64 ... main:
 //! fn() { ... } }`), compiled when it is applied for the dialect the HAL runs (HLSL on D3D11,
-//! MSL on Metal once its printer exists), and its pipeline made with the draw shaders'
+//! MSL on Metal), and its pipeline made with the draw shaders'
 //! (`Cx::fb_compile_kernels`). Its bindings (`KernelBindings`) say where each param, texture,
 //! image and buffer goes, by name, for the dialect it was compiled for.
 
@@ -120,6 +120,10 @@ fn code_key(code: &KernelCode) -> u64 {
         KernelCode::Spirv(k) => {
             1u8.hash(&mut h);
             k.spirv.hash(&mut h);
+        }
+        KernelCode::Metal(k) => {
+            2u8.hash(&mut h);
+            k.source.hash(&mut h);
         }
     }
     h.finish()

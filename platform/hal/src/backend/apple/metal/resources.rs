@@ -92,6 +92,12 @@ pub fn create_texture(device: ObjcId, t: &TextureObj, gen: u32, label: &str) -> 
     } else {
         usage_bits |= MTLTextureUsage::ShaderRead as u64;
     }
+    if t.usage & usage::STORAGE != 0 {
+        if depth || format::is_block(t.format) || texture_type != MTLTextureType::D2 || shared {
+            return Err(format!("a storage image is one 2D layer of a colour format, not {} x{}", format::name(t.format), t.depth));
+        }
+        usage_bits |= MTLTextureUsage::ShaderWrite as u64;
+    }
     unsafe {
         let _: () = msg_send![d, setTextureType: texture_type];
         let _: () = msg_send![d, setWidth: t.w as u64];
@@ -269,13 +275,27 @@ pub struct Upload {
     pub origin: [u64; 2],
 }
 
+/// A storage buffer's bytes waiting for the next blit encoder: written on the queue, in order
+/// with the dispatches that read and write the buffer.
+pub struct BufferUpload {
+    pub buffer: RcObjcId,
+    pub staging: ObjcId,
+    pub offset: u64,
+    /// where in the buffer
+    pub at: u64,
+    pub size: u64,
+}
+
 /// Encodes uploads on one blit encoder of `cb`.
-pub fn encode_uploads(cb: ObjcId, uploads: &mut Vec<Upload>) {
-    if uploads.is_empty() {
+pub fn encode_uploads(cb: ObjcId, uploads: &mut Vec<Upload>, buffers: &mut Vec<BufferUpload>) {
+    if uploads.is_empty() && buffers.is_empty() {
         return;
     }
     unsafe {
         let blit: ObjcId = msg_send![cb, blitCommandEncoder];
+        for u in buffers.drain(..) {
+            let _: () = msg_send![blit, copyFromBuffer: u.staging sourceOffset: u.offset toBuffer: u.buffer.as_id() destinationOffset: u.at size: u.size];
+        }
         for u in uploads.drain(..) {
             let size = MTLSize { width: u.size[0], height: u.size[1], depth: 1 };
             let origin = MTLOrigin { x: u.origin[0], y: u.origin[1], z: 0 };

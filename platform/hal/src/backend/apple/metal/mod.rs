@@ -29,7 +29,7 @@ use crate::ledger::{Kind, LedgerEntry};
 use crate::session::*;
 use crate::types::*;
 use device::{Device, Done, Mailbox};
-pub use pipeline::compile_msl;
+pub use pipeline::{compile_msl, compile_msl_kernel};
 use makepad_apple_sys::*;
 use resources::*;
 use std::collections::HashMap;
@@ -90,6 +90,8 @@ pub struct Metal {
     pick_pending: std::collections::HashSet<(u32, Id)>,
     batch: Option<frame::Batch>,
     uploads: Vec<Upload>,
+    /// storage-buffer writes waiting for the next blit encoder (`buffer_update`)
+    buffer_uploads: Vec<BufferUpload>,
     housekept_ns: u64,
     /// the window system, `None` in offscreen mode
     shell: Option<&'static Shared>,
@@ -164,6 +166,7 @@ impl Metal {
             pick_pending: Default::default(),
             batch: None,
             uploads: Vec::new(),
+            buffer_uploads: Vec::new(),
             housekept_ns: 0,
             shell,
             retain: flags & open_flags::RETAIN_WINDOWS != 0,
@@ -528,7 +531,23 @@ impl Gpu for Metal {
 
     fn buffer_update(&mut self, s: &mut Session, id: Id, b: &mut BufferObj, off: u64, data: &[u8]) {
         let completed = self.dev.completed.load(std::sync::atomic::Ordering::Acquire);
-        let Some(buf) = self.buf.get_mut(&(s.id, id.index)).filter(|x| x.gen == id.gen) else { return };
+        let Some(buf) = self.buf.get(&(s.id, id.index)).filter(|x| x.gen == id.gen) else { return };
+        if b.kind == buffer_kind::STORAGE && !writable_in_place(buf, completed) {
+            // a dispatch still pending may write it: a copy now would lose what it writes, so
+            // the bytes go in on the queue, after it and before the next frame's dispatches
+            let buffer = buf.buffer.clone();
+            let (_, seq) = self.ensure_batch();
+            let Some(loc) = self.dev.arena_put_transient(data, seq) else {
+                s.stats.bad_args += 1;
+                return;
+            };
+            self.buffer_uploads.push(BufferUpload { buffer, staging: loc.buffer, offset: loc.offset, at: off, size: data.len() as u64 });
+            if let Some(buf) = self.buf.get_mut(&(s.id, id.index)) {
+                buf.last_bound = seq;
+            }
+            return;
+        }
+        let buf = self.buf.get_mut(&(s.id, id.index)).expect("checked");
         if !writable_in_place(buf, completed) {
             let covers_all = off == 0 && data.len() as u64 >= buf.size;
             match copy_on_write(self.dev.device, buf, covers_all) {
@@ -564,12 +583,26 @@ impl Gpu for Metal {
         if dialect != self::dialect::MSL {
             return PipeStatus::Failed(format!("the Metal backend takes MSL, not dialect {dialect}"));
         }
-        if blob.desc.kind != pipeline_kind::RENDER {
-            return PipeStatus::Failed("the Metal backend does not make compute pipelines yet".into());
-        }
         let Ok(source) = std::str::from_utf8(blob.code) else { return PipeStatus::Failed("the pipeline source is not utf8".into()) };
-        let state = pipeline::create(&self.dev, s.id, id, s.font_frames.clone(), source, &blob.desc);
-        self.pipe.insert((s.id, id.index), pipeline::Pipe { gen: id.gen, state, desc: blob.desc, bindings: blob.bindings.as_slice().into(), announced: false });
+        let kind = match blob.desc.kind {
+            pipeline_kind::RENDER => pipeline::PipeKind::Draw(pipeline::create(&self.dev, s.id, id, s.font_frames.clone(), source, &blob.desc)),
+            pipeline_kind::COMPUTE => {
+                let table = blob.bindings.as_slice();
+                let Some(workgroup) = compute_binding::workgroup(table) else {
+                    return PipeStatus::Failed("a Metal kernel's binding table carries its workgroup size (compute_binding::workgroup_at)".into());
+                };
+                let nbuf = table[compute_binding::BUFFERS] as usize;
+                let over = (0..nbuf).map(|k| table[compute_binding::BUFFER_WORDS + 2 * k] & !compute_binding::WRITABLE)
+                    .chain([table[compute_binding::PARAMS]].into_iter().filter(|p| *p != compute_binding::NONE))
+                    .find(|index| *index > 30);
+                if let Some(index) = over {
+                    return PipeStatus::Failed(format!("a Metal kernel binds buffer index {index}; Metal's argument table ends at 30"));
+                }
+                pipeline::PipeKind::Kernel(pipeline::create_kernel(&self.dev, s.id, id, s.font_frames.clone(), source, workgroup))
+            }
+            other => return PipeStatus::Failed(format!("no pipeline kind {other}")),
+        };
+        self.pipe.insert((s.id, id.index), pipeline::Pipe { gen: id.gen, kind, desc: blob.desc, bindings: blob.bindings.as_slice().into(), announced: false });
         PipeStatus::Pending
     }
 

@@ -1,6 +1,7 @@
 //! Metal Shading Language from the shader IR: one library holding
 //! `vertex_main` and `fragment_main`, and the pick variant of the same
-//! shader (`ShaderOutput::pick`).
+//! shader (`ShaderOutput::pick`); and a compute kernel's library
+//! (`metal_compute`).
 //!
 //! Bindings: the geometry at `buffer(0)`, the instance records at
 //! `buffer(1)`, the dyn uniforms at `buffer(2)`, uniform buffers at their
@@ -14,6 +15,7 @@
 //! `thread Mp &_mp`.
 
 use crate::shader_ir::*;
+use crate::shader_ir_compute::{ComputeSlot, ComputeSlotKind, KernelBindings, KernelBuffer, KernelImage, MetalKernel};
 use crate::shader_ir_draw::{build_metal_entries, MetalDrawInfo};
 use crate::shader_ir_text::*;
 use crate::shader_output::*;
@@ -411,6 +413,231 @@ inline float4 _mp_pick_sample(thread Mp &_mp, uint b, texture2d<float> tw, float
     }
     return c;
 }
+";
+
+/// The Metal buffer index of a kernel's parameter block (the last argument-table slot).
+pub const METAL_KERNEL_PARAMS_BUFFER: u32 = 30;
+
+/// A compute kernel (`entry`, made by `build_compute_entry`) as MSL, entry `kernel_main`, and
+/// what the host binds it by.
+///
+/// Indices, each list in the IR's global order (the order a kernel first uses its resources, the
+/// order HLSL lists them in too): sampled textures at `texture(0..)`, storage images
+/// (`texture2d<T, access::write>`) at the texture indices after them; the storage buffers at
+/// `buffer(0..)` in the order a dispatch names them, `const device T*` when read-only and
+/// `device T*` when written (each `KernelBuffer::register` is its index); the params in one
+/// `constant` struct at `buffer(METAL_KERNEL_PARAMS_BUFFER)`, at the offsets HLSL packs them at;
+/// samplers are `constexpr`. The group count comes from `threadgroups_per_grid`, so a dispatch
+/// binds nothing for it. Workgroup arrays are `threadgroup` arrays of the entry. The workgroup
+/// size is not in MSL: the host passes it at each dispatch (`KernelBindings::workgroup`).
+///
+/// Refused, with every reason: cooperative matrices, f16 and bool in buffers or params, and
+/// buffer elements whose MSL layout differs from the one the other dialects use (a vec3 followed
+/// by a field in its padding: pad it).
+pub fn metal_compute(output: &ShaderOutput, entry: FuncId) -> Result<MetalKernel, String> {
+    let ir = &output.ir;
+    let mut errors = Vec::new();
+    let funcs = callees_first(ir, &[entry]);
+    let mut cx = TextCx::new(ir, Dialect::Metal, false);
+    let mut bodies = String::new();
+    for f in &funcs {
+        if *f != entry {
+            cx.function(*f, &mut bodies);
+        }
+    }
+    let mut main = String::new();
+    let f = &ir.functions[entry as usize];
+    cx.stmts(f, &f.body, 1, &mut main);
+    errors.append(&mut cx.errors);
+
+    let mut out = String::new();
+    out.push_str("#include <metal_stdlib>\nusing namespace metal;\n");
+    let mut done = vec![false; ir.structs.len()];
+    for s in 0..ir.structs.len() {
+        struct_def(&cx, s as u32, &mut done, &mut out);
+    }
+
+    let wg = ir.workgroup;
+    let mut b = KernelBindings { workgroup: [wg[0].max(1), wg[1].max(1), wg[2].max(1)], samplers: output.samplers.clone(), ..Default::default() };
+    // the parameter block: each param at its natural offset, padding spelled out (a vec3 is
+    // packed, 12 bytes as HLSL has it)
+    let mut offset = 0u32;
+    let mut params = String::new();
+    for (i, g) in ir.globals.iter().enumerate() {
+        if g.kind != IrGlobalKind::Io(IrIo::Uniform) {
+            continue;
+        }
+        let (scalar, lanes) = match ir.get(g.ty) {
+            IrTy::Scalar(s) => (*s, 1),
+            IrTy::Vec(n, s) => (*s, *n as u32),
+            other => {
+                errors.push(format!("kernel param {} must be a scalar or a vector, not {:?}", g.name, other));
+                continue;
+            }
+        };
+        if matches!(scalar, IrScalar::Bool | IrScalar::F16) {
+            errors.push(format!("kernel param {} cannot be a bool or an f16 (use u32 / f32)", g.name));
+            continue;
+        }
+        let (size, align) = ir_layout(ir, g.ty);
+        let at = round_up(offset, align);
+        if at > offset {
+            writeln!(params, "    uchar _mp_pad{}[{}];", offset, at - offset).ok();
+        }
+        let name = cx.plain_global_name(i as GlobalId);
+        if lanes == 3 {
+            writeln!(params, "    packed_{} {};", cx.ty_name(g.ty), name).ok();
+        } else {
+            writeln!(params, "    {};", cx.decl(g.ty, &name)).ok();
+        }
+        b.params.push(ComputeSlot { name: g.name, global: i as GlobalId, kind: ComputeSlotKind::Param { scalar, lanes }, offset: at, size });
+        offset = at + size;
+    }
+    if !b.params.is_empty() {
+        b.params_size = round_up(offset, 16);
+        writeln!(out, "struct MpUniforms {{\n{}}};", params).ok();
+    }
+    sampler_decls(output, &mut out);
+
+    // the invocation's state, the entry's arguments, and how it fills `_mp`
+    let mut fields = String::from("    uint _mp_iter;\n    uint3 _mp_gid;\n    uint3 _mp_lid;\n    uint3 _mp_grp;\n    uint3 _mp_groups;\n    uint _mp_lindex;\n    uint _mp_sg_size;\n    uint _mp_sg_lane;\n    uint _mp_sg_id;\n");
+    let mut args = Vec::new();
+    let mut fill = String::from("    Mp _mp;\n    _mp._mp_iter = 0u;\n    _mp._mp_gid = _mp_gid_in;\n    _mp._mp_lid = _mp_lid_in;\n    _mp._mp_grp = _mp_grp_in;\n    _mp._mp_groups = _mp_groups_in;\n    _mp._mp_lindex = _mp_lindex_in;\n    _mp._mp_sg_size = _mp_sg_size_in;\n    _mp._mp_sg_lane = _mp_sg_lane_in;\n    _mp._mp_sg_id = _mp_sg_id_in;\n");
+    if !b.params.is_empty() {
+        fields.push_str("    constant MpUniforms *u;\n");
+        args.push(format!("constant MpUniforms *u [[buffer({})]]", METAL_KERNEL_PARAMS_BUFFER));
+        fill.push_str("    _mp.u = u;\n");
+    }
+    let mut t = 0u32;
+    for (i, g) in ir.globals.iter().enumerate() {
+        if let IrGlobalKind::Io(IrIo::Texture(tt)) = g.kind {
+            let name = cx.plain_global_name(i as GlobalId);
+            writeln!(fields, "    {} {};", metal_texture_type(tt), name).ok();
+            args.push(format!("{} {} [[texture({})]]", metal_texture_type(tt), name, t));
+            writeln!(fill, "    _mp.{0} = {0};", name).ok();
+            b.textures.push((g.name, tt));
+            t += 1;
+        }
+    }
+    for (i, g) in ir.globals.iter().enumerate() {
+        if g.kind != IrGlobalKind::Io(IrIo::StorageImage) {
+            continue;
+        }
+        let IrTy::Array(texel, _) = *ir.get(g.ty) else { continue };
+        let (scalar, lanes) = match ir.get(texel) {
+            IrTy::Scalar(s) => (*s, 1),
+            IrTy::Vec(n, s) => (*s, *n as u32),
+            _ => (IrScalar::Bool, 0),
+        };
+        if !matches!(scalar, IrScalar::F32 | IrScalar::U32 | IrScalar::I32) || lanes == 3 {
+            errors.push(format!("storage image {}: a texel of 1, 2 or 4 lanes of f32, u32 or i32", g.name));
+        }
+        let name = cx.plain_global_name(i as GlobalId);
+        let ty = format!("texture2d<{}, access::write>", cx.scalar_name(scalar));
+        writeln!(fields, "    {} {};", ty, name).ok();
+        args.push(format!("{} {} [[texture({})]]", ty, name, t));
+        writeln!(fill, "    _mp.{0} = {0};", name).ok();
+        b.images.push(KernelImage { name: g.name, scalar, lanes });
+        t += 1;
+    }
+    let mut index = 0u32;
+    for (i, g) in ir.globals.iter().enumerate() {
+        let IrGlobalKind::Io(IrIo::Storage(writable)) = g.kind else { continue };
+        let IrTy::Array(elem, _) = *ir.get(g.ty) else { continue };
+        let stride = match msl_layout(ir, elem) {
+            Some((size, _)) if size == ir_array_stride(ir, elem) => size,
+            _ => {
+                errors.push(format!(
+                    "buffer {}: its element lays out differently in MSL (an f16 or a bool, or a field in a vec3's padding); pad it", g.name));
+                0
+            }
+        };
+        if index >= METAL_KERNEL_PARAMS_BUFFER {
+            errors.push(format!("buffer {}: a Metal kernel binds at most {} buffers", g.name, METAL_KERNEL_PARAMS_BUFFER));
+        }
+        let name = cx.plain_global_name(i as GlobalId);
+        let ty = format!("{}device {}*", if writable { "" } else { "const " }, cx.ty_name(elem));
+        writeln!(fields, "    {} {};", ty, name).ok();
+        args.push(format!("{} {} [[buffer({})]]", ty, name, index));
+        writeln!(fill, "    _mp.{0} = {0};", name).ok();
+        b.buffers.push(KernelBuffer { name: g.name, writable, register: index, stride });
+        index += 1;
+    }
+    let mut shared = String::new();
+    for (i, g) in ir.globals.iter().enumerate() {
+        if g.kind != IrGlobalKind::Io(IrIo::Workgroup) {
+            continue;
+        }
+        let IrTy::Array(elem, n) = *ir.get(g.ty) else { continue };
+        let name = cx.plain_global_name(i as GlobalId);
+        writeln!(fields, "    threadgroup {} *{};", cx.ty_name(elem), name).ok();
+        writeln!(shared, "    threadgroup {} {}[{}];", cx.ty_name(elem), name, n.max(1)).ok();
+        writeln!(fill, "    _mp.{0} = {0};", name).ok();
+    }
+    writeln!(out, "struct Mp {{\n{}}};", fields).ok();
+    out.push_str(METAL_HELPERS);
+    out.push_str(METAL_KERNEL_HELPERS);
+    out.push_str(&bodies);
+    args.extend([
+        "uint3 _mp_gid_in [[thread_position_in_grid]]",
+        "uint3 _mp_lid_in [[thread_position_in_threadgroup]]",
+        "uint3 _mp_grp_in [[threadgroup_position_in_grid]]",
+        "uint3 _mp_groups_in [[threadgroups_per_grid]]",
+        "uint _mp_lindex_in [[thread_index_in_threadgroup]]",
+        "uint _mp_sg_size_in [[threads_per_simdgroup]]",
+        "uint _mp_sg_lane_in [[thread_index_in_simdgroup]]",
+        "uint _mp_sg_id_in [[simdgroup_index_in_threadgroup]]",
+    ].map(String::from));
+    writeln!(out, "kernel void kernel_main(\n    {}\n) {{", args.join(",\n    ")).ok();
+    out.push_str(&shared);
+    out.push_str(&fill);
+    out.push_str(&main);
+    out.push_str("}\n");
+    if !errors.is_empty() {
+        errors.dedup();
+        return Err(errors.join("\n"));
+    }
+    Ok(MetalKernel { source: out, bindings: b })
+}
+
+/// Size and alignment of a type in an MSL buffer, when every field sits where `ir_layout` puts
+/// it; None otherwise (and for f16 and bool, refused in buffers as HLSL refuses them).
+fn msl_layout(m: &IrModule, ty: TyId) -> Option<(u32, u32)> {
+    match m.get(ty) {
+        IrTy::Scalar(IrScalar::F16 | IrScalar::Bool) | IrTy::Vec(_, IrScalar::F16 | IrScalar::Bool) => None,
+        IrTy::Scalar(_) => Some((4, 4)),
+        IrTy::Vec(n, _) => {
+            let s = if *n == 3 { 16 } else { 4 * *n as u32 };
+            Some((s, s))
+        }
+        IrTy::Mat(c, r) => {
+            let col = if *r == 2 { 8 } else { 16 };
+            Some((*c as u32 * col, col))
+        }
+        IrTy::Array(e, n) if *n > 0 => {
+            let (es, ea) = msl_layout(m, *e)?;
+            (es == ir_array_stride(m, *e)).then_some((es * n, ea))
+        }
+        IrTy::Struct(s) => {
+            let (mut offset, mut align) = (0u32, 1u32);
+            for (f, ir_offset) in m.structs[*s as usize].fields.iter().zip(ir_struct_offsets(m, *s)) {
+                let (size, a) = msl_layout(m, f.ty)?;
+                offset = round_up(offset, a);
+                if offset != ir_offset {
+                    return None;
+                }
+                offset += size;
+                align = align.max(a);
+            }
+            let size = round_up(offset.max(1), align);
+            (size == ir_layout(m, ty).0).then_some((size, align))
+        }
+        _ => None,
+    }
+}
+
+const METAL_KERNEL_HELPERS: &str = "inline uint _mp_extract_bits(uint x, uint o, uint c) { return c == 0u ? 0u : (x >> o) & (0xffffffffu >> (32u - c)); }
+inline uint _mp_dot4_u8(uint a, uint b) { return (a & 255u) * (b & 255u) + ((a >> 8) & 255u) * ((b >> 8) & 255u) + ((a >> 16) & 255u) * ((b >> 16) & 255u) + (a >> 24) * (b >> 24); }
 ";
 
 pub fn metal_draw_source_into(output: &ShaderOutput, types: &impl crate::shader_types::ShaderTypes, pick: bool, out: &mut String) {

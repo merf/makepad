@@ -762,14 +762,18 @@ pub mod pipeline_binding {
 
 /// Layout of a compute pipeline's binding table (`PipelineDesc::bindings`, `pipeline_kind::COMPUTE`):
 /// the slot of the parameter block, the counts of what a dispatch binds, then two words per storage
-/// buffer. A dispatch names its textures, images and buffers in this order (`Dispatch::tex`,
-/// `images`, `buffers`).
+/// buffer, then the kernel's workgroup size (three words). A dispatch names its textures, images
+/// and buffers in this order (`Dispatch::tex`, `images`, `buffers`).
 ///
-/// Registers (HLSL; Metal uses the same numbers for its texture and buffer indices): sampled
+/// Registers are each dialect's own; the table is the same shape for both. HLSL (D3D11): sampled
 /// textures `t0..`, then the read-only buffers in the `t` registers after them; storage images
 /// `u0..`, then the writable buffers in the `u` registers after them; the parameter block at
-/// `b<PARAMS>`, the dispatch's group count (`uint4`) at `b13`. Each buffer's words give its
-/// register, whether it is written, and its element size.
+/// `b<PARAMS>`, the dispatch's group count (`uint4`) at `b13`. MSL (Metal): sampled textures at
+/// `texture(0..)`, the storage images at the texture indices after them; each buffer at
+/// `buffer(register)`; the parameter block at `buffer(PARAMS)`; the group count is the kernel's
+/// own (`threadgroups_per_grid`). Each buffer's words give its register, whether it is written,
+/// and its element size. The workgroup size is compiled into an HLSL kernel; Metal passes it at
+/// each dispatch.
 pub mod compute_binding {
     /// the constant-buffer slot of the parameter block (`Dispatch::uniforms`); NONE: no params
     pub const PARAMS: usize = 0;
@@ -784,6 +788,18 @@ pub mod compute_binding {
     pub const BUFFER_WORDS: usize = 4;
     pub const WRITABLE: u32 = 1 << 31;
     pub const NONE: u32 = u32::MAX;
+
+    /// Where the workgroup size starts in a table of `buffers` storage buffers.
+    pub const fn workgroup_at(buffers: usize) -> usize {
+        BUFFER_WORDS + 2 * buffers
+    }
+
+    /// The workgroup size a table carries (None: a table without one, or a zero in it).
+    pub fn workgroup(table: &[u32]) -> Option<[u32; 3]> {
+        let at = workgroup_at(*table.get(BUFFERS)? as usize);
+        let w = table.get(at..at + 3)?;
+        (w.iter().all(|v| *v > 0)).then(|| [w[0], w[1], w[2]])
+    }
 }
 
 /// `Lifecycle` event kinds.

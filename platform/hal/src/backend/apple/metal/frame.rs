@@ -349,11 +349,11 @@ impl Metal {
 
     /// Encodes the pending texture uploads ahead of whatever encodes next.
     pub(super) fn flush_uploads(&mut self) {
-        if self.uploads.is_empty() {
+        if self.uploads.is_empty() && self.buffer_uploads.is_empty() {
             return;
         }
         let (cb, _) = self.ensure_batch();
-        encode_uploads(cb, &mut self.uploads);
+        encode_uploads(cb, &mut self.uploads, &mut self.buffer_uploads);
     }
 
     /// Commits the open command buffer; the frames in it are answered when it completes.
@@ -598,7 +598,10 @@ impl Metal {
         let mut window_encoded = false;
         for pass in &view.passes[passes] {
             if pass.is_compute() {
-                exec::compute_unsupported(s, pass, "Metal");
+                // a pick replay draws ids: kernels and their writes are not run again
+                if !pick {
+                    self.encode_compute(s, sid, pass, view, cb, seq, frame, now, &mut deps);
+                }
                 continue;
             }
             let Some(dr) = slice(pass.draws, view.draws.len()) else {
@@ -684,9 +687,155 @@ impl Metal {
             self.depth_only_seen.push(key);
             let Some(pipe) = self.pipe.get(&(sid, d.pipeline.index)).filter(|p| p.gen == d.pipeline.gen) else { continue };
             // every state is asked for (queued) even after one is found missing
-            ready &= pipe.state.ready_for(&self.dev, &[], key.1);
+            let Some(state) = pipe.draw() else { continue };
+            ready &= state.ready_for(&self.dev, &[], key.1);
         }
         ready
+    }
+
+    /// A compute pass: its dispatches in order on one compute encoder of the batch's command
+    /// buffer. The encoder dispatches serially and every resource is hazard-tracked, so each
+    /// dispatch, and every pass after this one, sees what the dispatches before it wrote. Each
+    /// dispatch binds by its kernel's table (`compute_binding`): sampled textures at
+    /// `texture(0..)`, the storage images after them, each buffer at its register, the params at
+    /// `buffer(PARAMS)`; the workgroup size is the kernel's.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_compute(&mut self, s: &mut Session, sid: u32, pass: &Pass, view: &CmdView, cb: ObjcId, seq: u64, frame: u64, now: u64, deps: &mut Vec<LentRef>) {
+        let Some(dr) = pass.dispatches.off.checked_add(pass.dispatches.len).filter(|e| *e as usize <= view.dispatches.len()).map(|e| pass.dispatches.off as usize..e as usize) else {
+            s.stats.bad_args += 1;
+            return;
+        };
+        s.stats.passes += 1;
+        let mut encoder: ObjcId = nil;
+        let mut names: Vec<String> = Vec::new();
+        'dispatch: for d in &view.dispatches[dr] {
+            if let Err(why) = exec::check_dispatch(s, sid, d, view.arena, now) {
+                exec::skip_dispatch(s, why);
+                continue;
+            }
+            let Some(pipe) = self.pipe.get(&(sid, d.pipeline.index)).filter(|p| p.gen == d.pipeline.gen) else {
+                s.stale();
+                s.stats.skipped_dispatches += 1;
+                continue;
+            };
+            let Some(kernel) = pipe.kernel().cloned() else {
+                eprintln!("[metal] a dispatch names a draw pipeline");
+                s.bad();
+                s.stats.skipped_dispatches += 1;
+                continue;
+            };
+            // still compiling, or failed: the app dispatches again when it hears PipelineReady
+            let Some(pso) = kernel.ready() else {
+                s.stats.skipped_dispatches += 1;
+                continue;
+            };
+            let table = pipe.bindings.clone();
+            let name = s.string(pipe.desc.name).unwrap_or("").to_owned();
+            let (ntex, nimg, nbuf) = (table[compute_binding::TEXTURES] as usize, table[compute_binding::IMAGES] as usize, table[compute_binding::BUFFERS] as usize);
+            // a surface lent by a session that is gone (or relaunched) is never sampled
+            for id in read_ids(view.arena, d.tex) {
+                match exec::lent_state(s, sid, id) {
+                    exec::LentState::Own => {}
+                    exec::LentState::Lent(l) => {
+                        if !deps.contains(&l) {
+                            deps.push(l);
+                        }
+                    }
+                    exec::LentState::Dead => {
+                        s.stale();
+                        s.stats.skipped_dispatches += 1;
+                        continue 'dispatch;
+                    }
+                }
+            }
+            let mut textures = Vec::with_capacity(ntex + nimg);
+            for i in 0..ntex {
+                let id = id_at(view.arena, d.tex, i);
+                let obj = if id.is_none() { None } else { texture_obj(&mut self.tex, self.dev.device, s, id, seq) };
+                textures.push(obj.unwrap_or(self.dev.fallback));
+            }
+            for i in 0..nimg {
+                let Some(obj) = texture_obj(&mut self.tex, self.dev.device, s, id_at(view.arena, d.images, i), seq) else {
+                    s.stale();
+                    s.stats.skipped_dispatches += 1;
+                    continue 'dispatch;
+                };
+                textures.push(obj);
+            }
+            let mut buffers = Vec::with_capacity(nbuf);
+            for k in 0..nbuf {
+                let (word, stride) = (table[compute_binding::BUFFER_WORDS + 2 * k], table[compute_binding::BUFFER_WORDS + 2 * k + 1]);
+                let id = id_at(view.arena, d.buffers, k);
+                let made = s.buffers.get(sid, id).map(|b| b.val.stride).unwrap_or(0);
+                if made != stride {
+                    eprintln!("[metal] dispatch: a buffer of {made}-byte elements bound where the kernel reads {stride}-byte elements");
+                    s.bad();
+                    s.stats.skipped_dispatches += 1;
+                    continue 'dispatch;
+                }
+                let Some(buf) = self.buf.get_mut(&(sid, id.index)).filter(|b| b.gen == id.gen) else {
+                    s.stale();
+                    s.stats.skipped_dispatches += 1;
+                    continue 'dispatch;
+                };
+                buf.last_bound = seq;
+                buffers.push((buf.buffer.as_id(), (word & !compute_binding::WRITABLE) as u64));
+            }
+            let params = match table[compute_binding::PARAMS] {
+                compute_binding::NONE => None,
+                index => {
+                    // SAFETY: the Slice is the caller's memory, borrowed for this hal_submit call
+                    let data = unsafe { d.uniforms.as_bytes() };
+                    match self.dev.arena_put(data, seq) {
+                        Some(loc) => Some((loc, index as u64)),
+                        None => {
+                            eprintln!("[metal] the uniform arena could not take a dispatch's params; the dispatch is skipped");
+                            s.stats.skipped_dispatches += 1;
+                            continue;
+                        }
+                    }
+                }
+            };
+            s.stats.dispatches += 1;
+            s.ledger.touch(Kind::Pipeline, d.pipeline.index, d.pipeline.gen, frame, now);
+            if d.groups.iter().any(|g| *g == 0) {
+                continue;
+            }
+            if encoder == nil {
+                encoder = unsafe { msg_send![cb, computeCommandEncoder] };
+                if encoder == nil {
+                    eprintln!("[metal] no compute encoder for pass \"{}\"", s.string(pass.name).unwrap_or(""));
+                    return;
+                }
+            }
+            let wg = kernel.workgroup;
+            unsafe {
+                let _: () = msg_send![encoder, setComputePipelineState: pso];
+                for (i, t) in textures.iter().enumerate() {
+                    let _: () = msg_send![encoder, setTexture: *t atIndex: i as u64];
+                }
+                for (buffer, index) in &buffers {
+                    let _: () = msg_send![encoder, setBuffer: *buffer offset: 0u64 atIndex: *index];
+                }
+                if let Some((loc, index)) = params {
+                    let _: () = msg_send![encoder, setBuffer: loc.buffer offset: loc.offset atIndex: index];
+                }
+                let groups = MTLSize { width: d.groups[0] as u64, height: d.groups[1] as u64, depth: d.groups[2] as u64 };
+                let threads = MTLSize { width: wg[0] as u64, height: wg[1] as u64, depth: wg[2] as u64 };
+                let _: () = msg_send![encoder, dispatchThreadgroups: groups threadsPerThreadgroup: threads];
+            }
+            if !name.is_empty() && !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        if encoder != nil {
+            unsafe {
+                let _: () = msg_send![encoder, endEncoding];
+            }
+            if let Some(b) = self.batch.as_mut() {
+                b.passes.push((s.string(pass.name).unwrap_or("").to_string(), names));
+            }
+        }
     }
 
     /// One pass into one render encoder. `None` when the pass could not be encoded (a missing
@@ -887,7 +1036,13 @@ impl Metal {
                 s.stale();
                 continue;
             };
-            let pso = match pipe.state.select(&self.dev, &formats, d.flags & Draw::BLEND != 0) {
+            let Some(state) = pipe.draw() else {
+                eprintln!("[metal] a draw names a compute pipeline");
+                s.bad();
+                s.stats.skipped_draws += 1;
+                continue;
+            };
+            let pso = match state.select(&self.dev, &formats, d.flags & Draw::BLEND != 0) {
                 Select::State(pso) => pso,
                 // still compiling or failed: the draw is left out, the app paints again when the
                 // pipeline is ready

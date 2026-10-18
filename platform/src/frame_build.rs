@@ -31,13 +31,28 @@ use makepad_hal::{
     compute_binding, format, pass_load as load, pipeline_binding as binding, pipeline_blend, pipeline_kind, usage, Attr, CmdWriter, Draw, FrameMeta, HalInfo, Id,
     Inst, Pass, PipelineDesc, Slice, StrId,
 };
-use makepad_script::shader_ir_compute::HlslKernel;
+use makepad_script::shader_ir_compute::{HlslKernel, KernelBindings, MetalKernel};
 use std::collections::HashMap;
 
+/// A compute kernel's binding table (`compute_binding`): the parameter block's slot (`params`
+/// when it has params), the counts of textures, images and buffers, then each buffer's register,
+/// access and element size, in the order a dispatch names them, then the workgroup size.
+fn kernel_binding_table(b: &KernelBindings, params: u32) -> Vec<u32> {
+    let mut table = vec![compute_binding::NONE; compute_binding::BUFFER_WORDS];
+    table[compute_binding::PARAMS] = if b.params_size > 0 { params } else { compute_binding::NONE };
+    table[compute_binding::TEXTURES] = b.textures.len() as u32;
+    table[compute_binding::IMAGES] = b.images.len() as u32;
+    table[compute_binding::BUFFERS] = b.buffers.len() as u32;
+    for buf in &b.buffers {
+        table.extend([buf.register | if buf.writable { compute_binding::WRITABLE } else { 0 }, buf.stride]);
+    }
+    table.extend(b.workgroup.map(|w| w.max(1)));
+    table
+}
+
 /// A compute kernel's `PipelineCreate` blob for D3D11 (`dialect::HLSL`): the HLSL payload (its
-/// textures' shapes and its samplers) and the binding table (`compute_binding`) its dispatches are
-/// bound by: the parameter block's register, the counts of textures, images and buffers, then each
-/// buffer's register, access and element size, in the order a dispatch names them.
+/// textures' shapes and its samplers) and the binding table its dispatches are bound by
+/// (`kernel_binding_table`).
 pub fn hlsl_kernel_pipeline_blob(kernel: &HlslKernel, name: StrId, source: StrId) -> Result<Vec<u8>, String> {
     use makepad_script::shader::{SamplerAddress, SamplerFilter, TextureType};
     let b = &kernel.bindings;
@@ -52,27 +67,29 @@ pub fn hlsl_kernel_pipeline_blob(kernel: &HlslKernel, name: StrId, source: StrId
         compare: s.compare, pixel: false,
     }).collect();
     let code = makepad_hal::hlsl::HlslPipeline { source: kernel.source.clone(), textures, samplers }.encode();
-    let mut table = vec![compute_binding::NONE; compute_binding::BUFFER_WORDS];
-    table[compute_binding::PARAMS] = if b.params_size > 0 { makepad_script::shader_ir_hlsl::HLSL_KERNEL_PARAMS_REGISTER } else { compute_binding::NONE };
-    table[compute_binding::TEXTURES] = b.textures.len() as u32;
-    table[compute_binding::IMAGES] = b.images.len() as u32;
-    table[compute_binding::BUFFERS] = b.buffers.len() as u32;
-    for buf in &b.buffers {
-        table.extend([buf.register | if buf.writable { compute_binding::WRITABLE } else { 0 }, buf.stride]);
-    }
+    let table = kernel_binding_table(b, makepad_script::shader_ir_hlsl::HLSL_KERNEL_PARAMS_REGISTER);
     let desc = PipelineDesc { kind: pipeline_kind::COMPUTE, name, source, ..Default::default() };
     Ok(CmdWriter::pipeline_blob(desc, &code, &table, &[]))
 }
 
 /// A compute kernel's `PipelineCreate` dialect and blob, for the backend it was compiled for
-/// (`compute.rs`): HLSL on D3D11. Metal takes its arm once kernels print as MSL
-/// (`KernelCode::Metal`, `metal_kernel_pipeline_blob`); the HAL's Vulkan backend runs no kernels.
+/// (`compute.rs`): HLSL on D3D11, MSL on Metal; the HAL's Vulkan backend runs no kernels.
 pub(crate) fn kernel_pipeline_blob(code: &makepad_script::shader_ir_compute::KernelCode, name: StrId, source: StrId) -> Result<(u32, Vec<u8>), String> {
     use makepad_script::shader_ir_compute::KernelCode;
     match code {
         KernelCode::Hlsl(k) => Ok((makepad_hal::dialect::HLSL, hlsl_kernel_pipeline_blob(k, name, source)?)),
+        KernelCode::Metal(k) => Ok((makepad_hal::dialect::MSL, metal_kernel_pipeline_blob(k, name, source)?)),
         KernelCode::Spirv(_) => Err("the HAL's Vulkan backend runs no compute kernels yet (SPIR-V kernels bind buffers by device address)".into()),
     }
+}
+
+/// A compute kernel's `PipelineCreate` blob for Metal (`dialect::MSL`): the MSL source (its
+/// samplers are `constexpr` in it) and the binding table its dispatches are bound by
+/// (`kernel_binding_table`), whose workgroup size Metal dispatches with.
+pub fn metal_kernel_pipeline_blob(kernel: &MetalKernel, name: StrId, source: StrId) -> Result<Vec<u8>, String> {
+    let table = kernel_binding_table(&kernel.bindings, makepad_script::shader_ir_metal::METAL_KERNEL_PARAMS_BUFFER);
+    let desc = PipelineDesc { kind: pipeline_kind::COMPUTE, name, source, ..Default::default() };
+    Ok(CmdWriter::pipeline_blob(desc, kernel.source.as_bytes(), &table, &[]))
 }
 
 /// A storage buffer's HAL buffer: what pool slot generation and contents it holds.

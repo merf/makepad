@@ -5,9 +5,10 @@
 //! per buffer the kernel uses, then its scalar/vector params. The host fills
 //! the block by name from `ComputeLayout` and dispatches.
 //!
-//! HLSL (D3D11; Metal's model too): buffers, textures and images are bound to
-//! slots and the params ride in a constant buffer (`KernelBindings`, registers
-//! as `shader_ir_hlsl::hlsl_compute` documents).
+//! HLSL (D3D11) and MSL (Metal): buffers, textures and images are bound to
+//! slots and the params ride in a constant block (`KernelBindings`, registers
+//! as `shader_ir_hlsl::hlsl_compute` and `shader_ir_metal::metal_compute`
+//! document).
 
 use crate::shader_ir::*;
 use crate::shader_output::{ShaderSampler, TextureType};
@@ -59,7 +60,7 @@ impl ComputeLayout {
 /// the kernel first uses them) then its params, at their natural alignment.
 pub fn compute_layout(m: &IrModule) -> Result<ComputeLayout, String> {
     if let Some(g) = m.globals.iter().find(|g| g.kind == IrGlobalKind::Io(IrIo::StorageImage)) {
-        return Err(format!("storage image {}: SPIR-V kernels have no storage images yet (HLSL kernels do)", g.name));
+        return Err(format!("storage image {}: SPIR-V kernels have no storage images yet (HLSL and MSL kernels do)", g.name));
     }
     let mut slots = Vec::new();
     let mut offset = 0u32;
@@ -151,6 +152,14 @@ impl KernelBindings {
 /// A kernel as HLSL for D3D11 (`cs_5_0`, entry `kernel_main`) and its bindings.
 #[derive(Clone, Debug)]
 pub struct HlslKernel {
+    pub source: String,
+    pub bindings: KernelBindings,
+}
+
+/// A kernel as MSL for Metal (entry `kernel_main`) and its bindings: the same lists as HLSL's,
+/// with each buffer's `register` its Metal buffer index (`shader_ir_metal::metal_compute`).
+#[derive(Clone, Debug)]
+pub struct MetalKernel {
     pub source: String,
     pub bindings: KernelBindings,
 }

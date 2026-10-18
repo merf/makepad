@@ -348,10 +348,160 @@ fn what_hlsl_and_the_other_dialects_cannot_run_is_refused() {
     );
     let r = compile_compute_kernel(&mut vm, obj);
     assert!(r.as_ref().is_err_and(|e| e.contains("SPIR-V kernels have no storage images")), "{r:?}");
-    // GLSL, WGSL and Metal say why they compile none
-    for (backend, why) in [(shader_backend::ShaderBackend::Glsl, "GL ES 3.0"), (shader_backend::ShaderBackend::Wgsl, "WGSL"), (shader_backend::ShaderBackend::Metal, "Metal")] {
+    // GLSL and WGSL say why they compile none
+    for (backend, why) in [(shader_backend::ShaderBackend::Glsl, "GL ES 3.0"), (shader_backend::ShaderBackend::Wgsl, "WGSL")] {
         let r = compile_compute_kernel_for(&mut vm, obj, backend, false);
         assert!(r.as_ref().is_err_and(|e| e.contains(why)), "{backend:?}: {r:?}");
     }
     assert!(matches!(compile_compute_kernel_for(&mut vm, obj, shader_backend::ShaderBackend::Hlsl, false), Ok(KernelCode::Hlsl(_))));
+    assert!(matches!(compile_compute_kernel_for(&mut vm, obj, shader_backend::ShaderBackend::Metal, false), Ok(KernelCode::Metal(_))));
+}
+
+// ---- MSL (Metal): the same slots, buffers at their own indices, the params at buffer(30)
+
+fn metal_kernel(body: &str) -> Result<MetalKernel, String> {
+    metal_kernel_after("", body)
+}
+
+fn metal_kernel_after(prelude: &str, body: &str) -> Result<MetalKernel, String> {
+    let (mut vm, obj) = eval_kernel_after(prelude, body);
+    let r = compile_compute_kernel_metal(&mut vm, obj);
+    let errors = vm.take_errors();
+    if !errors.is_empty() {
+        return Err(format!("{errors:?}"));
+    }
+    r
+}
+
+/// The source compiles with the offline Metal compiler, when its toolchain is installed (the
+/// Metal backend's own compile of every kernel here is in platform/tests/compute_metal.rs).
+fn validate_msl(k: &MetalKernel) {
+    let installed = std::process::Command::new("xcrun").args(["-sdk", "macosx", "metal", "--version"]).output().is_ok_and(|o| o.status.success());
+    if !installed {
+        return;
+    }
+    let path = std::env::temp_dir().join(format!("makepad-kernel-{}-{}.metal", std::process::id(), k.source.len()));
+    std::fs::write(&path, &k.source).unwrap();
+    let out = std::process::Command::new("xcrun").args(["-sdk", "macosx", "metal", "-c", "-o"]).arg(path.with_extension("air")).arg(&path).output().unwrap();
+    let numbered: String = k.source.lines().enumerate().map(|(i, l)| format!("{}:{l}\n", i + 1)).collect();
+    assert!(out.status.success(), "metal: {}\n{numbered}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn msl_scale_kernel_binds_buffers_by_index_and_params_at_buffer_30() {
+    let k = metal_kernel(
+        "workgroup_size: 64\n\
+         src: shader.buffer(f32)\n\
+         dst: shader.buffer_rw(f32)\n\
+         n: shader.uniform(u32)\n\
+         scale: shader.uniform(f32)\n\
+         offset: shader.uniform(vec2f)\n\
+         tint: shader.uniform(vec4f)\n\
+         main: fn() {\n\
+             let i = global_id().x\n\
+             if i < self.n { self.dst[i] = self.src[i] * self.scale + self.offset.x + self.tint.w }\n\
+         }",
+    )
+    .unwrap();
+    let b = &k.bindings;
+    assert_eq!(b.workgroup, [64, 1, 1]);
+    // one index space for every buffer, in the order the kernel first uses them
+    let buffers: Vec<String> = b.buffers.iter().map(|x| format!("{}:{}{}/{}", x.name, if x.writable { "rw" } else { "r" }, x.register, x.stride)).collect();
+    assert_eq!(buffers, ["dst:rw0/4", "src:r1/4"]);
+    // the params where HLSL packs them
+    let params: Vec<String> = b.params.iter().map(|s| format!("{}@{}", s.name, s.offset)).collect();
+    assert_eq!(params, ["n@0", "scale@4", "offset@8", "tint@16"]);
+    assert_eq!(b.params_size, 32);
+    assert!(k.source.contains("device float* kernel_dst [[buffer(0)]]"), "{}", k.source);
+    assert!(k.source.contains("const device float* kernel_src [[buffer(1)]]"));
+    assert!(k.source.contains("constant MpUniforms *u [[buffer(30)]]"));
+    validate_msl(&k);
+}
+
+#[test]
+fn msl_kernel_writes_a_storage_image_and_reads_a_texture() {
+    let k = metal_kernel(
+        "workgroup_size: 8\n\
+         workgroup_size_y: 8\n\
+         src: shader.texture_2d(float)\n\
+         out: shader.storage_2d(vec4f)\n\
+         counts: shader.buffer_rw(u32)\n\
+         size: shader.uniform(vec2u)\n\
+         main: fn() {\n\
+             let p = global_id().xy\n\
+             if p.x < self.size.x && p.y < self.size.y {\n\
+                 let c = self.src.sample_lod(vec2(float(p.x), float(p.y)) / vec2(float(self.size.x), float(self.size.y)), 0.0)\n\
+                 self.out[p] = vec4(c.x, float(p.x) / 255.0, float(group_count().x), 1.0)\n\
+                 let old = atomic_add(self.counts[0], 1)\n\
+                 atomic_add(self.counts[1], old)\n\
+             }\n\
+         }",
+    )
+    .unwrap();
+    let b = &k.bindings;
+    assert_eq!(b.workgroup, [8, 8, 1]);
+    assert_eq!(b.textures.len(), 1);
+    assert_eq!((b.images.len(), b.images[0].lanes), (1, 4));
+    assert_eq!((b.buffers[0].writable, b.buffers[0].register, b.buffers[0].stride), (true, 0, 4));
+    // the image after the sampled texture, written with write()
+    assert!(k.source.contains("texture2d<float, access::write> kernel_out [[texture(1)]]"), "{}", k.source);
+    assert!(k.source.contains("_mp.kernel_out.write("), "{}", k.source);
+    assert!(k.source.contains("[[threadgroups_per_grid]]"));
+    assert!(k.source.contains("atomic_fetch_add_explicit((device atomic_uint*)&(_mp.kernel_counts[0u])"), "{}", k.source);
+    validate_msl(&k);
+}
+
+#[test]
+fn msl_workgroup_memory_barriers_and_subgroups() {
+    let k = metal_kernel(
+        "workgroup_size: 64\n\
+         x: shader.buffer(f32)\n\
+         y: shader.buffer_rw(f32)\n\
+         partial: shader.workgroup(f32, 64)\n\
+         hits: shader.workgroup(u32, 1)\n\
+         main: fn() {\n\
+             let t = local_id().x\n\
+             self.partial[t] = self.x[global_id().x]\n\
+             atomic_add(self.hits[0], 1)\n\
+             barrier()\n\
+             if t == 0 {\n\
+                 var s = 0.0\n\
+                 for k in 0..64 { s += self.partial[k] }\n\
+                 self.y[group_id().x] = s + float(extract_bits(local_index(), 0, 4)) + unpack_half2(pack_half2(vec2(s, s))).x + subgroup_add(1.0) + float(subgroup_size() + subgroup_lane() + subgroup_id() + self.hits[0])\n\
+             }\n\
+         }",
+    )
+    .unwrap();
+    assert!(k.source.contains("threadgroup float kernel_partial[64];"), "{}", k.source);
+    assert!(k.source.contains("threadgroup_barrier(mem_flags::mem_threadgroup);"));
+    assert!(k.source.contains("(threadgroup atomic_uint*)"), "{}", k.source);
+    assert!(k.source.contains("simd_sum("));
+    validate_msl(&k);
+}
+
+#[test]
+fn msl_buffers_of_structs_keep_the_shared_layout() {
+    let k = metal_kernel_after(
+        "let Copy = struct{ pos: vec4f, scale: f32, id: u32, pad: vec2f }",
+        "copies: shader.buffer_rw(Copy)\n\
+         main: fn() { let i = global_id().x\n self.copies[i].scale = self.copies[i].scale * 2.0 }",
+    )
+    .unwrap();
+    assert_eq!(k.bindings.buffers[0].stride, 32);
+    validate_msl(&k);
+    // a vec3 element is 16 bytes in MSL as in the shared layout: taken (HLSL refuses it)
+    let k = metal_kernel(
+        "points: shader.buffer_rw(vec3f)\n\
+         main: fn() { self.points[global_id().x] = vec3(1.0, 2.0, 3.0) }",
+    )
+    .unwrap();
+    assert_eq!(k.bindings.buffers[0].stride, 16);
+    validate_msl(&k);
+    // a field in a vec3's padding sits at 12 in the shared layout and 16 in MSL: refused
+    let r = metal_kernel_after(
+        "let Copy = struct{ pos: vec3f, id: u32, scale: vec2f }",
+        "copies: shader.buffer_rw(Copy)\n\
+         main: fn() { self.copies[global_id().x].id = 1 }",
+    );
+    assert!(r.as_ref().is_err_and(|e| e.contains("lays out differently")), "{r:?}");
 }

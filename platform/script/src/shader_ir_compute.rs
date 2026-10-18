@@ -1,4 +1,5 @@
-//! Splash compute kernels, compiled to SPIR-V (Vulkan) or HLSL (D3D11).
+//! Splash compute kernels, compiled to SPIR-V (Vulkan), HLSL (D3D11) or MSL
+//! (Metal).
 //!
 //! A kernel is a Splash object with a `main: fn() { ... }` body:
 //!
@@ -20,11 +21,11 @@
 //! body with another constant. `workgroup_size_y` / `workgroup_size_z`
 //! default to 1. In SPIR-V buffers are reached by device address, so the
 //! host binds a kernel only through its push constants (`ComputeLayout`); in
-//! HLSL they are bound to slots and the params ride in a constant buffer
-//! (`KernelBindings`).
+//! HLSL and MSL they are bound to slots and the params ride in a constant
+//! block (`KernelBindings`).
 //!
-//! A kernel writes a 2D image through `shader.storage_2d(vec4f)` (HLSL
-//! only for now), texel by texel: `self.out[global_id().xy] = color`.
+//! A kernel writes a 2D image through `shader.storage_2d(vec4f)` (HLSL and
+//! MSL, not SPIR-V yet), texel by texel: `self.out[global_id().xy] = color`.
 
 pub use makepad_shader::shader_ir_compute::*;
 use makepad_shader::shader_ir::CooperativeMatrix;
@@ -125,34 +126,44 @@ pub fn compile_compute_kernel_hlsl(vm: &mut ScriptVm, kernel: ScriptObject) -> R
     makepad_shader::shader_ir_hlsl::hlsl_compute(&output.compiled, entry)
 }
 
+/// Compiles `kernel` to MSL for Metal (entry `kernel_main`), with the slots, the parameter
+/// block's layout and the workgroup size its host dispatches it by.
+pub fn compile_compute_kernel_metal(vm: &mut ScriptVm, kernel: ScriptObject) -> Result<MetalKernel, String> {
+    let (output, entry) = lower_compute_kernel(vm, kernel, false)?;
+    makepad_shader::shader_ir_metal::metal_compute(&output.compiled, entry)
+}
+
 /// A kernel in the dialect a backend takes.
 #[derive(Clone, Debug)]
 pub enum KernelCode {
     Spirv(CompiledKernel),
     Hlsl(HlslKernel),
+    Metal(MetalKernel),
 }
 
 impl KernelCode {
     /// Where the kernel's params, textures, images and buffers bind, by name, for the slot-bound
-    /// dialects (HLSL, and MSL once it is printed); SPIR-V kernels bind by push constants
+    /// dialects (HLSL and MSL); SPIR-V kernels bind by push constants
     /// (`CompiledKernel::layout`) and give none.
     pub fn bindings(&self) -> Option<&KernelBindings> {
         match self {
             KernelCode::Hlsl(k) => Some(&k.bindings),
+            KernelCode::Metal(k) => Some(&k.bindings),
             KernelCode::Spirv(_) => None,
         }
     }
 }
 
 /// Compiles `kernel` for the shader backend a HAL asked for: SPIR-V for Vulkan
-/// (`ShaderBackend::Glsl` with `vulkan`), HLSL for D3D11. The others are refused with the reason.
+/// (`ShaderBackend::Glsl` with `vulkan`), HLSL for D3D11, MSL for Metal. The others are refused
+/// with the reason.
 pub fn compile_compute_kernel_for(vm: &mut ScriptVm, kernel: ScriptObject, backend: ShaderBackend, vulkan: bool) -> Result<KernelCode, String> {
     match backend {
         ShaderBackend::Glsl if vulkan => compile_compute_kernel(vm, kernel).map(KernelCode::Spirv),
         ShaderBackend::Hlsl => compile_compute_kernel_hlsl(vm, kernel).map(KernelCode::Hlsl),
         ShaderBackend::Glsl => Err("compute kernels: GL ES 3.0 has no compute stage".to_string()),
         ShaderBackend::Wgsl => Err("compute kernels: WGSL kernels are not built yet".to_string()),
-        ShaderBackend::Metal => Err("compute kernels: Metal kernels are not built yet".to_string()),
+        ShaderBackend::Metal => compile_compute_kernel_metal(vm, kernel).map(KernelCode::Metal),
         ShaderBackend::Rust => Err("compute kernels: the Rust shader backend runs no kernels".to_string()),
     }
 }

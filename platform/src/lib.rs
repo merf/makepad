@@ -67,7 +67,7 @@ mod draw_vars;
 mod frame_build;
 mod frame_build_compute;
 mod compute;
-pub use frame_build::hlsl_kernel_pipeline_blob;
+pub use frame_build::{hlsl_kernel_pipeline_blob, metal_kernel_pipeline_blob};
 pub mod shader_pack;
 pub mod collect;
 pub mod splash_blank;

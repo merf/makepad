@@ -47,14 +47,57 @@ pub struct PipeState {
 unsafe impl Send for PipeState {}
 unsafe impl Sync for PipeState {}
 
+/// What a pipeline compiles to: the states of a draw shader, or a compute kernel's.
+pub enum PipeKind {
+    Draw(Arc<PipeState>),
+    Kernel(Arc<KernelState>),
+}
+
 /// The backend's record of a pipeline.
 pub struct Pipe {
     pub gen: u32,
-    pub state: Arc<PipeState>,
+    pub kind: PipeKind,
     pub desc: PipelineDesc,
     pub bindings: Arc<[u32]>,
     /// the session was told the first outcome (variants announce readiness again)
     pub announced: bool,
+}
+
+impl Pipe {
+    pub fn draw(&self) -> Option<&Arc<PipeState>> {
+        match &self.kind {
+            PipeKind::Draw(state) => Some(state),
+            PipeKind::Kernel(_) => None,
+        }
+    }
+
+    pub fn kernel(&self) -> Option<&Arc<KernelState>> {
+        match &self.kind {
+            PipeKind::Kernel(state) => Some(state),
+            PipeKind::Draw(_) => None,
+        }
+    }
+}
+
+/// A compute kernel: its `MTLComputePipelineState` once compiled, and the workgroup size every
+/// dispatch of it runs with (MSL has no `numthreads`: it is given at each dispatch).
+pub struct KernelState {
+    pub state: OnceLock<Result<RcObjcId, String>>,
+    pub workgroup: [u32; 3],
+}
+
+// SAFETY: Metal objects are usable from any thread; the cell is write-once
+unsafe impl Send for KernelState {}
+unsafe impl Sync for KernelState {}
+
+impl KernelState {
+    /// The pipeline state, once it compiled.
+    pub fn ready(&self) -> Option<ObjcId> {
+        match self.state.get() {
+            Some(Ok(p)) => Some(p.as_id()),
+            _ => None,
+        }
+    }
 }
 
 /// Attachments the premultiplied-over blend applies to: four-channel formats every Metal GPU
@@ -283,6 +326,100 @@ pub fn compile_msl(source: &str) -> Result<(), String> {
                 _ => Err("Metal library is missing vertex_main or fragment_main".into()),
             }
         }
+    };
+    unsafe {
+        let _: () = msg_send![pool, release];
+    }
+    result
+}
+
+/// Starts the compile of a compute kernel (`kernel_main` of `source`); `PipelineReady` /
+/// `PipelineFailed` arrive through the mailbox. A workgroup larger than the device runs in one
+/// threadgroup fails the pipeline.
+pub(super) fn create_kernel(dev: &Device, sid: u32, id: Id, incarnation: Arc<crate::font::FrameProgress>, source: &str, workgroup: [u32; 3]) -> Arc<KernelState> {
+    let kernel = Arc::new(KernelState { state: OnceLock::new(), workgroup });
+    let state = kernel.clone();
+    let mailbox = dev.mailbox.clone();
+    let source = source.to_owned();
+    let device = RcObjcId::from_unowned(NonNull::new(dev.device).expect("device"));
+    let finish = move |result: Result<RcObjcId, String>| {
+        let done = match &result {
+            Ok(_) => Done::PipelineReady { sid, id, incarnation: incarnation.clone() },
+            Err(log) => Done::PipelineFailed { sid, id, incarnation: incarnation.clone(), log: log.clone() },
+        };
+        let _ = state.state.set(result);
+        mailbox.push(done);
+    };
+    dev.compile(Box::new(move || {
+        let options = compile_options();
+        let callback_device = device.clone();
+        let callback_source = source.clone();
+        let completion = objc_block!(move |library: ObjcId, error: ObjcId| {
+            if library == nil {
+                finish(Err(format!("{}\n{callback_source}", describe_error(error, "Metal returned no library"))));
+                return;
+            }
+            let pool: ObjcId = unsafe { msg_send![class!(NSAutoreleasePool), new] };
+            match NonNull::new(unsafe { msg_send![library, newFunctionWithName: str_to_nsstring("kernel_main")] }).map(RcObjcId::from_owned) {
+                None => finish(Err("Metal library is missing kernel_main".into())),
+                Some(function) => {
+                    let finish = finish.clone();
+                    let completion = objc_block!(move |pipeline: ObjcId, error: ObjcId| {
+                        let result = match NonNull::new(pipeline) {
+                            Some(p) => {
+                                let max: u64 = unsafe { msg_send![p.as_ptr(), maxTotalThreadsPerThreadgroup] };
+                                let threads = workgroup.iter().map(|w| *w as u64).product::<u64>();
+                                if threads > max {
+                                    Err(format!("a workgroup of {threads} invocations ({workgroup:?}) exceeds this kernel's {max} on this device"))
+                                } else {
+                                    Ok(RcObjcId::from_unowned(p))
+                                }
+                            }
+                            None => Err(describe_error(error, "Metal returned no compute pipeline")),
+                        };
+                        finish(result);
+                    });
+                    unsafe {
+                        let _: () = msg_send![callback_device.as_id(), newComputePipelineStateWithFunction: function.as_id() completionHandler: &completion];
+                    }
+                }
+            }
+            unsafe {
+                let _: () = msg_send![pool, release];
+            }
+        });
+        unsafe {
+            let _: () = msg_send![device.as_id(), newLibraryWithSource: str_to_nsstring(&source) options: options.as_id() completionHandler: &completion];
+        }
+    }));
+    kernel
+}
+
+/// Compiles a compute kernel's MSL as the backend does (`kernel_main`, the same options) and makes
+/// its pipeline state, synchronously and with no window: what a shader test checks a generated
+/// kernel with. Err when the compile fails, the entry is missing, or there is no Metal device.
+pub fn compile_msl_kernel(source: &str) -> Result<(), String> {
+    let device = unsafe { MTLCreateSystemDefaultDevice() };
+    let Some(device) = NonNull::new(device).map(RcObjcId::from_owned) else {
+        return Err("no Metal device".into());
+    };
+    let options = compile_options();
+    let pool: ObjcId = unsafe { msg_send![class!(NSAutoreleasePool), new] };
+    let mut error: ObjcId = nil;
+    let library: ObjcId = unsafe { msg_send![device.as_id(), newLibraryWithSource: str_to_nsstring(source) options: options.as_id() error: &mut error] };
+    let result = match NonNull::new(library).map(RcObjcId::from_owned) {
+        None => Err(describe_error(error, "Metal returned no library")),
+        Some(library) => match NonNull::new(unsafe { msg_send![library.as_id(), newFunctionWithName: str_to_nsstring("kernel_main")] }).map(RcObjcId::from_owned) {
+            None => Err("Metal library is missing kernel_main".into()),
+            Some(function) => {
+                let mut error: ObjcId = nil;
+                let state: ObjcId = unsafe { msg_send![device.as_id(), newComputePipelineStateWithFunction: function.as_id() error: &mut error] };
+                match NonNull::new(state).map(RcObjcId::from_owned) {
+                    Some(_) => Ok(()),
+                    None => Err(describe_error(error, "Metal returned no compute pipeline")),
+                }
+            }
+        },
     };
     unsafe {
         let _: () = msg_send![pool, release];
