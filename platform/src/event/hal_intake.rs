@@ -848,9 +848,17 @@ impl Cx {
                 }
             }
             HalEvent::PipelineFailed { pipeline, log } => {
-                if let Some((shader, waited)) = self.hal.frames.pipeline_failed(pipeline) {
-                    let name = self.draw_shaders[shader].debug_id;
-                    let error = format!("hal: pipeline of shader {:?} failed: {}", name, String::from_utf8_lossy(log));
+                if let Some((owner, waited)) = self.hal.frames.pipeline_failed(pipeline) {
+                    let error = match owner {
+                        crate::frame_build::PipeOwner::Draw(shader) => {
+                            format!("hal: pipeline of shader {:?} failed: {}", self.draw_shaders[shader].debug_id, String::from_utf8_lossy(log))
+                        }
+                        crate::frame_build::PipeOwner::Kernel(kernel) => {
+                            let error = format!("hal: pipeline of compute kernel {:?} failed: {}", self.compute_kernels.kernels[kernel].debug_id, String::from_utf8_lossy(log));
+                            self.compute_kernels.kernels[kernel].error = Some(error.clone());
+                            error
+                        }
+                    };
                     crate::shader_error::note(error.clone());
                     crate::error!("{}", error);
                     // a pass that kept its picture for this pipeline paints again

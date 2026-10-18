@@ -3,6 +3,7 @@ use crate::draw_list::DrawCallUniforms;
 use crate::draw_list::DrawListUniforms;
 use crate::draw_pass::DrawPassUniforms;
 use crate::draw_pass::ScriptDrawPass;
+use crate::compute::ComputeKernel;
 use crate::window::MacosWindowChrome;
 use crate::window::MacosWindowConfig;
 use crate::window::MacosWindowKind;
@@ -31,6 +32,10 @@ pub fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
     vm.heap_mut()
         .set_type_default(pass_default.as_object().unwrap());
     set_script_value!(vm, draw.ScriptDrawPass = pass_default);
+
+    // A compute kernel is declared as a draw shader is: its fields are the kernel's.
+    let kernel_default = ComputeKernel::script_shader(vm);
+    set_script_value!(vm, draw.ComputeKernel = kernel_default);
 
     let window_default = ScriptWindowHandle::script_api(vm);
     vm.heap_mut()

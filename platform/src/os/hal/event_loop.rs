@@ -497,9 +497,10 @@ impl Cx {
             if self.need_redrawing() {
                 self.call_draw_event(time_now);
             }
-            if !self.draw_shaders.compile_set.is_empty() {
+            if !self.draw_shaders.compile_set.is_empty() || !self.compute_kernels.compile_set.is_empty() {
                 let mut fb = std::mem::take(&mut self.hal.frames);
                 self.fb_compile_shaders(&mut fb);
+                self.fb_compile_kernels(&mut fb);
                 self.hal.frames = fb;
             }
             // Embedders must remain responsive while resources arrive. Keep the last

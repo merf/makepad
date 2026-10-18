@@ -117,6 +117,9 @@ pub struct Cx {
 
     pub draw_shaders: CxDrawShaders,
 
+    /// Compute kernels, compiled for the running backend (`compute.rs`).
+    pub compute_kernels: crate::compute::CxComputeKernels,
+
     pub new_draw_event: DrawEvent,
     /// Run on every Event::Signal before the app sees it: subsystems above the platform
     /// (the text system's glyph workers) react to their workers' signals.
@@ -999,6 +1002,8 @@ impl Cx {
             uniform_buffers: Default::default(),
 
             draw_shaders: Default::default(),
+
+            compute_kernels: Default::default(),
 
             new_draw_event: Default::default(),
             signal_hooks: Vec::new(),

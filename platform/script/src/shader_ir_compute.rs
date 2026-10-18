@@ -132,6 +132,18 @@ pub enum KernelCode {
     Hlsl(HlslKernel),
 }
 
+impl KernelCode {
+    /// Where the kernel's params, textures, images and buffers bind, by name, for the slot-bound
+    /// dialects (HLSL, and MSL once it is printed); SPIR-V kernels bind by push constants
+    /// (`CompiledKernel::layout`) and give none.
+    pub fn bindings(&self) -> Option<&KernelBindings> {
+        match self {
+            KernelCode::Hlsl(k) => Some(&k.bindings),
+            KernelCode::Spirv(_) => None,
+        }
+    }
+}
+
 /// Compiles `kernel` for the shader backend a HAL asked for: SPIR-V for Vulkan
 /// (`ShaderBackend::Glsl` with `vulkan`), HLSL for D3D11. The others are refused with the reason.
 pub fn compile_compute_kernel_for(vm: &mut ScriptVm, kernel: ScriptObject, backend: ShaderBackend, vulkan: bool) -> Result<KernelCode, String> {

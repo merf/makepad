@@ -64,6 +64,17 @@ pub fn hlsl_kernel_pipeline_blob(kernel: &HlslKernel, name: StrId, source: StrId
     Ok(CmdWriter::pipeline_blob(desc, &code, &table, &[]))
 }
 
+/// A compute kernel's `PipelineCreate` dialect and blob, for the backend it was compiled for
+/// (`compute.rs`): HLSL on D3D11. Metal takes its arm once kernels print as MSL
+/// (`KernelCode::Metal`, `metal_kernel_pipeline_blob`); the HAL's Vulkan backend runs no kernels.
+pub(crate) fn kernel_pipeline_blob(code: &makepad_script::shader_ir_compute::KernelCode, name: StrId, source: StrId) -> Result<(u32, Vec<u8>), String> {
+    use makepad_script::shader_ir_compute::KernelCode;
+    match code {
+        KernelCode::Hlsl(k) => Ok((makepad_hal::dialect::HLSL, hlsl_kernel_pipeline_blob(k, name, source)?)),
+        KernelCode::Spirv(_) => Err("the HAL's Vulkan backend runs no compute kernels yet (SPIR-V kernels bind buffers by device address)".into()),
+    }
+}
+
 struct TexRec {
     id: Id,
     gen: u64,
@@ -112,13 +123,22 @@ pub(crate) enum PipelineWait {
 /// One HAL pipeline: the draw shaders with the same code, colour format and blend op share it.
 pub(crate) struct PipeRec {
     id: Id,
-    /// the first draw shader that created it: its mapping holds the code the others compare with
-    first_shader: usize,
+    /// what made it: the first draw shader (its mapping holds the code the others compare with),
+    /// or a compute kernel
+    owner: PipeOwner,
     ready: bool,
     /// a draw was built for it before the HAL said it was ready (the HAL skipped that draw)
     drawn_unready: bool,
     failed: bool,
     pick: Option<usize>,
+}
+
+/// What a pipeline was made for: a draw shader's draws, or a compute kernel's dispatches (both an
+/// index into theirs, `Cx::draw_shaders`, `Cx::compute_kernels`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PipeOwner {
+    Draw(usize),
+    Kernel(usize),
 }
 
 /// Counters of the last build, for the check run and the traces.
@@ -449,12 +469,12 @@ impl FrameBuilder {
         self.pipes.get(pipe).is_some_and(|p| p.ready)
     }
 
-    /// The failed pipeline's first shader, and whether a pass waited for it (it paints again,
+    /// What the failed pipeline was made for, and whether a pass waited for it (it paints again,
     /// without those draws).
-    pub(crate) fn pipeline_failed(&mut self, id: Id) -> Option<(usize, bool)> {
+    pub(crate) fn pipeline_failed(&mut self, id: Id) -> Option<(PipeOwner, bool)> {
         let p = self.pipes.get_mut(id.index as usize).filter(|p| p.id == id)?;
         p.failed = true;
-        Some((p.first_shader, std::mem::take(&mut p.drawn_unready)))
+        Some((p.owner, std::mem::take(&mut p.drawn_unready)))
     }
 }
 
@@ -890,7 +910,8 @@ impl Cx {
                 let mapping = &self.draw_shaders[index].mapping;
                 fb.pipe_by_hash.get(&key).and_then(|v| {
                     v.iter().copied().find(|p| {
-                        let o = &self.draw_shaders[fb.pipes[*p].first_shader].mapping;
+                        let PipeOwner::Draw(first) = fb.pipes[*p].owner else { return false };
+                        let o = &self.draw_shaders[first].mapping;
                         o.code == mapping.code && o.pick_code == mapping.pick_code && o.hal_code == mapping.hal_code
                             && o.hal_pick_code == mapping.hal_pick_code && o.color_format == mapping.color_format && o.blend_op == mapping.blend_op
                     })
@@ -954,7 +975,7 @@ impl Cx {
             let attr = Attr { label: name, site: source, ..Default::default() };
             fb.w.pipeline_create(id, dialect, attr, &blob);
             fb.stats.pipeline_creates += 1;
-            fb.pipes.push(PipeRec { id, first_shader: index, ready: false, drawn_unready: false, failed: false, pick: None });
+            fb.pipes.push(PipeRec { id, owner: PipeOwner::Draw(index), ready: false, drawn_unready: false, failed: false, pick: None });
             let pick_bytes = mapping.hal_pick_code.as_deref().or_else(|| mapping.pick_code.as_ref().map(|s| s.as_bytes()));
             if let Some(code) = pick_bytes {
                 let pick_index = fb.pipes.len();
@@ -964,7 +985,7 @@ impl Cx {
                 pick_desc.blend = pipeline_blend::RAW;
                 let pick_blob = CmdWriter::pipeline_blob(pick_desc, code, &bindings, &layout);
                 fb.w.pipeline_create(pick_id, dialect, attr, &pick_blob);
-                fb.pipes.push(PipeRec { id: pick_id, first_shader: index, ready: false, drawn_unready: false, failed: false, pick: None });
+                fb.pipes.push(PipeRec { id: pick_id, owner: PipeOwner::Draw(index), ready: false, drawn_unready: false, failed: false, pick: None });
                 fb.pipes[pipe].pick = Some(pick_index);
                 fb.stats.pipeline_creates += 1;
             }
@@ -972,6 +993,35 @@ impl Cx {
             self.draw_shaders[index].pipeline_id = Some(pipe);
         }
         self.draw_shaders.compile_set.clear();
+    }
+
+    /// Makes the pipeline of every compute kernel compiled since the last build (`compute.rs`),
+    /// beside the draw shaders' (one namespace of pipelines, so `pipelines_pending` waits for
+    /// both). A kernel that cannot be made keeps its reason and never runs.
+    pub(crate) fn fb_compile_kernels(&mut self, fb: &mut FrameBuilder) {
+        let queued: Vec<usize> = std::mem::take(&mut self.compute_kernels.compile_set).into_iter().collect();
+        for index in queued {
+            let Some(kernel) = self.compute_kernels.kernels.get_mut(index) else { continue };
+            let Some(code) = kernel.code.as_ref() else { continue };
+            let name = fb.intern_live(kernel.debug_id);
+            match kernel_pipeline_blob(code, name, 0) {
+                Ok((dialect, blob)) => {
+                    let pipe = fb.pipes.len();
+                    let id = Id::new(pipe as u32, 1);
+                    let attr = Attr { label: name, ..Default::default() };
+                    fb.w.pipeline_create(id, dialect, attr, &blob);
+                    fb.stats.pipeline_creates += 1;
+                    fb.pipes.push(PipeRec { id, owner: PipeOwner::Kernel(index), ready: false, drawn_unready: false, failed: false, pick: None });
+                    kernel.pipeline = Some(pipe);
+                }
+                Err(error) => {
+                    let error = format!("compute kernel '{}' will NOT run: {error}", kernel.debug_id);
+                    crate::shader_error::note(error.clone());
+                    crate::error!("{}", error);
+                    kernel.error = Some(error);
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------------ the walk
@@ -1711,8 +1761,8 @@ mod tests {
         let mut fb = FrameBuilder::default();
         let new_id = Id::new(0, 1);
         let bad_id = Id::new(1, 1);
-        fb.pipes.push(PipeRec { id: new_id, first_shader: 0, ready: false, drawn_unready: false, failed: false, pick: None });
-        fb.pipes.push(PipeRec { id: bad_id, first_shader: 1, ready: false, drawn_unready: false, failed: false, pick: None });
+        fb.pipes.push(PipeRec { id: new_id, owner: PipeOwner::Draw(0), ready: false, drawn_unready: false, failed: false, pick: None });
+        fb.pipes.push(PipeRec { id: bad_id, owner: PipeOwner::Draw(1), ready: false, drawn_unready: false, failed: false, pick: None });
         assert_eq!(fb.pipelines_pending(), 2);
         // compiling: the pass waits for it (keeps its picture) and its answer repaints
         assert!(fb.pipeline_waited_for(0));
@@ -1720,7 +1770,7 @@ mod tests {
         assert!(!fb.pipeline_waited_for(0), "ready: nothing to wait for");
         // a pipeline that fails: the pass that waited paints again, and nobody waits for it after
         assert!(fb.pipeline_waited_for(1));
-        assert_eq!(fb.pipeline_failed(bad_id), Some((1, true)));
+        assert_eq!(fb.pipeline_failed(bad_id), Some((PipeOwner::Draw(1), true)));
         assert!(!fb.pipeline_waited_for(1), "a failed pipeline never holds a picture");
         assert_eq!(fb.pipelines_pending(), 0);
     }
