@@ -335,6 +335,20 @@ fn show(w: &Win) {
         let cmd = if w.no_focus || w.popup() { SW_SHOWNOACTIVATE } else { SW_SHOW };
         let _ = ShowWindow(w.hwnd.get(), cmd);
     }
+    if w.no_focus && !w.popup() {
+        to_back(w);
+    }
+}
+
+/// A no-focus window (`--remote`, `NO_FOCUS`) goes behind the other windows once shown: Windows
+/// gives such a process no focus but would still lay its new window over whatever the user is
+/// working in, so an agent's launches kept popping up over the user's work. Grabs read the app's
+/// own frames, so they work behind other windows too.
+fn to_back(w: &Win) {
+    // HWND_BOTTOM is 1, not in the vendored bindings.
+    unsafe {
+        let _ = SetWindowPos(w.hwnd.get(), Some(HWND(1 as _)), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
 }
 
 fn style_for(kind: u32) -> (WINDOW_STYLE, WINDOW_EX_STYLE) {
@@ -545,6 +559,9 @@ fn command(s: &'static Shared, sid: u32, cmd: OsCmd) {
                 };
                 unsafe {
                     let _ = ShowWindow(w.hwnd.get(), cmd);
+                }
+                if w.no_focus && !w.popup() && !matches!(state, window_state::MINIMIZE | window_state::HIDE) {
+                    to_back(&w);
                 }
                 publish_geom(&w);
             }
