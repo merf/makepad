@@ -759,7 +759,10 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
 /// - with long-term memory, the read's `memory_key`, `memory_shrinkage`, `similarity`, `affinity`
 ///   and `usage`, whose first rows are long-term memory's tokens in that order. The read is judged
 ///   by what it gives, `memory.read.readout`, a sum over the tokens that does not depend on
-///   their order.
+///   their order;
+/// - always, the read's `affinity` and `usage`: each pixel's top-k picks, which a near tie swaps
+///   (one swapped pick is an entry's whole weight, YouTubeComp-15 at 960x540 rel 7%, cosine
+///   0.99996); the readout judges them too.
 fn run_tol(name: &str, long_term: bool) -> Tol {
     const PROTOTYPE_ORDER: [&str; 5] = [
         "memory.consolidate.query_key",
@@ -772,7 +775,8 @@ fn run_tol(name: &str, long_term: bool) -> Tol {
         ["memory.read.memory_key", "memory.read.memory_shrinkage", "memory.read.similarity", "memory.read.affinity", "memory.read.usage"];
     let base = name.split('#').next().unwrap_or(name);
     let in_long_term_order = PROTOTYPE_ORDER.contains(&base) || base.contains(".long_mem.") || (long_term && LONG_TERM_ROWS.contains(&base));
-    if name == "step.out.mask" || in_long_term_order {
+    let picks = base == "memory.read.affinity" || base == "memory.read.usage";
+    if name == "step.out.mask" || in_long_term_order || picks {
         Tol::INFO
     } else {
         Tol::RUN

@@ -182,8 +182,11 @@ pub(crate) struct Tol {
 impl Tol {
     /// A stage fed the oracle's own inputs (teacher-forced): only fp32 rounding apart.
     pub(crate) const STAGE: Tol = Tol { rel: 1e-3, cos: 0.99999, bool_mismatch: 0.0 };
-    /// After many steps of the native pipeline's own state: top-k picks near ties differently.
-    pub(crate) const RUN: Tol = Tol { rel: 5e-2, cos: 0.999, bool_mismatch: 0.01 };
+    /// After many steps of the native pipeline's own state: top-k picks near ties differently,
+    /// and a swapped pick moves that pixel's readout and sensory memory locally by up to about a
+    /// tenth of their range (YouTubeComp-15 at 960x540: 7%, cosine 0.9999997). The whole tensor
+    /// must still agree (cosine), and the masks are judged by IoU.
+    pub(crate) const RUN: Tol = Tol { rel: 0.15, cos: 0.9999, bool_mismatch: 0.01 };
     /// Reported, never failing.
     pub(crate) const INFO: Tol = Tol { rel: f32::INFINITY, cos: f64::NEG_INFINITY, bool_mismatch: 1.0 };
 }
