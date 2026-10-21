@@ -4,8 +4,9 @@
 //! A step (`step(image, mask, force_permanent, end)`), with `curr_ti` counting steps since the
 //! last clear and `last_mem_ti` the last memorised one:
 //! - resize the image (and mask) when its shorter side exceeds `max_internal_size` (bilinear,
-//!   align_corners false), then pad to a multiple of 16, centred (left = (W'-W)/2 rounded down,
-//!   the rest right; likewise top and bottom), the mask too;
+//!   align_corners false, bit for bit as PyTorch's CUDA kernel: `Bilinear`), then pad to a
+//!   multiple of 16, centred (left = (W'-W)/2 rounded down, the rest right; likewise top and
+//!   bottom), the mask too;
 //! - `curr_ti += 1`; memorise when `curr_ti - last_mem_ti >= mem_every` or a mask is given, and
 //!   not `end`; segment when there is no mask (with a mask for every object, never); update the
 //!   sensory memory when `curr_ti - last_mem_ti` is in the stagger set (1..=mem_every when
@@ -27,11 +28,10 @@
 
 use crate::memory::{MemoryManager, Permanence, VALUE_DIM};
 use crate::model::{dev, CutieNet, Feat, ImageFeatures, Keys, Tap, Weights};
-use crate::oracle::{Comparer, Oracle, Report, Row, ScheduleRow, Tol};
+use crate::oracle::{Comparer, Oracle, OracleTap, Report, Row, ScheduleRow, Tol};
 use crate::{CutieConfig, DiffusionError, Result};
 use makepad_ai_common::gpu::{
-    gpu_birefnet_resize_bilinear, gpu_cutie_aggregate, gpu_cutie_crop, gpu_cutie_pad, gpu_cutie_softmax_axis0, gpu_download, gpu_slice_rows,
-    gpu_upload, GpuTensor,
+    gpu_cutie_aggregate, gpu_cutie_crop, gpu_cutie_pad, gpu_cutie_softmax_axis0, gpu_download, gpu_slice_rows, gpu_upload, GpuTensor,
 };
 use std::collections::HashSet;
 
@@ -107,6 +107,8 @@ impl Frame {
         if rgb.len() != plane * 3 {
             return Err(DiffusionError::model(format!("cutie step: {} bytes for a {}x{} RGB frame", rgb.len(), self.width, self.height)));
         }
+        // HOST FALLBACK: wants a kernel (u8 HWC RGB uploaded as bytes -> planar f32, x * (1/255f)):
+        // the host converts every frame and uploads 4 bytes a channel.
         let scale = 1.0f32 / 255.0f32;
         let mut planes = vec![0.0f32; 3 * plane];
         for (i, px) in rgb.chunks_exact(3).enumerate() {
@@ -118,10 +120,10 @@ impl Frame {
     }
 
     /// Planar [planes, width*height] at the size given, to the padded size inside Cutie: resized
-    /// (bilinear, align_corners false) if need be, then padded with zeros.
+    /// (`Bilinear`) if need be, then padded with zeros.
     pub(crate) fn to_internal(&self, x: &GpuTensor) -> Result<GpuTensor> {
         if self.resized() {
-            let x = gpu_birefnet_resize_bilinear(x, self.width, self.height, self.w, self.h, false).map_err(|e| dev("step resize", e))?;
+            let x = Bilinear::new(self.width, self.height, self.w, self.h).resize(x)?;
             self.pad.pad(&x, self.w, self.h)
         } else {
             self.pad.pad(x, self.w, self.h)
@@ -132,10 +134,95 @@ impl Frame {
     pub(crate) fn to_given(&self, x: &GpuTensor) -> Result<GpuTensor> {
         let x = self.pad.unpad(x, self.w, self.h)?;
         if self.resized() {
-            gpu_birefnet_resize_bilinear(&x, self.w, self.h, self.width, self.height, false).map_err(|e| dev("step resize back", e))
+            Bilinear::new(self.w, self.h, self.width, self.height).resize(&x)
         } else {
             Ok(x)
         }
+    }
+}
+
+/// One axis of a bilinear resize: each output index's two source indices and their weights.
+struct BilinearAxis {
+    lower: Vec<usize>,
+    upper: Vec<usize>,
+    w_lower: Vec<f32>,
+    w_upper: Vec<f32>,
+}
+
+impl BilinearAxis {
+    /// As PyTorch's CUDA kernel computes them in f32 (`area_pixel_compute_source_index`, size
+    /// given, align_corners false): scale = in / out, source = fma(scale, dst + 0.5, -0.5) (nvcc
+    /// contracts the kernel's `scale * (dst + 0.5) - 0.5`) clamped at 0; the lower index the
+    /// source truncated, the upper the next one but at the edge; weights source - lower and 1
+    /// minus that.
+    fn new(size_in: usize, size_out: usize) -> Self {
+        let scale = size_in as f32 / size_out as f32;
+        let mut axis = Self { lower: Vec::new(), upper: Vec::new(), w_lower: Vec::new(), w_upper: Vec::new() };
+        for dst in 0..size_out {
+            let source = scale.mul_add(dst as f32 + 0.5, -0.5);
+            let source = if source < 0.0 { 0.0 } else { source };
+            let lower = source as usize;
+            let w_upper = source - lower as f32;
+            axis.lower.push(lower);
+            axis.upper.push(if lower + 1 < size_in { lower + 1 } else { lower });
+            axis.w_upper.push(w_upper);
+            axis.w_lower.push(1.0 - w_upper);
+        }
+        axis
+    }
+}
+
+/// `F.interpolate(mode='bilinear', align_corners=False)` to a given size, bit for bit as PyTorch's
+/// CUDA kernel (`upsample_bilinear2d_out_frame`) gives it: each output is fma(h0, fma(w0, a,
+/// w1 * b), h1 * fma(w0, c, w1 * d)), as nvcc contracts the kernel's sum, a and b the first
+/// source row's pair, c and d the second's. Bit-exact against PyTorch 2.11's CUDA output on
+/// random data, 1920x1080 to 1777x1000 and back, 1080x1920 to 1000x1777, 3840x2160 and
+/// 1440x1080 down (the oracle's frames are never resized). `gpu_birefnet_resize_bilinear`
+/// computes the source position in another order, up to 1.2e-4 off on 0..1 data.
+struct Bilinear {
+    in_w: usize,
+    in_h: usize,
+    out_w: usize,
+    out_h: usize,
+    x: BilinearAxis,
+    y: BilinearAxis,
+}
+
+impl Bilinear {
+    fn new(in_w: usize, in_h: usize, out_w: usize, out_h: usize) -> Self {
+        Self { in_w, in_h, out_w, out_h, x: BilinearAxis::new(in_w, out_w), y: BilinearAxis::new(in_h, out_h) }
+    }
+
+    /// Planar [planes, in_w*in_h] to [planes, out_w*out_h].
+    fn resize(&self, x: &GpuTensor) -> Result<GpuTensor> {
+        if x.cols() != self.in_w * self.in_h {
+            return Err(DiffusionError::model(format!("cutie resize: {} columns for {}x{}", x.cols(), self.in_w, self.in_h)));
+        }
+        // HOST FALLBACK: wants a kernel (bilinear resize, align_corners false, as PyTorch's CUDA
+        // kernel computes it: `BilinearAxis` and `Bilinear::resize_host`).
+        let src = gpu_download(x).map_err(|e| dev("step resize", e))?;
+        let out = self.resize_host(&src, x.rows());
+        gpu_upload(&out, x.rows(), self.out_w * self.out_h).map_err(|e| dev("step resize", e))
+    }
+
+    fn resize_host(&self, src: &[f32], planes: usize) -> Vec<f32> {
+        let (in_plane, out_plane) = (self.in_w * self.in_h, self.out_w * self.out_h);
+        let mut out = vec![0.0f32; planes * out_plane];
+        for (p, dst) in out.chunks_exact_mut(out_plane).enumerate() {
+            let src = &src[p * in_plane..(p + 1) * in_plane];
+            for (oy, dst) in dst.chunks_exact_mut(self.out_w).enumerate() {
+                let row0 = &src[self.y.lower[oy] * self.in_w..][..self.in_w];
+                let row1 = &src[self.y.upper[oy] * self.in_w..][..self.in_w];
+                let (h0, h1) = (self.y.w_lower[oy], self.y.w_upper[oy]);
+                for (ox, d) in dst.iter_mut().enumerate() {
+                    let (x0, x1, w0, w1) = (self.x.lower[ox], self.x.upper[ox], self.x.w_lower[ox], self.x.w_upper[ox]);
+                    let top = w0.mul_add(row0[x0], w1 * row0[x1]);
+                    let bottom = w0.mul_add(row1[x0], w1 * row1[x1]);
+                    *d = h0.mul_add(top, h1 * bottom);
+                }
+            }
+        }
+        out
     }
 }
 
@@ -200,6 +287,25 @@ impl StepSchedule {
     pub(crate) fn reset(&mut self) {
         self.curr_ti = -1;
         self.last_mem_ti = 0;
+    }
+
+    /// Whether the worker clears the sensory memory before a row of the oracle's run
+    /// (`raw/schedule.tsv`): a mask on a row that is not the commit starts the propagation.
+    pub(crate) fn restarts(row: &ScheduleRow) -> bool {
+        row.with_mask && !row.force_permanent
+    }
+
+    /// A row of the oracle's run as the processor schedules it: the counters reset when the
+    /// propagation starts, then the step's plan, memorised when it says so or forced.
+    pub(crate) fn replay(&mut self, row: &ScheduleRow) -> StepPlan {
+        if Self::restarts(row) {
+            self.reset();
+        }
+        let plan = self.next(row.with_mask, false);
+        if plan.memorise || row.force_permanent {
+            self.memorised();
+        }
+        plan
     }
 }
 
@@ -397,7 +503,9 @@ pub(crate) fn record(report: &mut Report, stage: &str, step: &str, name: &str, p
 }
 
 /// The names of the step's oracle taps under any of `prefixes` that nothing put (the oracle's
-/// `#n` names counted from the comparer's repeats).
+/// `#n` names counted from the comparer's repeats). A zero-size tap is what an absent native
+/// tensor is (PyTorch keeps emptied tensors, e.g. after `clear_non_permanent_memory`), so it is
+/// not listed.
 pub(crate) fn uncompared(cmp: &Comparer, prefixes: &[&str]) -> Vec<String> {
     let mut put = HashSet::new();
     for (name, &count) in &cmp.seen {
@@ -408,6 +516,7 @@ pub(crate) fn uncompared(cmp: &Comparer, prefixes: &[&str]) -> Vec<String> {
         .names(&cmp.step)
         .into_iter()
         .filter(|name| prefixes.iter().any(|p| name.starts_with(p)) && !put.contains(*name))
+        .filter(|name| cmp.oracle.tap(&cmp.step, name).map_or(true, |t| !t.values.is_empty()))
         .map(String::from)
         .collect()
 }
@@ -513,17 +622,15 @@ pub(crate) fn check_without_network(oracle: &Oracle, report: &mut Report) -> Res
     let mut memory = MemoryManager::new(&config);
     for row in &oracle.schedule()? {
         let step = row.tap.clone().unwrap_or_else(|| format!("s{}", row.step));
-        if row.with_mask && !row.force_permanent {
-            schedule.reset();
+        if StepSchedule::restarts(row) {
             memory.clear_sensory_memory();
         }
         let consolidations = memory.consolidations;
-        let plan = schedule.next(row.with_mask, false);
+        let plan = schedule.replay(row);
         if plan.memorise || row.force_permanent {
             let as_permanent = if row.force_permanent { Permanence::All } else { Permanence::First };
             memory.initialize_sensory_if_needed(&keys, n)?;
             memory.add_memory(&keys, &value, &obj_value, as_permanent, &mut Tap::none())?;
-            schedule.memorised();
         }
         record_schedule(report, "memory", &step, "schedule.without_network", row, &schedule, &memory, memory.consolidations != consolidations, None);
     }
@@ -569,7 +676,9 @@ pub(crate) fn check_without_network(oracle: &Oracle, report: &mut Report) -> Res
 /// The propagation's start is given the commit's output read back as a label map, as the worker
 /// does (it saves each step's masks and loads them again). `step.out.mask` (the argmax labels) is
 /// reported, not failed: one pixel's label flipping fails any tolerance on label numbers, so the
-/// label maps are judged by IoU instead.
+/// label maps are judged by IoU instead. Taps whose columns or rows follow long-term memory's
+/// order are reported, not failed, too (`run_tol`); long-term memory is compared without its
+/// order instead (`compare_long_term`).
 pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights) -> Result<()> {
     const MIN_IOU: f64 = 0.998;
     let net = CutieNet::load(weights)?;
@@ -585,12 +694,11 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
     let masks = WorkerMasks::new(oracle)?;
     let mut frame_labels: Vec<Option<Vec<u8>>> = vec![None; oracle.frames];
     frame_labels[0] = Some(masks.seed.clone());
-    let tol = |name: &str| if name == "step.out.mask" { Tol::INFO } else { Tol::RUN };
 
     for row in &schedule {
         let step = row.tap.clone().unwrap_or_else(|| format!("s{}", row.step));
         // The propagation starts from its memory frame again, with the sensory memory cleared.
-        if row.with_mask && !row.force_permanent {
+        if StepSchedule::restarts(row) {
             processor.clear_sensory_memory();
         }
         let frame = oracle.frame_rgb(row.frame)?;
@@ -603,6 +711,9 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
         let consolidations = processor.memory.consolidations;
         let prob = match &row.tap {
             Some(tapped) => {
+                compare_long_term(oracle, report, tapped, "state.before", &processor.memory)?;
+                let long_term = oracle.has(tapped, "state.before.long_mem.b0.key");
+                let tol = |name: &str| run_tol(name, long_term);
                 let mut cmp = Comparer::new(oracle, report, "run", tapped, &tol);
                 let prob = cmp.with(|tap| processor.step_tapped(&frame, w, h, mask.as_deref(), row.force_permanent, false, tap))?;
                 // Taps no part puts (e.g. a convolution whose BatchNorm is folded) are noted.
@@ -610,6 +721,7 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
                 if !missing.is_empty() {
                     cmp.report.note(format!("run/{tapped}: {} oracle taps never put: {}", missing.len(), missing.join(", ")));
                 }
+                compare_long_term(oracle, report, tapped, "state.after", &processor.memory)?;
                 prob
             }
             None => processor.step(&frame, w, h, mask.as_deref(), row.force_permanent, false)?,
@@ -632,6 +744,116 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
         let area: Vec<usize> = (1..=n as u8).map(|o| labels.iter().filter(|&&l| l == o).count()).collect();
         record_schedule(report, "run", &step, "schedule", row, &processor.schedule, &processor.memory, consolidated, Some(&area));
         frame_labels[row.frame] = Some(labels);
+    }
+    Ok(())
+}
+
+/// Stage `run`'s tolerance for a tap (`long_term`: the step reads through long-term memory):
+/// `Tol::RUN`, but reported only (`Tol::INFO`) for
+/// - `step.out.mask` (the label maps are judged by IoU);
+/// - the consolidation's prototype side (`memory.consolidate.query_key`, `.query_selection`,
+///   `.similarity`, `.affinity`, `.readout`), one column a prototype in order of use: the
+///   oracle's neighbours in that order are as close as 3.7e-5 apart, so a native run's own usage
+///   reorders them;
+/// - long-term memory in that order (`*.long_mem.*`), compared by `compare_long_term` instead;
+/// - with long-term memory, the read's `memory_key`, `memory_shrinkage`, `similarity`, `affinity`
+///   and `usage`, whose first rows are long-term memory's tokens in that order. The read is judged
+///   by what it gives, `memory.read.readout`, a sum over the tokens that does not depend on
+///   their order.
+fn run_tol(name: &str, long_term: bool) -> Tol {
+    const PROTOTYPE_ORDER: [&str; 5] = [
+        "memory.consolidate.query_key",
+        "memory.consolidate.query_selection",
+        "memory.consolidate.similarity",
+        "memory.consolidate.affinity",
+        "memory.consolidate.readout",
+    ];
+    const LONG_TERM_ROWS: [&str; 5] =
+        ["memory.read.memory_key", "memory.read.memory_shrinkage", "memory.read.similarity", "memory.read.affinity", "memory.read.usage"];
+    let base = name.split('#').next().unwrap_or(name);
+    let in_long_term_order = PROTOTYPE_ORDER.contains(&base) || base.contains(".long_mem.") || (long_term && LONG_TERM_ROWS.contains(&base));
+    if name == "step.out.mask" || in_long_term_order {
+        Tol::INFO
+    } else {
+        Tol::RUN
+    }
+}
+
+/// Stage `run`: long-term memory (`<prefix>.long_mem.b0.*`) against the oracle's without its
+/// order. Its tokens are each consolidation's most used, sorted by use: in the oracle, neighbours
+/// in that order are as close as 3.7e-5 apart, and 14 to 16 candidates are within 1% of the cut
+/// at `num_prototypes` (prop_f40). A native run's own usage (top-k near ties in its reads)
+/// reorders them or swaps a few across the cut: the columns permute, and a swapped token is
+/// another one about as used. So each oracle token is paired with the native token of the
+/// nearest key when that one's nearest oracle token is it in turn (distinct prototypes' keys
+/// differ by 0.7% of the largest key or more); the pairs' keys, shrinkage, values and counts are
+/// compared at `Tol::RUN`, and the tokens left without a pair are counted, failing when more
+/// than half are (a wrong choice of prototypes, not near ties). Quadratic in the tokens (128 in
+/// the oracle).
+fn compare_long_term(oracle: &Oracle, report: &mut Report, step: &str, prefix: &str, memory: &MemoryManager) -> Result<()> {
+    let name = |part: &str| format!("{prefix}.long_mem.b0.{part}");
+    let long = &memory.long;
+    let expected_key = if oracle.has(step, &name("key")) { Some(oracle.tap(step, &name("key"))?) } else { None };
+    let n = expected_key.as_ref().map_or(0, |t| t.shape.last().copied().unwrap_or(0));
+    if n != long.size() {
+        report.fail("run", step, &name("key"), format!("{} long-term tokens, the oracle {n}", long.size()));
+        return Ok(());
+    }
+    let (Some(expected_key), Some(key)) = (expected_key, &long.key) else {
+        return Ok(());
+    };
+    let download = |t: &GpuTensor| gpu_download(t).map_err(|e| dev("long-term memory", e));
+    let native_key = download(key)?;
+    let ck = native_key.len() / n;
+    // Squared distance from column i of `a` to column j of `b`, both [ck, n].
+    let distance = |a: &[f32], i: usize, b: &[f32], j: usize| -> f64 {
+        (0..ck)
+            .map(|c| {
+                let d = a[c * n + i] as f64 - b[c * n + j] as f64;
+                d * d
+            })
+            .sum()
+    };
+    let nearest = |a: &[f32], i: usize, b: &[f32]| (0..n).min_by(|&j, &k| distance(a, i, b, j).total_cmp(&distance(a, i, b, k))).unwrap_or(0);
+    let pairs: Vec<(usize, usize)> = (0..n)
+        .map(|i| (i, nearest(&expected_key.values, i, &native_key)))
+        .filter(|&(i, j)| nearest(&native_key, j, &expected_key.values) == i)
+        .collect();
+    let unpaired = n - pairs.len();
+    let note = format!("{} of {n} tokens paired by key, {unpaired} unpaired (swapped at a cut)", pairs.len());
+    record(report, "run", step, &name("tokens (paired)"), unpaired * 2 <= n, pairs.len() as f64 / n as f64, note);
+
+    // The pairs' columns of a tensor [rows, n], the oracle's against their native partners.
+    let compare = |report: &mut Report, part: &str, native: &[f32], expected: &OracleTap| {
+        let rows = expected.values.len() / n;
+        let (mut actual, mut values) = (Vec::with_capacity(rows * pairs.len()), Vec::with_capacity(rows * pairs.len()));
+        for r in 0..rows {
+            for &(i, j) in &pairs {
+                actual.push(native[r * n + j]);
+                values.push(expected.values[r * n + i]);
+            }
+        }
+        let expected = OracleTap { shape: vec![rows, pairs.len()], dtype: expected.dtype.clone(), values };
+        report.compare("run", step, &format!("{} (paired)", name(part)), &actual, &expected, Tol::RUN);
+    };
+    compare(report, "key", &native_key, &expected_key);
+    let mut native: Vec<(String, Option<Vec<f32>>)> = vec![
+        ("shrinkage".into(), long.shrinkage.as_ref().map(download).transpose()?),
+        ("use_count".into(), long.use_count.as_ref().map(download).transpose()?),
+        ("life_count".into(), long.life_count.as_ref().map(download).transpose()?),
+    ];
+    let values = long.values.as_ref().map(download).transpose()?;
+    for o in 0..oracle.objects {
+        let per = VALUE_DIM * n;
+        native.push((format!("value.obj{}", o + 1), values.as_ref().and_then(|v| v.get(o * per..(o + 1) * per)).map(<[f32]>::to_vec)));
+    }
+    for (part, native) in &native {
+        let expected = if oracle.has(step, &name(part)) { Some(oracle.tap(step, &name(part))?) } else { None };
+        match (native, expected.filter(|t| !t.values.is_empty())) {
+            (Some(native), Some(expected)) => compare(report, part, native, &expected),
+            (None, None) => {}
+            (native, _) => report.fail("run", step, &name(part), if native.is_some() { "not in the oracle" } else { "missing" }),
+        }
     }
     Ok(())
 }

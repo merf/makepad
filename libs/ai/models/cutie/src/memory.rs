@@ -8,8 +8,10 @@
 //!   and each object's values [256, N], one column a token (h*w a memorised frame). The permanent
 //!   part comes first (`perm_end_pt` columns): `as_permanent` 'all' (a commit) prepends to it,
 //!   'first' makes the first frame permanent only while there is none. Temporary columns have a
-//!   use count and a life count (f32, life starts at 1e-7). Each read adds the read's usage to the
-//!   use counts and 1 to the life counts (temporary part only).
+//!   use count and a life count (f32 on the device, life starts at 1e-7). Each read adds the
+//!   read's usage to the use counts and 1 to the life counts (temporary part only), on the
+//!   device as PyTorch does; they are downloaded only where the host chooses tokens by them
+//!   (consolidation, removing obsolete tokens).
 //! - **Long-term memory**: when working memory's temporary part reaches (max_mem_frames - 1) * h*w
 //!   tokens after an add, all but the last (min_mem_frames - 1) frames of it consolidate: if
 //!   long-term's own tokens are at least max_long_tokens - num_prototypes, it first keeps only its
@@ -40,16 +42,17 @@
 //! Ties: `torch.topk` does not say which of equal values it keeps. Every top-k here (the read's
 //! per-pixel top-k in `gpu_cutie_topk_softmax`, the prototypes, long-term memory's survivors)
 //! keeps the lower index first. That is what the oracle's runs did wherever equal similarities
-//! met at the k-th place: working memory holds the first frame twice (the commit's permanent
-//! memory, then the propagation's first temporary frame), so pairs of identical keys tie.
+//! met at the read's k-th place: working memory holds the first frame twice (the commit's
+//! permanent memory, then the propagation's first temporary frame), so pairs of identical keys
+//! tie. The oracle has no tie among the prototypes or survivors, so the rule is unverified there.
 
 use crate::model::{dev, CutieNet, Feat, Keys, Tap, Weights};
 use crate::oracle::{Comparer, Oracle, Report, Tol, STEPS};
-use crate::processor::{record, uncompared};
+use crate::processor::{record, uncompared, StepPlan, StepSchedule};
 use crate::{CutieConfig, DiffusionError, Result};
 use makepad_ai_common::gpu::{
     gpu_add, gpu_concat_cols, gpu_concat_rows_many, gpu_cutie_matmul, gpu_cutie_similarity, gpu_cutie_softmax_axis0,
-    gpu_cutie_topk_softmax, gpu_download, gpu_gather_cols, gpu_slice_cols, gpu_slice_rows, gpu_upload, GpuTensor,
+    gpu_cutie_topk_softmax, gpu_download, gpu_gather_cols, gpu_rife_fill, gpu_slice_cols, gpu_slice_rows, gpu_upload, GpuTensor,
 };
 
 /// Channels of each object's values in working and long-term memory (`model.value_dim`).
@@ -83,9 +86,10 @@ pub(crate) struct KeyValueStore {
     pub(crate) values: Option<GpuTensor>,
     /// The temporary part's selection [64, N - perm_end] (`save_selection`).
     pub(crate) selection: Option<GpuTensor>,
-    /// The temporary part's use and life counts (`save_usage`), f32 as PyTorch accumulates them.
-    pub(crate) use_count: Vec<f32>,
-    pub(crate) life_count: Vec<f32>,
+    /// The temporary part's use and life counts [1, N - perm_end] (`save_usage`), f32 on the
+    /// device as PyTorch accumulates them; None while the temporary part is empty.
+    pub(crate) use_count: Option<GpuTensor>,
+    pub(crate) life_count: Option<GpuTensor>,
     /// Columns of the permanent part (`perm_end_pt`).
     pub(crate) perm_end: usize,
     save_selection: bool,
@@ -109,8 +113,8 @@ impl KeyValueStore {
             shrinkage: None,
             values: None,
             selection: None,
-            use_count: Vec::new(),
-            life_count: Vec::new(),
+            use_count: None,
+            life_count: None,
             perm_end: 0,
             save_selection,
             save_usage,
@@ -181,37 +185,46 @@ impl KeyValueStore {
                 self.selection = Some(Self::joined(self.selection.as_ref(), selection, false)?);
             }
             if self.save_usage {
-                self.use_count.extend(std::iter::repeat(0.0f32).take(ne));
-                self.life_count.extend(std::iter::repeat(0.0f32 + NEW_LIFE).take(ne));
+                let fill = |value: f32| gpu_rife_fill(1, ne, value).map_err(|e| dev("memory counts", e));
+                self.use_count = Some(Self::joined(self.use_count.as_ref(), &fill(0.0)?, false)?);
+                self.life_count = Some(Self::joined(self.life_count.as_ref(), &fill(0.0 + NEW_LIFE)?, false)?);
             }
         }
         Ok(())
     }
 
-    /// `update_bucket_usage`: `usage` is this store's share of a read's usage (every token, the
-    /// permanent part first); the temporary tokens' part is added to their use counts and 1 to
-    /// their life counts.
-    pub(crate) fn update_usage(&mut self, usage: &[f32]) {
-        if !self.save_usage {
-            return;
+    /// `update_bucket_usage`: this store's share of a read's usage is columns `start..start +
+    /// size` of `usage` [1, N] (the permanent part first); the temporary tokens' part is added to
+    /// their use counts and 1 to their life counts, on the device.
+    pub(crate) fn update_usage(&mut self, usage: &GpuTensor, start: usize) -> Result<()> {
+        let temp = self.non_perm_size();
+        if !self.save_usage || temp == 0 {
+            return Ok(());
         }
-        let usage = &usage[self.perm_end.min(usage.len())..];
-        if usage.is_empty() {
-            return;
-        }
-        for ((count, life), &u) in self.use_count.iter_mut().zip(&mut self.life_count).zip(usage) {
-            *count += u;
-            *life += 1.0;
-        }
+        let (Some(use_count), Some(life_count)) = (&self.use_count, &self.life_count) else {
+            return Err(DiffusionError::model("cutie memory: temporary tokens without counts"));
+        };
+        let usage = gpu_slice_cols(usage, start + self.perm_end, temp).map_err(|e| dev("memory usage", e))?;
+        let one = gpu_rife_fill(1, temp, 1.0).map_err(|e| dev("memory usage", e))?;
+        self.use_count = Some(gpu_add(use_count, &usage).map_err(|e| dev("memory usage", e))?);
+        self.life_count = Some(gpu_add(life_count, &one).map_err(|e| dev("memory usage", e))?);
+        Ok(())
     }
 
-    /// `get_usage`: the temporary tokens' use counts normalised by their lives.
-    pub(crate) fn usage(&self) -> Vec<f32> {
-        self.use_count.iter().zip(&self.life_count).map(|(u, l)| u / l).collect()
+    /// `get_usage`: the temporary tokens' use counts normalised by their lives, downloaded for
+    /// the host's top-k (empty without counts).
+    pub(crate) fn usage(&self) -> Result<Vec<f32>> {
+        let (Some(use_count), Some(life_count)) = (&self.use_count, &self.life_count) else {
+            return Ok(Vec::new());
+        };
+        let use_count = gpu_download(use_count).map_err(|e| dev("memory usage", e))?;
+        let life_count = gpu_download(life_count).map_err(|e| dev("memory usage", e))?;
+        Ok(use_count.iter().zip(&life_count).map(|(u, l)| u / l).collect())
     }
 
     /// The indices of the `k` largest of `values`, largest first; equal values by lower index
-    /// (`torch.topk(.., sorted=True)`, its ties as the oracle broke them).
+    /// (`torch.topk(.., sorted=True)`). The tie rule copies what the oracle showed for the read's
+    /// top-k; it is unverified here, the oracle having no tie or near tie at the prototypes' cut.
     pub(crate) fn most_used(values: &[f32], k: usize) -> Result<Vec<u32>> {
         if k > values.len() || k == 0 {
             return Err(DiffusionError::model(format!("cutie memory: top {k} of {} tokens", values.len())));
@@ -229,12 +242,17 @@ impl KeyValueStore {
         };
         let m = self.non_perm_size().saturating_sub(keep_last);
         let none = || DiffusionError::model("cutie memory: nothing to consolidate");
+        let mut usage = self.usage()?;
+        if usage.len() < m {
+            return Err(DiffusionError::model("cutie memory: consolidating tokens without counts"));
+        }
+        usage.truncate(m);
         Ok(Candidates {
             key: Self::cols(key, self.perm_end, m)?.ok_or_else(none)?,
             shrinkage: Self::cols(shrinkage, self.perm_end, m)?.ok_or_else(none)?,
             selection: Self::cols(selection, 0, m)?.ok_or_else(none)?,
             values: Self::cols(values, self.perm_end, m)?.ok_or_else(none)?,
-            usage: self.usage()[..m].to_vec(),
+            usage,
         })
     }
 
@@ -253,16 +271,19 @@ impl KeyValueStore {
                 None => Ok(None),
             }
         };
+        // The temporary part's own tensors (selection, counts): their last `keep_last` columns.
+        let keep_temp = |t: &Option<GpuTensor>| -> Result<Option<GpuTensor>> {
+            match t {
+                Some(t) => Self::cols(t, temp - keep_last, keep_last),
+                None => Ok(None),
+            }
+        };
         self.key = keep(&self.key)?;
         self.shrinkage = keep(&self.shrinkage)?;
         self.values = keep(&self.values)?;
-        if let Some(selection) = &self.selection {
-            self.selection = Self::cols(selection, temp - keep_last, keep_last)?;
-        }
-        if self.save_usage {
-            self.use_count.drain(..temp - keep_last);
-            self.life_count.drain(..temp - keep_last);
-        }
+        self.selection = keep_temp(&self.selection)?;
+        self.use_count = keep_temp(&self.use_count)?;
+        self.life_count = keep_temp(&self.life_count)?;
         Ok(())
     }
 
@@ -272,7 +293,7 @@ impl KeyValueStore {
         if self.perm_end != 0 {
             return Err(DiffusionError::model("cutie memory: long-term memory has a permanent part"));
         }
-        let survivors = Self::most_used(&self.usage(), max_size)?;
+        let survivors = Self::most_used(&self.usage()?, max_size)?;
         let gather = |t: &Option<GpuTensor>| -> Result<Option<GpuTensor>> {
             t.as_ref().map(|t| gpu_gather_cols(t, &survivors)).transpose().map_err(|e| dev("memory survivors", e))
         };
@@ -280,8 +301,8 @@ impl KeyValueStore {
         self.shrinkage = gather(&self.shrinkage)?;
         self.values = gather(&self.values)?;
         self.selection = gather(&self.selection)?;
-        self.use_count = survivors.iter().map(|&i| self.use_count[i as usize]).collect();
-        self.life_count = survivors.iter().map(|&i| self.life_count[i as usize]).collect();
+        self.use_count = gather(&self.use_count)?;
+        self.life_count = gather(&self.life_count)?;
         Ok(())
     }
 
@@ -296,10 +317,9 @@ impl KeyValueStore {
         if let Some(selection) = &self.selection {
             tap.put(&format!("{prefix}.selection"), selection)?;
         }
-        if self.save_usage && !self.use_count.is_empty() {
-            let n = self.use_count.len();
-            tap.put(&format!("{prefix}.use_count"), &gpu_upload(&self.use_count, 1, n).map_err(|e| dev("memory dump", e))?)?;
-            tap.put(&format!("{prefix}.life_count"), &gpu_upload(&self.life_count, 1, n).map_err(|e| dev("memory dump", e))?)?;
+        if let (Some(use_count), Some(life_count)) = (&self.use_count, &self.life_count) {
+            tap.put(&format!("{prefix}.use_count"), use_count)?;
+            tap.put(&format!("{prefix}.life_count"), life_count)?;
         }
         let per = values.rows() / objects.max(1);
         for o in 0..objects {
@@ -395,6 +415,11 @@ impl MemoryManager {
         let (Some(memory_key), Some(memory_shrinkage)) = (memory_key, memory_shrinkage) else {
             return Err(DiffusionError::model("cutie memory read: nothing memorised"));
         };
+        // `torch.topk` raises when memory holds fewer tokens than top_k (a frame of under 30
+        // tokens at stride 16); `gpu_cutie_topk_softmax` would take them all instead.
+        if self.top_k > memory_key.cols() {
+            return Err(DiffusionError::model(format!("cutie memory read: top {} of {} memory tokens", self.top_k, memory_key.cols())));
+        }
         tap.put("memory.read.memory_key", &memory_key)?;
         tap.put("memory.read.memory_shrinkage", &memory_shrinkage)?;
         tap.put("memory.read.query_key", &keys.key.t)?;
@@ -406,10 +431,9 @@ impl MemoryManager {
         tap.put("memory.read.affinity", &affinity)?;
         if self.use_long_term {
             tap.put("memory.read.usage", &usage)?;
-            let usage = gpu_download(&usage).map_err(|e| dev("memory usage", e))?;
-            self.work.update_usage(&usage[long_size..]);
+            self.work.update_usage(&usage, long_size)?;
             if long_size > 0 && self.count_long_term_usage {
-                self.long.update_usage(&usage[..long_size]);
+                self.long.update_usage(&usage, 0)?;
             }
         }
         Ok(affinity)
@@ -585,7 +609,8 @@ impl OracleMemory {
     }
 
     /// A store as the oracle's `<prefix>.*` taps have it, None when the oracle has none. The
-    /// permanent part is what has no counts.
+    /// permanent part is what has no counts. Zero-size taps (PyTorch keeps emptied tensors) are
+    /// absent tensors here.
     fn store(oracle: &Oracle, step: &str, prefix: &str, objects: usize, save_selection: bool, save_usage: bool) -> Result<Option<KeyValueStore>> {
         if !oracle.has(step, &format!("{prefix}.key")) {
             return Ok(None);
@@ -593,20 +618,30 @@ impl OracleMemory {
         let mut s = KeyValueStore::new(save_selection, save_usage);
         let key = oracle.tap(step, &format!("{prefix}.key"))?;
         let n = *key.shape.last().unwrap_or(&0);
-        let ck = key.values.len() / n.max(1);
+        if n == 0 {
+            return Ok(None);
+        }
+        let ck = key.values.len() / n;
         s.key = Some(gpu_upload(&key.values, ck, n).map_err(|e| dev("oracle state", e))?);
         s.shrinkage = Some(Self::upload(oracle, step, &format!("{prefix}.shrinkage"), 1, n)?);
         s.values = Some(Self::objects(oracle, step, &format!("{prefix}.value"), objects, VALUE_DIM, n)?);
-        if oracle.has(step, &format!("{prefix}.selection")) {
-            let selection = oracle.tap(step, &format!("{prefix}.selection"))?;
-            let t = *selection.shape.last().unwrap_or(&0);
-            s.selection = Some(gpu_upload(&selection.values, ck, t).map_err(|e| dev("oracle state", e))?);
-        }
-        if oracle.has(step, &format!("{prefix}.use_count")) {
-            s.use_count = oracle.tap(step, &format!("{prefix}.use_count"))?.values;
-            s.life_count = oracle.tap(step, &format!("{prefix}.life_count"))?.values;
-        }
-        s.perm_end = n - s.use_count.len();
+        // The temporary part's own tensors, [rows, temporary tokens].
+        let temp = |name: &str, rows: usize| -> Result<Option<GpuTensor>> {
+            let name = format!("{prefix}.{name}");
+            if !oracle.has(step, &name) {
+                return Ok(None);
+            }
+            let t = oracle.tap(step, &name)?;
+            let cols = t.values.len() / rows;
+            if cols == 0 {
+                return Ok(None);
+            }
+            gpu_upload(&t.values, rows, cols).map(Some).map_err(|e| dev("oracle state", e))
+        };
+        s.selection = temp("selection", ck)?;
+        s.use_count = temp("use_count", 1)?;
+        s.life_count = temp("life_count", 1)?;
+        s.perm_end = n - s.use_count.as_ref().map_or(0, |c| c.cols());
         Ok(Some(s))
     }
 
@@ -641,25 +676,42 @@ impl OracleMemory {
 /// with the oracle's own inputs: the read's memory half (similarity, top-k, usage counted,
 /// readout) on the oracle's `key.*`, compared with `memory.read.*`; the sensory and object memory
 /// the network is given (`pixel_fusion.in.sensory`, `object_transformer.in.obj_memory`,
-/// `encode_mask.in.sensory`); the segment's sensory update (`segment.out.sensory`); `add_memory`
+/// `encode_mask.in.sensory`); the segment's sensory update (`segment.out.sensory`, kept when the
+/// step's plan from `StepSchedule` says so, which the next sensory comparison checks); `add_memory`
 /// with `encode_mask.out.*` and the step's permanence, its consolidation compared with
 /// `memory.consolidate.*`; then the whole state against `state.after.*` (counts, long-term
 /// prototypes, the sieve) and the schedule's sizes; then the processor's own work without the
 /// network (`processor::check_without_network`: the whole run's schedule, each tapped step's
 /// frame and mask handling). The network's half of the read (pixel fusion, the
-/// object transformer) is the transformer stage's. Every tap at `Tol::STAGE`, the affinity
-/// too: its near ties are far above fp32 rounding, and its exact ties (the first frame held twice)
-/// fall to the lower index in the oracle as in `gpu_cutie_topk_softmax`.
+/// object transformer) is the transformer stage's.
+///
+/// Some comparisons only check how the oracle's own tensors are laid out and stacked, being
+/// made from them: the read's `memory_key`, `memory_shrinkage`, `query_key`, `query_selection`;
+/// `pixel_fusion.in.sensory`, `object_transformer.in.obj_memory` and `encode_mask.in.sensory`
+/// (but for the sensory update's decision); `state.after.*` of what a step leaves alone (the
+/// sensory memory a memorising step replaces with `encode_mask.out.sensory`, keys and values on
+/// steps that add nothing); `step.out.prob` on segmenting steps. The rest is computed here.
+///
+/// Every tap at `Tol::STAGE`, the affinity too. Its exact ties (the first frame held twice) fall
+/// to the lower index in the oracle as in `gpu_cutie_topk_softmax`. The closest pair at the k-th
+/// place that is not an exact tie is 33 ulps apart (3.9e-6, Solege-03 prop_f40); the native
+/// similarity (up to 1.9e-5 off at that step) changes no column's top k on either clip. The
+/// margin is thin: a similarity kernel must keep near-tied entries within those 33 ulps.
 pub(crate) fn check(oracle: &Oracle, report: &mut Report, _weights: &mut Weights) -> Result<()> {
     let config = CutieConfig::default();
     let schedule = oracle.schedule()?;
     let objects = oracle.objects;
     let tol = |_: &str| Tol::STAGE;
+    // Each row's plan, as the processor decides it over the worker's run.
+    let mut replay = StepSchedule::new(&config);
+    let plans: Vec<StepPlan> = schedule.iter().map(|row| replay.replay(row)).collect();
     for step in STEPS {
-        let row = schedule
+        let (index, row) = schedule
             .iter()
-            .find(|r| r.tap.as_deref() == Some(step))
+            .enumerate()
+            .find(|(_, r)| r.tap.as_deref() == Some(step))
             .ok_or_else(|| DiffusionError::model(format!("cutie oracle: {step} is not in the schedule")))?;
+        let plan = plans[index];
         let keys = OracleMemory::keys(oracle, step)?;
         let (w, h) = (keys.key.w, keys.key.h);
         let mut memory = OracleMemory::manager(oracle, step, &config, w, h)?;
@@ -674,7 +726,13 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, _weights: &mut Weights
                 memory.read_values(&affinity, &keys, tap)?;
                 Ok(())
             })?;
-            memory.update_sensory(OracleMemory::feat(oracle, step, "segment.out.sensory", objects, SENSORY_DIM, w, h)?)?;
+            if plan.update_sensory {
+                memory.update_sensory(OracleMemory::feat(oracle, step, "segment.out.sensory", objects, SENSORY_DIM, w, h)?)?;
+            }
+        }
+        let memorise = plan.memorise || row.force_permanent;
+        if memorise != oracle.has(step, "encode_mask.out.value") {
+            cmp.report.fail("memory", step, "schedule.memorise", format!("memorise {memorise}, the oracle {}", !memorise));
         }
         if oracle.has(step, "encode_mask.out.value") {
             memory.initialize_sensory_if_needed(&keys, objects)?;
