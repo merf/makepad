@@ -29,7 +29,7 @@
 
 use crate::memory::{MemoryManager, Permanence, VALUE_DIM};
 use crate::model::{dev, CutieNet, Feat, ImageFeatures, Keys, Tap, Weights};
-use crate::oracle::{Comparer, Oracle, OracleTap, Report, ScheduleRow, Tol};
+use crate::oracle::{Clear, Comparer, Oracle, OracleTap, Report, ScheduleRow, Tol};
 use crate::{CutieConfig, DiffusionError, Result};
 use makepad_ai_common::gpu::{
     gpu_cutie_aggregate, gpu_cutie_crop, gpu_cutie_pad, gpu_cutie_resize_bilinear, gpu_cutie_rgb_planes, gpu_cutie_softmax_axis0,
@@ -197,16 +197,11 @@ impl StepSchedule {
         self.last_mem_ti = 0;
     }
 
-    /// Whether the worker clears the sensory memory before a row of the oracle's run
-    /// (`raw/schedule.tsv`): a mask on a row that is not the commit starts the propagation.
-    pub(crate) fn restarts(row: &ScheduleRow) -> bool {
-        row.with_mask && !row.force_permanent
-    }
-
-    /// A row of the oracle's run as the processor schedules it: the counters reset when the
-    /// propagation starts, then the step's plan, memorised when it says so or forced.
+    /// A row of the oracle's run as the processor schedules it: the counters reset by any clear
+    /// before it (`ScheduleRow::clears`), then the step's plan, memorised when it says so or
+    /// forced.
     pub(crate) fn replay(&mut self, row: &ScheduleRow) -> StepPlan {
-        if Self::restarts(row) {
+        if !row.clears().is_empty() {
             self.reset();
         }
         let plan = self.next(row.with_mask, false);
@@ -400,6 +395,18 @@ impl<'a> CutieProcessor<'a> {
         self.schedule.reset();
         self.memory.clear_sensory_memory();
     }
+
+    /// The clears the oracle's run gave the processor before a step, in order.
+    pub(crate) fn apply_clears(&mut self, clears: &[Clear]) -> Result<()> {
+        for clear in clears {
+            match clear {
+                Clear::All => self.clear_memory(),
+                Clear::NonPermanent => self.clear_non_permanent_memory()?,
+                Clear::Sensory => self.clear_sensory_memory(),
+            }
+        }
+        Ok(())
+    }
 }
 
 // --- The check ---
@@ -490,6 +497,23 @@ impl WorkerMasks {
         Ok(Self { objects, plane, seed })
     }
 
+    /// The label map the worker gives step `index` of the oracle's run (a step with a mask), as
+    /// the oracle's run read it back from disk: the latest earlier step's on the same frame
+    /// (`step_labels`), or the seed on a frame no step had yet. Older oracles have no step labels
+    /// and step each frame once but frame 0, whose label maps all equal the seed's: the seed on
+    /// the commit, else the frame's last label map (`labels`).
+    pub(crate) fn given<'a>(&'a self, schedule: &[ScheduleRow], index: usize, step_labels: Option<&'a [u8]>, labels: &'a [u8]) -> &'a [u8] {
+        let (row, plane) = (&schedule[index], self.plane);
+        match step_labels {
+            Some(steps) => match schedule[..index].iter().rposition(|r| r.frame == row.frame) {
+                Some(j) => &steps[j * plane..(j + 1) * plane],
+                None => &self.seed,
+            },
+            None if row.force_permanent => &self.seed,
+            None => &labels[row.frame * plane..(row.frame + 1) * plane],
+        }
+    }
+
     /// A label map one-hot: objects x plane.
     pub(crate) fn one_hot(&self, labels: &[u8]) -> Vec<f32> {
         let mut one_hot = vec![0.0f32; self.objects * self.plane];
@@ -504,11 +528,10 @@ impl WorkerMasks {
 
 /// The processor's own work checked without the network (part of stage `memory`):
 ///
-/// - The whole run's schedule: the worker's steps (the commit, the sensory memory cleared, the
-///   propagation) through `StepSchedule` and a `MemoryManager` fed zeros at the oracle's sizes,
-///   every step's counters, memorising, consolidation and token counts against
-///   `raw/schedule.tsv`. Nothing is read: usage only chooses which tokens become prototypes,
-///   never when or how many.
+/// - The whole run's schedule: the worker's steps (the commit, the clears, the propagations)
+///   through `StepSchedule` and a `MemoryManager` fed zeros at the oracle's sizes, every step's
+///   counters, memorising, consolidation and token counts against `raw/schedule.tsv`. Nothing is
+///   read: usage only chooses which tokens become prototypes, never when or how many.
 /// - Each tapped step's frame and mask handling, given the network's output: the frame scaled and
 ///   padded (`step.in.image`, `encode_image.in.image`), the worker's mask (`step.in.mask`) through
 ///   softmax(aggregate) or the oracle's `segment.out.prob`, then `step.last_mask`,
@@ -530,8 +553,12 @@ pub(crate) fn check_without_network(oracle: &Oracle, report: &mut Report) -> Res
     let mut memory = MemoryManager::new(config);
     for row in oracle.schedule() {
         let step = row.tap.clone().unwrap_or_else(|| format!("s{}", row.step));
-        if StepSchedule::restarts(row) {
-            memory.clear_sensory_memory();
+        for clear in row.clears() {
+            match clear {
+                Clear::All => memory = MemoryManager::new(config),
+                Clear::NonPermanent => memory.clear_non_permanent_memory()?,
+                Clear::Sensory => memory.clear_sensory_memory(),
+            }
         }
         let counts = AddOutcome::counts(&memory);
         let plan = schedule.replay(row);
@@ -546,9 +573,11 @@ pub(crate) fn check_without_network(oracle: &Oracle, report: &mut Report) -> Res
 
     let masks = WorkerMasks::new(oracle)?;
     let labels = oracle.labels()?;
+    let step_labels = oracle.step_labels()?;
     let plane = oracle.width * oracle.height;
     let tol = |_: &str| Tol::STAGE;
-    for row in oracle.schedule().iter().filter(|r| r.tap.is_some()) {
+    let schedule = oracle.schedule();
+    for (index, row) in schedule.iter().enumerate().filter(|(_, r)| r.tap.is_some()) {
         let step = row.tap.as_deref().unwrap_or_default();
         let mut cmp = Comparer::new(oracle, report, "processor", step, &tol);
         cmp.with(|tap| {
@@ -556,9 +585,9 @@ pub(crate) fn check_without_network(oracle: &Oracle, report: &mut Report) -> Res
             tap.put("step.in.image", &image)?;
             tap.put("encode_image.in.image", &frame.to_internal(&image)?)?;
             let prob = if row.with_mask {
-                // The seed on the commit; after it, the commit's output read back (the oracle's
-                // label map of the frame).
-                let label_map = if row.force_permanent { &masks.seed[..] } else { &labels[row.frame * plane..(row.frame + 1) * plane] };
+                // The mask the worker read back: the seed on the first commit, after it an
+                // earlier step's output on the frame.
+                let label_map = masks.given(schedule, index, step_labels.as_deref(), &labels);
                 let mask = gpu_upload(&masks.one_hot(label_map), n, plane).map_err(|e| dev("step mask", e))?;
                 tap.put("step.in.mask", &mask)?;
                 CutieProcessor::mask_prob(&frame.to_internal(&mask)?)?
@@ -578,12 +607,14 @@ pub(crate) fn check_without_network(oracle: &Oracle, report: &mut Report) -> Res
 
 /// Stage `run`: the oracle's whole run natively, as the worker drives Cutie (commit frame 0 with
 /// the seed masks as a label map one-hot, `force_permanent`; clear the sensory memory; frame 0
-/// again with the same mask; frames 1.. with none): every frame's label map against the oracle's
-/// (IoU per object, 0.998 or better), the schedule (memorised, consolidated, token counts)
+/// again with the same mask; frames 1.. with none; in the `edits` scenario more commits, clears
+/// and propagations, `ScheduleRow::clears` giving each clear): every step's label map against
+/// the oracle's (IoU per object, 0.998 or better; each step's own where the oracle has
+/// `step_labels.u8`, else the frame's), the schedule (memorised, consolidated, token counts)
 /// against `raw/schedule.tsv`, the tapped steps' taps (`Tol::RUN`).
 ///
-/// The propagation's start is given the commit's output read back as a label map, as the worker
-/// does (it saves each step's masks and loads them again). `step.out.mask` (the argmax labels) is
+/// A step with a mask is given the latest native output on its frame read back as a label map,
+/// as the worker does (it saves each step's masks and loads them again). `step.out.mask` (the argmax labels) is
 /// reported, not failed: one pixel's label flipping fails any tolerance on label numbers, so the
 /// label maps are judged by IoU instead. Taps whose columns or rows follow long-term memory's
 /// order are reported, not failed, too (`run_tol`); long-term memory is compared without its
@@ -600,6 +631,7 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
     if expected_labels.len() != oracle.frames * plane {
         return Err(DiffusionError::model("cutie oracle: raw/labels.u8 has the wrong size"));
     }
+    let step_labels = oracle.step_labels()?;
     // Each frame's latest label map, frame 0's the seed's to begin with.
     let masks = WorkerMasks::new(oracle)?;
     let mut frame_labels: Vec<Option<Vec<u8>>> = vec![None; oracle.frames];
@@ -607,12 +639,11 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
     // The steps without taps, timed: what a step costs as the worker runs it.
     let (mut untapped, mut untapped_time) = (0usize, std::time::Duration::ZERO);
 
-    for row in schedule {
+    for (index, row) in schedule.iter().enumerate() {
         let step = row.tap.clone().unwrap_or_else(|| format!("s{}", row.step));
-        // The propagation starts from its memory frame again, with the sensory memory cleared.
-        if StepSchedule::restarts(row) {
-            processor.clear_sensory_memory();
-        }
+        // A propagation starts from its memory frame again, with the sensory memory cleared (and
+        // in the edits, the temporary memory or all of it before).
+        processor.apply_clears(&row.clears())?;
         let frame = oracle.frame_rgb(row.frame)?;
         let mask = if row.with_mask {
             let labels = frame_labels[row.frame].as_ref().ok_or_else(|| DiffusionError::model(format!("cutie run: no mask for frame {}", row.frame)))?;
@@ -647,7 +678,10 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
         let labels = CutieProcessor::labels(&prob, n + 1, plane);
 
         // The label map against the oracle's, object by object.
-        let expected = &expected_labels[row.frame * plane..(row.frame + 1) * plane];
+        let expected = match &step_labels {
+            Some(steps) => &steps[index * plane..(index + 1) * plane],
+            None => &expected_labels[row.frame * plane..(row.frame + 1) * plane],
+        };
         for o in 1..=n as u8 {
             let (mut both, mut either) = (0usize, 0usize);
             for (&a, &e) in labels.iter().zip(expected) {

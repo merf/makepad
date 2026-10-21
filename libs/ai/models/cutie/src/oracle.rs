@@ -5,13 +5,18 @@
 //!   endian f32 in PyTorch's memory order) for the tapped steps, the schedule's `tap` column:
 //!   `commit_f0`, `prop_f0`, `prop_f1`, `prop_f5`, `prop_f40` (working memory consolidates) and
 //!   `prop_f41` (the first read through long-term memory) with the default settings, others
-//!   with others (`prop_f165` where long-term memory first drops its least used tokens);
+//!   with others (`prop_f165` where long-term memory first drops its least used tokens), and the
+//!   `edits` scenario's own (`commit_f10` after propagating, `back_f10` and `back_f9` after
+//!   `clear_non_permanent_memory`, `restore_f10`, `prop2_f11`, `fresh_f16` into empty memory,
+//!   `fresh_f17`);
 //! - `raw/meta.txt` (frames, width, height, objects, then every setting Cutie ran with as
 //!   `config.<key>=<value>`, `long_term.<key>` too; older oracles have none and ran with the
 //!   defaults), `raw/frames.u8` (frames x h x w x 3 RGB), `raw/seed.u8` (objects x h x w, 0/1),
-//!   `raw/labels.u8` (frames x h x w, the masks out as label maps), `raw/schedule.tsv` (each
-//!   processor step: frame, memorised, consolidated, the memory's sizes, and in newer oracles
-//!   whether long-term memory dropped its least used tokens).
+//!   `raw/labels.u8` (frames x h x w, the masks out as label maps, each frame's last),
+//!   `raw/schedule.tsv` (each processor step: frame, memorised, consolidated, the memory's sizes,
+//!   and in newer oracles whether long-term memory dropped its least used tokens and the clears
+//!   before the step), in newer oracles `raw/step_labels.u8` (steps x h x w, each step's label
+//!   map: the `edits` scenario steps frames more than once, backwards too).
 //!
 //! Names: `net.<module>` is a module's output by its name in `CUTIE`; `encode_image.*`, `key.*`,
 //! `encode_mask.*`, `pixel_fusion.*`, `object_transformer.*`, `segment.*` the network methods'
@@ -87,6 +92,31 @@ pub(crate) struct ScheduleRow {
     /// Long-term memory dropped its least used tokens before consolidating
     /// (`remove_obsolete_features`); None in oracles that did not record it.
     pub(crate) obsolete_removed: Option<bool>,
+    /// The processor's clears before the step, in order; None in oracles that did not record
+    /// them (`clears` says what those did).
+    pub(crate) recorded_clears: Option<Vec<Clear>>,
+}
+
+/// A clear the worker gives the processor between steps (`InferenceCore`'s `clear_memory`,
+/// `clear_non_permanent_memory`, `clear_sensory_memory`). Each resets the step counters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Clear {
+    All,
+    NonPermanent,
+    Sensory,
+}
+
+impl ScheduleRow {
+    /// The clears before this step: as recorded (the schedule's `clear` column), or, in older
+    /// oracles, which ran only the worker's commit and one propagation, the sensory memory
+    /// cleared where a mask starts the propagation (a mask on a step that is not a commit).
+    pub(crate) fn clears(&self) -> Vec<Clear> {
+        match &self.recorded_clears {
+            Some(clears) => clears.clone(),
+            None if self.with_mask && !self.force_permanent => vec![Clear::Sensory],
+            None => Vec::new(),
+        }
+    }
 }
 
 fn io(path: &Path, e: impl std::fmt::Display) -> DiffusionError {
@@ -259,21 +289,51 @@ impl Oracle {
         &self.schedule
     }
 
-    /// `raw/schedule.tsv`: a header, then a step a line. The 13th column, `obsolete_removed`, is
-    /// in newer oracles only.
+    /// Each step's label map as the oracle's run made it (`raw/step_labels.u8`, steps x h x w:
+    /// a frame stepped twice has two), in newer oracles; None in older ones, which step each
+    /// frame once but frame 0 (`labels`).
+    pub(crate) fn step_labels(&self) -> Result<Option<Vec<u8>>> {
+        let path = self.dir.join("raw").join("step_labels.u8");
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&path).map_err(|e| io(&path, e))?;
+        if bytes.len() != self.schedule.len() * self.width * self.height {
+            return Err(io(&path, format!("{} bytes for {} steps of {}x{}", bytes.len(), self.schedule.len(), self.width, self.height)));
+        }
+        Ok(Some(bytes))
+    }
+
+    /// `raw/schedule.tsv`: a header, then a step a line. The 13th column, `obsolete_removed`, and
+    /// the 14th, `clear`, are in newer oracles only.
     fn read_schedule(dir: &Path) -> Result<Vec<ScheduleRow>> {
         let path = dir.join("raw").join("schedule.tsv");
         let text = fs::read_to_string(&path).map_err(|e| io(&path, e))?;
         let mut lines = text.lines().filter(|l| !l.is_empty());
         let header: Vec<&str> = lines.next().unwrap_or("").split('\t').collect();
         let obsolete_column = header.iter().position(|&h| h == "obsolete_removed");
+        let clear_column = header.iter().position(|&h| h == "clear");
         let mut rows = Vec::new();
         for line in lines {
             let c: Vec<&str> = line.split('\t').collect();
-            if c.len() < 12 || obsolete_column.is_some_and(|i| c.len() <= i) {
+            if c.len() < 12 || obsolete_column.into_iter().chain(clear_column).any(|i| c.len() <= i) {
                 return Err(io(&path, format!("short line {line:?}")));
             }
             let num = |s: &str| s.parse::<i64>().map_err(|e| io(&path, e));
+            let recorded_clears = match clear_column.map(|i| c[i]) {
+                None => None,
+                Some("-") => Some(Vec::new()),
+                Some(list) => Some(
+                    list.split('+')
+                        .map(|name| match name {
+                            "all" => Ok(Clear::All),
+                            "non_permanent" => Ok(Clear::NonPermanent),
+                            "sensory" => Ok(Clear::Sensory),
+                            _ => Err(io(&path, format!("clear {name:?}"))),
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                ),
+            };
             rows.push(ScheduleRow {
                 step: num(c[0])? as usize,
                 tap: (c[1] != "-").then(|| c[1].to_string()),
@@ -288,6 +348,7 @@ impl Oracle {
                 long_tokens: num(c[10])? as usize,
                 mask_area: c[11].split(',').filter_map(|v| v.parse().ok()).collect(),
                 obsolete_removed: obsolete_column.map(|i| c[i] == "1"),
+                recorded_clears,
             });
         }
         Ok(rows)

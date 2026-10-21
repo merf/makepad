@@ -781,6 +781,11 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, _weights: &mut Weights
         let (w, h) = (keys.key.w, keys.key.h);
         let mut memory = OracleMemory::manager(oracle, step, config, w, h)?;
         let mut cmp = Comparer::new(oracle, report, "memory", step, &tol);
+        // A step that segments reads memory: without its read's taps the read would go
+        // unchecked (and the state after it with it).
+        if oracle.has(step, "segment.out.prob") && !oracle.has(step, "memory.read.similarity") {
+            cmp.report.fail("memory", step, "memory.read.similarity", "not in the oracle, which segments here");
+        }
         if oracle.has(step, "memory.read.similarity") {
             cmp.with(|tap| {
                 tap.put("pixel_fusion.in.sensory", &memory.sensory()?.t)?;

@@ -38,7 +38,7 @@
 use crate::memory::{KeyValueStore, Permanence};
 use crate::model::{add, dev, relu, Conv2d, CutieNet, Feat, Tap, Weights};
 use crate::oracle::{Oracle, Report};
-use crate::processor::{CutieProcessor, Frame, StepSchedule, WorkerMasks};
+use crate::processor::{CutieProcessor, Frame, WorkerMasks};
 use crate::{DiffusionError, Result};
 use makepad_ai_common::gpu::{
     cutie_conv_out, gpu_cutie_matmul, gpu_cutie_maxpool3x3s2, gpu_cutie_similarity, gpu_cutie_topk_softmax, gpu_download, gpu_perf_stats,
@@ -526,9 +526,7 @@ fn replay(oracle: &Oracle, net: &CutieNet, frames: &[u8], masks: &WorkerMasks, i
     frame_labels[0] = Some(masks.seed.clone());
     let mut steps = Vec::with_capacity(oracle.schedule().len());
     for row in oracle.schedule() {
-        if StepSchedule::restarts(row) {
-            processor.clear_sensory_memory();
-        }
+        processor.apply_clears(&row.clears())?;
         let rgb = &frames[row.frame * size..(row.frame + 1) * size];
         let mask = match row.with_mask {
             true => Some(masks.one_hot(
