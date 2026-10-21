@@ -389,13 +389,35 @@ impl<'a> CutieProcessor<'a> {
 
 // --- The check ---
 
-/// A step's counters and memory sizes against its row of `raw/schedule.tsv` (the mask areas, when
-/// given, are noted: the label maps are judged by IoU).
+/// What a step's add did to memory: working memory consolidated, and long-term memory dropped its
+/// least used tokens first.
+#[derive(Clone, Copy, Debug)]
+struct AddOutcome {
+    consolidated: bool,
+    obsolete_removed: bool,
+}
+
+impl AddOutcome {
+    /// What happened between `before` (the memory's counts then) and now.
+    fn since(before: (usize, usize), memory: &MemoryManager) -> Self {
+        Self { consolidated: memory.consolidations != before.0, obsolete_removed: memory.obsolete_removals != before.1 }
+    }
+
+    /// The memory's counts, for `since`.
+    fn counts(memory: &MemoryManager) -> (usize, usize) {
+        (memory.consolidations, memory.obsolete_removals)
+    }
+}
+
+/// A step's counters and memory sizes against its row of `raw/schedule.tsv`, and whether it
+/// consolidated and dropped long-term memory's least used tokens (the latter only where the oracle
+/// recorded it). The mask areas, when given, are noted: the label maps are judged by IoU.
 #[allow(clippy::too_many_arguments)]
 fn record_schedule(
-    report: &mut Report, stage: &str, step: &str, name: &str, row: &ScheduleRow, schedule: &StepSchedule, memory: &MemoryManager, consolidated: bool,
+    report: &mut Report, stage: &str, step: &str, name: &str, row: &ScheduleRow, schedule: &StepSchedule, memory: &MemoryManager, outcome: AddOutcome,
     area: Option<&[usize]>,
 ) {
+    let AddOutcome { consolidated, obsolete_removed } = outcome;
     let (work, permanent, long) = memory.sizes();
     let memorised = schedule.last_mem_ti == schedule.curr_ti;
     let mut differ = Vec::new();
@@ -408,11 +430,15 @@ fn record_schedule(
     if consolidated != row.consolidated {
         differ.push(format!("consolidated {consolidated} (oracle {})", row.consolidated));
     }
+    if row.obsolete_removed.is_some_and(|e| e != obsolete_removed) {
+        differ.push(format!("obsolete removed {obsolete_removed} (oracle {})", !obsolete_removed));
+    }
     if (work, permanent, long) != (row.work_tokens, row.work_permanent, row.long_tokens) {
         differ.push(format!("tokens {work}/{permanent}/{long} (oracle {}/{}/{})", row.work_tokens, row.work_permanent, row.long_tokens));
     }
     let mut note = if differ.is_empty() {
-        format!("ti {} memorised {memorised} consolidated {consolidated} tokens {work}/{permanent}/{long}", row.ti)
+        let removed = if row.obsolete_removed.is_some() { format!(" obsolete removed {obsolete_removed}") } else { String::new() };
+        format!("ti {} memorised {memorised} consolidated {consolidated}{removed} tokens {work}/{permanent}/{long}", row.ti)
     } else {
         differ.join("; ")
     };
@@ -476,7 +502,7 @@ pub(crate) fn check_without_network(oracle: &Oracle, report: &mut Report) -> Res
     /// Object summaries a frame (`num_summaries`) and each one's width (the embedding, then the area).
     const SUMMARIES: usize = 16;
     const SUMMARY_WIDTH: usize = 257;
-    let config = CutieConfig::default();
+    let config = &oracle.config;
     let n = oracle.objects;
     let frame = Frame::new(oracle.width, oracle.height, config.max_internal_size);
     let (pw, ph) = frame.padded();
@@ -485,28 +511,29 @@ pub(crate) fn check_without_network(oracle: &Oracle, report: &mut Report) -> Res
     let keys = Keys { key: zeros(1, 64)?, shrinkage: zeros(1, 1)?, selection: zeros(1, 64)? };
     let value = zeros(n, VALUE_DIM)?;
     let obj_value = gpu_upload(&vec![0.0; n * SUMMARIES * SUMMARY_WIDTH], n * SUMMARIES, SUMMARY_WIDTH).map_err(|e| dev("schedule", e))?;
-    let mut schedule = StepSchedule::new(&config);
-    let mut memory = MemoryManager::new(&config);
-    for row in &oracle.schedule()? {
+    let mut schedule = StepSchedule::new(config);
+    let mut memory = MemoryManager::new(config);
+    for row in oracle.schedule() {
         let step = row.tap.clone().unwrap_or_else(|| format!("s{}", row.step));
         if StepSchedule::restarts(row) {
             memory.clear_sensory_memory();
         }
-        let consolidations = memory.consolidations;
+        let counts = AddOutcome::counts(&memory);
         let plan = schedule.replay(row);
         if plan.memorise || row.force_permanent {
             let as_permanent = if row.force_permanent { Permanence::All } else { Permanence::First };
             memory.initialize_sensory_if_needed(&keys, n)?;
             memory.add_memory(&keys, &value, &obj_value, as_permanent, &mut Tap::none())?;
         }
-        record_schedule(report, "memory", &step, "schedule.without_network", row, &schedule, &memory, memory.consolidations != consolidations, None);
+        let outcome = AddOutcome::since(counts, &memory);
+        record_schedule(report, "memory", &step, "schedule.without_network", row, &schedule, &memory, outcome, None);
     }
 
     let masks = WorkerMasks::new(oracle)?;
     let labels = oracle.labels()?;
     let plane = oracle.width * oracle.height;
     let tol = |_: &str| Tol::STAGE;
-    for row in oracle.schedule()?.iter().filter(|r| r.tap.is_some()) {
+    for row in oracle.schedule().iter().filter(|r| r.tap.is_some()) {
         let step = row.tap.as_deref().unwrap_or_default();
         let mut cmp = Comparer::new(oracle, report, "processor", step, &tol);
         cmp.with(|tap| {
@@ -552,8 +579,8 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
     let net = CutieNet::load(weights)?;
     let (w, h, n) = (oracle.width, oracle.height, oracle.objects);
     let plane = w * h;
-    let mut processor = CutieProcessor::new(&net, CutieConfig::default(), n);
-    let schedule = oracle.schedule()?;
+    let mut processor = CutieProcessor::new(&net, oracle.config.clone(), n);
+    let schedule = oracle.schedule();
     let expected_labels = oracle.labels()?;
     if expected_labels.len() != oracle.frames * plane {
         return Err(DiffusionError::model("cutie oracle: raw/labels.u8 has the wrong size"));
@@ -565,7 +592,7 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
     // The steps without taps, timed: what a step costs as the worker runs it.
     let (mut untapped, mut untapped_time) = (0usize, std::time::Duration::ZERO);
 
-    for row in &schedule {
+    for row in schedule {
         let step = row.tap.clone().unwrap_or_else(|| format!("s{}", row.step));
         // The propagation starts from its memory frame again, with the sensory memory cleared.
         if StepSchedule::restarts(row) {
@@ -578,7 +605,7 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
         } else {
             None
         };
-        let consolidations = processor.memory.consolidations;
+        let counts = AddOutcome::counts(&processor.memory);
         let prob = match &row.tap {
             Some(tapped) => {
                 compare_long_term(oracle, report, tapped, "state.before", &processor.memory)?;
@@ -616,9 +643,9 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
             report.record("run", &step, &format!("labels.f{}.obj{o}", row.frame), iou >= MIN_IOU, format!("iou={iou:.6}"));
         }
 
-        let consolidated = processor.memory.consolidations != consolidations;
+        let outcome = AddOutcome::since(counts, &processor.memory);
         let area: Vec<usize> = (1..=n as u8).map(|o| labels.iter().filter(|&&l| l == o).count()).collect();
-        record_schedule(report, "run", &step, "schedule", row, &processor.schedule, &processor.memory, consolidated, Some(&area));
+        record_schedule(report, "run", &step, "schedule", row, &processor.schedule, &processor.memory, outcome, Some(&area));
         frame_labels[row.frame] = Some(labels);
     }
     let ms = untapped_time.as_secs_f64() * 1e3;

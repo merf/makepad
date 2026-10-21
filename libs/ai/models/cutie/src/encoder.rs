@@ -14,7 +14,7 @@
 //! selection = sigmoid(e)).
 
 use crate::model::{add, dev, relu, Conv2d, CutieNet, Feat, ImageFeatures, Keys, Tap, Weights};
-use crate::oracle::{Comparer, Oracle, Report, Tol, STEPS};
+use crate::oracle::{Comparer, Oracle, Report, Tol};
 use crate::{DiffusionError, Result};
 use makepad_ai_common::gpu::{
     cutie_conv_out, gpu_add, gpu_cutie_maxpool3x3s2, gpu_cutie_normalise_rows, gpu_cutie_sigmoid, gpu_mul, gpu_rife_fill,
@@ -262,7 +262,7 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
     let pixel_encoder = PixelEncoder::load(weights)?;
     let key_proj = KeyProjection::load(weights)?;
     let tol = |_: &str| Tol::STAGE;
-    for step in STEPS {
+    for step in oracle.steps() {
         // Every step encodes its frame (the commit and each propagation): an oracle step without
         // it has lost the stage's coverage.
         if !oracle.has(step, "encode_image.in.image") {

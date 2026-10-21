@@ -29,7 +29,7 @@
 //! object-major, PyTorch's order.
 
 use crate::model::{add, dev, relu, CAResBlock, Conv2d, CutieNet, Feat, FusionBlock, LayerNorm, Linear, PositionalEncoding, Tap, Weights};
-use crate::oracle::{Comparer, Oracle, OracleTap, Report, Tol, STEPS};
+use crate::oracle::{Comparer, Oracle, OracleTap, Report, Tol};
 use crate::{DiffusionError, Result};
 use makepad_ai_common::gpu::{
     gpu_add, gpu_add_cols_broadcast, gpu_attention_packed_cross_bias, gpu_attention_packed_cross_f32, gpu_birefnet_relu,
@@ -448,7 +448,7 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
     let transformer = QueryTransformer::load(weights)?;
     let n = oracle.objects;
     let tol = |_: &str| Tol::STAGE;
-    for step in STEPS {
+    for step in oracle.steps() {
         if !oracle.has(step, "object_transformer.in.pixel") {
             continue;
         }

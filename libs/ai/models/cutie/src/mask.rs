@@ -21,7 +21,7 @@
 //! area = each summary's weights summed; summaries = [sums, area] [16, 257] per object.
 
 use crate::model::{add, dev, relu, Conv2d, CutieNet, Feat, FusionBlock, Linear, PositionalEncoding, Tap, Weights};
-use crate::oracle::{Comparer, Oracle, OracleTap, Report, Tol, STEPS};
+use crate::oracle::{Comparer, Oracle, OracleTap, Report, Tol};
 use crate::{DiffusionError, Result};
 use makepad_ai_common::gpu::{
     cutie_conv_out, gpu_birefnet_relu, gpu_concat_cols, gpu_concat_rows_many, gpu_cutie_add_broadcast, gpu_cutie_gru,
@@ -367,7 +367,7 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
     // Each step's inputs, to say where a step repeats an earlier one's encode.
     let mut encoded: Vec<(&str, bool, Vec<Vec<f32>>)> = Vec::new();
     let mut distinct = 0;
-    for step in STEPS {
+    for step in oracle.steps() {
         if !oracle.has(step, "encode_mask.in.masks") {
             continue;
         }

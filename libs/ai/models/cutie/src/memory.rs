@@ -44,10 +44,14 @@
 //! keeps the lower index first. That is what the oracle's runs did wherever equal similarities
 //! met at the read's k-th place: working memory holds the first frame twice (the commit's
 //! permanent memory, then the propagation's first temporary frame), so pairs of identical keys
-//! tie. The oracle has no tie among the prototypes or survivors, so the rule is unverified there.
+//! tie. The oracles have no tie among the prototypes or survivors, so the rule is unverified there.
+//! Long-term memory's survivors are checked by Solege-03-long (`long_term.max_num_tokens=700`,
+//! `buffer_tokens=100`), whose step `prop_f165` keeps the 472 most used of 640 before the
+//! consolidation adds 128: no tie, the closest neighbours in that order 9.7e-8 apart, and the
+//! teacher-forced survivors are the oracle's in its order.
 
 use crate::model::{dev, CutieNet, Feat, Keys, Tap, Weights};
-use crate::oracle::{Comparer, Oracle, Report, Tol, STEPS};
+use crate::oracle::{Comparer, Oracle, Report, Tol};
 use crate::processor::{StepPlan, StepSchedule};
 use crate::{CutieConfig, DiffusionError, Result};
 use makepad_ai_common::gpu::{
@@ -352,6 +356,9 @@ pub(crate) struct MemoryManager {
     engaged: bool,
     /// How many times working memory has consolidated (the run check's schedule).
     pub(crate) consolidations: usize,
+    /// How many times long-term memory has dropped its least used tokens before a consolidation
+    /// (`remove_obsolete_features`; the schedule's `obsolete_removed`).
+    pub(crate) obsolete_removals: usize,
 }
 
 impl MemoryManager {
@@ -373,6 +380,7 @@ impl MemoryManager {
             objects: 0,
             engaged: false,
             consolidations: 0,
+            obsolete_removals: 0,
         }
     }
 
@@ -469,6 +477,7 @@ impl MemoryManager {
                 let reserve = self.max_long_tokens.saturating_sub(self.num_prototypes);
                 if self.long.non_perm_size() >= reserve {
                     self.long.remove_obsolete(reserve.saturating_sub(self.buffer_tokens))?;
+                    self.obsolete_removals += 1;
                 }
                 self.consolidate(self.min_mem_frames * plane, tap)?;
             }
@@ -692,14 +701,14 @@ impl OracleMemory {
 /// similarity (up to 1.9e-5 off at that step) changes no column's top k on either clip. The
 /// margin is thin: a similarity kernel must keep near-tied entries within those 33 ulps.
 pub(crate) fn check(oracle: &Oracle, report: &mut Report, _weights: &mut Weights) -> Result<()> {
-    let config = CutieConfig::default();
-    let schedule = oracle.schedule()?;
+    let config = &oracle.config;
+    let schedule = oracle.schedule();
     let objects = oracle.objects;
     let tol = |_: &str| Tol::STAGE;
     // Each row's plan, as the processor decides it over the worker's run.
-    let mut replay = StepSchedule::new(&config);
+    let mut replay = StepSchedule::new(config);
     let plans: Vec<StepPlan> = schedule.iter().map(|row| replay.replay(row)).collect();
-    for step in STEPS {
+    for step in oracle.steps() {
         let (index, row) = schedule
             .iter()
             .enumerate()
@@ -708,7 +717,7 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, _weights: &mut Weights
         let plan = plans[index];
         let keys = OracleMemory::keys(oracle, step)?;
         let (w, h) = (keys.key.w, keys.key.h);
-        let mut memory = OracleMemory::manager(oracle, step, &config, w, h)?;
+        let mut memory = OracleMemory::manager(oracle, step, config, w, h)?;
         let mut cmp = Comparer::new(oracle, report, "memory", step, &tol);
         if oracle.has(step, "memory.read.similarity") {
             cmp.with(|tap| {
@@ -745,12 +754,18 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, _weights: &mut Weights
         for name in cmp.uncompared(&["memory.", "state.after.work_mem.", "state.after.long_mem.", "state.after.sensory.", "state.after.obj_memory."]) {
             cmp.report.fail("memory", step, &name, "never compared");
         }
-        // The schedule's sizes after the step.
+        // The schedule's sizes after the step, and whether it consolidated and dropped long-term
+        // memory's least used tokens (not compared where the oracle did not record it).
         let sizes = memory.sizes();
         let consolidated = memory.consolidations > 0;
+        let obsolete_removed = memory.obsolete_removals > 0;
         let expected = (row.work_tokens, row.work_permanent, row.long_tokens);
-        let pass = sizes == expected && consolidated == row.consolidated;
-        let note = format!("tokens {sizes:?} consolidated {consolidated} (oracle {expected:?} {})", row.consolidated);
+        let pass = sizes == expected && consolidated == row.consolidated && row.obsolete_removed.is_none_or(|e| e == obsolete_removed);
+        let expected_removed = row.obsolete_removed.map_or("-".to_string(), |e| e.to_string());
+        let note = format!(
+            "tokens {sizes:?} consolidated {consolidated} obsolete removed {obsolete_removed} (oracle {expected:?} {} {expected_removed})",
+            row.consolidated
+        );
         report.record("memory", step, "schedule", pass, note);
     }
     crate::processor::check_without_network(oracle, report)

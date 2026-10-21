@@ -16,7 +16,7 @@
 //! either way, so this always runs them all at once (Cutie's fast path).
 
 use crate::model::{add, add_to_each, dev, relu, Conv2d, CutieNet, Feat, GroupResBlock, ImageFeatures, Tap, Weights};
-use crate::oracle::{Comparer, Oracle, OracleTap, Report, Tol, STEPS};
+use crate::oracle::{Comparer, Oracle, OracleTap, Report, Tol};
 use crate::{DiffusionError, Result};
 use makepad_ai_common::gpu::{
     gpu_cutie_aggregate, gpu_cutie_gru, gpu_cutie_resize_bilinear, gpu_cutie_sigmoid, gpu_cutie_softmax_axis0,
@@ -275,7 +275,7 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
     let decoder = MaskDecoder::load(weights)?;
     let tol = |name: &str| if name == "segment.out.logits" { Tol::INFO } else { Tol::STAGE };
     let mut steps = 0;
-    for step in STEPS {
+    for step in oracle.steps() {
         if !oracle.has(step, "segment.in.memory_readout") {
             continue;
         }

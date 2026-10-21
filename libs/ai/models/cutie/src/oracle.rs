@@ -2,13 +2,16 @@
 //! `tools/cutie-oracle` (PyTorch, fp32, TF32 off): a folder per clip with
 //!
 //! - `taps/<step>/manifest.tsv` (name, dtype, dims a line) and `taps/<step>/<name>.f32` (little-
-//!   endian f32 in PyTorch's memory order) for the steps `commit_f0`, `prop_f0`, `prop_f1`,
-//!   `prop_f5`, `prop_f40` (working memory consolidates) and `prop_f41` (the first read through
-//!   long-term memory);
-//! - `raw/meta.txt` (frames, width, height, objects), `raw/frames.u8` (frames x h x w x 3 RGB),
-//!   `raw/seed.u8` (objects x h x w, 0/1), `raw/labels.u8` (frames x h x w, the masks out as
-//!   label maps), `raw/schedule.tsv` (each processor step: frame, memorised, consolidated, the
-//!   memory's sizes).
+//!   endian f32 in PyTorch's memory order) for the tapped steps, the schedule's `tap` column:
+//!   `commit_f0`, `prop_f0`, `prop_f1`, `prop_f5`, `prop_f40` (working memory consolidates) and
+//!   `prop_f41` (the first read through long-term memory) with the default settings, others
+//!   with others (`prop_f165` where long-term memory first drops its least used tokens);
+//! - `raw/meta.txt` (frames, width, height, objects, then every setting Cutie ran with as
+//!   `config.<key>=<value>`, `long_term.<key>` too; older oracles have none and ran with the
+//!   defaults), `raw/frames.u8` (frames x h x w x 3 RGB), `raw/seed.u8` (objects x h x w, 0/1),
+//!   `raw/labels.u8` (frames x h x w, the masks out as label maps), `raw/schedule.tsv` (each
+//!   processor step: frame, memorised, consolidated, the memory's sizes, and in newer oracles
+//!   whether long-term memory dropped its least used tokens).
 //!
 //! Names: `net.<module>` is a module's output by its name in `CUTIE`; `encode_image.*`, `key.*`,
 //! `encode_mask.*`, `pixel_fusion.*`, `object_transformer.*`, `segment.*` the network methods'
@@ -17,14 +20,11 @@
 //! `step.*` the processor step's input and output. A name seen twice in a step has `#1` added.
 
 use crate::model::{Feat, Tap};
-use crate::{DiffusionError, Result};
+use crate::{CutieConfig, DiffusionError, Result};
 use makepad_ai_common::gpu::{gpu_download, GpuTensor};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-
-/// The tapped steps, in order.
-pub(crate) const STEPS: [&str; 6] = ["commit_f0", "prop_f0", "prop_f1", "prop_f5", "prop_f40", "prop_f41"];
 
 pub(crate) struct Oracle {
     pub(crate) dir: PathBuf,
@@ -32,6 +32,10 @@ pub(crate) struct Oracle {
     pub(crate) width: usize,
     pub(crate) height: usize,
     pub(crate) objects: usize,
+    /// The settings Cutie ran with (`config.*` in `raw/meta.txt`; the defaults where absent).
+    pub(crate) config: CutieConfig,
+    /// Every processor step of the run (`raw/schedule.tsv`).
+    schedule: Vec<ScheduleRow>,
     manifests: HashMap<String, Vec<(String, String, Vec<usize>)>>,
 }
 
@@ -80,6 +84,9 @@ pub(crate) struct ScheduleRow {
     pub(crate) work_permanent: usize,
     pub(crate) long_tokens: usize,
     pub(crate) mask_area: Vec<usize>,
+    /// Long-term memory dropped its least used tokens before consolidating
+    /// (`remove_obsolete_features`); None in oracles that did not record it.
+    pub(crate) obsolete_removed: Option<bool>,
 }
 
 fn io(path: &Path, e: impl std::fmt::Display) -> DiffusionError {
@@ -96,8 +103,10 @@ impl Oracle {
                 .and_then(|v| v.trim().parse().ok())
                 .ok_or_else(|| io(&meta_path, format!("no {key}")))
         };
+        let config = Self::read_config(&meta).map_err(|e| io(&meta_path, e))?;
+        let schedule = Self::read_schedule(dir)?;
         let mut manifests = HashMap::new();
-        for step in STEPS {
+        for step in schedule.iter().filter_map(|r| r.tap.as_deref()) {
             let path = dir.join("taps").join(step).join("manifest.tsv");
             let text = fs::read_to_string(&path).map_err(|e| io(&path, e))?;
             let rows = text
@@ -113,7 +122,60 @@ impl Oracle {
                 .collect();
             manifests.insert(step.to_string(), rows);
         }
-        Ok(Self { dir: dir.to_path_buf(), frames: get("frames")?, width: get("width")?, height: get("height")?, objects: get("objects")?, manifests })
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            frames: get("frames")?,
+            width: get("width")?,
+            height: get("height")?,
+            objects: get("objects")?,
+            config,
+            schedule,
+            manifests,
+        })
+    }
+
+    /// The settings in `meta.txt`'s `config.<key>=<value>` lines over the defaults (an oracle
+    /// without them ran with the defaults). Settings that do not change what Cutie computes (the
+    /// device, the weights' file names, `amp`, which the oracle runs in fp32 anyway, `chunk_size`,
+    /// `save_aux`) are passed over; one the port does not do (`flip_aug`), or does not know, is
+    /// an error rather than a check of something else.
+    fn read_config(meta: &str) -> std::result::Result<CutieConfig, String> {
+        let mut config = CutieConfig::default();
+        for (key, value) in meta.lines().filter_map(|l| l.strip_prefix("config.")).filter_map(|l| l.split_once('=')) {
+            let value = value.trim();
+            let count = || value.parse::<usize>().map_err(|e| format!("config.{key}={value}: {e}"));
+            let flag = || match value {
+                "true" => Ok(true),
+                "false" => Ok(false),
+                _ => Err(format!("config.{key}={value}: not true or false")),
+            };
+            match key {
+                "device" | "weights" | "ritm_weights" | "amp" | "chunk_size" | "save_aux" => {}
+                "flip_aug" if !flag()? => {}
+                // Cutie resizes only when this is positive.
+                "max_internal_size" => {
+                    config.max_internal_size = value.parse::<i64>().map_err(|e| format!("config.{key}={value}: {e}"))?.max(0) as usize
+                }
+                "use_long_term" => config.use_long_term = flag()?,
+                "mem_every" => config.mem_every = count()?,
+                "top_k" => config.top_k = count()?,
+                "stagger_updates" => config.stagger_updates = count()?,
+                "max_mem_frames" => config.max_mem_frames_without_long_term = count()?,
+                "long_term.count_usage" => config.count_long_term_usage = flag()?,
+                "long_term.max_mem_frames" => config.max_mem_frames = count()?,
+                "long_term.min_mem_frames" => config.min_mem_frames = count()?,
+                "long_term.num_prototypes" => config.num_prototypes = count()?,
+                "long_term.max_num_tokens" => config.max_long_tokens = count()?,
+                "long_term.buffer_tokens" => config.buffer_tokens = count()?,
+                _ => return Err(format!("config.{key}={value}: a setting the port does not do")),
+            }
+        }
+        Ok(config)
+    }
+
+    /// The tapped steps, in the run's order.
+    pub(crate) fn steps(&self) -> Vec<&str> {
+        self.schedule.iter().filter_map(|r| r.tap.as_deref()).collect()
     }
 
     /// The names tapped in `step`, in the order they were tapped.
@@ -181,13 +243,23 @@ impl Oracle {
         self.raw("labels.u8")
     }
 
-    pub(crate) fn schedule(&self) -> Result<Vec<ScheduleRow>> {
-        let path = self.dir.join("raw").join("schedule.tsv");
+    /// Every processor step of the run, in order.
+    pub(crate) fn schedule(&self) -> &[ScheduleRow] {
+        &self.schedule
+    }
+
+    /// `raw/schedule.tsv`: a header, then a step a line. The 13th column, `obsolete_removed`, is
+    /// in newer oracles only.
+    fn read_schedule(dir: &Path) -> Result<Vec<ScheduleRow>> {
+        let path = dir.join("raw").join("schedule.tsv");
         let text = fs::read_to_string(&path).map_err(|e| io(&path, e))?;
+        let mut lines = text.lines().filter(|l| !l.is_empty());
+        let header: Vec<&str> = lines.next().unwrap_or("").split('\t').collect();
+        let obsolete_column = header.iter().position(|&h| h == "obsolete_removed");
         let mut rows = Vec::new();
-        for line in text.lines().skip(1).filter(|l| !l.is_empty()) {
+        for line in lines {
             let c: Vec<&str> = line.split('\t').collect();
-            if c.len() < 12 {
+            if c.len() < 12 || obsolete_column.is_some_and(|i| c.len() <= i) {
                 return Err(io(&path, format!("short line {line:?}")));
             }
             let num = |s: &str| s.parse::<i64>().map_err(|e| io(&path, e));
@@ -204,6 +276,7 @@ impl Oracle {
                 work_permanent: num(c[9])? as usize,
                 long_tokens: num(c[10])? as usize,
                 mask_area: c[11].split(',').filter_map(|v| v.parse().ok()).collect(),
+                obsolete_removed: obsolete_column.map(|i| c[i] == "1"),
             });
         }
         Ok(rows)
