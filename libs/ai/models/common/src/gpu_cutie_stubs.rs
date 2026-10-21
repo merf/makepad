@@ -22,6 +22,24 @@ pub fn gpu_cutie_conv2d_reference(
     Err(GPU_UNAVAILABLE.to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_cutie_conv2d_fused(
+    _x: &GpuTensor, _batch: usize, _in_w: usize, _in_h: usize, _cache_namespace: &str, _key: &str,
+    _weights: &[f32], _bias: Option<&[f32]>, _out_channels: usize, _k: usize, _pad: usize, _stride: usize,
+    _residual: Option<&GpuTensor>, _relu: bool,
+) -> Result<GpuTensor, String> {
+    Err(GPU_UNAVAILABLE.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_cutie_conv2d_fused_reference(
+    _x: &GpuTensor, _batch: usize, _in_w: usize, _in_h: usize, _cache_namespace: &str, _key: &str,
+    _weights: &[f32], _bias: Option<&[f32]>, _out_channels: usize, _k: usize, _pad: usize, _stride: usize,
+    _residual: Option<&GpuTensor>, _relu: bool,
+) -> Result<GpuTensor, String> {
+    Err(GPU_UNAVAILABLE.to_string())
+}
+
 pub fn gpu_cutie_maxpool3x3s2(_x: &GpuTensor, _w: usize, _h: usize) -> Result<GpuTensor, String> {
     Err(GPU_UNAVAILABLE.to_string())
 }

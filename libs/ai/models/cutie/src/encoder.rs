@@ -13,7 +13,7 @@
 //! convs on that: `key_proj` (64, the key), `d_proj` (1; shrinkage = d^2 + 1), `e_proj` (64;
 //! selection = sigmoid(e)).
 
-use crate::model::{add, dev, relu, Conv2d, CutieNet, Feat, ImageFeatures, Keys, Tap, Weights};
+use crate::model::{dev, relu, Conv2d, CutieNet, Feat, ImageFeatures, Keys, Tap, Weights};
 use crate::oracle::{Comparer, Oracle, Report, Tol};
 use crate::{DiffusionError, Result};
 use makepad_ai_common::gpu::{
@@ -54,13 +54,14 @@ impl Bottleneck {
 
     /// relu(bn3(conv3(relu(bn2(conv2(relu(bn1(conv1(x)))))))) + residual), the residual x or
     /// its downsample.
+    /// The ReLUs and the residual's add are in the convolutions' bias passes
+    /// (`Conv2d::forward_fused`).
     pub(crate) fn forward(&self, x: &Feat) -> Result<Feat> {
-        let out = relu(&self.conv1.forward(x)?)?;
-        let out = relu(&self.conv2.forward(&out)?)?;
-        let out = self.conv3.forward(&out)?;
+        let out = self.conv1.forward_relu(x)?;
+        let out = self.conv2.forward_relu(&out)?;
         match &self.downsample {
-            Some(d) => relu(&add(&out, &d.forward(x)?)?),
-            None => relu(&add(&out, x)?),
+            Some(d) => self.conv3.forward_fused(&out, Some(&d.forward(x)?), true),
+            None => self.conv3.forward_fused(&out, Some(x), true),
         }
     }
 }

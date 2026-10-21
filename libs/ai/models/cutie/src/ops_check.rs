@@ -24,7 +24,8 @@ use crate::oracle::{OracleTap, Report, Tol};
 use crate::Result;
 use makepad_ai_common::gpu::{
     gpu_cutie_add_broadcast, gpu_cutie_add_broadcast_reference, gpu_cutie_aggregate, gpu_cutie_aggregate_reference,
-    gpu_cutie_attn_mask, gpu_cutie_attn_mask_reference, gpu_cutie_conv2d, gpu_cutie_conv2d_reference, gpu_cutie_crop,
+    gpu_add, gpu_birefnet_relu, gpu_cutie_attn_mask, gpu_cutie_attn_mask_reference, gpu_cutie_conv2d, gpu_cutie_conv2d_fused,
+    gpu_cutie_conv2d_fused_reference, gpu_cutie_conv2d_reference, gpu_cutie_crop,
     gpu_cutie_crop_reference, gpu_cutie_eca, gpu_cutie_eca_reference, gpu_cutie_gru, gpu_cutie_gru_reference,
     gpu_cutie_layer_norm, gpu_cutie_layer_norm_reference, gpu_cutie_matmul, gpu_cutie_matmul_reference,
     gpu_cutie_maxpool3x3s2, gpu_cutie_maxpool3x3s2_reference, gpu_cutie_normalise_rows, gpu_cutie_normalise_rows_reference,
@@ -299,7 +300,58 @@ impl OpsCheck<'_> {
         self.conv("odd", 2, 2, 5, 4, 3, 1, 1, 1, true, false)?;
         self.conv("odd", 1, 3, 7, 7, 2, 7, 3, 2, false, false)?;
         self.conv("odd", 4, 9, 3, 2, 5, 3, 1, 1, true, false)?;
+
+        // The epilogue fused into the bias pass (a residual, a ReLU): the plain convolution then
+        // gpu_add and gpu_birefnet_relu to the bit, on both paths (side by side, strided batch,
+        // a 1x1 reading its input directly), and the host reference at TIGHT.
+        self.fused_conv("tail 1x1", 1, 64, 96, 56, 256, 1, 0, 1, true, true, true)?;
+        self.fused_conv("3x3 relu", 1, 64, 96, 56, 64, 3, 1, 1, true, false, true)?;
+        self.fused_conv("strided tail", 1, 128, 48, 28, 256, 3, 1, 2, true, true, true)?;
+        self.fused_conv("side by side", 3, 64, 24, 14, 64, 3, 1, 1, true, true, true)?;
+        self.fused_conv("side by side relu", 2, 256, 24, 14, 256, 3, 1, 1, true, false, true)?;
+        self.fused_conv("batched residual", 2, 128, 96, 56, 128, 3, 1, 1, true, true, false)?;
+        self.fused_conv("batched 1x1", 2, 64, 96, 56, 64, 1, 0, 1, true, true, true)?;
+        self.fused_conv("odd nobias", 2, 7, 13, 9, 5, 3, 1, 2, false, true, true)?;
+        self.fused_conv("odd nan", 1, 3, 17, 11, 4, 5, 2, 1, true, true, true)?;
         Ok(())
+    }
+
+    /// `gpu_cutie_conv2d_fused` with a random residual (`residual`) and a ReLU (`relu`) against
+    /// the plain convolution followed by `gpu_add` and `gpu_birefnet_relu` (exactly: it replaces
+    /// them), and against its host reference. The "nan" cases put NaN in the residual, which the
+    /// ReLU makes 0 on both sides.
+    #[allow(clippy::too_many_arguments)]
+    fn fused_conv(
+        &mut self, what: &str, batch: usize, in_c: usize, w: usize, h: usize, out_c: usize, k: usize, pad: usize, stride: usize,
+        bias: bool, residual: bool, relu: bool,
+    ) -> Result<()> {
+        use makepad_ai_common::gpu::cutie_conv_out;
+        let x = up(&self.rng.normals(batch * in_c * w * h, 1.0), batch * in_c, w * h)?;
+        let weights = self.rng.normals(out_c * in_c * k * k, 1.0 / ((in_c * k * k) as f32).sqrt());
+        let b = bias.then(|| self.rng.normals(out_c, 0.1));
+        let opix = cutie_conv_out(w, k, pad, stride) * cutie_conv_out(h, k, pad, stride);
+        let mut r = self.rng.normals(batch * out_c * opix, 1.0);
+        if what.ends_with("nan") {
+            r.iter_mut().step_by(7).for_each(|v| *v = f32::NAN);
+        }
+        let r = if residual { Some(up(&r, batch * out_c, opix)?) } else { None };
+        self.conv_cases += 1;
+        let key = format!("{CONV_KEY_PREFIX}:{}:{what}", self.conv_cases);
+        let case = format!("{what} {k}x{k}s{stride}p{pad} {in_c}->{out_c} {w}x{h} n{batch}{}{}", if residual { " +res" } else { "" }, if relu { " relu" } else { "" });
+        let fused = gpu_cutie_conv2d_fused(&x, batch, w, h, CUTIE_NAMESPACE, &key, &weights, b.as_deref(), out_c, k, pad, stride, r.as_ref(), relu)
+            .map_err(|e| dev(&case, e))?;
+        let mut apart = gpu_cutie_conv2d(&x, batch, w, h, CUTIE_NAMESPACE, &key, &weights, b.as_deref(), out_c, k, pad, stride).map_err(|e| dev(&case, e))?;
+        if let Some(r) = &r {
+            apart = gpu_add(&apart, r).map_err(|e| dev(&case, e))?;
+        }
+        if relu {
+            apart = gpu_birefnet_relu(&apart).map_err(|e| dev(&case, e))?;
+        }
+        self.compare("conv fused", &format!("{case} = apart"), &fused, &apart, EXACT)?;
+        let expected =
+            gpu_cutie_conv2d_fused_reference(&x, batch, w, h, CUTIE_NAMESPACE, &key, &weights, b.as_deref(), out_c, k, pad, stride, r.as_ref(), relu)
+                .map_err(|e| dev(&case, e))?;
+        self.compare("conv fused", &case, &fused, &expected, TIGHT)
     }
 
     // --- Pooling and elementwise ---

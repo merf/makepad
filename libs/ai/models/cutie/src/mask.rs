@@ -20,7 +20,7 @@
 //! ReLU, Linear to 16); weights = sigmoid(logits) * masks; sums = weights^T @ feature [16, 256],
 //! area = each summary's weights summed; summaries = [sums, area] [16, 257] per object.
 
-use crate::model::{add, dev, relu, Conv2d, CutieNet, Feat, FusionBlock, Linear, PositionalEncoding, Tap, Weights};
+use crate::model::{dev, relu, Conv2d, CutieNet, Feat, FusionBlock, Linear, PositionalEncoding, Tap, Weights};
 use crate::oracle::{Comparer, Oracle, OracleTap, Report, Tol};
 use crate::{DiffusionError, Result};
 use makepad_ai_common::gpu::{
@@ -67,14 +67,14 @@ impl BasicBlock {
         })
     }
 
+    /// The ReLUs and the residual's add are in the convolutions' bias passes
+    /// (`Conv2d::forward_fused`).
     fn forward(&self, x: &Feat) -> Result<Feat> {
-        let out = relu(&self.conv1.forward(x)?)?;
-        let out = self.conv2.forward(&out)?;
-        let out = match &self.downsample {
-            Some(d) => add(&out, &d.forward(x)?)?,
-            None => add(&out, x)?,
-        };
-        relu(&out)
+        let out = self.conv1.forward_relu(x)?;
+        match &self.downsample {
+            Some(d) => self.conv2.forward_fused(&out, Some(&d.forward(x)?), true),
+            None => self.conv2.forward_fused(&out, Some(x), true),
+        }
     }
 }
 

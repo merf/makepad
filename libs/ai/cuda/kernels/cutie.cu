@@ -87,7 +87,7 @@ extern "C" cudaError_t makepad_cuda_cutie_maxpool3x3s2_f32(
     return cudaGetLastError();
 }
 
-// --- Convolution: f32 im2col, then cuBLAS SGEMM (in the Rust wrapper), then the bias ---
+// --- Convolution: f32 im2col, then cuBLAS SGEMM (in the Rust wrapper), then the bias, residual and ReLU ---
 
 // The columns of `images` planar images [images*channels, height*width] for a square k x k
 // window with stride and zero padding, row r = c*k*k + ky*k + kx and column q = oy*ow + ox: the
@@ -131,48 +131,61 @@ extern "C" cudaError_t makepad_cuda_cutie_im2col_f32(
     return cudaGetLastError();
 }
 
+// What a convolution does after its product, in one pass: the bias added, then the residual
+// (a skip connection: the same layout as the output), then the ReLU, each rounded as the separate
+// ops it replaces round it (gpu_add's a + b, gpu_birefnet_relu's fmaxf(x, 0), which makes a NaN
+// 0), so the result is theirs to the bit with one read and write of the output instead of three.
+static __device__ __forceinline__ float cutie_conv_epilogue(
+    float v, const float* __restrict__ bias, uint32_t c, const float* __restrict__ residual, size_t at, bool relu) {
+    if (bias) v = __fadd_rn(v, bias[c]);
+    if (residual) v = __fadd_rn(v, residual[at]);
+    return relu ? fmaxf(v, 0.0f) : v;
+}
+
 // The side-by-side GEMM's result [channels][images][plane] to the images' planar layout
-// [images][channels][plane], plus the bias (when given).
-static __global__ void cutie_unstack_bias_kernel(
-    const float* __restrict__ src, float* __restrict__ out, const float* __restrict__ bias, uint32_t images,
-    uint32_t channels, size_t plane, size_t rows) {
+// [images][channels][plane], with the epilogue (bias, residual and ReLU each when given).
+static __global__ void cutie_unstack_epilogue_kernel(
+    const float* __restrict__ src, float* __restrict__ out, const float* __restrict__ bias,
+    const float* __restrict__ residual, bool relu, uint32_t images, uint32_t channels, size_t plane, size_t rows) {
     const size_t q = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (q >= plane) return;
     for (size_t row = blockIdx.y; row < rows; row += gridDim.y) {
         const size_t b = row / channels, c = row % channels;
-        const float v = src[(c * images + b) * plane + q];
-        out[row * plane + q] = bias ? __fadd_rn(v, bias[c]) : v;
+        const size_t at = row * plane + q;
+        out[at] = cutie_conv_epilogue(src[(c * images + b) * plane + q], bias, uint32_t(c), residual, at, relu);
     }
 }
 
-extern "C" cudaError_t makepad_cuda_cutie_unstack_bias_f32(
-    const float* src, float* out, const float* bias, uint32_t images, uint32_t channels, size_t plane,
-    cudaStream_t stream) {
+extern "C" cudaError_t makepad_cuda_cutie_unstack_epilogue_f32(
+    const float* src, float* out, const float* bias, const float* residual, uint32_t relu, uint32_t images,
+    uint32_t channels, size_t plane, cudaStream_t stream) {
     const size_t rows = size_t(images) * channels;
     if (!plane || !rows) return cudaSuccess;
     const dim3 block(256, 1, 1);
     const dim3 grid((unsigned)((plane + 255) / 256), (unsigned)(rows < 65535 ? rows : 65535), 1);
-    cutie_unstack_bias_kernel<<<grid, block, 0, stream>>>(src, out, bias, images, channels, plane, rows);
+    cutie_unstack_epilogue_kernel<<<grid, block, 0, stream>>>(src, out, bias, residual, relu != 0, images, channels, plane, rows);
     return cudaGetLastError();
 }
 
-// out[row][q] += bias[row % channels] over [rows, plane] (rows = images*channels).
-static __global__ void cutie_add_channel_bias_kernel(
-    float* __restrict__ out, const float* __restrict__ bias, uint32_t channels, size_t plane, size_t rows) {
+// The epilogue in place over [rows, plane] (rows = images*channels; the bias by row % channels).
+static __global__ void cutie_conv_epilogue_kernel(
+    float* __restrict__ out, const float* __restrict__ bias, const float* __restrict__ residual, bool relu,
+    uint32_t channels, size_t plane, size_t rows) {
     const size_t q = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (q >= plane) return;
     for (size_t row = blockIdx.y; row < rows; row += gridDim.y) {
         const size_t at = row * plane + q;
-        out[at] = __fadd_rn(out[at], bias[row % channels]);
+        out[at] = cutie_conv_epilogue(out[at], bias, uint32_t(row % channels), residual, at, relu);
     }
 }
 
-extern "C" cudaError_t makepad_cuda_cutie_add_channel_bias_f32(
-    float* out, const float* bias, uint32_t channels, size_t plane, size_t rows, cudaStream_t stream) {
+extern "C" cudaError_t makepad_cuda_cutie_conv_epilogue_f32(
+    float* out, const float* bias, const float* residual, uint32_t relu, uint32_t channels, size_t plane, size_t rows,
+    cudaStream_t stream) {
     if (!plane || !rows) return cudaSuccess;
     const dim3 block(256, 1, 1);
     const dim3 grid((unsigned)((plane + 255) / 256), (unsigned)(rows < 65535 ? rows : 65535), 1);
-    cutie_add_channel_bias_kernel<<<grid, block, 0, stream>>>(out, bias, channels, plane, rows);
+    cutie_conv_epilogue_kernel<<<grid, block, 0, stream>>>(out, bias, residual, relu != 0, channels, plane, rows);
     return cudaGetLastError();
 }
 

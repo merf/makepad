@@ -21,12 +21,13 @@ unsafe extern "C" {
         x: *const f32, col: *mut f32, images: u32, channels: u32, width: u32, height: u32, ow: u32, oh: u32,
         k: u32, pad: u32, stride: u32, side_by_side: u32, stream: cudaStream_t,
     ) -> cudaError_t;
-    fn makepad_cuda_cutie_add_channel_bias_f32(
-        out: *mut f32, bias: *const f32, channels: u32, plane: usize, rows: usize, stream: cudaStream_t,
-    ) -> cudaError_t;
-    fn makepad_cuda_cutie_unstack_bias_f32(
-        src: *const f32, out: *mut f32, bias: *const f32, images: u32, channels: u32, plane: usize,
+    fn makepad_cuda_cutie_conv_epilogue_f32(
+        out: *mut f32, bias: *const f32, residual: *const f32, relu: u32, channels: u32, plane: usize, rows: usize,
         stream: cudaStream_t,
+    ) -> cudaError_t;
+    fn makepad_cuda_cutie_unstack_epilogue_f32(
+        src: *const f32, out: *mut f32, bias: *const f32, residual: *const f32, relu: u32, images: u32, channels: u32,
+        plane: usize, stream: cudaStream_t,
     ) -> cudaError_t;
     fn makepad_cuda_cutie_sigmoid_f32(x: *const f32, out: *mut f32, n: usize, stream: cudaStream_t) -> cudaError_t;
     fn makepad_cuda_cutie_gru_f32(
@@ -201,6 +202,20 @@ pub fn gpu_cutie_conv2d(
     x: &GpuTensor, batch: usize, in_w: usize, in_h: usize, cache_namespace: &str, key: &str,
     weights: &[f32], bias: Option<&[f32]>, out_channels: usize, k: usize, pad: usize, stride: usize,
 ) -> Result<GpuTensor, String> {
+    gpu_cutie_conv2d_fused(x, batch, in_w, in_h, cache_namespace, key, weights, bias, out_channels, k, pad, stride, None, false)
+}
+
+/// `gpu_cutie_conv2d`, then `residual` added (when given: the output's shape, [batch*out_channels,
+/// out_h*out_w]) and a ReLU (when `relu`), in the pass that adds the bias: relu((conv + bias) +
+/// residual), each add rounded as `gpu_add` rounds it and the ReLU `gpu_birefnet_relu`'s (fmaxf(x,
+/// 0)), so the result is those ops' to the bit, the output read and written once instead of three
+/// times (a ResNet block's tail). The reference is the plain convolution, then those two ops.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_cutie_conv2d_fused(
+    x: &GpuTensor, batch: usize, in_w: usize, in_h: usize, cache_namespace: &str, key: &str,
+    weights: &[f32], bias: Option<&[f32]>, out_channels: usize, k: usize, pad: usize, stride: usize,
+    residual: Option<&GpuTensor>, relu: bool,
+) -> Result<GpuTensor, String> {
     let op = "gpu_cutie_conv2d";
     cutie_check_f32(op, x)?;
     if batch == 0 || x.rows == 0 || x.rows % batch != 0 || x.cols != in_w * in_h || k == 0 || stride == 0 || in_w + 2 * pad < k || in_h + 2 * pad < k {
@@ -213,6 +228,12 @@ pub fn gpu_cutie_conv2d(
     }
     let (ow, oh) = (cutie_conv_out(in_w, k, pad, stride), cutie_conv_out(in_h, k, pad, stride));
     let opix = ow * oh;
+    if let Some(r) = residual {
+        cutie_check_f32(op, r)?;
+        if (r.rows, r.cols) != (batch * out_channels, opix) {
+            return Err(format!("{op} {key}: residual {}x{} for an output {}x{opix}", r.rows, r.cols, batch * out_channels));
+        }
+    }
     let dim = |v: usize| i32::try_from(v).map_err(|_| format!("{op} {key}: {v} exceeds cuBLAS's sizes"));
     let (m, n, kd) = (dim(opix)?, dim(out_channels)?, dim(kdim)?);
     let d = |v: usize| cutie_u32(op, v);
@@ -242,12 +263,16 @@ pub fn gpu_cutie_conv2d(
         let x_ptr = x.device_ptr()?;
         let out_ptr = out.device_ptr()?;
         let bias_ptr = if bias.is_some() { unsafe { w_ptr.add(weights.len()) } } else { std::ptr::null() };
+        let residual_ptr = match residual {
+            Some(r) => r.device_ptr()?.cast_const(),
+            None => std::ptr::null(),
+        };
         let per_image = kdim * opix;
         let side_by_side =
             batch > 1 && opix <= CUTIE_CONV_SIDE_BY_SIDE_PIXELS && batch * per_image * size_of::<f32>() <= CUTIE_CONV_SCRATCH_BYTES;
         if side_by_side {
             // Small images: one GEMM over every image's columns side by side keeps cuBLAS's
-            // tiles full, then each image's channels are put back in place with the bias.
+            // tiles full, then each image's channels are put back in place with the epilogue.
             let wide = dim(batch * opix)?;
             let col = GpuTensor::from_pool(kdim, batch * opix)?;
             let stacked = GpuTensor::from_pool(out_channels, batch * opix)?;
@@ -267,8 +292,9 @@ pub fn gpu_cutie_conv2d(
             }
             .map_err(|e| format!("{op} {key}: {e}"))?;
             gpu_check(unsafe {
-                makepad_cuda_cutie_unstack_bias_f32(
-                    stacked.device_ptr()?, out_ptr, bias_ptr, batch_u, out_channels_u, opix, backend.stream,
+                makepad_cuda_cutie_unstack_epilogue_f32(
+                    stacked.device_ptr()?, out_ptr, bias_ptr, residual_ptr, relu as u32, batch_u, out_channels_u, opix,
+                    backend.stream,
                 )
             })?;
             return Ok(out);
@@ -305,9 +331,11 @@ pub fn gpu_cutie_conv2d(
             .map_err(|e| format!("{op} {key}: {e}"))?;
             first += count;
         }
-        if bias.is_some() {
+        if bias.is_some() || residual.is_some() || relu {
             gpu_check(unsafe {
-                makepad_cuda_cutie_add_channel_bias_f32(out_ptr, bias_ptr, out_channels_u, opix, batch * out_channels, backend.stream)
+                makepad_cuda_cutie_conv_epilogue_f32(
+                    out_ptr, bias_ptr, residual_ptr, relu as u32, out_channels_u, opix, batch * out_channels, backend.stream,
+                )
             })?;
         }
         Ok(out)
@@ -348,6 +376,24 @@ pub fn gpu_cutie_conv2d_reference(
     }
     let parts: Vec<&GpuTensor> = outs.iter().collect();
     gpu_concat_rows_many(&parts)
+}
+
+/// Reference: `gpu_cutie_conv2d_reference`, then `gpu_add` with the residual and
+/// `gpu_birefnet_relu`, the separate ops the fused epilogue replaces.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_cutie_conv2d_fused_reference(
+    x: &GpuTensor, batch: usize, in_w: usize, in_h: usize, cache_namespace: &str, key: &str,
+    weights: &[f32], bias: Option<&[f32]>, out_channels: usize, k: usize, pad: usize, stride: usize,
+    residual: Option<&GpuTensor>, relu: bool,
+) -> Result<GpuTensor, String> {
+    let mut out = gpu_cutie_conv2d_reference(x, batch, in_w, in_h, cache_namespace, key, weights, bias, out_channels, k, pad, stride)?;
+    if let Some(r) = residual {
+        out = gpu_add(&out, r)?;
+    }
+    if relu {
+        out = gpu_birefnet_relu(&out)?;
+    }
+    Ok(out)
 }
 
 // --- Pooling ---

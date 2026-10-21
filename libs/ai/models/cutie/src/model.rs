@@ -20,7 +20,7 @@
 use crate::torch_pth::PthStateDict;
 use crate::{DiffusionError, Result};
 use makepad_ai_common::gpu::{
-    cutie_conv_out, gpu_add, gpu_birefnet_relu, gpu_concat_rows_many, gpu_cutie_add_broadcast, gpu_cutie_conv2d, gpu_cutie_eca,
+    cutie_conv_out, gpu_add, gpu_birefnet_relu, gpu_concat_rows_many, gpu_cutie_add_broadcast, gpu_cutie_conv2d_fused, gpu_cutie_eca,
     gpu_cutie_layer_norm, gpu_cutie_sine_encoding, gpu_download, gpu_linear_f32_resident, gpu_planar_tokens_transpose,
     gpu_slice_rows, gpu_upload, GpuTensor,
 };
@@ -234,11 +234,24 @@ pub(crate) struct Conv2d {
 
 impl Conv2d {
     pub(crate) fn forward(&self, x: &Feat) -> Result<Feat> {
+        self.forward_fused(x, None, false)
+    }
+
+    /// relu(conv(x)), the ReLU in the pass that adds the bias.
+    pub(crate) fn forward_relu(&self, x: &Feat) -> Result<Feat> {
+        self.forward_fused(x, None, true)
+    }
+
+    /// conv(x) + `residual` (the output's shape), then a ReLU when `relu`, in the pass that adds
+    /// the bias (`gpu_cutie_conv2d_fused`: the same values as `add` and `relu` after it, to the
+    /// bit, with one pass over the output instead of three).
+    pub(crate) fn forward_fused(&self, x: &Feat, residual: Option<&Feat>, relu: bool) -> Result<Feat> {
         if x.c != self.in_c {
             return Err(DiffusionError::model(format!("cutie conv {}: {} channels in, wants {}", self.key, x.c, self.in_c)));
         }
-        let t = gpu_cutie_conv2d(
+        let t = gpu_cutie_conv2d_fused(
             &x.t, x.n, x.w, x.h, CUTIE_NAMESPACE, &self.key, &self.weights, self.bias.as_deref(), self.out_c, self.k, self.pad, self.stride,
+            residual.map(|r| &r.t), relu,
         )
         .map_err(|e| dev(&self.key, e))?;
         let (w, h) = (cutie_conv_out(x.w, self.k, self.pad, self.stride), cutie_conv_out(x.h, self.k, self.pad, self.stride));
@@ -304,8 +317,8 @@ impl CAResBlock {
     }
 
     pub(crate) fn forward(&self, x: &Feat) -> Result<Feat> {
-        let h = self.conv1.forward(&relu(x)?)?;
-        let h = self.conv2.forward(&relu(&h)?)?;
+        let h = self.conv1.forward_relu(&relu(x)?)?;
+        let h = self.conv2.forward(&h)?;
         Feat::new(gpu_cutie_eca(&h.t, &x.t, h.n, h.c, &self.eca).map_err(|e| dev("eca", e))?, h.n, h.c, h.w, h.h)
     }
 }
@@ -328,11 +341,10 @@ impl GroupResBlock {
     }
 
     pub(crate) fn forward(&self, g: &Feat) -> Result<Feat> {
-        let out = self.conv1.forward(&relu(g)?)?;
-        let out = self.conv2.forward(&relu(&out)?)?;
+        let out = self.conv1.forward_relu(&relu(g)?)?;
         match &self.downsample {
-            Some(d) => add(&out, &d.forward(g)?),
-            None => add(&out, g),
+            Some(d) => self.conv2.forward_fused(&out, Some(&d.forward(g)?), false),
+            None => self.conv2.forward_fused(&out, Some(g), false),
         }
     }
 }
