@@ -23032,6 +23032,9 @@ mod imp {
     }
 
     use std::mem::size_of;
+
+    // Cutie's device ops (models/vision/src/cutie*.rs).
+    include!("cutie_ops.rs");
 }
 
 #[cfg(not(all(any(target_os = "linux", target_os = "windows"), makepad_ai_cuda_kernels)))]

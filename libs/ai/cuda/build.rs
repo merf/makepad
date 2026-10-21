@@ -116,6 +116,7 @@ fn build_cuda_backends(target_os: &str, require_cuda: bool) {
         manifest_dir.join("kernels/pixal.cu"),
         manifest_dir.join("kernels/ssm_conv.cu"),
         manifest_dir.join("kernels/train.cu"),
+        manifest_dir.join("kernels/cutie.cu"),
     ];
     for src_path in &src_paths {
         println!("cargo:rerun-if-changed={}", src_path.display());
