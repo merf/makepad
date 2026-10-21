@@ -755,3 +755,157 @@ extern "C" cudaError_t makepad_cuda_cutie_attn_mask_f32(
     cutie_attn_mask_kernel<<<grid, 256, 0, stream>>>(fg, seen, out, heads, queries, p, rows);
     return cudaGetLastError();
 }
+
+// --- The per-frame step ---
+
+// (x - sub[row]) / div[row] over planar [rows, plane], a true division (CUTIE.encode_image's
+// (image - pixel_mean) / pixel_std, each op rounded).
+static __global__ void cutie_normalise_rows_kernel(
+    const float* __restrict__ x, float* __restrict__ out, const float* __restrict__ sub, const float* __restrict__ div,
+    size_t plane, size_t n) {
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
+        const size_t row = i / plane;
+        out[i] = __fdiv_rn(__fsub_rn(x[i], sub[row]), div[row]);
+    }
+}
+
+extern "C" cudaError_t makepad_cuda_cutie_normalise_rows_f32(
+    const float* x, float* out, const float* sub, const float* div, uint32_t rows, size_t plane, cudaStream_t stream) {
+    const size_t n = size_t(rows) * plane;
+    if (!n) return cudaSuccess;
+    cutie_normalise_rows_kernel<<<cutie_blocks(n, 256), 256, 0, stream>>>(x, out, sub, div, plane, n);
+    return cudaGetLastError();
+}
+
+// RGB bytes (plane pixels of 3) to planar f32 [3, plane], each byte times `scale` (PyTorch's CUDA
+// x / 255 multiplies by the reciprocal).
+static __global__ void cutie_rgb_planes_kernel(const uint8_t* __restrict__ rgb, float* __restrict__ out, size_t plane, float scale) {
+    const size_t n = plane * 3;
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
+        const size_t c = i / plane, px = i % plane;
+        out[i] = __fmul_rn(float(rgb[px * 3 + c]), scale);
+    }
+}
+
+extern "C" cudaError_t makepad_cuda_cutie_rgb_planes_f32(const uint8_t* rgb, float* out, size_t plane, float scale, cudaStream_t stream) {
+    if (!plane) return cudaSuccess;
+    cutie_rgb_planes_kernel<<<cutie_blocks(plane * 3, 256), 256, 0, stream>>>(rgb, out, plane, scale);
+    return cudaGetLastError();
+}
+
+// F.interpolate(mode='bilinear', align_corners=False) of planar [planes, in_h*in_w] to out_w x
+// out_h, as PyTorch's CUDA upsample_bilinear2d_out_frame computes it: the source position
+// fma(scale, dst + 0.5, -0.5) clamped at 0 (nvcc contracts the kernel's scale * (dst + 0.5) -
+// 0.5), the lower index truncated, the upper one past it but at the edge, lambdas l1 = src -
+// lower and l0 = 1 - l1; then fma(h0, fma(w0, a, w1 * b), h1 * fma(w0, c, w1 * d)), which is
+// how nvcc contracts its h0 * (w0 * a + w1 * b) + h1 * (w0 * c + w1 * d).
+static __device__ __forceinline__ void cutie_bilinear_source(
+    float scale, uint32_t dst, uint32_t in, uint32_t& lower, uint32_t& upper, float& l0, float& l1) {
+    float src = __fmaf_rn(scale, __fadd_rn(float(dst), 0.5f), -0.5f);
+    src = src < 0.0f ? 0.0f : src;
+    lower = uint32_t(src);
+    upper = lower + (lower < in - 1 ? 1u : 0u);
+    l1 = __fsub_rn(src, float(lower));
+    l0 = __fsub_rn(1.0f, l1);
+}
+
+static __global__ void cutie_resize_bilinear_kernel(
+    const float* __restrict__ x, float* __restrict__ out, uint32_t in_w, uint32_t in_h, uint32_t out_w, uint32_t out_h,
+    float scale_x, float scale_y, size_t n) {
+    const size_t out_plane = size_t(out_w) * out_h, in_plane = size_t(in_w) * in_h;
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
+        const size_t p = i / out_plane, at = i % out_plane;
+        const uint32_t oy = uint32_t(at / out_w), ox = uint32_t(at % out_w);
+        uint32_t y0, y1, x0, x1;
+        float h0, h1, w0, w1;
+        cutie_bilinear_source(scale_y, oy, in_h, y0, y1, h0, h1);
+        cutie_bilinear_source(scale_x, ox, in_w, x0, x1, w0, w1);
+        const float* src = x + p * in_plane;
+        const float* row0 = src + size_t(y0) * in_w;
+        const float* row1 = src + size_t(y1) * in_w;
+        const float top = __fmaf_rn(w0, row0[x0], __fmul_rn(w1, row0[x1]));
+        const float bottom = __fmaf_rn(w0, row1[x0], __fmul_rn(w1, row1[x1]));
+        out[i] = __fmaf_rn(h0, top, __fmul_rn(h1, bottom));
+    }
+}
+
+extern "C" cudaError_t makepad_cuda_cutie_resize_bilinear_f32(
+    const float* x, float* out, uint32_t planes, uint32_t in_w, uint32_t in_h, uint32_t out_w, uint32_t out_h,
+    float scale_x, float scale_y, cudaStream_t stream) {
+    const size_t n = size_t(out_w) * out_h * planes;
+    if (!n) return cudaSuccess;
+    if (!in_w || !in_h) return cudaErrorInvalidValue;
+    cutie_resize_bilinear_kernel<<<cutie_blocks(n, 256), 256, 0, stream>>>(x, out, in_w, in_h, out_w, out_h, scale_x, scale_y, n);
+    return cudaGetLastError();
+}
+
+// out[i] = a[i % a_len] + b[i]: one block `a` added to each block of `b` (Cutie's x + g of one
+// image's features broadcast over the objects).
+static __global__ void cutie_add_broadcast_kernel(
+    const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out, size_t a_len, size_t n) {
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
+        out[i] = __fadd_rn(a[i % a_len], b[i]);
+    }
+}
+
+extern "C" cudaError_t makepad_cuda_cutie_add_broadcast_f32(
+    const float* a, const float* b, float* out, size_t a_len, size_t n, cudaStream_t stream) {
+    if (!n) return cudaSuccess;
+    if (!a_len || n % a_len) return cudaErrorInvalidValue;
+    cutie_add_broadcast_kernel<<<cutie_blocks(n, 256), 256, 0, stream>>>(a, b, out, a_len, n);
+    return cudaGetLastError();
+}
+
+// The object transformer's values from the object memory [objects*queries, width+1] (each
+// summary's sums, then its area): sums / (area + eps), true divisions, written interleaved
+// [queries*objects, width] (row q*objects + o).
+static __global__ void cutie_object_values_kernel(
+    const float* __restrict__ memory, float* __restrict__ out, uint32_t objects, uint32_t queries, uint32_t width, float eps,
+    size_t n) {
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
+        const size_t row = i / width, c = i % width;
+        const size_t q = row / objects, o = row % objects;
+        const float* src = memory + (o * queries + q) * (size_t(width) + 1);
+        out[i] = __fdiv_rn(src[c], __fadd_rn(src[width], eps));
+    }
+}
+
+extern "C" cudaError_t makepad_cuda_cutie_object_values_f32(
+    const float* memory, float* out, uint32_t objects, uint32_t queries, uint32_t width, float eps, cudaStream_t stream) {
+    const size_t n = size_t(objects) * queries * width;
+    if (!n) return cudaSuccess;
+    cutie_object_values_kernel<<<cutie_blocks(n, 256), 256, 0, stream>>>(memory, out, objects, queries, width, eps, n);
+    return cudaGetLastError();
+}
+
+// Cutie's PositionalEncoding (channel-last, normalised) at w x h as tokens [h*w, 4*freqs], token
+// y*w + x: the x encoding in the first 2*freqs channels, the y encoding in the rest, sin and cos
+// interleaved per frequency. Each axis' position i / ((len - 1) + eps) * scale, times the
+// frequency, every op rounded as PyTorch's tensor ops round it; then CUDA's own sinf and cosf, as
+// torch.sin and torch.cos on CUDA (not correctly rounded: about 1 entry in 7 is 1 ulp from the
+// exact value, and PyTorch's are these).
+static __global__ void cutie_sine_encoding_kernel(
+    const float* __restrict__ inv_freq, float* __restrict__ out, uint32_t freqs, uint32_t w, uint32_t h, float scale,
+    float eps, size_t n) {
+    const uint32_t dim = 4 * freqs, half = 2 * freqs;
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
+        const size_t token = i / dim;
+        const uint32_t ch = uint32_t(i % dim);
+        const bool along_x = ch < half;
+        const uint32_t len = along_x ? w : h;
+        const uint32_t at = along_x ? uint32_t(token % w) : uint32_t(token / w);
+        const uint32_t local = along_x ? ch : ch - half;
+        const float last = __fadd_rn(float(len - 1), eps);
+        const float pos = __fmul_rn(__fdiv_rn(float(at), last), scale);
+        const float angle = __fmul_rn(pos, inv_freq[local / 2]);
+        out[i] = (local & 1) ? cosf(angle) : sinf(angle);
+    }
+}
+
+extern "C" cudaError_t makepad_cuda_cutie_sine_encoding_f32(
+    const float* inv_freq, float* out, uint32_t freqs, uint32_t w, uint32_t h, float scale, float eps, cudaStream_t stream) {
+    const size_t n = size_t(w) * h * 4 * freqs;
+    if (!n) return cudaSuccess;
+    cutie_sine_encoding_kernel<<<cutie_blocks(n, 256), 256, 0, stream>>>(inv_freq, out, freqs, w, h, scale, eps, n);
+    return cudaGetLastError();
+}

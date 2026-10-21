@@ -15,19 +15,24 @@
 //!
 //! The references share the kernels' reading of PyTorch's semantics, so a few results are also
 //! pinned to PyTorch's own (`pinned`): values torch 2.11 computed on CUDA for inputs where its
-//! summation order differs from a sequential one.
+//! summation order differs from a sequential one, where nvcc contracts its bilinear resize into
+//! FMAs, and where CUDA's sinf and cosf are not correctly rounded.
 
 use crate::model::{dev, CUTIE_NAMESPACE};
 use crate::oracle::{OracleTap, Report, Tol};
 use crate::Result;
 use makepad_ai_common::gpu::{
-    gpu_cutie_aggregate, gpu_cutie_aggregate_reference, gpu_cutie_attn_mask, gpu_cutie_attn_mask_reference,
-    gpu_cutie_conv2d, gpu_cutie_conv2d_reference, gpu_cutie_crop, gpu_cutie_crop_reference, gpu_cutie_eca,
-    gpu_cutie_eca_reference, gpu_cutie_gru, gpu_cutie_gru_reference, gpu_cutie_matmul, gpu_cutie_matmul_reference,
-    gpu_cutie_maxpool3x3s2, gpu_cutie_maxpool3x3s2_reference, gpu_cutie_others, gpu_cutie_others_reference, gpu_cutie_pad,
-    gpu_cutie_pad_reference, gpu_cutie_sigmoid, gpu_cutie_sigmoid_reference, gpu_cutie_similarity,
-    gpu_cutie_similarity_reference, gpu_cutie_softmax_axis0, gpu_cutie_softmax_axis0_reference, gpu_cutie_topk_softmax,
-    gpu_cutie_topk_softmax_reference, gpu_download, gpu_synchronize, gpu_upload, gpu_weight_cache_evict_prefix, GpuTensor,
+    gpu_cutie_add_broadcast, gpu_cutie_add_broadcast_reference, gpu_cutie_aggregate, gpu_cutie_aggregate_reference,
+    gpu_cutie_attn_mask, gpu_cutie_attn_mask_reference, gpu_cutie_conv2d, gpu_cutie_conv2d_reference, gpu_cutie_crop,
+    gpu_cutie_crop_reference, gpu_cutie_eca, gpu_cutie_eca_reference, gpu_cutie_gru, gpu_cutie_gru_reference,
+    gpu_cutie_layer_norm, gpu_cutie_layer_norm_reference, gpu_cutie_matmul, gpu_cutie_matmul_reference,
+    gpu_cutie_maxpool3x3s2, gpu_cutie_maxpool3x3s2_reference, gpu_cutie_normalise_rows, gpu_cutie_normalise_rows_reference,
+    gpu_cutie_object_values, gpu_cutie_object_values_reference, gpu_cutie_others, gpu_cutie_others_reference, gpu_cutie_pad,
+    gpu_cutie_pad_reference, gpu_cutie_resize_bilinear, gpu_cutie_resize_bilinear_reference, gpu_cutie_rgb_planes,
+    gpu_cutie_rgb_planes_reference, gpu_cutie_sigmoid, gpu_cutie_sigmoid_reference, gpu_cutie_similarity,
+    gpu_cutie_similarity_reference, gpu_cutie_sine_encoding, gpu_cutie_sine_encoding_reference, gpu_cutie_softmax_axis0,
+    gpu_cutie_softmax_axis0_reference, gpu_cutie_topk_softmax, gpu_cutie_topk_softmax_reference, gpu_download,
+    gpu_synchronize, gpu_upload, gpu_weight_cache_evict_prefix, GpuTensor,
 };
 use std::time::Instant;
 
@@ -38,8 +43,9 @@ const EXACT: Tol = Tol { rel: 0.0, cos: 1.0 - 1e-12, bool_mismatch: 0.0 };
 /// Ops that sum, or call exp, tanh or log: fp32 rounding apart.
 const TIGHT: Tol = Tol { rel: 1e-5, cos: 0.9999999, bool_mismatch: 0.0 };
 
-/// The conv cases' weight cache keys start with this (under Cutie's namespace), each case its
-/// own key: random weights under a reused key would read a stale cached copy. Evicted after.
+/// The conv and layer norm cases' weight cache keys start with this (under Cutie's namespace),
+/// each case its own key: random weights under a reused key would read a stale cached copy.
+/// Evicted after.
 const CONV_KEY_PREFIX: &str = "ops-check";
 
 /// Deterministic inputs (xorshift64*), so a failure reproduces.
@@ -115,6 +121,35 @@ const PINNED_TOPK: [u32; 32] = [
     0x00000000, 0x347151c4, 0x3b4eb054, 0x3028f2d2, 0x3710b40f, 0x3df7e005, 0x32ca9d3d, 0x39ad8a3b,
     0x2e8dda2c, 0x3572fd14, 0x3c501eee, 0x312a1e70, 0x3811b525, 0x3ef997ac, 0x33cc04aa, 0x3aaebe0b,
     0x2f8ed5d0, 0x3674ac11, 0x3d519159, 0x322b4d39, 0x3912b797, 0x00000000, 0x34cd70fd, 0x3baff50f,
+];
+
+/// torch 2.11 (CUDA, fp32) `F.interpolate(x, size=(8, 5), mode='bilinear', align_corners=False)`
+/// of x = golden(35) as [1, 1, 5, 7]: 7x5 down to 5 wide and up to 8 high, where nvcc's FMAs in
+/// PyTorch's kernel round differently from separate products and sums.
+const PINNED_RESIZE: [u32; 40] = [
+    0x3e31c5fb, 0x3ee0b187, 0x3f67733a, 0x3ebd1b60, 0x3f2274f3, 0x3ea1f6cd, 0x3f14e2aa, 0x3f1bfd20,
+    0x3f031798, 0x3edaca84, 0x3f01faec, 0x3f42aefb, 0x3e805fac, 0x3f2db0b8, 0x3e399322, 0x3f162da2,
+    0x3f36e1ae, 0x3ee8c524, 0x3f01e36d, 0x3ec52ef7, 0x3ef4c0ae, 0x3f1b1464, 0x3f289549, 0x3ecc2c42,
+    0x3f06ca2b, 0x3e3a4c2a, 0x3ede8e36, 0x3f5cc7fb, 0x3eb491a8, 0x3f1afcd8, 0x3eabf1e0, 0x3f19e02f,
+    0x3f00faa4, 0x3f08151e, 0x3eb1925f, 0x3ef505a6, 0x3f3e6a0e, 0x3e561200, 0x3f2c9eff, 0x3e0ee607,
+];
+
+/// torch 2.11 (CUDA) Cutie's `PositionalEncoding(16, scale=32, temperature=128)` at 3x2 ([1, 2,
+/// 3, 16]) and its `inv_freq`: 10 of its 96 entries are 1 ulp from sin and cos rounded from f64.
+const PINNED_SINE_FREQS: [u32; 4] = [0x3f800000, 0x3e9837f0, 0x3db504f3, 0x3cd744fd];
+const PINNED_SINE: [u32; 96] = [
+    0x00000000, 0x3f800000, 0x00000000, 0x3f800000, 0x00000000, 0x3f800000, 0x00000000, 0x3f800000,
+    0x00000000, 0x3f800000, 0x00000000, 0x3f800000, 0x00000000, 0x3f800000, 0x00000000, 0x3f800000,
+    0xbe93671b, 0xbf752951, 0xbf7fbf4e, 0x3d35f42e, 0x3f7cde39, 0x3e1fafe5, 0x3ed0fb97, 0x3f69b438,
+    0x00000000, 0x3f800000, 0x00000000, 0x3f800000, 0x00000000, 0x3f800000, 0x00000000, 0x3f800000,
+    0x3f0d2977, 0x3f559037, 0xbdb5c632, 0xbf7efd5a, 0x3e9dbbc3, 0xbf738c81, 0x3f3ec81c, 0x3f2ab31a,
+    0x00000000, 0x3f800000, 0x00000000, 0x3f800000, 0x00000000, 0x3f800000, 0x00000000, 0x3f800000,
+    0x00000000, 0x3f800000, 0x00000000, 0x3f800000, 0x00000000, 0x3f800000, 0x00000000, 0x3f800000,
+    0x3f0d28a2, 0x3f5590c4, 0xbdb5c3b5, 0xbf7efd61, 0x3e9dbbea, 0xbf738c7b, 0x3f3ec818, 0x3f2ab31e,
+    0xbe93671b, 0xbf752951, 0xbf7fbf4e, 0x3d35f42e, 0x3f7cde39, 0x3e1fafe5, 0x3ed0fb97, 0x3f69b438,
+    0x3f0d28a2, 0x3f5590c4, 0xbdb5c3b5, 0xbf7efd61, 0x3e9dbbea, 0xbf738c7b, 0x3f3ec818, 0x3f2ab31e,
+    0x3f0d2977, 0x3f559037, 0xbdb5c632, 0xbf7efd5a, 0x3e9dbbc3, 0xbf738c81, 0x3f3ec81c, 0x3f2ab31a,
+    0x3f0d28a2, 0x3f5590c4, 0xbdb5c3b5, 0xbf7efd61, 0x3e9dbbea, 0xbf738c7b, 0x3f3ec818, 0x3f2ab31e,
 ];
 
 /// How long `f` takes on the device: after a warm run, the best of `rounds` rounds of 3 runs
@@ -525,12 +560,151 @@ impl OpsCheck<'_> {
         Ok(())
     }
 
+    // --- The per-frame step ---
+
+    /// One block [rows, cols] added to each of `k` blocks.
+    fn add_broadcast(&mut self, rows: usize, cols: usize, k: usize, timed: bool) -> Result<()> {
+        let a = up(&self.rng.normals(rows * cols, 1.0), rows, cols)?;
+        let b = up(&self.rng.normals(k * rows * cols, 1.0), k * rows, cols)?;
+        let case = format!("{rows}x{cols} onto {k}");
+        let actual = gpu_cutie_add_broadcast(&a, &b).map_err(|e| dev(&case, e))?;
+        let expected = gpu_cutie_add_broadcast_reference(&a, &b).map_err(|e| dev(&case, e))?;
+        self.compare("add_bcast", &case, &actual, &expected, EXACT)?;
+        if timed {
+            let kernel = time_ms(5, || gpu_cutie_add_broadcast(&a, &b))?;
+            let reference = time_ms(2, || gpu_cutie_add_broadcast_reference(&a, &b))?;
+            self.timing("add_bcast", &case, kernel, reference);
+        }
+        Ok(())
+    }
+
+    /// (x - sub[r]) / div[r] of 0..1 planes; `sub` and `div` ImageNet's for 3 rows, else random.
+    fn normalise_rows(&mut self, rows: usize, cols: usize, timed: bool) -> Result<()> {
+        let x = up(&self.rng.uniforms(rows * cols, 0.0, 1.0), rows, cols)?;
+        let (sub, div) = if rows == 3 {
+            (vec![0.485, 0.456, 0.406], vec![0.229, 0.224, 0.225])
+        } else {
+            (self.rng.uniforms(rows, 0.0, 1.0), self.rng.uniforms(rows, 0.1, 1.0))
+        };
+        let (sub, div) = (up(&sub, rows, 1)?, up(&div, rows, 1)?);
+        let case = format!("{rows}x{cols}");
+        let actual = gpu_cutie_normalise_rows(&x, &sub, &div).map_err(|e| dev(&case, e))?;
+        let expected = gpu_cutie_normalise_rows_reference(&x, &sub, &div).map_err(|e| dev(&case, e))?;
+        self.compare("normalise", &case, &actual, &expected, EXACT)?;
+        if timed {
+            let kernel = time_ms(5, || gpu_cutie_normalise_rows(&x, &sub, &div))?;
+            let reference = time_ms(2, || gpu_cutie_normalise_rows_reference(&x, &sub, &div))?;
+            self.timing("normalise", &case, kernel, reference);
+        }
+        Ok(())
+    }
+
+    /// Random RGB bytes w x h to planes, times 1/255 as the processor does.
+    fn rgb_planes(&mut self, w: usize, h: usize, timed: bool) -> Result<()> {
+        let rgb: Vec<u8> = (0..w * h * 3).map(|_| self.rng.next_u64() as u8).collect();
+        let (plane, scale) = (w * h, 1.0f32 / 255.0f32);
+        let case = format!("{w}x{h}");
+        let actual = gpu_cutie_rgb_planes(&rgb, plane, scale).map_err(|e| dev(&case, e))?;
+        let expected = gpu_cutie_rgb_planes_reference(&rgb, plane, scale).map_err(|e| dev(&case, e))?;
+        self.compare("rgb", &case, &actual, &expected, EXACT)?;
+        if timed {
+            let kernel = time_ms(5, || gpu_cutie_rgb_planes(&rgb, plane, scale))?;
+            let reference = time_ms(2, || gpu_cutie_rgb_planes_reference(&rgb, plane, scale))?;
+            self.timing("rgb", &case, kernel, reference);
+        }
+        Ok(())
+    }
+
+    /// Bilinear resize of random 0..1 planes, in_w x in_h to out_w x out_h.
+    #[allow(clippy::too_many_arguments)]
+    fn resize(&mut self, planes: usize, in_w: usize, in_h: usize, out_w: usize, out_h: usize, timed: bool) -> Result<()> {
+        let x = up(&self.rng.uniforms(planes * in_w * in_h, 0.0, 1.0), planes, in_w * in_h)?;
+        let case = format!("{planes} planes {in_w}x{in_h} to {out_w}x{out_h}");
+        let actual = gpu_cutie_resize_bilinear(&x, in_w, in_h, out_w, out_h).map_err(|e| dev(&case, e))?;
+        let expected = gpu_cutie_resize_bilinear_reference(&x, in_w, in_h, out_w, out_h).map_err(|e| dev(&case, e))?;
+        self.compare("resize", &case, &actual, &expected, EXACT)?;
+        if timed {
+            let kernel = time_ms(5, || gpu_cutie_resize_bilinear(&x, in_w, in_h, out_w, out_h))?;
+            let reference = time_ms(1, || gpu_cutie_resize_bilinear_reference(&x, in_w, in_h, out_w, out_h))?;
+            self.timing("resize", &case, kernel, reference);
+        }
+        Ok(())
+    }
+
+    /// The object transformer's values from `objects` objects' memory [objects*16, 257]: sums of
+    /// a few hundred, areas from 0 (only the 1e-4 left) up to the frame's tokens.
+    fn object_values(&mut self, objects: usize, timed: bool) -> Result<()> {
+        const QUERIES: usize = 16;
+        const WIDTH: usize = 257;
+        let mut memory = self.rng.normals(objects * QUERIES * WIDTH, 100.0);
+        for (r, row) in memory.chunks_mut(WIDTH).enumerate() {
+            row[WIDTH - 1] = match r % 4 {
+                0 => 0.0,
+                1 => 1e-6,
+                _ => self.rng.uniform() * 336.0,
+            };
+        }
+        let memory = up(&memory, objects * QUERIES, WIDTH)?;
+        let case = format!("n{objects}");
+        let actual = gpu_cutie_object_values(&memory, objects, 1e-4).map_err(|e| dev(&case, e))?;
+        let expected = gpu_cutie_object_values_reference(&memory, objects, 1e-4).map_err(|e| dev(&case, e))?;
+        self.compare("obj_values", &case, &actual, &expected, EXACT)?;
+        if timed {
+            let kernel = time_ms(5, || gpu_cutie_object_values(&memory, objects, 1e-4))?;
+            let reference = time_ms(2, || gpu_cutie_object_values_reference(&memory, objects, 1e-4))?;
+            self.timing("obj_values", &case, kernel, reference);
+        }
+        Ok(())
+    }
+
+    /// Cutie's sine encoding (64 frequencies 1 / 128^(2i/128), scale 32) at w x h.
+    fn sine_encoding(&mut self, w: usize, h: usize, timed: bool) -> Result<()> {
+        let inv_freq: Vec<f32> = (0..64).map(|i| (1.0 / 128f64.powf(2.0 * i as f64 / 128.0)) as f32).collect();
+        let case = format!("{w}x{h}");
+        let actual = gpu_cutie_sine_encoding(&inv_freq, w, h, 32.0, 1e-6).map_err(|e| dev(&case, e))?;
+        let expected = gpu_cutie_sine_encoding_reference(&inv_freq, w, h, 32.0, 1e-6).map_err(|e| dev(&case, e))?;
+        self.compare("sine", &case, &actual, &expected, TIGHT)?;
+        if timed {
+            let kernel = time_ms(5, || gpu_cutie_sine_encoding(&inv_freq, w, h, 32.0, 1e-6))?;
+            let reference = time_ms(2, || gpu_cutie_sine_encoding_reference(&inv_freq, w, h, 32.0, 1e-6))?;
+            self.timing("sine", &case, kernel, reference);
+        }
+        Ok(())
+    }
+
+    /// LayerNorm of rows [rows, cols] with its affine cached against `gpu_layer_norm_pytorch`.
+    fn layer_norm(&mut self, rows: usize, cols: usize, timed: bool) -> Result<()> {
+        let x = up(&self.rng.normals(rows * cols, 3.0), rows, cols)?;
+        let gamma = self.rng.normals(cols, 1.0);
+        let beta = self.rng.normals(cols, 0.5);
+        self.conv_cases += 1;
+        let key = format!("{CONV_KEY_PREFIX}:{}:layer norm", self.conv_cases);
+        let case = format!("{rows}x{cols}");
+        let run = |reference: bool| {
+            let f = if reference { gpu_cutie_layer_norm_reference } else { gpu_cutie_layer_norm };
+            f(&x, CUTIE_NAMESPACE, &key, &gamma, &beta, 1e-5)
+        };
+        let actual = run(false).map_err(|e| dev(&case, e))?;
+        // Again, from the cached affine.
+        let again = run(false).map_err(|e| dev(&case, e))?;
+        let expected = run(true).map_err(|e| dev(&case, e))?;
+        self.compare("layer_norm", &case, &actual, &expected, EXACT)?;
+        self.compare("layer_norm", &format!("{case} cached"), &again, &expected, EXACT)?;
+        if timed {
+            let kernel = time_ms(5, || run(false))?;
+            let reference = time_ms(5, || run(true))?;
+            self.timing("layer_norm", &case, kernel, reference);
+        }
+        Ok(())
+    }
+
     // --- PyTorch's own results ---
 
     /// The kernels against PyTorch's values (`PINNED_*`) where its order over objects and picks
-    /// is not sequential: exactly (the same fp32 operations in the same order, CUDA's own expf
-    /// and logf). The references too: exactly where they only add and multiply, within `TIGHT`
-    /// where they call the host's exp or ln.
+    /// is not sequential, where its bilinear resize is contracted into FMAs, and where its sin
+    /// and cos are not correctly rounded: exactly (the same fp32 operations in the same order,
+    /// CUDA's own expf, logf, sinf and cosf). The references too: exactly where they only add,
+    /// multiply and fuse, within `TIGHT` where they call the host's exp, ln, sin or cos.
     fn pinned(&mut self) -> Result<()> {
         let masks: Vec<f32> = golden(40).iter().map(|v| v * 0.15).collect();
         let masks = up(&masks, 5, 8)?;
@@ -551,6 +725,21 @@ impl OpsCheck<'_> {
         self.compare_pinned("topk", &format!("{case} kernel"), &aff, &PINNED_TOPK, EXACT)?;
         let (aff, _) = gpu_cutie_topk_softmax_reference(&sim, 30).map_err(|e| dev(case, e))?;
         self.compare_pinned("topk", &format!("{case} reference"), &aff, &PINNED_TOPK, TIGHT)?;
+
+        let x = up(&golden(35), 1, 35)?;
+        let case = "torch 7x5 to 5x8";
+        let out = gpu_cutie_resize_bilinear(&x, 7, 5, 5, 8).map_err(|e| dev(case, e))?;
+        self.compare_pinned("resize", &format!("{case} kernel"), &out, &PINNED_RESIZE, EXACT)?;
+        let out = gpu_cutie_resize_bilinear_reference(&x, 7, 5, 5, 8).map_err(|e| dev(case, e))?;
+        self.compare_pinned("resize", &format!("{case} reference"), &out, &PINNED_RESIZE, EXACT)?;
+
+        // The kernel is CUDA's sinf and cosf, PyTorch's to the bit; the reference rounds from f64.
+        let inv_freq: Vec<f32> = PINNED_SINE_FREQS.iter().map(|&b| f32::from_bits(b)).collect();
+        let case = "torch dim 16 at 3x2";
+        let pe = gpu_cutie_sine_encoding(&inv_freq, 3, 2, 32.0, 1e-6).map_err(|e| dev(case, e))?;
+        self.compare_pinned("sine", &format!("{case} kernel"), &pe, &PINNED_SINE, EXACT)?;
+        let pe = gpu_cutie_sine_encoding_reference(&inv_freq, 3, 2, 32.0, 1e-6).map_err(|e| dev(case, e))?;
+        self.compare_pinned("sine", &format!("{case} reference"), &pe, &PINNED_SINE, TIGHT)?;
         Ok(())
     }
 }
@@ -732,5 +921,53 @@ fn run(ck: &mut OpsCheck) -> Result<()> {
     let mut aux = ck.rng.normals(2 * P16, 4.0);
     aux.iter_mut().step_by(29).for_each(|v| *v = f32::NAN);
     ck.attn_mask("nan", 2, P16, 8, 16, aux, false)?;
+
+    // The per-frame step: the fusion blocks' and the decoder's x + g (1 to 3 objects at strides
+    // 16, 8 and 4), the summarizer's encoding added to each object's tokens; odd sizes.
+    for n in 1..=3 {
+        ck.add_broadcast(256, P16, n, n == 3)?;
+    }
+    ck.add_broadcast(128, 48 * 28, 2, false)?;
+    ck.add_broadcast(128, P4, 3, true)?;
+    ck.add_broadcast(P16, 256, 2, false)?;
+    ck.add_broadcast(5, 37, 4, false)?;
+    // The image normalised: the oracle's frame, a 1000p one, odd rows.
+    ck.normalise_rows(3, FRAME, true)?;
+    ck.normalise_rows(3, 1792 * 1008, true)?;
+    ck.normalise_rows(7, 33, false)?;
+    // The frame's bytes to planes.
+    ck.rgb_planes(384, 216, true)?;
+    ck.rgb_planes(1920, 1080, true)?;
+    ck.rgb_planes(7, 5, false)?;
+    ck.rgb_planes(1, 1, false)?;
+    // A frame over max_internal_size resized in and the probabilities back out (1080p and 4K,
+    // portrait), and odd sizes: down, up, mixed, one pixel either way.
+    ck.resize(3, 1920, 1080, 1777, 1000, true)?;
+    ck.resize(3, 1777, 1000, 1920, 1080, true)?;
+    ck.resize(2, 1080, 1920, 1000, 1777, false)?;
+    ck.resize(1, 3840, 2160, 1777, 1000, false)?;
+    ck.resize(2, 1440, 1080, 1333, 1000, false)?;
+    for (planes, iw, ih, ow, oh) in [(2, 7, 5, 4, 3), (2, 4, 3, 9, 7), (1, 1, 1, 3, 2), (1, 3, 2, 1, 1), (3, 5, 1, 2, 1), (1, 13, 9, 13, 4)] {
+        ck.resize(planes, iw, ih, ow, oh, false)?;
+    }
+    // The decoder's x2 (strides 16 to 8 and 8 to 4, every object's channels) and x4 (the
+    // logits to the padded frame).
+    ck.resize(2 * 256, 24, 14, 48, 28, false)?;
+    ck.resize(3 * 128, 48, 28, 96, 56, true)?;
+    ck.resize(3, 96, 56, 384, 224, true)?;
+    // The object transformer's values for 1 to 3 objects, and 6.
+    for n in 1..=3 {
+        ck.object_values(n, n == 3)?;
+    }
+    ck.object_values(6, false)?;
+    // The sine encoding at the oracle's stride-16 grids (384x224, 960x544), 1000p's, a pixel.
+    ck.sine_encoding(24, 14, true)?;
+    ck.sine_encoding(60, 34, false)?;
+    ck.sine_encoding(112, 63, true)?;
+    ck.sine_encoding(1, 1, false)?;
+    // The object transformer's LayerNorms: queries (16 an object) and odd rows.
+    ck.layer_norm(16 * 3, 256, true)?;
+    ck.layer_norm(16, 256, false)?;
+    ck.layer_norm(7, 12, false)?;
     Ok(())
 }

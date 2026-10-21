@@ -48,10 +48,13 @@ pub struct CutieConfig {
     /// The shorter side is resized down to this before anything else (0: never).
     pub max_internal_size: usize,
     pub use_long_term: bool,
+    /// Without long-term memory, working memory keeps this many frames (one of them the
+    /// permanent memory), dropping the oldest (Cutie's top-level `max_mem_frames`).
+    pub max_mem_frames_without_long_term: usize,
     /// Long-term memory counts its tokens' use.
     pub count_long_term_usage: bool,
-    /// Working memory holds this many frames (one of them the permanent memory) before it
-    /// consolidates (`long_term.max_mem_frames`).
+    /// With long-term memory, working memory holds this many frames (one of them the permanent
+    /// memory) before it consolidates (`long_term.max_mem_frames`).
     pub max_mem_frames: usize,
     /// What consolidation leaves in working memory (`long_term.min_mem_frames`).
     pub min_mem_frames: usize,
@@ -68,6 +71,7 @@ impl Default for CutieConfig {
             stagger_updates: 5,
             max_internal_size: 1000,
             use_long_term: true,
+            max_mem_frames_without_long_term: 5,
             count_long_term_usage: true,
             max_mem_frames: 10,
             min_mem_frames: 5,
@@ -145,7 +149,7 @@ pub fn validate(oracle_dir: &Path, weights_path: &Path, stages: &[String]) -> Re
         if let Err(e) = result {
             report.fail(stage, "-", "(stage)", e.to_string());
         }
-        report.note(format!("stage {stage}: {:.1} s", started.elapsed().as_secs_f64()));
+        report.note(format!("stage {stage}: {:.3} s", started.elapsed().as_secs_f64()));
     }
     report.print();
     let summary = ValidateSummary { comparisons: report.rows.len(), failures: report.failures };

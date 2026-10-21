@@ -48,7 +48,7 @@
 
 use crate::model::{dev, CutieNet, Feat, Keys, Tap, Weights};
 use crate::oracle::{Comparer, Oracle, Report, Tol, STEPS};
-use crate::processor::{record, uncompared, StepPlan, StepSchedule};
+use crate::processor::{StepPlan, StepSchedule};
 use crate::{CutieConfig, DiffusionError, Result};
 use makepad_ai_common::gpu::{
     gpu_add, gpu_concat_cols, gpu_concat_rows_many, gpu_cutie_matmul, gpu_cutie_similarity, gpu_cutie_softmax_axis0,
@@ -61,9 +61,6 @@ pub(crate) const VALUE_DIM: usize = 256;
 pub(crate) const SENSORY_DIM: usize = 256;
 /// The life count a new temporary token starts with (`KeyValueMemoryStore.add`: zeros + 1e-7).
 const NEW_LIFE: f32 = 1e-7;
-/// Frames working memory keeps without long-term memory: the GUI config's top-level
-/// `max_mem_frames`, which `CutieConfig` does not carry (its `max_mem_frames` is long-term's).
-const MAX_MEM_FRAMES_WITHOUT_LONG_TERM: usize = 5;
 
 /// How an add joins the permanent part (`KeyValueMemoryStore.add`'s `as_permanent`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -363,7 +360,7 @@ impl MemoryManager {
             top_k: config.top_k,
             use_long_term: config.use_long_term,
             count_long_term_usage: config.count_long_term_usage,
-            max_mem_frames: if config.use_long_term { config.max_mem_frames } else { MAX_MEM_FRAMES_WITHOUT_LONG_TERM }.saturating_sub(1),
+            max_mem_frames: if config.use_long_term { config.max_mem_frames } else { config.max_mem_frames_without_long_term }.saturating_sub(1),
             min_mem_frames: config.min_mem_frames.saturating_sub(1),
             num_prototypes: config.num_prototypes,
             max_long_tokens: config.max_long_tokens,
@@ -515,7 +512,8 @@ impl MemoryManager {
     pub(crate) fn initialize_sensory_if_needed(&mut self, keys: &Keys, objects: usize) -> Result<()> {
         if self.sensory.is_none() {
             let (w, h) = (keys.key.w, keys.key.h);
-            self.sensory = Some(Feat::upload(&vec![0.0; objects * SENSORY_DIM * w * h], objects, SENSORY_DIM, w, h)?);
+            let zeros = gpu_rife_fill(objects * SENSORY_DIM, w * h, 0.0).map_err(|e| dev("sensory memory", e))?;
+            self.sensory = Some(Feat::new(zeros, objects, SENSORY_DIM, w, h)?);
             self.objects = objects;
         }
         Ok(())
@@ -601,7 +599,7 @@ impl OracleMemory {
             m.sensory = Some(Feat::new(t, objects, SENSORY_DIM, w, h)?);
         }
         if oracle.has(step, "state.before.obj_memory.obj1") {
-            let shape = oracle.tap(step, "state.before.obj_memory.obj1")?.shape;
+            let shape = oracle.shape(step, "state.before.obj_memory.obj1")?;
             let (rows, cols) = (shape[shape.len() - 2], shape[shape.len() - 1]);
             m.obj_memory = Some(Self::objects(oracle, step, "state.before.obj_memory", objects, rows, cols)?);
         }
@@ -660,15 +658,11 @@ impl OracleMemory {
 
     /// The step's `key.*`, as the key projection gives them.
     fn keys(oracle: &Oracle, step: &str) -> Result<Keys> {
-        let shape = oracle.tap(step, "key.key")?.shape;
-        let (c, h, w) = (shape[shape.len() - 3], shape[shape.len() - 2], shape[shape.len() - 1]);
-        let feat = |name: &str, c: usize| -> Result<Feat> { Feat::new(Self::upload(oracle, step, name, c, w * h)?, 1, c, w, h) };
-        Ok(Keys { key: feat("key.key", c)?, shrinkage: feat("key.shrinkage", 1)?, selection: feat("key.selection", c)? })
-    }
-
-    /// A per-object (n, c at w x h) tap as a `Feat`.
-    fn feat(oracle: &Oracle, step: &str, name: &str, n: usize, c: usize, w: usize, h: usize) -> Result<Feat> {
-        Feat::new(Self::upload(oracle, step, name, n * c, w * h)?, n, c, w, h)
+        Ok(Keys {
+            key: oracle.feat(step, "key.key")?,
+            shrinkage: oracle.feat(step, "key.shrinkage")?,
+            selection: oracle.feat(step, "key.selection")?,
+        })
     }
 }
 
@@ -727,7 +721,7 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, _weights: &mut Weights
                 Ok(())
             })?;
             if plan.update_sensory {
-                memory.update_sensory(OracleMemory::feat(oracle, step, "segment.out.sensory", objects, SENSORY_DIM, w, h)?)?;
+                memory.update_sensory(oracle.feat_as(step, "segment.out.sensory", objects, SENSORY_DIM)?)?;
             }
         }
         let memorise = plan.memorise || row.force_permanent;
@@ -737,18 +731,18 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, _weights: &mut Weights
         if oracle.has(step, "encode_mask.out.value") {
             memory.initialize_sensory_if_needed(&keys, objects)?;
             cmp.with(|tap| tap.put("encode_mask.in.sensory", &memory.sensory()?.t))?;
-            let value = OracleMemory::feat(oracle, step, "encode_mask.out.value", objects, VALUE_DIM, w, h)?;
+            let value = oracle.feat_as(step, "encode_mask.out.value", objects, VALUE_DIM)?;
             let summaries = oracle.tap(step, "encode_mask.out.obj_summaries")?;
             let cols = *summaries.shape.last().unwrap_or(&1);
             let obj_value = gpu_upload(&summaries.values, summaries.values.len() / cols, cols).map_err(|e| dev("oracle summaries", e))?;
             let as_permanent = if row.force_permanent { Permanence::All } else { Permanence::First };
             cmp.with(|tap| memory.add_memory(&keys, &value, &obj_value, as_permanent, tap))?;
-            memory.update_sensory(OracleMemory::feat(oracle, step, "encode_mask.out.sensory", objects, SENSORY_DIM, w, h)?)?;
+            memory.update_sensory(oracle.feat_as(step, "encode_mask.out.sensory", objects, SENSORY_DIM)?)?;
         }
         cmp.with(|tap| memory.dump("state.after", tap))?;
         // Every memory tap the oracle has must have been compared (the last mask is the
         // processor's).
-        for name in uncompared(&cmp, &["memory.", "state.after.work_mem.", "state.after.long_mem.", "state.after.sensory.", "state.after.obj_memory."]) {
+        for name in cmp.uncompared(&["memory.", "state.after.work_mem.", "state.after.long_mem.", "state.after.sensory.", "state.after.obj_memory."]) {
             cmp.report.fail("memory", step, &name, "never compared");
         }
         // The schedule's sizes after the step.
@@ -757,7 +751,7 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, _weights: &mut Weights
         let expected = (row.work_tokens, row.work_permanent, row.long_tokens);
         let pass = sizes == expected && consolidated == row.consolidated;
         let note = format!("tokens {sizes:?} consolidated {consolidated} (oracle {expected:?} {})", row.consolidated);
-        record(report, "memory", step, "schedule", pass, if pass { 1.0 } else { 0.0 }, note);
+        report.record("memory", step, "schedule", pass, note);
     }
     crate::processor::check_without_network(oracle, report)
 }

@@ -4,9 +4,9 @@
 //! A step (`step(image, mask, force_permanent, end)`), with `curr_ti` counting steps since the
 //! last clear and `last_mem_ti` the last memorised one:
 //! - resize the image (and mask) when its shorter side exceeds `max_internal_size` (bilinear,
-//!   align_corners false, bit for bit as PyTorch's CUDA kernel: `Bilinear`), then pad to a
-//!   multiple of 16, centred (left = (W'-W)/2 rounded down, the rest right; likewise top and
-//!   bottom), the mask too;
+//!   align_corners false, bit for bit as PyTorch's CUDA kernel: `gpu_cutie_resize_bilinear`),
+//!   then pad to a multiple of 16, centred (left = (W'-W)/2 rounded down, the rest right;
+//!   likewise top and bottom), the mask too;
 //! - `curr_ti += 1`; memorise when `curr_ti - last_mem_ti >= mem_every` or a mask is given, and
 //!   not `end`; segment when there is no mask (with a mask for every object, never); update the
 //!   sensory memory when `curr_ti - last_mem_ti` is in the stagger set (1..=mem_every when
@@ -28,12 +28,12 @@
 
 use crate::memory::{MemoryManager, Permanence, VALUE_DIM};
 use crate::model::{dev, CutieNet, Feat, ImageFeatures, Keys, Tap, Weights};
-use crate::oracle::{Comparer, Oracle, OracleTap, Report, Row, ScheduleRow, Tol};
+use crate::oracle::{Comparer, Oracle, OracleTap, Report, ScheduleRow, Tol};
 use crate::{CutieConfig, DiffusionError, Result};
 use makepad_ai_common::gpu::{
-    gpu_cutie_aggregate, gpu_cutie_crop, gpu_cutie_pad, gpu_cutie_softmax_axis0, gpu_download, gpu_slice_rows, gpu_upload, GpuTensor,
+    gpu_cutie_aggregate, gpu_cutie_crop, gpu_cutie_pad, gpu_cutie_resize_bilinear, gpu_cutie_rgb_planes, gpu_cutie_softmax_axis0,
+    gpu_download, gpu_slice_rows, gpu_upload, GpuTensor,
 };
-use std::collections::HashSet;
 
 /// Cutie pads every frame to a multiple of this (the network's stride).
 const PAD_TO: usize = 16;
@@ -101,29 +101,21 @@ impl Frame {
     }
 
     /// RGB bytes (height x width x 3) as Cutie's image: planes [3, width*height] in 0..1, x / 255
-    /// as PyTorch's CUDA division by a scalar does it (times the f32 reciprocal).
+    /// as PyTorch's CUDA division by a scalar does it (times the f32 reciprocal), made on the
+    /// device from the bytes.
     pub(crate) fn image(&self, rgb: &[u8]) -> Result<GpuTensor> {
         let plane = self.width * self.height;
         if rgb.len() != plane * 3 {
             return Err(DiffusionError::model(format!("cutie step: {} bytes for a {}x{} RGB frame", rgb.len(), self.width, self.height)));
         }
-        // HOST FALLBACK: wants a kernel (u8 HWC RGB uploaded as bytes -> planar f32, x * (1/255f)):
-        // the host converts every frame and uploads 4 bytes a channel.
-        let scale = 1.0f32 / 255.0f32;
-        let mut planes = vec![0.0f32; 3 * plane];
-        for (i, px) in rgb.chunks_exact(3).enumerate() {
-            for c in 0..3 {
-                planes[c * plane + i] = px[c] as f32 * scale;
-            }
-        }
-        gpu_upload(&planes, 3, plane).map_err(|e| dev("step image", e))
+        gpu_cutie_rgb_planes(rgb, plane, 1.0f32 / 255.0f32).map_err(|e| dev("step image", e))
     }
 
     /// Planar [planes, width*height] at the size given, to the padded size inside Cutie: resized
-    /// (`Bilinear`) if need be, then padded with zeros.
+    /// (`gpu_cutie_resize_bilinear`) if need be, then padded with zeros.
     pub(crate) fn to_internal(&self, x: &GpuTensor) -> Result<GpuTensor> {
         if self.resized() {
-            let x = Bilinear::new(self.width, self.height, self.w, self.h).resize(x)?;
+            let x = gpu_cutie_resize_bilinear(x, self.width, self.height, self.w, self.h).map_err(|e| dev("step resize", e))?;
             self.pad.pad(&x, self.w, self.h)
         } else {
             self.pad.pad(x, self.w, self.h)
@@ -134,95 +126,10 @@ impl Frame {
     pub(crate) fn to_given(&self, x: &GpuTensor) -> Result<GpuTensor> {
         let x = self.pad.unpad(x, self.w, self.h)?;
         if self.resized() {
-            Bilinear::new(self.w, self.h, self.width, self.height).resize(&x)
+            gpu_cutie_resize_bilinear(&x, self.w, self.h, self.width, self.height).map_err(|e| dev("step resize", e))
         } else {
             Ok(x)
         }
-    }
-}
-
-/// One axis of a bilinear resize: each output index's two source indices and their weights.
-struct BilinearAxis {
-    lower: Vec<usize>,
-    upper: Vec<usize>,
-    w_lower: Vec<f32>,
-    w_upper: Vec<f32>,
-}
-
-impl BilinearAxis {
-    /// As PyTorch's CUDA kernel computes them in f32 (`area_pixel_compute_source_index`, size
-    /// given, align_corners false): scale = in / out, source = fma(scale, dst + 0.5, -0.5) (nvcc
-    /// contracts the kernel's `scale * (dst + 0.5) - 0.5`) clamped at 0; the lower index the
-    /// source truncated, the upper the next one but at the edge; weights source - lower and 1
-    /// minus that.
-    fn new(size_in: usize, size_out: usize) -> Self {
-        let scale = size_in as f32 / size_out as f32;
-        let mut axis = Self { lower: Vec::new(), upper: Vec::new(), w_lower: Vec::new(), w_upper: Vec::new() };
-        for dst in 0..size_out {
-            let source = scale.mul_add(dst as f32 + 0.5, -0.5);
-            let source = if source < 0.0 { 0.0 } else { source };
-            let lower = source as usize;
-            let w_upper = source - lower as f32;
-            axis.lower.push(lower);
-            axis.upper.push(if lower + 1 < size_in { lower + 1 } else { lower });
-            axis.w_upper.push(w_upper);
-            axis.w_lower.push(1.0 - w_upper);
-        }
-        axis
-    }
-}
-
-/// `F.interpolate(mode='bilinear', align_corners=False)` to a given size, bit for bit as PyTorch's
-/// CUDA kernel (`upsample_bilinear2d_out_frame`) gives it: each output is fma(h0, fma(w0, a,
-/// w1 * b), h1 * fma(w0, c, w1 * d)), as nvcc contracts the kernel's sum, a and b the first
-/// source row's pair, c and d the second's. Bit-exact against PyTorch 2.11's CUDA output on
-/// random data, 1920x1080 to 1777x1000 and back, 1080x1920 to 1000x1777, 3840x2160 and
-/// 1440x1080 down (the oracle's frames are never resized). `gpu_birefnet_resize_bilinear`
-/// computes the source position in another order, up to 1.2e-4 off on 0..1 data.
-struct Bilinear {
-    in_w: usize,
-    in_h: usize,
-    out_w: usize,
-    out_h: usize,
-    x: BilinearAxis,
-    y: BilinearAxis,
-}
-
-impl Bilinear {
-    fn new(in_w: usize, in_h: usize, out_w: usize, out_h: usize) -> Self {
-        Self { in_w, in_h, out_w, out_h, x: BilinearAxis::new(in_w, out_w), y: BilinearAxis::new(in_h, out_h) }
-    }
-
-    /// Planar [planes, in_w*in_h] to [planes, out_w*out_h].
-    fn resize(&self, x: &GpuTensor) -> Result<GpuTensor> {
-        if x.cols() != self.in_w * self.in_h {
-            return Err(DiffusionError::model(format!("cutie resize: {} columns for {}x{}", x.cols(), self.in_w, self.in_h)));
-        }
-        // HOST FALLBACK: wants a kernel (bilinear resize, align_corners false, as PyTorch's CUDA
-        // kernel computes it: `BilinearAxis` and `Bilinear::resize_host`).
-        let src = gpu_download(x).map_err(|e| dev("step resize", e))?;
-        let out = self.resize_host(&src, x.rows());
-        gpu_upload(&out, x.rows(), self.out_w * self.out_h).map_err(|e| dev("step resize", e))
-    }
-
-    fn resize_host(&self, src: &[f32], planes: usize) -> Vec<f32> {
-        let (in_plane, out_plane) = (self.in_w * self.in_h, self.out_w * self.out_h);
-        let mut out = vec![0.0f32; planes * out_plane];
-        for (p, dst) in out.chunks_exact_mut(out_plane).enumerate() {
-            let src = &src[p * in_plane..(p + 1) * in_plane];
-            for (oy, dst) in dst.chunks_exact_mut(self.out_w).enumerate() {
-                let row0 = &src[self.y.lower[oy] * self.in_w..][..self.in_w];
-                let row1 = &src[self.y.upper[oy] * self.in_w..][..self.in_w];
-                let (h0, h1) = (self.y.w_lower[oy], self.y.w_upper[oy]);
-                for (ox, d) in dst.iter_mut().enumerate() {
-                    let (x0, x1, w0, w1) = (self.x.lower[ox], self.x.upper[ox], self.x.w_lower[ox], self.x.w_upper[ox]);
-                    let top = w0.mul_add(row0[x0], w1 * row0[x1]);
-                    let bottom = w0.mul_add(row1[x0], w1 * row1[x1]);
-                    *d = h0.mul_add(top, h1 * bottom);
-                }
-            }
-        }
-        out
     }
 }
 
@@ -482,45 +389,6 @@ impl<'a> CutieProcessor<'a> {
 
 // --- The check ---
 
-/// A check's row that is not a tensor comparison (a label map's IoU, the schedule): `score` 1 is
-/// a match, shown as the cosine.
-pub(crate) fn record(report: &mut Report, stage: &str, step: &str, name: &str, pass: bool, score: f64, note: String) {
-    if !pass {
-        report.failures += 1;
-    }
-    report.rows.push(Row {
-        stage: stage.into(),
-        step: step.into(),
-        name: name.into(),
-        n: 1,
-        max_abs: (1.0 - score) as f32,
-        max_ref: 1.0,
-        rel: (1.0 - score) as f32,
-        cos: score,
-        pass,
-        note,
-    });
-}
-
-/// The names of the step's oracle taps under any of `prefixes` that nothing put (the oracle's
-/// `#n` names counted from the comparer's repeats). A zero-size tap is what an absent native
-/// tensor is (PyTorch keeps emptied tensors, e.g. after `clear_non_permanent_memory`), so it is
-/// not listed.
-pub(crate) fn uncompared(cmp: &Comparer, prefixes: &[&str]) -> Vec<String> {
-    let mut put = HashSet::new();
-    for (name, &count) in &cmp.seen {
-        put.insert(name.clone());
-        put.extend((1..count).map(|i| format!("{name}#{i}")));
-    }
-    cmp.oracle
-        .names(&cmp.step)
-        .into_iter()
-        .filter(|name| prefixes.iter().any(|p| name.starts_with(p)) && !put.contains(*name))
-        .filter(|name| cmp.oracle.tap(&cmp.step, name).map_or(true, |t| !t.values.is_empty()))
-        .map(String::from)
-        .collect()
-}
-
 /// A step's counters and memory sizes against its row of `raw/schedule.tsv` (the mask areas, when
 /// given, are noted: the label maps are judged by IoU).
 #[allow(clippy::too_many_arguments)]
@@ -551,8 +419,7 @@ fn record_schedule(
     if let Some(area) = area {
         note += &format!("; mask area {area:?} (oracle {:?})", row.mask_area);
     }
-    let pass = differ.is_empty();
-    record(report, stage, step, name, pass, if pass { 1.0 } else { 0.0 }, note);
+    report.record(stage, step, name, differ.is_empty(), note);
 }
 
 /// What the worker gives Cutie in the oracle's run besides the frames: masks as label maps
@@ -717,7 +584,7 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
                 let mut cmp = Comparer::new(oracle, report, "run", tapped, &tol);
                 let prob = cmp.with(|tap| processor.step_tapped(&frame, w, h, mask.as_deref(), row.force_permanent, false, tap))?;
                 // Taps no part puts (e.g. a convolution whose BatchNorm is folded) are noted.
-                let missing = uncompared(&cmp, &[""]);
+                let missing = cmp.uncompared(&[""]);
                 if !missing.is_empty() {
                     cmp.report.note(format!("run/{tapped}: {} oracle taps never put: {}", missing.len(), missing.join(", ")));
                 }
@@ -737,7 +604,7 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
                 either += (a == o || e == o) as usize;
             }
             let iou = if either == 0 { 1.0 } else { both as f64 / either as f64 };
-            record(report, "run", &step, &format!("labels.f{}.obj{o}", row.frame), iou >= MIN_IOU, iou, format!("iou={iou:.6}"));
+            report.record("run", &step, &format!("labels.f{}.obj{o}", row.frame), iou >= MIN_IOU, format!("iou={iou:.6}"));
         }
 
         let consolidated = processor.memory.consolidations != consolidations;
@@ -825,7 +692,7 @@ fn compare_long_term(oracle: &Oracle, report: &mut Report, step: &str, prefix: &
         .collect();
     let unpaired = n - pairs.len();
     let note = format!("{} of {n} tokens paired by key, {unpaired} unpaired (swapped at a cut)", pairs.len());
-    record(report, "run", step, &name("tokens (paired)"), unpaired * 2 <= n, pairs.len() as f64 / n as f64, note);
+    report.record("run", step, &name("tokens (paired)"), unpaired * 2 <= n, note);
 
     // The pairs' columns of a tensor [rows, n], the oracle's against their native partners.
     let compare = |report: &mut Report, part: &str, native: &[f32], expected: &OracleTap| {

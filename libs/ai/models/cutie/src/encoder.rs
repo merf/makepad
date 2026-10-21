@@ -14,12 +14,12 @@
 //! selection = sigmoid(e)).
 
 use crate::model::{add, dev, relu, Conv2d, CutieNet, Feat, ImageFeatures, Keys, Tap, Weights};
-use crate::oracle::{Comparer, Oracle, OracleTap, Report, Tol, STEPS};
+use crate::oracle::{Comparer, Oracle, Report, Tol, STEPS};
 use crate::{DiffusionError, Result};
 use makepad_ai_common::gpu::{
-    cutie_conv_out, gpu_add, gpu_cutie_maxpool3x3s2, gpu_cutie_sigmoid, gpu_mul, gpu_rife_fill, gpu_upload,
+    cutie_conv_out, gpu_add, gpu_cutie_maxpool3x3s2, gpu_cutie_normalise_rows, gpu_cutie_sigmoid, gpu_mul, gpu_rife_fill,
+    gpu_upload, GpuTensor,
 };
-use std::collections::{HashMap, HashSet};
 
 /// Cutie's image normalisation (`model_cfg.pixel_mean`, `pixel_std`: ImageNet's), per RGB channel.
 pub(crate) const PIXEL_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
@@ -107,11 +107,17 @@ pub(crate) struct PixelEncoder {
     pub(crate) layer3: ResLayer,
     /// 1x1 1024 -> 256 with bias (`pix_feat_proj`, a module of `CUTIE` itself).
     pub(crate) pix_feat_proj: Conv2d,
+    /// `PIXEL_MEAN` and `PIXEL_STD` on the device, [3, 1].
+    pub(crate) pixel_mean: GpuTensor,
+    pub(crate) pixel_std: GpuTensor,
 }
 
 impl PixelEncoder {
     pub(crate) fn load(w: &mut Weights) -> Result<Self> {
+        let upload = |values: &[f32; 3]| gpu_upload(values, 3, 1).map_err(|e| dev("pixel normalisation", e));
         Ok(Self {
+            pixel_mean: upload(&PIXEL_MEAN)?,
+            pixel_std: upload(&PIXEL_STD)?,
             conv1: w.conv_bn("pixel_encoder.conv1", "pixel_encoder.bn1", 3, 64, 7, 3, 2)?,
             res2: ResLayer::load(w, "pixel_encoder.res2", 64, 64, 3, 1)?,
             layer2: ResLayer::load(w, "pixel_encoder.layer2", 256, 128, 4, 2)?,
@@ -120,33 +126,22 @@ impl PixelEncoder {
         })
     }
 
-    /// `(image - mean) / std` per channel, in that order and in f32, as `CUTIE.encode_image`.
-    /// `image` is one image of 3 channels.
-    // HOST FALLBACK: wants a kernel (per-row (x - a[r]) / b[r] on planar [rows, cols], a true
-    // division: multiplying by 1 / std is up to 1 ulp off). It costs a download (with a stream
-    // sync) and an upload of 3 x H x W floats a frame: 2.8 MB each way at the worker's 640x360
-    // working frames (padded 640x368), 21.7 MB at max_internal_size (1008x1792 padded). The
-    // subtraction alone is exact on the device today (`gpu_add_rows_broadcast` with -mean).
-    pub(crate) fn normalise(image: &Feat) -> Result<Feat> {
+    /// `(image - mean) / std` per channel, in that order and in f32 (a true division), as
+    /// `CUTIE.encode_image`. `image` is one image of 3 channels.
+    pub(crate) fn normalise(&self, image: &Feat) -> Result<Feat> {
         if image.n != 1 || image.c != 3 {
             return Err(DiffusionError::model(format!(
                 "cutie encode_image: {} images of {} channels, wants one RGB image",
                 image.n, image.c
             )));
         }
-        let mut v = image.download()?;
-        let plane = image.plane();
-        for (c, values) in v.chunks_mut(plane).enumerate() {
-            for x in values {
-                *x = (*x - PIXEL_MEAN[c]) / PIXEL_STD[c];
-            }
-        }
-        Feat::new(gpu_upload(&v, 3, plane).map_err(|e| dev("normalise", e))?, 1, 3, image.w, image.h)
+        let t = gpu_cutie_normalise_rows(&image.t, &self.pixel_mean, &self.pixel_std).map_err(|e| dev("normalise", e))?;
+        Feat::new(t, 1, 3, image.w, image.h)
     }
 
     /// `CUTIE.encode_image` (see `CutieNet::encode_image`).
     pub(crate) fn encode(&self, image: &Feat, tap: &mut Tap) -> Result<ImageFeatures> {
-        let image = Self::normalise(image)?;
+        let image = self.normalise(image)?;
         tap.put("encode_image.normalised", &image.t)?;
         let x = self.conv1.forward(&image)?;
         tap.put("net.pixel_encoder.bn1", &x.t)?;
@@ -237,43 +232,25 @@ impl CutieNet {
     }
 }
 
-/// An oracle tap of shape [n, c, h, w] on the device as a `Feat`. (General: wanted in `oracle.rs`
-/// as `OracleTap::feat` at the merge, so the other parts' checks need no copy.)
-fn oracle_feat(t: &OracleTap) -> Result<Feat> {
-    let [n, c, h, w] = t.shape[..] else {
-        return Err(DiffusionError::model(format!("cutie oracle: {:?} is not [n, c, h, w]", t.shape)));
-    };
-    Feat::upload(&t.values, n, c, w, h)
-}
-
 /// The oracle names this stage owns: everything `encode_image` and `transform_key` tap.
-fn stage_owns(name: &str) -> bool {
-    let base = name.split('#').next().unwrap_or(name);
-    base == "net.pix_feat_proj"
-        || ["encode_image.", "net.pixel_encoder.", "net.key_proj.", "key."].iter().any(|p| base.starts_with(p))
-}
+const OWNED: [&str; 5] = ["net.pix_feat_proj", "encode_image.", "net.pixel_encoder.", "net.key_proj.", "key."];
 
 /// Names the stage owns but does not compare: its input, and conv1 before bn1 (folded here).
 const NOT_COMPARED: [&str; 2] = ["encode_image.in.image", "net.pixel_encoder.conv1"];
 
 /// Fails every name the stage owns that one side has and the other lacks, so a renamed tap or a
-/// regenerated oracle cannot drop comparisons and still pass. `seen` is the `Comparer`'s count of
-/// each name put (a name put again is the oracle's `name#1`, ...).
-fn check_coverage(oracle: &Oracle, report: &mut Report, step: &str, seen: &HashMap<String, usize>) {
-    let mut put = HashSet::new();
-    for (name, &count) in seen {
-        put.insert(name.clone());
-        put.extend((1..count).map(|i| format!("{name}#{i}")));
-    }
-    for name in oracle.names(step) {
-        if stage_owns(name) && !NOT_COMPARED.contains(&name) && !put.contains(name) {
-            report.fail("encoder", step, name, "in the oracle, not put by the port");
+/// regenerated oracle cannot drop comparisons and still pass.
+fn check_coverage(comparer: &mut Comparer) {
+    let step = comparer.step.clone();
+    for name in comparer.uncompared(&OWNED) {
+        if !NOT_COMPARED.contains(&name.as_str()) {
+            comparer.report.fail("encoder", &step, &name, "in the oracle, not put by the port");
         }
     }
-    let mut extra: Vec<&String> = put.iter().filter(|name| !oracle.has(step, name)).collect();
+    let mut extra: Vec<String> = comparer.put_names().into_iter().filter(|name| !comparer.oracle.has(&step, name)).collect();
     extra.sort();
     for name in extra {
-        report.fail("encoder", step, name, "put by the port, not in the oracle");
+        comparer.report.fail("encoder", &step, &name, "put by the port, not in the oracle");
     }
 }
 
@@ -292,13 +269,12 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
             report.fail("encoder", step, "encode_image.in.image", "not in the oracle: every step encodes its frame");
             continue;
         }
-        let image = oracle_feat(&oracle.tap(step, "encode_image.in.image")?)?;
-        let f16 = oracle_feat(&oracle.tap(step, "encode_image.out.f16")?)?;
+        let image = oracle.feat(step, "encode_image.in.image")?;
+        let f16 = oracle.feat(step, "encode_image.out.f16")?;
         let mut comparer = Comparer::new(oracle, report, "encoder", step, &tol);
         comparer.with(|tap| pixel_encoder.encode(&image, tap))?;
         comparer.with(|tap| key_proj.forward(&f16, tap))?;
-        let seen = std::mem::take(&mut comparer.seen);
-        check_coverage(oracle, report, step, &seen);
+        check_coverage(&mut comparer);
     }
     Ok(())
 }

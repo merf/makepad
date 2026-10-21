@@ -65,6 +65,23 @@ unsafe extern "C" {
         aux: *const f32, out: *mut f32, scratch: *mut u32, n: u32, p: usize, heads: u32, queries: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    fn makepad_cuda_cutie_normalise_rows_f32(
+        x: *const f32, out: *mut f32, sub: *const f32, div: *const f32, rows: u32, plane: usize, stream: cudaStream_t,
+    ) -> cudaError_t;
+    fn makepad_cuda_cutie_rgb_planes_f32(rgb: *const u8, out: *mut f32, plane: usize, scale: f32, stream: cudaStream_t) -> cudaError_t;
+    fn makepad_cuda_cutie_resize_bilinear_f32(
+        x: *const f32, out: *mut f32, planes: u32, in_w: u32, in_h: u32, out_w: u32, out_h: u32, scale_x: f32,
+        scale_y: f32, stream: cudaStream_t,
+    ) -> cudaError_t;
+    fn makepad_cuda_cutie_add_broadcast_f32(
+        a: *const f32, b: *const f32, out: *mut f32, a_len: usize, n: usize, stream: cudaStream_t,
+    ) -> cudaError_t;
+    fn makepad_cuda_cutie_object_values_f32(
+        memory: *const f32, out: *mut f32, objects: u32, queries: u32, width: u32, eps: f32, stream: cudaStream_t,
+    ) -> cudaError_t;
+    fn makepad_cuda_cutie_sine_encoding_f32(
+        inv_freq: *const f32, out: *mut f32, freqs: u32, w: u32, h: u32, scale: f32, eps: f32, stream: cudaStream_t,
+    ) -> cudaError_t;
 }
 
 /// The most taps `makepad_cuda_cutie_eca_f32` takes by value (Cutie's ECA has 3 or 5).
@@ -977,4 +994,327 @@ pub fn gpu_cutie_attn_mask_reference(aux: &GpuTensor, heads: usize, queries: usi
         }
     }
     gpu_upload(&out, n * heads * queries, p)
+}
+
+/// The sum of a block `a` [r, c] and each of the k blocks of `b` [k*r, c]: out = a + b_i, one
+/// rounding each (Cutie's x + g, one image's features broadcast over the objects, without
+/// repeating them first).
+pub fn gpu_cutie_add_broadcast(a: &GpuTensor, b: &GpuTensor) -> Result<GpuTensor, String> {
+    let op = "gpu_cutie_add_broadcast";
+    cutie_check_f32(op, a)?;
+    cutie_check_f32(op, b)?;
+    if a.rows == 0 || a.cols != b.cols || b.rows % a.rows != 0 {
+        return Err(format!("{op}: {}x{} over {}x{}", a.rows, a.cols, b.rows, b.cols));
+    }
+    with_dense_linear_backend(|backend| {
+        backend.prepare_device()?;
+        let out = GpuTensor::from_pool(b.rows, b.cols)?;
+        gpu_check(unsafe {
+            makepad_cuda_cutie_add_broadcast_f32(
+                a.device_ptr()?, b.device_ptr()?, out.device_ptr()?, a.rows * a.cols, b.rows * b.cols, backend.stream,
+            )
+        })?;
+        Ok(out)
+    })
+}
+
+pub fn gpu_cutie_add_broadcast_reference(a: &GpuTensor, b: &GpuTensor) -> Result<GpuTensor, String> {
+    cutie_check_f32("gpu_cutie_add_broadcast", a)?;
+    if a.rows == 0 || a.cols != b.cols || b.rows % a.rows != 0 {
+        return Err("gpu_cutie_add_broadcast shape mismatch".into());
+    }
+    let av = gpu_download(a)?;
+    let bv = gpu_download(b)?;
+    let out: Vec<f32> = bv.iter().enumerate().map(|(i, &g)| av[i % av.len()] + g).collect();
+    gpu_upload(&out, b.rows, b.cols)
+}
+
+// --- The per-frame step ---
+
+/// (x - sub[r]) / div[r] for each row r of `x` [rows, cols], `sub` and `div` one value a row on
+/// the device: CUTIE.encode_image's (image - pixel_mean) / pixel_std, each op rounded, a true
+/// division (multiplying by 1 / div would be up to an ulp off).
+pub fn gpu_cutie_normalise_rows(x: &GpuTensor, sub: &GpuTensor, div: &GpuTensor) -> Result<GpuTensor, String> {
+    let op = "gpu_cutie_normalise_rows";
+    for t in [x, sub, div] {
+        cutie_check_f32(op, t)?;
+    }
+    if sub.rows * sub.cols != x.rows || div.rows * div.cols != x.rows {
+        return Err(format!("{op}: {} and {} values for {} rows", sub.rows * sub.cols, div.rows * div.cols, x.rows));
+    }
+    let rows = cutie_u32(op, x.rows)?;
+    with_dense_linear_backend(|backend| {
+        backend.prepare_device()?;
+        let out = GpuTensor::from_pool(x.rows, x.cols)?;
+        gpu_check(unsafe {
+            makepad_cuda_cutie_normalise_rows_f32(
+                x.device_ptr()?, out.device_ptr()?, sub.device_ptr()?, div.device_ptr()?, rows, x.cols, backend.stream,
+            )
+        })?;
+        Ok(out)
+    })
+}
+
+pub fn gpu_cutie_normalise_rows_reference(x: &GpuTensor, sub: &GpuTensor, div: &GpuTensor) -> Result<GpuTensor, String> {
+    cutie_check_f32("gpu_cutie_normalise_rows", x)?;
+    if sub.rows * sub.cols != x.rows || div.rows * div.cols != x.rows {
+        return Err("gpu_cutie_normalise_rows shape mismatch".into());
+    }
+    let (s, d) = (gpu_download(sub)?, gpu_download(div)?);
+    let mut v = gpu_download(x)?;
+    for (r, row) in v.chunks_mut(x.cols.max(1)).enumerate() {
+        for value in row {
+            *value = (*value - s[r]) / d[r];
+        }
+    }
+    gpu_upload(&v, x.rows, x.cols)
+}
+
+/// RGB bytes (`plane` pixels, 3 bytes each) to planar f32 [3, plane], each byte times `scale`.
+/// The bytes are what goes to the device. Cutie's image is the worker's `x / 255` in PyTorch,
+/// which on CUDA multiplies by the f32 reciprocal: `scale` 1.0f32 / 255.0.
+pub fn gpu_cutie_rgb_planes(rgb: &[u8], plane: usize, scale: f32) -> Result<GpuTensor, String> {
+    let op = "gpu_cutie_rgb_planes";
+    if plane == 0 || rgb.len() != plane * 3 {
+        return Err(format!("{op}: {} bytes for {plane} RGB pixels", rgb.len()));
+    }
+    with_dense_linear_backend(|backend| {
+        backend.prepare_device()?;
+        // The bytes in a pooled buffer of whole f32 slots.
+        let bytes = GpuTensor::from_pool(rgb.len().div_ceil(size_of::<f32>()), 1)?;
+        bytes.buf.as_ref().ok_or("cutie rgb: buffer released")?.write(rgb, backend.stream)?;
+        let out = GpuTensor::from_pool(3, plane)?;
+        gpu_check(unsafe {
+            makepad_cuda_cutie_rgb_planes_f32(bytes.device_ptr()?.cast::<u8>().cast_const(), out.device_ptr()?, plane, scale, backend.stream)
+        })?;
+        Ok(out)
+    })
+}
+
+pub fn gpu_cutie_rgb_planes_reference(rgb: &[u8], plane: usize, scale: f32) -> Result<GpuTensor, String> {
+    if plane == 0 || rgb.len() != plane * 3 {
+        return Err("gpu_cutie_rgb_planes shape mismatch".into());
+    }
+    let mut planes = vec![0.0f32; 3 * plane];
+    for (i, px) in rgb.chunks_exact(3).enumerate() {
+        for c in 0..3 {
+            planes[c * plane + i] = px[c] as f32 * scale;
+        }
+    }
+    gpu_upload(&planes, 3, plane)
+}
+
+/// One axis of `gpu_cutie_resize_bilinear` as PyTorch's CUDA kernel computes it in f32
+/// (`area_pixel_compute_scale` and `_source_index`, size given, align_corners false): for each
+/// output index, its lower and upper source indices and their weights.
+fn cutie_bilinear_axis(size_in: usize, size_out: usize) -> Vec<(usize, usize, f32, f32)> {
+    let scale = size_in as f32 / size_out as f32;
+    (0..size_out)
+        .map(|dst| {
+            let source = scale.mul_add(dst as f32 + 0.5, -0.5);
+            let source = if source < 0.0 { 0.0 } else { source };
+            let lower = source as usize;
+            let upper = if lower + 1 < size_in { lower + 1 } else { lower };
+            let w_upper = source - lower as f32;
+            (lower, upper, 1.0 - w_upper, w_upper)
+        })
+        .collect()
+}
+
+/// `F.interpolate(mode='bilinear', align_corners=False)` of planar [planes, in_h*in_w] to
+/// [planes, out_h*out_w], bit for bit as PyTorch's CUDA kernel (`upsample_bilinear2d_out_frame`)
+/// gives it: scale = in / out in f32; source = fma(scale, dst + 0.5, -0.5) (nvcc contracts the
+/// kernel's `scale * (dst + 0.5) - 0.5`) clamped at 0; the lower index the source truncated, the
+/// upper the next one but at the edge; weights source - lower and 1 minus that; each output
+/// fma(h0, fma(w0, a, w1 * b), h1 * fma(w0, c, w1 * d)), as nvcc contracts the kernel's sum (a and
+/// b from the first source row, c and d from the second). The reference was bit-exact against
+/// PyTorch 2.11's CUDA output on random data at 1920x1080 to 1777x1000 and back, 1080x1920 to
+/// 1000x1777, 3840x2160 and 1440x1080 down. `gpu_birefnet_resize_bilinear` computes the source
+/// position in another order, up to 1.2e-4 off on 0..1 data.
+pub fn gpu_cutie_resize_bilinear(x: &GpuTensor, in_w: usize, in_h: usize, out_w: usize, out_h: usize) -> Result<GpuTensor, String> {
+    let op = "gpu_cutie_resize_bilinear";
+    cutie_check_f32(op, x)?;
+    if x.cols != in_w * in_h || in_w == 0 || in_h == 0 || out_w == 0 || out_h == 0 {
+        return Err(format!("{op}: {}x{} for {in_w}x{in_h} to {out_w}x{out_h}", x.rows, x.cols));
+    }
+    let d = |v: usize| cutie_u32(op, v);
+    let (planes, iw, ih, ow, oh) = (d(x.rows)?, d(in_w)?, d(in_h)?, d(out_w)?, d(out_h)?);
+    let (scale_x, scale_y) = (in_w as f32 / out_w as f32, in_h as f32 / out_h as f32);
+    with_dense_linear_backend(|backend| {
+        backend.prepare_device()?;
+        let out = GpuTensor::from_pool(x.rows, out_w * out_h)?;
+        gpu_check(unsafe {
+            makepad_cuda_cutie_resize_bilinear_f32(
+                x.device_ptr()?, out.device_ptr()?, planes, iw, ih, ow, oh, scale_x, scale_y, backend.stream,
+            )
+        })?;
+        Ok(out)
+    })
+}
+
+pub fn gpu_cutie_resize_bilinear_reference(x: &GpuTensor, in_w: usize, in_h: usize, out_w: usize, out_h: usize) -> Result<GpuTensor, String> {
+    cutie_check_f32("gpu_cutie_resize_bilinear", x)?;
+    if x.cols != in_w * in_h || in_w == 0 || in_h == 0 || out_w == 0 || out_h == 0 {
+        return Err("gpu_cutie_resize_bilinear shape mismatch".into());
+    }
+    let (ax, ay) = (cutie_bilinear_axis(in_w, out_w), cutie_bilinear_axis(in_h, out_h));
+    let src = gpu_download(x)?;
+    let (in_plane, out_plane) = (in_w * in_h, out_w * out_h);
+    let mut out = vec![0.0f32; x.rows * out_plane];
+    for (p, dst) in out.chunks_exact_mut(out_plane).enumerate() {
+        let src = &src[p * in_plane..(p + 1) * in_plane];
+        for (&(y0, y1, h0, h1), dst) in ay.iter().zip(dst.chunks_exact_mut(out_w)) {
+            let (row0, row1) = (&src[y0 * in_w..][..in_w], &src[y1 * in_w..][..in_w]);
+            for (&(x0, x1, w0, w1), d) in ax.iter().zip(dst.iter_mut()) {
+                let top = w0.mul_add(row0[x0], w1 * row0[x1]);
+                let bottom = w0.mul_add(row1[x0], w1 * row1[x1]);
+                *d = h0.mul_add(top, h1 * bottom);
+            }
+        }
+    }
+    gpu_upload(&out, x.rows, out_plane)
+}
+
+/// The object transformer's values from the object memory `memory` [objects*queries, width+1]
+/// (object-major, each summary's sums then its area): sums / (area + `eps`) as
+/// `object_transformer.py`'s `obj_sums / (obj_area + 1e-4)` rounds it (the add, then a true
+/// division), interleaved [queries*objects, width] (row q*objects + o).
+pub fn gpu_cutie_object_values(memory: &GpuTensor, objects: usize, eps: f32) -> Result<GpuTensor, String> {
+    let op = "gpu_cutie_object_values";
+    cutie_check_f32(op, memory)?;
+    if objects == 0 || memory.rows % objects != 0 || memory.cols < 2 {
+        return Err(format!("{op}: {}x{} for {objects} objects", memory.rows, memory.cols));
+    }
+    let (queries, width) = (memory.rows / objects, memory.cols - 1);
+    let d = |v: usize| cutie_u32(op, v);
+    let (objects_u, queries_u, width_u) = (d(objects)?, d(queries)?, d(width)?);
+    with_dense_linear_backend(|backend| {
+        backend.prepare_device()?;
+        let out = GpuTensor::from_pool(memory.rows, width)?;
+        gpu_check(unsafe {
+            makepad_cuda_cutie_object_values_f32(memory.device_ptr()?, out.device_ptr()?, objects_u, queries_u, width_u, eps, backend.stream)
+        })?;
+        Ok(out)
+    })
+}
+
+pub fn gpu_cutie_object_values_reference(memory: &GpuTensor, objects: usize, eps: f32) -> Result<GpuTensor, String> {
+    cutie_check_f32("gpu_cutie_object_values", memory)?;
+    if objects == 0 || memory.rows % objects != 0 || memory.cols < 2 {
+        return Err("gpu_cutie_object_values shape mismatch".into());
+    }
+    let (queries, width) = (memory.rows / objects, memory.cols - 1);
+    let v = gpu_download(memory)?;
+    let mut out = vec![0.0f32; objects * queries * width];
+    for o in 0..objects {
+        for q in 0..queries {
+            let row = &v[(o * queries + q) * (width + 1)..(o * queries + q + 1) * (width + 1)];
+            let area = row[width] + eps;
+            for (dst, &s) in out[(q * objects + o) * width..(q * objects + o + 1) * width].iter_mut().zip(row) {
+                *dst = s / area;
+            }
+        }
+    }
+    gpu_upload(&out, objects * queries, width)
+}
+
+/// Cutie's `PositionalEncoding` (channel-last, normalised) at `w` x `h` from its frequencies
+/// `inv_freq` (F of them): tokens [h*w, 4F], token y*w + x, the x encoding in channels 0..2F and
+/// the y encoding in 2F..4F, sin and cos interleaved per frequency. Each axis' positions are
+/// i / ((len - 1) + `eps`) * `scale`, times each frequency, every op rounded as PyTorch's tensor
+/// ops round it; then CUDA's own sinf and cosf, which is what torch.sin and torch.cos give on CUDA
+/// (bit for bit against the oracle's encodings at 24x14 and 60x34).
+pub fn gpu_cutie_sine_encoding(inv_freq: &[f32], w: usize, h: usize, scale: f32, eps: f32) -> Result<GpuTensor, String> {
+    let op = "gpu_cutie_sine_encoding";
+    if inv_freq.is_empty() || w == 0 || h == 0 {
+        return Err(format!("{op}: {} frequencies at {w}x{h}", inv_freq.len()));
+    }
+    let d = |v: usize| cutie_u32(op, v);
+    let (freqs, wu, hu) = (d(inv_freq.len())?, d(w)?, d(h)?);
+    with_dense_linear_backend(|backend| {
+        backend.prepare_device()?;
+        let freq_buf = gpu_upload_small(backend, inv_freq)?;
+        let out = GpuTensor::from_pool(w * h, 4 * inv_freq.len())?;
+        let status = unsafe {
+            makepad_cuda_cutie_sine_encoding_f32(
+                freq_buf.ptr.as_ptr().cast::<f32>(), out.device_ptr()?, freqs, wu, hu, scale, eps, backend.stream,
+            )
+        };
+        gpu_pool_release(freq_buf);
+        gpu_check(status)?;
+        Ok(out)
+    })
+}
+
+/// Reference: sin and cos in f64, rounded once. CUDA's sinf and cosf are not correctly rounded
+/// (about 1 entry in 7 of Cutie's encodings is 1 ulp from this), so the two are fp32 rounding
+/// apart.
+pub fn gpu_cutie_sine_encoding_reference(inv_freq: &[f32], w: usize, h: usize, scale: f32, eps: f32) -> Result<GpuTensor, String> {
+    if inv_freq.is_empty() || w == 0 || h == 0 {
+        return Err("gpu_cutie_sine_encoding shape mismatch".into());
+    }
+    let half = inv_freq.len() * 2;
+    let axis = |len: usize| -> Vec<f32> {
+        let last = (len - 1) as f32 + eps;
+        let mut emb = Vec::with_capacity(len * half);
+        for i in 0..len {
+            let pos = i as f32 / last * scale;
+            for &f in inv_freq {
+                let angle = (pos * f) as f64;
+                emb.extend([angle.sin() as f32, angle.cos() as f32]);
+            }
+        }
+        emb
+    };
+    let (ex, ey) = (axis(w), axis(h));
+    let mut pe = Vec::with_capacity(h * w * 2 * half);
+    for y in 0..h {
+        for x in 0..w {
+            pe.extend_from_slice(&ex[x * half..(x + 1) * half]);
+            pe.extend_from_slice(&ey[y * half..(y + 1) * half]);
+        }
+    }
+    gpu_upload(&pe, h * w, 2 * half)
+}
+
+/// nn.LayerNorm over each row of `x` [rows, cols] (cols % 4 == 0), the kernel of
+/// `gpu_layer_norm_pytorch` (PyTorch's CUDA order), with `gamma` and `beta` kept on the device
+/// under `{cache_namespace}::{key}::cutie_ln` instead of uploaded on every call.
+pub fn gpu_cutie_layer_norm(
+    x: &GpuTensor, cache_namespace: &str, key: &str, gamma: &[f32], beta: &[f32], eps: f32,
+) -> Result<GpuTensor, String> {
+    let op = "gpu_cutie_layer_norm";
+    cutie_check_f32(op, x)?;
+    if gamma.len() != x.cols || beta.len() != x.cols || x.cols % 4 != 0 {
+        return Err(format!("{op} {key}: {} and {} affine values for {} columns", gamma.len(), beta.len(), x.cols));
+    }
+    let (rows, cols) = (cutie_u32(op, x.rows)?, cutie_u32(op, x.cols)?);
+    with_dense_linear_backend(|backend| {
+        backend.prepare_device()?;
+        let qualified_key = format!("{cache_namespace}::{key}::cutie_ln");
+        backend.cached_weight_buffer(&qualified_key, 2 * x.cols * size_of::<f32>(), || {
+            Ok(gamma.iter().chain(beta).flat_map(|v| v.to_le_bytes()).collect())
+        })?;
+        let gamma_ptr = backend
+            .weight_buffers
+            .get(&qualified_key)
+            .ok_or_else(|| format!("missing cached cutie layer norm {qualified_key}"))?
+            .ptr
+            .as_ptr()
+            .cast::<f32>();
+        let beta_ptr = unsafe { gamma_ptr.add(x.cols) };
+        let out = GpuTensor::from_pool(x.rows, x.cols)?;
+        gpu_check(unsafe {
+            makepad_cuda_layer_norm_pytorch_f32(x.device_ptr()?, gamma_ptr, beta_ptr, out.device_ptr()?, rows, cols, eps, backend.stream)
+        })?;
+        Ok(out)
+    })
+}
+
+/// Reference: `gpu_layer_norm_pytorch` itself (the same kernel, its affine uploaded per call).
+pub fn gpu_cutie_layer_norm_reference(
+    x: &GpuTensor, _cache_namespace: &str, _key: &str, gamma: &[f32], beta: &[f32], eps: f32,
+) -> Result<GpuTensor, String> {
+    cutie_check_f32("gpu_cutie_layer_norm", x)?;
+    gpu_layer_norm_pytorch(x, gamma, beta, eps)
 }

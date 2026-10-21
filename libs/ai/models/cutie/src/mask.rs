@@ -15,22 +15,19 @@
 //! Object summarizer: each object's mask area-downsampled to the value's size (`gpu_pixal_pool`
 //! is PyTorch's area interpolation), masks repeated for the first 8 summaries and 1 - mask for the
 //! last 8; the value (tokens [h*w, 256]) through `input_proj` (Linear 256 -> 256) plus the sine
-//! positional encoding (`PositionalEncoding(256, scale=32, temperature=128)`, channel-last: x
-//! encodings in the first 128 channels, y in the next, sin/cos interleaved, positions normalised
-//! by the last index); then `feature_pred` (Linear, ReLU, Linear) and `weights_pred` (Linear,
+//! positional encoding (`model::PositionalEncoding`, channel-last); then `feature_pred` (Linear,
+//! ReLU, Linear) and `weights_pred` (Linear,
 //! ReLU, Linear to 16); weights = sigmoid(logits) * masks; sums = weights^T @ feature [16, 256],
 //! area = each summary's weights summed; summaries = [sums, area] [16, 257] per object.
 
-use crate::model::{add, dev, relu, Conv2d, CutieNet, Feat, FusionBlock, Linear, Tap, Weights};
+use crate::model::{add, dev, relu, Conv2d, CutieNet, Feat, FusionBlock, Linear, PositionalEncoding, Tap, Weights};
 use crate::oracle::{Comparer, Oracle, OracleTap, Report, Tol, STEPS};
 use crate::{DiffusionError, Result};
 use makepad_ai_common::gpu::{
-    cutie_conv_out, gpu_add, gpu_birefnet_relu, gpu_concat_cols, gpu_concat_rows_many, gpu_cutie_gru, gpu_cutie_matmul,
-    gpu_cutie_maxpool3x3s2, gpu_cutie_others, gpu_cutie_sigmoid, gpu_download, gpu_mul, gpu_pixal_pool,
-    gpu_planar_tokens_transpose, gpu_realesrgan_scale_add, gpu_reshape, gpu_rife_fill, gpu_slice_rows, gpu_upload, GpuTensor,
+    cutie_conv_out, gpu_birefnet_relu, gpu_concat_cols, gpu_concat_rows_many, gpu_cutie_add_broadcast, gpu_cutie_gru,
+    gpu_cutie_matmul, gpu_cutie_maxpool3x3s2, gpu_cutie_others, gpu_cutie_sigmoid, gpu_download, gpu_mul, gpu_pixal_pool,
+    gpu_planar_tokens_transpose, gpu_realesrgan_scale_add, gpu_reshape, gpu_rife_fill, gpu_slice_rows, GpuTensor,
 };
-use std::cell::RefCell;
-use std::collections::HashMap;
 
 /// The pixel features' width (`model/base.yaml`).
 const PIXEL_DIM: usize = 256;
@@ -44,11 +41,6 @@ const FINAL_DIM: usize = 256;
 const EMBED_DIM: usize = 256;
 /// Summaries per object: the first half pool over the mask, the second over its complement.
 const NUM_SUMMARIES: usize = 16;
-/// The summarizer's positional encoding's scale (`pixel_pe_scale`; the temperature is in the
-/// checkpoint's `inv_freq`).
-const PE_SCALE: f32 = 32.0;
-/// PositionalEncoding's epsilon, added to the last position before normalising by it.
-const PE_EPS: f32 = 1e-6;
 /// What the object transformer adds to a summary's area before dividing its sums by it
 /// (`object_transformer.py`: `obj_sums / (obj_area + 1e-4)`).
 const AREA_EPS: f32 = 1e-4;
@@ -238,12 +230,8 @@ pub(crate) struct ObjectSummarizer {
     feature_pred: [Linear; 2],
     /// Linear, ReLU, Linear (256 -> 256 -> 16): each pixel's weight logit for each summary.
     weights_pred: [Linear; 2],
-    /// The positional encoding's frequencies (`pos_enc.inv_freq`: 1 / 128^(2i/128), 64 of them).
-    inv_freq: Vec<f32>,
-    /// The positional encoding of each grid asked for ([h*w, 256] by (w, h)), made once a size as
-    /// PositionalEncoding caches it. Every size is kept (PyTorch keeps the last), so processors
-    /// sharing the network at different sizes do not remake each other's.
-    pe_cache: RefCell<HashMap<(usize, usize), GpuTensor>>,
+    /// `pos_enc`.
+    pos_enc: PositionalEncoding,
 }
 
 impl ObjectSummarizer {
@@ -258,8 +246,7 @@ impl ObjectSummarizer {
                 w.linear("object_summarizer.weights_pred.0", EMBED_DIM, EMBED_DIM, true)?,
                 w.linear("object_summarizer.weights_pred.2", EMBED_DIM, NUM_SUMMARIES, true)?,
             ],
-            inv_freq: w.f32("object_summarizer.pos_enc.inv_freq", &[EMBED_DIM / 4])?,
-            pe_cache: RefCell::new(HashMap::new()),
+            pos_enc: PositionalEncoding::load(w, "object_summarizer.pos_enc", EMBED_DIM)?,
         })
     }
 
@@ -296,9 +283,8 @@ impl ObjectSummarizer {
         let parts: Vec<&GpuTensor> = per_object.iter().collect();
         let x = gpu_concat_rows_many(&parts).map_err(|e| dev("summary tokens", e))?;
         let x = self.input_proj.forward(&x)?;
-        let pe = self.position_encoding(value.w, value.h)?;
-        let pe = gpu_concat_rows_many(&vec![&pe; n]).map_err(|e| dev("summary encoding", e))?;
-        let x = gpu_add(&x, &pe).map_err(|e| dev("summary encoding", e))?;
+        let pe = self.pos_enc.tokens(value.w, value.h)?;
+        let x = gpu_cutie_add_broadcast(&pe, &x).map_err(|e| dev("summary encoding", e))?;
 
         let hidden = gpu_birefnet_relu(&self.feature_pred[0].forward(&x)?).map_err(|e| dev("summary features", e))?;
         let feature = self.feature_pred[1].forward(&hidden)?;
@@ -342,48 +328,6 @@ impl ObjectSummarizer {
         let parts: Vec<&GpuTensor> = per_object.iter().collect();
         gpu_concat_rows_many(&parts).map_err(|e| dev("summary masks", e))
     }
-
-    /// The sine positional encoding for a `w` x `h` grid (`PositionalEncoding`, channel-last),
-    /// token-major [h*w, 256], in f32 in PyTorch's order: each axis' positions divided by (the
-    /// last position + 1e-6) then scaled by 32, times each frequency, sin and cos interleaved; x's
-    /// encoding in the first 128 channels, y's in the next 128. It depends only on the grid, so it
-    /// is made on the host once a size and kept. The angles are PyTorch's to the bit, but sin and
-    /// cos are the host's where PyTorch's are CUDA's sinf and cosf: about 14% of entries differ
-    /// by 1 ulp (at most 6e-8).
-    fn position_encoding(&self, w: usize, h: usize) -> Result<GpuTensor> {
-        if let Some(pe) = self.pe_cache.borrow().get(&(w, h)) {
-            return gpu_slice_rows(pe, 0, pe.rows()).map_err(|e| dev("summary encoding", e));
-        }
-        let half = self.inv_freq.len() * 2;
-        if 2 * half != EMBED_DIM {
-            return Err(DiffusionError::model(format!("cutie positional encoding: {} frequencies for {EMBED_DIM}", self.inv_freq.len())));
-        }
-        let axis = |len: usize| -> Vec<f32> {
-            let last = (len as f32 - 1.0) + PE_EPS;
-            let mut emb = Vec::with_capacity(len * half);
-            for i in 0..len {
-                let pos = i as f32 / last * PE_SCALE;
-                for f in &self.inv_freq {
-                    let angle = pos * f;
-                    emb.extend([angle.sin(), angle.cos()]);
-                }
-            }
-            emb
-        };
-        let (ex, ey) = (axis(w), axis(h));
-        let mut pe = vec![0.0f32; h * w * EMBED_DIM];
-        for y in 0..h {
-            for x in 0..w {
-                let row = &mut pe[(y * w + x) * EMBED_DIM..(y * w + x + 1) * EMBED_DIM];
-                row[..half].copy_from_slice(&ex[x * half..(x + 1) * half]);
-                row[half..].copy_from_slice(&ey[y * half..(y + 1) * half]);
-            }
-        }
-        let pe = gpu_upload(&pe, h * w, EMBED_DIM).map_err(|e| dev("summary encoding", e))?;
-        let view = gpu_slice_rows(&pe, 0, pe.rows()).map_err(|e| dev("summary encoding", e))?;
-        self.pe_cache.borrow_mut().insert((w, h), pe);
-        Ok(view)
-    }
 }
 
 impl CutieNet {
@@ -403,15 +347,6 @@ impl CutieNet {
     ) -> Result<(Feat, Feat, GpuTensor)> {
         self.mask_encoder.encode_mask(&self.object_summarizer, image, pix_feat, sensory, masks, deep_update, tap)
     }
-}
-
-/// An oracle tap shaped [.., h, w] as `n` images of `c` channels.
-fn oracle_feat(tap: &OracleTap, step: &str, name: &str, n: usize, c: usize) -> Result<Feat> {
-    let dims = &tap.shape;
-    if dims.len() < 2 || tap.values.len() != n * c * dims[dims.len() - 2] * dims[dims.len() - 1] {
-        return Err(DiffusionError::model(format!("cutie oracle {step}/{name}: {dims:?} is not {n} images of {c} channels")));
-    }
-    Feat::upload(&tap.values, n, c, dims[dims.len() - 1], dims[dims.len() - 2])
 }
 
 /// Stage `mask`: for every oracle step with `encode_mask` taps, the oracle's inputs
@@ -438,10 +373,13 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
         }
         let [image, pix_feat, sensory, masks] = INPUTS.map(|name| oracle.tap(step, name));
         let taps = [image?, pix_feat?, sensory?, masks?];
-        let image = oracle_feat(&taps[0], step, INPUTS[0], 1, 3)?;
-        let pix_feat = oracle_feat(&taps[1], step, INPUTS[1], 1, PIXEL_DIM)?;
-        let sensory = oracle_feat(&taps[2], step, INPUTS[2], n, SENSORY_DIM)?;
-        let masks = oracle_feat(&taps[3], step, INPUTS[3], n, 1)?;
+        let feat = |i: usize, n: usize, c: usize| {
+            taps[i].feat_as(n, c).map_err(|e| DiffusionError::model(format!("{step}/{}: {e}", INPUTS[i])))
+        };
+        let image = feat(0, 1, 3)?;
+        let pix_feat = feat(1, 1, PIXEL_DIM)?;
+        let sensory = feat(2, n, SENSORY_DIM)?;
+        let masks = feat(3, n, 1)?;
         let deep_update = oracle.has(step, "net.mask_encoder.sensory_update");
         let inputs: Vec<Vec<f32>> = taps.into_iter().map(|t| t.values).collect();
         match encoded.iter().find(|(_, d, v)| *d == deep_update && *v == inputs) {

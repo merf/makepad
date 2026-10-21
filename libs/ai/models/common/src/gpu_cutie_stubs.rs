@@ -125,3 +125,63 @@ pub fn gpu_cutie_attn_mask(_aux: &GpuTensor, _heads: usize, _queries: usize) -> 
 pub fn gpu_cutie_attn_mask_reference(_aux: &GpuTensor, _heads: usize, _queries: usize) -> Result<GpuTensor, String> {
     Err(GPU_UNAVAILABLE.to_string())
 }
+
+pub fn gpu_cutie_add_broadcast(_a: &GpuTensor, _b: &GpuTensor) -> Result<GpuTensor, String> {
+    Err(GPU_UNAVAILABLE.to_string())
+}
+
+pub fn gpu_cutie_add_broadcast_reference(_a: &GpuTensor, _b: &GpuTensor) -> Result<GpuTensor, String> {
+    Err(GPU_UNAVAILABLE.to_string())
+}
+
+pub fn gpu_cutie_normalise_rows(_x: &GpuTensor, _sub: &GpuTensor, _div: &GpuTensor) -> Result<GpuTensor, String> {
+    Err(GPU_UNAVAILABLE.to_string())
+}
+
+pub fn gpu_cutie_normalise_rows_reference(_x: &GpuTensor, _sub: &GpuTensor, _div: &GpuTensor) -> Result<GpuTensor, String> {
+    Err(GPU_UNAVAILABLE.to_string())
+}
+
+pub fn gpu_cutie_rgb_planes(_rgb: &[u8], _plane: usize, _scale: f32) -> Result<GpuTensor, String> {
+    Err(GPU_UNAVAILABLE.to_string())
+}
+
+pub fn gpu_cutie_rgb_planes_reference(_rgb: &[u8], _plane: usize, _scale: f32) -> Result<GpuTensor, String> {
+    Err(GPU_UNAVAILABLE.to_string())
+}
+
+pub fn gpu_cutie_resize_bilinear(_x: &GpuTensor, _in_w: usize, _in_h: usize, _out_w: usize, _out_h: usize) -> Result<GpuTensor, String> {
+    Err(GPU_UNAVAILABLE.to_string())
+}
+
+pub fn gpu_cutie_resize_bilinear_reference(_x: &GpuTensor, _in_w: usize, _in_h: usize, _out_w: usize, _out_h: usize) -> Result<GpuTensor, String> {
+    Err(GPU_UNAVAILABLE.to_string())
+}
+
+pub fn gpu_cutie_object_values(_memory: &GpuTensor, _objects: usize, _eps: f32) -> Result<GpuTensor, String> {
+    Err(GPU_UNAVAILABLE.to_string())
+}
+
+pub fn gpu_cutie_object_values_reference(_memory: &GpuTensor, _objects: usize, _eps: f32) -> Result<GpuTensor, String> {
+    Err(GPU_UNAVAILABLE.to_string())
+}
+
+pub fn gpu_cutie_sine_encoding(_inv_freq: &[f32], _w: usize, _h: usize, _scale: f32, _eps: f32) -> Result<GpuTensor, String> {
+    Err(GPU_UNAVAILABLE.to_string())
+}
+
+pub fn gpu_cutie_sine_encoding_reference(_inv_freq: &[f32], _w: usize, _h: usize, _scale: f32, _eps: f32) -> Result<GpuTensor, String> {
+    Err(GPU_UNAVAILABLE.to_string())
+}
+
+pub fn gpu_cutie_layer_norm(
+    _x: &GpuTensor, _cache_namespace: &str, _key: &str, _gamma: &[f32], _beta: &[f32], _eps: f32,
+) -> Result<GpuTensor, String> {
+    Err(GPU_UNAVAILABLE.to_string())
+}
+
+pub fn gpu_cutie_layer_norm_reference(
+    _x: &GpuTensor, _cache_namespace: &str, _key: &str, _gamma: &[f32], _beta: &[f32], _eps: f32,
+) -> Result<GpuTensor, String> {
+    Err(GPU_UNAVAILABLE.to_string())
+}

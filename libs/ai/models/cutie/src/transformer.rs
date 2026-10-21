@@ -9,8 +9,8 @@
 //! The object transformer (embed 256, 8 heads, 16 queries, 3 blocks, FFN 2048): queries from the
 //! object memory (sums / (area + 1e-4), through `summary_to_query_init` and `_emb`, added to the
 //! learnt `query_init` / `query_emb`); pixels through `pixel_init_proj` (the running pixel) and
-//! `pixel_emb_proj` plus the sine encoding (`spatial_pe`, PositionalEncoding(256, scale 32,
-//! temperature 128), the pixel PE). Before each block and after it, `mask_pred[i]` (ReLU, 1x1 to
+//! `pixel_emb_proj` plus the sine encoding (`spatial_pe`, `model::PositionalEncoding`, the pixel
+//! PE). Before each block and after it, `mask_pred[i]` (ReLU, 1x1 to
 //! 1 logit) gives the aux logits; the attention mask for the next block from them
 //! (`gpu_cutie_attn_mask`, additive). A block: `read_from_pixel` (queries norm, then masked
 //! cross-attention to the pixels, PE added to q and k only, residual), `self_attn` (norm, self
@@ -28,15 +28,14 @@
 //! care; and a planar batch [n*256, h*w] becomes these tokens with one transpose. Taps are put
 //! object-major, PyTorch's order.
 
-use crate::model::{add, dev, relu, CAResBlock, Conv2d, CutieNet, Feat, FusionBlock, LayerNorm, Linear, Tap, Weights};
+use crate::model::{add, dev, relu, CAResBlock, Conv2d, CutieNet, Feat, FusionBlock, LayerNorm, Linear, PositionalEncoding, Tap, Weights};
 use crate::oracle::{Comparer, Oracle, OracleTap, Report, Tol, STEPS};
 use crate::{DiffusionError, Result};
 use makepad_ai_common::gpu::{
     gpu_add, gpu_add_cols_broadcast, gpu_attention_packed_cross_bias, gpu_attention_packed_cross_f32, gpu_birefnet_relu,
-    gpu_concat_cols, gpu_concat_rows_many, gpu_cutie_attn_mask, gpu_cutie_others, gpu_download, gpu_pixal_pool,
-    gpu_planar_tokens_transpose, gpu_reshape, gpu_slice_cols, gpu_slice_rows, gpu_upload, GpuTensor,
+    gpu_concat_cols, gpu_concat_rows_many, gpu_cutie_attn_mask, gpu_cutie_object_values, gpu_cutie_others, gpu_download,
+    gpu_pixal_pool, gpu_planar_tokens_transpose, gpu_reshape, gpu_slice_cols, gpu_slice_rows, gpu_upload, GpuTensor,
 };
-use std::cell::RefCell;
 
 /// The object transformer's width (`embed_dim`, also the pixel and value width), heads, queries
 /// (`num_queries`, also the object summaries), blocks and FFN width (`config/model/base.yaml`).
@@ -46,13 +45,6 @@ const HEAD_DIM: usize = EMBED / HEADS;
 const QUERIES: usize = 16;
 const BLOCKS: usize = 3;
 const FF_DIM: usize = 2048;
-/// The pixel PE's scale (`pixel_pe_scale`); its temperature (128) is already in the checkpoint's
-/// `spatial_pe.inv_freq`.
-const PE_SCALE: f32 = 32.0;
-/// PositionalEncoding's eps on the last position.
-const PE_EPS: f32 = 1e-6;
-/// How many sizes' pixel PE are kept (processors at different sizes may share the network).
-const PE_SIZES: usize = 4;
 /// Added to each summary's area before dividing by it (`QueryTransformer.forward`).
 const AREA_EPS: f32 = 1e-4;
 
@@ -234,15 +226,12 @@ pub(crate) struct QueryTransformer {
     summary_to_query_emb: Linear,
     pixel_init_proj: Conv2d,
     pixel_emb_proj: Conv2d,
-    /// The spatial PE's frequencies [64]: 1 / 128^(2i/128).
-    inv_freq: Vec<f32>,
+    /// The pixels' sine encoding.
+    spatial_pe: PositionalEncoding,
     blocks: Vec<Block>,
     /// `mask_pred[i]`'s 1x1 conv (256 -> 1), after a ReLU; one before the blocks and one after
     /// each.
     mask_pred: Vec<Conv2d>,
-    /// The sine encoding at the last few sizes used (w, h, planar [256, h*w]), made on the host
-    /// once a size, as PyTorch caches it; the oldest goes when a new size comes.
-    spatial_pe: RefCell<Vec<(usize, usize, GpuTensor)>>,
 }
 
 impl QueryTransformer {
@@ -259,10 +248,9 @@ impl QueryTransformer {
             summary_to_query_emb: w.linear(&format!("{p}.summary_to_query_emb"), EMBED, EMBED, true)?,
             pixel_init_proj: w.conv(&format!("{p}.pixel_init_proj"), EMBED, EMBED, 1, 0, 1, true)?,
             pixel_emb_proj: w.conv(&format!("{p}.pixel_emb_proj"), EMBED, EMBED, 1, 0, 1, true)?,
-            inv_freq: w.f32(&format!("{p}.spatial_pe.inv_freq"), &[EMBED / 4])?,
+            spatial_pe: PositionalEncoding::load(w, &format!("{p}.spatial_pe"), EMBED)?,
             blocks: (0..BLOCKS).map(|b| Block::load(w, &format!("{p}.blocks.{b}"))).collect::<Result<_>>()?,
             mask_pred: (0..=BLOCKS).map(|i| w.conv(&format!("{p}.mask_pred.{i}.1"), EMBED, 1, 1, 0, 1, true)).collect::<Result<_>>()?,
-            spatial_pe: RefCell::new(Vec::new()),
         })
     }
 
@@ -297,9 +285,10 @@ impl QueryTransformer {
         tap.put(&format!("{p}.pixel_init_proj"), &pixel_init.t)?;
         let pixel_emb = self.pixel_emb_proj.forward(pixel)?;
         tap.put(&format!("{p}.pixel_emb_proj"), &pixel_emb.t)?;
-        let spatial_pe = self.spatial_pe(pixel.w, pixel.h)?;
-        put_spatial_pe(tap, &format!("{p}.spatial_pe"), &spatial_pe, n)?;
-        let pixel_pe = to_tokens(&add_planar_pe(&pixel_emb, &spatial_pe)?)?;
+        if tap.active() {
+            put_spatial_pe(tap, &format!("{p}.spatial_pe"), &self.spatial_pe.tokens(pixel.w, pixel.h)?, n)?;
+        }
+        let pixel_pe = to_tokens(&add_planar_pe(&pixel_emb, &self.spatial_pe.planar(pixel.w, pixel.h)?)?)?;
 
         // The blocks, each masked by the aux logits before it. (PyTorch also makes a mask from
         // the last aux logits; nothing reads it, so it is not made here.)
@@ -328,55 +317,6 @@ impl QueryTransformer {
         tap.put(&format!("net.object_transformer.mask_pred.{i}"), &logits.t)?;
         Ok(logits.t)
     }
-
-    /// The sine encoding at w x h, planar [256, h*w] (a view of the cached one; made on the host
-    /// the first time a size comes, then kept with the last few sizes').
-    fn spatial_pe(&self, w: usize, h: usize) -> Result<GpuTensor> {
-        let fail = |e: String| dev("spatial pe", e);
-        let mut cache = self.spatial_pe.borrow_mut();
-        let i = match cache.iter().position(|&(cw, ch, _)| (cw, ch) == (w, h)) {
-            Some(i) => i,
-            None => {
-                let tokens = gpu_upload(&sine_encoding(&self.inv_freq, w, h), w * h, EMBED).map_err(fail)?;
-                if cache.len() == PE_SIZES {
-                    cache.remove(0);
-                }
-                cache.push((w, h, gpu_planar_tokens_transpose(&tokens).map_err(fail)?));
-                cache.len() - 1
-            }
-        };
-        gpu_slice_rows(&cache[i].2, 0, EMBED).map_err(fail)
-    }
-}
-
-/// `PositionalEncoding(256, scale 32, temperature 128)` at w x h as tokens [h*w, 256] (position
-/// y*w + x): the x encoding in channels 0..128 and the y encoding in 128..256, each sin, cos
-/// interleaved per frequency, positions i / (last + 1e-6) * 32, every step in PyTorch's fp32
-/// order (sin and cos rounded from f64).
-fn sine_encoding(inv_freq: &[f32], w: usize, h: usize) -> Vec<f32> {
-    let encode = |len: usize| -> Vec<f32> {
-        let last = len.saturating_sub(1) as f32 + PE_EPS;
-        let mut out = Vec::with_capacity(len * inv_freq.len() * 2);
-        for i in 0..len {
-            let pos = i as f32 / last * PE_SCALE;
-            for &f in inv_freq {
-                let a = (pos * f) as f64;
-                out.push(a.sin() as f32);
-                out.push(a.cos() as f32);
-            }
-        }
-        out
-    };
-    let half = inv_freq.len() * 2;
-    let (ex, ey) = (encode(w), encode(h));
-    let mut pe = Vec::with_capacity(h * w * 2 * half);
-    for y in 0..h {
-        for x in 0..w {
-            pe.extend_from_slice(&ex[x * half..(x + 1) * half]);
-            pe.extend_from_slice(&ey[y * half..(y + 1) * half]);
-        }
-    }
-    pe
 }
 
 /// Object-shared rows [len, 256] as interleaved tokens [len*n, 256], each row repeated per object
@@ -396,22 +336,15 @@ fn add_planar_pe(x: &Feat, pe: &GpuTensor) -> Result<Feat> {
     Feat::new(gpu_reshape(sum, x.n * x.c, x.plane()).map_err(fail)?, x.n, x.c, x.w, x.h)
 }
 
-/// Puts the sine encoding (planar [256, h*w]) as the oracle has it, one copy an object [n, h, w,
-/// 256] (made only while a check runs).
-fn put_spatial_pe(tap: &mut Tap, name: &str, pe: &GpuTensor, n: usize) -> Result<()> {
-    if !tap.active() {
-        return Ok(());
-    }
-    let fail = |e: String| dev("tap", e);
-    let tokens = gpu_planar_tokens_transpose(pe).map_err(fail)?;
-    tap.put(name, &gpu_concat_rows_many(&vec![&tokens; n]).map_err(fail)?)
+/// Puts the sine encoding (tokens [h*w, 256]) as the oracle has it, one copy an object [n, h, w,
+/// 256].
+fn put_spatial_pe(tap: &mut Tap, name: &str, tokens: &GpuTensor, n: usize) -> Result<()> {
+    tap.put(name, &gpu_concat_rows_many(&vec![tokens; n]).map_err(|e| dev("tap", e))?)
 }
 
 /// The queries' source: each summary's sums over its area, `obj_sums / (obj_area + 1e-4)`, from
 /// `obj_memory` [n*16, 257] (object-major, the area last; in inference its time axis is already
 /// summed) to interleaved [16*n, 256].
-// HOST FALLBACK: wants a kernel (each row's first 256 divided by its last column + 1e-4, rows
-// reordered object-major to interleaved)
 fn object_values(obj_memory: &GpuTensor, n: usize) -> Result<GpuTensor> {
     let width = EMBED + 1;
     if obj_memory.rows() != n * QUERIES || obj_memory.cols() != width {
@@ -422,20 +355,7 @@ fn object_values(obj_memory: &GpuTensor, n: usize) -> Result<GpuTensor> {
             n * QUERIES
         )));
     }
-    let fail = |e: String| dev("object values", e);
-    let memory = gpu_download(obj_memory).map_err(fail)?;
-    let mut values = vec![0.0f32; n * QUERIES * EMBED];
-    for o in 0..n {
-        for q in 0..QUERIES {
-            let row = &memory[(o * QUERIES + q) * width..(o * QUERIES + q + 1) * width];
-            let area = row[EMBED] + AREA_EPS;
-            let out = &mut values[(q * n + o) * EMBED..(q * n + o + 1) * EMBED];
-            for (v, &s) in out.iter_mut().zip(&row[..EMBED]) {
-                *v = s / area;
-            }
-        }
-    }
-    gpu_upload(&values, n * QUERIES, EMBED).map_err(fail)
+    gpu_cutie_object_values(obj_memory, n, AREA_EPS).map_err(|e| dev("object values", e))
 }
 
 // --- Token layouts ---
@@ -532,13 +452,13 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
         if !oracle.has(step, "object_transformer.in.pixel") {
             continue;
         }
-        let pix_feat = oracle_feat(oracle, step, "encode_image.out.pix_feat", 1, EMBED)?;
-        let visual_readout = oracle_feat(oracle, step, "pixel_fusion.in.visual_readout", n, EMBED)?;
-        let sensory = oracle_feat(oracle, step, "pixel_fusion.in.sensory", n, EMBED)?;
-        let last_mask = oracle_feat(oracle, step, "pixel_fusion.in.last_mask", n, 1)?;
+        let pix_feat = oracle.feat_as(step, "encode_image.out.pix_feat", 1, EMBED)?;
+        let visual_readout = oracle.feat_as(step, "pixel_fusion.in.visual_readout", n, EMBED)?;
+        let sensory = oracle.feat_as(step, "pixel_fusion.in.sensory", n, EMBED)?;
+        let last_mask = oracle.feat_as(step, "pixel_fusion.in.last_mask", n, 1)?;
         Comparer::new(oracle, report, "fusion", step, &tol).with(|tap| fuser.forward(&pix_feat, &visual_readout, &sensory, &last_mask, tap))?;
 
-        let pixel = oracle_feat(oracle, step, "object_transformer.in.pixel", n, EMBED)?;
+        let pixel = oracle.feat_as(step, "object_transformer.in.pixel", n, EMBED)?;
         let memory = oracle.tap(step, "object_transformer.in.obj_memory")?;
         let obj_memory = gpu_upload(&memory.values, n * QUERIES, EMBED + 1).map_err(|e| dev("check", e))?;
         Comparer::new(oracle, report, "transformer", step, &tol).with(|tap| transformer.forward(&pixel, &obj_memory, None, tap))?;
@@ -574,18 +494,6 @@ fn check_open_rows(report: &mut Report, transformer: &QueryTransformer, pixel: &
         report.note("transformer/edge: out.pixel is finite with every mask row open");
     }
     Ok(())
-}
-
-/// An oracle tap of n images of c channels (its last two dimensions the height and width) as a
-/// planar batch.
-fn oracle_feat(oracle: &Oracle, step: &str, name: &str, n: usize, c: usize) -> Result<Feat> {
-    let tap = oracle.tap(step, name)?;
-    let dims = tap.shape.len();
-    let (h, w) = if dims >= 2 { (tap.shape[dims - 2], tap.shape[dims - 1]) } else { (0, 0) };
-    if tap.values.len() != n * c * h * w {
-        return Err(DiffusionError::model(format!("cutie oracle {step}/{name}: {:?} is not {n} x {c} channels", tap.shape)));
-    }
-    Feat::upload(&tap.values, n, c, w, h)
 }
 
 /// The oracle's attention mask for block `b` (bool [n*8, 16, h*w], 1 = blocked) as the additive

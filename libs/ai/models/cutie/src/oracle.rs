@@ -16,10 +16,10 @@
 //! affinity, usage and readouts; `state.before.*` / `state.after.*` the memory between steps;
 //! `step.*` the processor step's input and output. A name seen twice in a step has `#1` added.
 
-use crate::model::Tap;
+use crate::model::{Feat, Tap};
 use crate::{DiffusionError, Result};
 use makepad_ai_common::gpu::{gpu_download, GpuTensor};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -40,6 +40,29 @@ pub(crate) struct OracleTap {
     pub(crate) shape: Vec<usize>,
     pub(crate) dtype: String,
     pub(crate) values: Vec<f32>,
+}
+
+impl OracleTap {
+    /// A planar tap, [n, c, h, w] or Cutie's grouped [1, n, c, h, w], on the device as n images
+    /// of c channels.
+    pub(crate) fn feat(&self) -> Result<Feat> {
+        match self.shape[..] {
+            [n, c, h, w] | [1, n, c, h, w] => Feat::upload(&self.values, n, c, w, h),
+            _ => Err(DiffusionError::model(format!("cutie oracle: {:?} is not [n, c, h, w] or [1, n, c, h, w]", self.shape))),
+        }
+    }
+
+    /// A tap of `n` images of `c` channels whose last two dimensions are the height and the
+    /// width, whatever the leading ones say (a batch of masks [1, n, H, W] is n images of one
+    /// channel), on the device.
+    pub(crate) fn feat_as(&self, n: usize, c: usize) -> Result<Feat> {
+        let dims = self.shape.len();
+        let (h, w) = if dims >= 2 { (self.shape[dims - 2], self.shape[dims - 1]) } else { (0, 0) };
+        if self.values.len() != n * c * h * w || self.values.is_empty() {
+            return Err(DiffusionError::model(format!("cutie oracle: {:?} is not {n} images of {c} channels", self.shape)));
+        }
+        Feat::upload(&self.values, n, c, w, h)
+    }
 }
 
 /// A row of `raw/schedule.tsv`.
@@ -102,19 +125,39 @@ impl Oracle {
         self.manifests.get(step).is_some_and(|m| m.iter().any(|(n, _, _)| n == name))
     }
 
-    pub(crate) fn tap(&self, step: &str, name: &str) -> Result<OracleTap> {
-        let (_, dtype, shape) = self
-            .manifests
+    /// A tap's manifest line: its dtype and shape.
+    fn entry(&self, step: &str, name: &str) -> Result<(&str, &[usize])> {
+        self.manifests
             .get(step)
             .and_then(|m| m.iter().find(|(n, _, _)| n == name))
-            .ok_or_else(|| DiffusionError::model(format!("cutie oracle: no tap {step}/{name}")))?;
+            .map(|(_, dtype, shape)| (dtype.as_str(), shape.as_slice()))
+            .ok_or_else(|| DiffusionError::model(format!("cutie oracle: no tap {step}/{name}")))
+    }
+
+    /// A tap's shape, from the manifest (nothing is read).
+    pub(crate) fn shape(&self, step: &str, name: &str) -> Result<&[usize]> {
+        Ok(self.entry(step, name)?.1)
+    }
+
+    /// A planar tap on the device (`OracleTap::feat`).
+    pub(crate) fn feat(&self, step: &str, name: &str) -> Result<Feat> {
+        self.tap(step, name)?.feat().map_err(|e| DiffusionError::model(format!("{step}/{name}: {e}")))
+    }
+
+    /// A tap of `n` images of `c` channels on the device (`OracleTap::feat_as`).
+    pub(crate) fn feat_as(&self, step: &str, name: &str, n: usize, c: usize) -> Result<Feat> {
+        self.tap(step, name)?.feat_as(n, c).map_err(|e| DiffusionError::model(format!("{step}/{name}: {e}")))
+    }
+
+    pub(crate) fn tap(&self, step: &str, name: &str) -> Result<OracleTap> {
+        let (dtype, shape) = self.entry(step, name)?;
         let path = self.dir.join("taps").join(step).join(format!("{name}.f32"));
         let bytes = fs::read(&path).map_err(|e| io(&path, e))?;
         let values: Vec<f32> = bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
         if values.len() != shape.iter().product::<usize>() {
             return Err(io(&path, format!("{} values for {shape:?}", values.len())));
         }
-        Ok(OracleTap { shape: shape.clone(), dtype: dtype.clone(), values })
+        Ok(OracleTap { shape: shape.to_vec(), dtype: dtype.to_string(), values })
     }
 
     fn raw(&self, name: &str) -> Result<Vec<u8>> {
@@ -273,8 +316,12 @@ impl Report {
         self.notes.push(text.into());
     }
 
-    pub(crate) fn fail(&mut self, stage: &str, step: &str, name: &str, why: impl Into<String>) {
-        self.failures += 1;
+    /// A row that is not a tensor comparison (a label map's IoU, the schedule, a pairing),
+    /// passing or failing as the check judged it; `note` says what was found.
+    pub(crate) fn record(&mut self, stage: &str, step: &str, name: &str, pass: bool, note: impl Into<String>) {
+        if !pass {
+            self.failures += 1;
+        }
         self.rows.push(Row {
             stage: stage.into(),
             step: step.into(),
@@ -284,26 +331,24 @@ impl Report {
             max_ref: f32::NAN,
             rel: f32::NAN,
             cos: f64::NAN,
-            pass: false,
-            note: why.into(),
+            pass,
+            note: note.into(),
         });
     }
 
-    /// One line a comparison, then the notes.
+    pub(crate) fn fail(&mut self, stage: &str, step: &str, name: &str, why: impl Into<String>) {
+        self.record(stage, step, name, false, why);
+    }
+
+    /// One line a comparison (rows that are not one show no numbers), then the notes.
     pub(crate) fn print(&self) {
         for r in &self.rows {
-            println!(
-                "{} {:<11} {:<9} {:<64} n={:<8} max_abs={:<11.4e} rel={:<11.4e} cos={:<12.9} {}",
-                if r.pass { "PASS" } else { "FAIL" },
-                r.stage,
-                r.step,
-                r.name,
-                r.n,
-                r.max_abs,
-                r.rel,
-                r.cos,
-                r.note
-            );
+            let numbers = if r.max_abs.is_nan() && r.cos.is_nan() {
+                format!("{:<10} {:<19} {:<15} {:<16}", "n=-", "max_abs=-", "rel=-", "cos=-")
+            } else {
+                format!("n={:<8} max_abs={:<11.4e} rel={:<11.4e} cos={:<12.9}", r.n, r.max_abs, r.rel, r.cos)
+            };
+            println!("{} {:<11} {:<9} {:<64} {numbers} {}", if r.pass { "PASS" } else { "FAIL" }, r.stage, r.step, r.name, r.note);
         }
         for n in &self.notes {
             println!("NOTE {n}");
@@ -348,5 +393,29 @@ impl<'a> Comparer<'a> {
         let mut sink = |name: &str, t: &GpuTensor| self.take(name, t);
         let mut tap = Tap::new(&mut sink);
         f(&mut tap)
+    }
+
+    /// Every name put so far as the oracle names it: a name put again is `name#1`, `name#2`, ...
+    pub(crate) fn put_names(&self) -> HashSet<String> {
+        let mut put = HashSet::new();
+        for (name, &count) in &self.seen {
+            put.insert(name.clone());
+            put.extend((1..count).map(|i| format!("{name}#{i}")));
+        }
+        put
+    }
+
+    /// The step's oracle taps under any of `prefixes` ("" for all) that nothing put, in the
+    /// oracle's order. A zero-size tap is what an absent native tensor is (PyTorch keeps emptied
+    /// tensors, e.g. after `clear_non_permanent_memory`), so it is not listed.
+    pub(crate) fn uncompared(&self, prefixes: &[&str]) -> Vec<String> {
+        let put = self.put_names();
+        self.oracle
+            .names(&self.step)
+            .into_iter()
+            .filter(|name| prefixes.iter().any(|p| name.starts_with(p)) && !put.contains(*name))
+            .filter(|name| self.oracle.shape(&self.step, name).map_or(true, |s| s.iter().product::<usize>() > 0))
+            .map(String::from)
+            .collect()
     }
 }

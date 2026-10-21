@@ -3,7 +3,7 @@
 //!
 //! `decoder_feat_proc`: 1x1 convs on f8 (512 -> 256) and f4 (256 -> 128). `up_16_8` and `up_8_4`
 //! (MaskUpsampleBlock): the objects' features bilinear x2 (align_corners false,
-//! `gpu_birefnet_resize_bilinear`), the image's skip added to each object, then a GroupResBlock
+//! `gpu_cutie_resize_bilinear`), the image's skip added to each object, then a GroupResBlock
 //! (256 -> 128, then 128 -> 128). `pred`: 3x3 p1 on ReLU(p4) to one logit per object at stride 4.
 //! The sensory update (SensoryUpdater): `g16_conv` 1x1 on p16, `g8_conv` 1x1 on p8
 //! area-downsampled by 2, `g4_conv` 1x1 on [p4, logit] (129) area-downsampled by 4, summed; then
@@ -15,11 +15,11 @@
 //! Cutie's decoder can run the objects in chunks (`chunk_size`); every object comes out the same
 //! either way, so this always runs them all at once (Cutie's fast path).
 
-use crate::model::{add, dev, relu, Conv2d, CutieNet, Feat, GroupResBlock, ImageFeatures, Tap, Weights};
+use crate::model::{add, add_to_each, dev, relu, Conv2d, CutieNet, Feat, GroupResBlock, ImageFeatures, Tap, Weights};
 use crate::oracle::{Comparer, Oracle, OracleTap, Report, Tol, STEPS};
 use crate::{DiffusionError, Result};
 use makepad_ai_common::gpu::{
-    gpu_birefnet_resize_bilinear, gpu_cutie_aggregate, gpu_cutie_gru, gpu_cutie_sigmoid, gpu_cutie_softmax_axis0,
+    gpu_cutie_aggregate, gpu_cutie_gru, gpu_cutie_resize_bilinear, gpu_cutie_sigmoid, gpu_cutie_softmax_axis0,
     gpu_download, gpu_pixal_pool, GpuTensor,
 };
 
@@ -43,9 +43,9 @@ impl MaskUpsampleBlock {
                 skip.n, skip.c, skip.w, skip.h, g.c
             )));
         }
-        let up = gpu_birefnet_resize_bilinear(&g.t, g.w, g.h, w, h, false).map_err(|e| dev("mask upsample", e))?;
+        let up = gpu_cutie_resize_bilinear(&g.t, g.w, g.h, w, h).map_err(|e| dev("mask upsample", e))?;
         let up = Feat::new(up, g.n, g.c, w, h)?;
-        let g = if g.n == 1 { add(skip, &up)? } else { add(&skip.repeat(g.n)?, &up)? };
+        let g = add_to_each(skip, &up)?;
         self.out_conv.forward(&g)
     }
 }
@@ -153,7 +153,7 @@ impl MaskDecoder {
         let prob = gpu_cutie_sigmoid(&logits.t).map_err(|e| dev("segment sigmoid", e))?;
         let agg = gpu_cutie_aggregate(&prob).map_err(|e| dev("segment aggregate", e))?;
         let (w, h) = (logits.w * 4, logits.h * 4);
-        let logits = gpu_birefnet_resize_bilinear(&agg, logits.w, logits.h, w, h, false).map_err(|e| dev("segment upsample", e))?;
+        let logits = gpu_cutie_resize_bilinear(&agg, logits.w, logits.h, w, h).map_err(|e| dev("segment upsample", e))?;
         let prob = gpu_cutie_softmax_axis0(&logits).map_err(|e| dev("segment softmax", e))?;
         tap.put("segment.out.sensory", &new_sensory.t)?;
         tap.put("segment.out.logits", &logits)?;
@@ -174,16 +174,6 @@ impl CutieNet {
     pub(crate) fn segment(&self, feats: &ImageFeatures, memory_readout: &Feat, sensory: &Feat, update_sensory: bool, tap: &mut Tap) -> Result<(Feat, GpuTensor, GpuTensor)> {
         self.mask_decoder.segment(&feats.f8, &feats.f4, memory_readout, sensory, update_sensory, tap)
     }
-}
-
-/// An oracle tap as planar images: [n, c, h, w], or Cutie's grouped [1, n, c, h, w].
-fn oracle_feat(oracle: &Oracle, step: &str, name: &str) -> Result<Feat> {
-    let tap = oracle.tap(step, name)?;
-    let (n, c, h, w) = match tap.shape[..] {
-        [n, c, h, w] | [1, n, c, h, w] => (n, c, h, w),
-        _ => return Err(DiffusionError::model(format!("cutie oracle {step}/{name}: shape {:?} is not planar", tap.shape))),
-    };
-    Feat::upload(&tap.values, n, c, w, h)
 }
 
 /// Which entries of `segment.out.logits` the decoder check compares with `Tol::STAGE`.
@@ -290,10 +280,10 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
             continue;
         }
         steps += 1;
-        let f8 = oracle_feat(oracle, step, "encode_image.out.f8")?;
-        let f4 = oracle_feat(oracle, step, "encode_image.out.f4")?;
-        let readout = oracle_feat(oracle, step, "segment.in.memory_readout")?;
-        let sensory = oracle_feat(oracle, step, "segment.in.sensory")?;
+        let f8 = oracle.feat(step, "encode_image.out.f8")?;
+        let f4 = oracle.feat(step, "encode_image.out.f4")?;
+        let readout = oracle.feat(step, "segment.in.memory_readout")?;
+        let sensory = oracle.feat(step, "segment.in.sensory")?;
         let update_sensory = oracle.has(step, "net.mask_decoder.sensory_update");
         let mut cmp = Comparer::new(oracle, report, "decoder", step, &tol);
         let (_, logits, prob) = cmp.with(|tap| decoder.segment(&f8, &f4, &readout, &sensory, update_sensory, tap))?;

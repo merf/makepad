@@ -1,7 +1,7 @@
 //! Cutie's network, as `cutie-base-mega` runs it (the `merf/Cutie` fork, `cutie/model/*.py`): the
 //! pieces every part shares (the checkpoint, convolutions with BatchNorm folded in, linears,
-//! LayerNorm, the residual and fusion blocks, taps) and the assembled `CutieNet`. Each part is in
-//! its own file and adds its methods to `CutieNet` there:
+//! LayerNorm, the residual and fusion blocks, the sine positional encoding, taps) and the
+//! assembled `CutieNet`. Each part is in its own file and adds its methods to `CutieNet` there:
 //!
 //! - `encoder.rs`: the pixel encoder (ResNet-50 to stride 16), `encode_image`, the key
 //!   projection, `transform_key`.
@@ -20,9 +20,11 @@
 use crate::torch_pth::PthStateDict;
 use crate::{DiffusionError, Result};
 use makepad_ai_common::gpu::{
-    cutie_conv_out, gpu_add, gpu_birefnet_relu, gpu_concat_rows_many, gpu_cutie_conv2d, gpu_cutie_eca,
-    gpu_download, gpu_layer_norm_pytorch, gpu_linear_f32_resident, gpu_slice_rows, gpu_upload, GpuTensor,
+    cutie_conv_out, gpu_add, gpu_birefnet_relu, gpu_concat_rows_many, gpu_cutie_add_broadcast, gpu_cutie_conv2d, gpu_cutie_eca,
+    gpu_cutie_layer_norm, gpu_cutie_sine_encoding, gpu_download, gpu_linear_f32_resident, gpu_planar_tokens_transpose,
+    gpu_slice_rows, gpu_upload, GpuTensor,
 };
+use std::cell::RefCell;
 use std::path::Path;
 
 /// The device weight cache's namespace for Cutie (`unload_cutie` evicts it).
@@ -110,6 +112,7 @@ impl Weights {
     /// An nn.LayerNorm over `dim` (`{name}.weight`, `{name}.bias`, eps 1e-5).
     pub(crate) fn layer_norm(&mut self, name: &str, dim: usize) -> Result<LayerNorm> {
         Ok(LayerNorm {
+            key: format!("{}{name}", self.key_prefix),
             gamma: self.f32(&format!("{name}.weight"), &[dim])?,
             beta: self.f32(&format!("{name}.bias"), &[dim])?,
             eps: 1e-5,
@@ -192,15 +195,6 @@ impl Feat {
         let parts: Vec<&GpuTensor> = views.iter().collect();
         Self::new(gpu_concat_rows_many(&parts).map_err(|e| dev("cat channels", e))?, self.n, self.c + other.c, self.w, self.h)
     }
-
-    /// A single image repeated n times (Cutie's expand of shared pixel features to each object).
-    pub(crate) fn repeat(&self, n: usize) -> Result<Self> {
-        if self.n != 1 {
-            return Err(DiffusionError::model("cutie feat repeat: not a single image"));
-        }
-        let parts: Vec<&Feat> = std::iter::repeat(self).take(n).collect();
-        Self::cat_images(&parts)
-    }
 }
 
 pub(crate) fn relu(x: &Feat) -> Result<Feat> {
@@ -209,6 +203,18 @@ pub(crate) fn relu(x: &Feat) -> Result<Feat> {
 
 pub(crate) fn add(a: &Feat, b: &Feat) -> Result<Feat> {
     Feat::new(gpu_add(&a.t, &b.t).map_err(|e| dev("add", e))?, a.n, a.c, a.w, a.h)
+}
+
+/// One image `x` added to each image of `g` (same channels and size): Cutie's `x + g` of shared
+/// image features broadcast over the objects, without repeating `x` first.
+pub(crate) fn add_to_each(x: &Feat, g: &Feat) -> Result<Feat> {
+    if x.n != 1 || (x.c, x.w, x.h) != (g.c, g.w, g.h) {
+        return Err(DiffusionError::model(format!(
+            "cutie add to each: {} images of {} at {}x{} onto {} of {} at {}x{}",
+            x.n, x.c, x.w, x.h, g.n, g.c, g.w, g.h
+        )));
+    }
+    Feat::new(gpu_cutie_add_broadcast(&x.t, &g.t).map_err(|e| dev("add to each", e))?, g.n, g.c, g.w, g.h)
 }
 
 // --- Layers ---
@@ -263,8 +269,10 @@ impl Linear {
     }
 }
 
-/// nn.LayerNorm over the last dimension of rows [rows, dim] (PyTorch's CUDA kernel's order).
+/// nn.LayerNorm over the last dimension of rows [rows, dim] (PyTorch's CUDA kernel's order), its
+/// affine kept on the device under `key`.
 pub(crate) struct LayerNorm {
+    pub(crate) key: String,
     pub(crate) gamma: Vec<f32>,
     pub(crate) beta: Vec<f32>,
     pub(crate) eps: f32,
@@ -272,7 +280,7 @@ pub(crate) struct LayerNorm {
 
 impl LayerNorm {
     pub(crate) fn forward(&self, x: &GpuTensor) -> Result<GpuTensor> {
-        gpu_layer_norm_pytorch(x, &self.gamma, &self.beta, self.eps).map_err(|e| dev("layer norm", e))
+        gpu_cutie_layer_norm(x, CUTIE_NAMESPACE, &self.key, &self.gamma, &self.beta, self.eps).map_err(|e| dev(&self.key, e))
     }
 }
 
@@ -351,14 +359,74 @@ impl FusionBlock {
 
     /// Taps `{name}.distributor`, `{name}.block1`, `{name}.block2` (the oracle's module names).
     pub(crate) fn forward(&self, x: &Feat, g: &Feat, name: &str, tap: &mut Tap) -> Result<Feat> {
-        let x = self.x_transform.forward(x)?.repeat(g.n)?;
-        let g = add(&x, &self.g_transform.forward(g)?)?;
+        let x = self.x_transform.forward(x)?;
+        let g = add_to_each(&x, &self.g_transform.forward(g)?)?;
         tap.put(&format!("{name}.distributor"), &g.t)?;
         let g = self.block1.forward(&g)?;
         tap.put(&format!("{name}.block1"), &g.t)?;
         let g = self.block2.forward(&g)?;
         tap.put(&format!("{name}.block2"), &g.t)?;
         Ok(g)
+    }
+}
+
+// --- Positional encoding ---
+
+/// Cutie's sine `PositionalEncoding(256, scale 32, temperature 128)` (`transformer/
+/// positional_encoding.py`, channel-last, normalised), which the object summarizer (`pos_enc`)
+/// and the object transformer (`spatial_pe`) both use: at a w x h grid, token y*w + x has the x
+/// encoding in channels 0..128 and the y encoding in 128..256, sin and cos interleaved per
+/// frequency, positions i / ((len - 1) + 1e-6) * 32. Made on the device the first time a size is
+/// asked for (`gpu_cutie_sine_encoding`: PyTorch's rounding and CUDA's sinf and cosf, so the
+/// oracle's to the bit) and kept for the last few sizes, as PyTorch caches the last one.
+pub(crate) struct PositionalEncoding {
+    /// The frequencies (`inv_freq`: 1 / 128^(2i/128), 64 of them).
+    inv_freq: Vec<f32>,
+    /// (w, h, tokens [h*w, dim], planar [dim, h*w]), the newest last.
+    cache: RefCell<Vec<(usize, usize, GpuTensor, GpuTensor)>>,
+}
+
+impl PositionalEncoding {
+    /// The positions' scale (`pixel_pe_scale`); the temperature is in the checkpoint's `inv_freq`.
+    const SCALE: f32 = 32.0;
+    /// Added to the last position before dividing by it.
+    const EPS: f32 = 1e-6;
+    /// Sizes kept: processors at different sizes may share the network.
+    const SIZES: usize = 4;
+
+    /// The encoding of `dim` channels whose frequencies are `{name}.inv_freq` [dim / 4].
+    pub(crate) fn load(w: &mut Weights, name: &str, dim: usize) -> Result<Self> {
+        Ok(Self { inv_freq: w.f32(&format!("{name}.inv_freq"), &[dim / 4])?, cache: RefCell::new(Vec::new()) })
+    }
+
+    /// The encoding at w x h as tokens [h*w, dim] (a view of the kept one).
+    pub(crate) fn tokens(&self, w: usize, h: usize) -> Result<GpuTensor> {
+        let i = self.entry(w, h)?;
+        let t = &self.cache.borrow()[i].2;
+        gpu_slice_rows(t, 0, t.rows()).map_err(|e| dev("positional encoding", e))
+    }
+
+    /// The encoding at w x h planar, [dim, h*w] (a view of the kept one).
+    pub(crate) fn planar(&self, w: usize, h: usize) -> Result<GpuTensor> {
+        let i = self.entry(w, h)?;
+        let t = &self.cache.borrow()[i].3;
+        gpu_slice_rows(t, 0, t.rows()).map_err(|e| dev("positional encoding", e))
+    }
+
+    /// The cache's index of w x h, made first if need be (the oldest size goes).
+    fn entry(&self, w: usize, h: usize) -> Result<usize> {
+        let mut cache = self.cache.borrow_mut();
+        if let Some(i) = cache.iter().position(|&(cw, ch, ..)| (cw, ch) == (w, h)) {
+            return Ok(i);
+        }
+        let fail = |e: String| dev("positional encoding", e);
+        let tokens = gpu_cutie_sine_encoding(&self.inv_freq, w, h, Self::SCALE, Self::EPS).map_err(fail)?;
+        let planar = gpu_planar_tokens_transpose(&tokens).map_err(fail)?;
+        if cache.len() == Self::SIZES {
+            cache.remove(0);
+        }
+        cache.push((w, h, tokens, planar));
+        Ok(cache.len() - 1)
     }
 }
 
