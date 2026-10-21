@@ -545,7 +545,8 @@ pub(crate) fn check_without_network(oracle: &Oracle, report: &mut Report) -> Res
 /// reported, not failed: one pixel's label flipping fails any tolerance on label numbers, so the
 /// label maps are judged by IoU instead. Taps whose columns or rows follow long-term memory's
 /// order are reported, not failed, too (`run_tol`); long-term memory is compared without its
-/// order instead (`compare_long_term`).
+/// order instead (`compare_long_term`). The steps without taps are timed (a note): what a step
+/// costs as the worker runs it, the tapped steps' downloads and comparisons left out.
 pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights) -> Result<()> {
     const MIN_IOU: f64 = 0.998;
     let net = CutieNet::load(weights)?;
@@ -561,6 +562,8 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
     let masks = WorkerMasks::new(oracle)?;
     let mut frame_labels: Vec<Option<Vec<u8>>> = vec![None; oracle.frames];
     frame_labels[0] = Some(masks.seed.clone());
+    // The steps without taps, timed: what a step costs as the worker runs it.
+    let (mut untapped, mut untapped_time) = (0usize, std::time::Duration::ZERO);
 
     for row in &schedule {
         let step = row.tap.clone().unwrap_or_else(|| format!("s{}", row.step));
@@ -591,7 +594,13 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
                 compare_long_term(oracle, report, tapped, "state.after", &processor.memory)?;
                 prob
             }
-            None => processor.step(&frame, w, h, mask.as_deref(), row.force_permanent, false)?,
+            None => {
+                let started = std::time::Instant::now();
+                let prob = processor.step(&frame, w, h, mask.as_deref(), row.force_permanent, false)?;
+                untapped += 1;
+                untapped_time += started.elapsed();
+                prob
+            }
         };
         let labels = CutieProcessor::labels(&prob, n + 1, plane);
 
@@ -612,6 +621,8 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
         record_schedule(report, "run", &step, "schedule", row, &processor.schedule, &processor.memory, consolidated, Some(&area));
         frame_labels[row.frame] = Some(labels);
     }
+    let ms = untapped_time.as_secs_f64() * 1e3;
+    report.note(format!("run: {untapped} steps without taps in {ms:.1} ms, {:.2} ms a step", ms / untapped.max(1) as f64));
     Ok(())
 }
 
