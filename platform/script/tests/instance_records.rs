@@ -62,10 +62,77 @@ fn hlsl_reads_the_record_from_a_buffer_and_carries_only_what_the_pixel_stage_rea
     assert!(src.contains("uint _t0 = ((_mp_instance_index + _mp_inst_base) * 650u);"), "{src}");
     assert!(src.contains("dyninst_n = int2(asint(_mp_inst[(_t0 + 644u)]), asint(_mp_inst[(_t0 + 645u)]));"), "{src}");
     assert!(src.contains("dyninst_u = _mp_inst[(_t0 + 648u)];"), "{src}");
-    // The pixel stage reads p, n, u and f (7 lanes), never the matrices.
+    // The pixel stage reads p, n, u and f from the buffer too, by the record
+    // index passed nointerpolation: no instance value is a varying.
     let varying = &src[src.find("struct VertexOut").unwrap()..];
     let varying = &varying[..varying.find("};").unwrap()];
-    assert!(varying.contains("float4 packed_varying_1 : TEXCOORD1;") && !varying.contains("packed_varying_2"), "{varying}");
+    assert!(varying.contains("nointerpolation uint instance_record : TEXCOORD0;") && !varying.contains("packed_varying"), "{varying}");
+    let pixel = &src[src.find("PixelOut pixel_main").unwrap()..];
+    assert!(pixel.contains("(input.instance_record * 650u)") && pixel.contains("dyninst_u = _mp_inst[(_t"), "{pixel}");
+    validate_hlsl(&src);
+}
+
+/// 48 vec4 instance values the pixel stage reads: as varyings they were past
+/// shader model 5's 32 outputs (`vs_5_0 output limit (32) exceeded`).
+#[test]
+fn hlsl_pixel_stage_reads_more_instance_values_than_there_are_varyings() {
+    let host = Box::leak(Box::new(ScriptVmHost::new(0i32, ())));
+    let mut vm = ScriptVm { host: host.host_context(), bx: Box::new(ScriptVmBase::new()) };
+    vm.bx.captured_errors = Some(Vec::new());
+    let mut fields = String::new();
+    let mut sum = String::from("self.v0");
+    for k in 0..48 {
+        fields.push_str(&format!("v{k}: shader.instance(vec4f)
+"));
+        if k > 0 {
+            sum.push_str(&format!(" + self.v{k}"));
+        }
+    }
+    let code = format!(
+        "use mod.pod.*
+use mod.math.*
+use mod.shader
+let sh = {{
+geom: shader.vertex_buffer(vec2f, nil)
+vertex_pos: shader.vertex_position(vec4f)
+pixel: shader.fragment_output(0, vec4f)
+         uv: shader.varying(vec2f)
+{fields}         vertex: fn() {{ self.uv = self.geom; self.vertex_pos = vec4(self.geom.x, self.geom.y, 0.0, 1.0) }}
+         fragment: fn() {{ self.pixel = ({sum}) * self.uv.x }}
+}}
+         shader.test_compile_draw_source(sh, \"hlsl\", false)"
+    );
+    let value = vm.with_instruction_limit(50_000_000, |vm| vm.eval(ScriptMod::new("", "", "x", 0, 0, &code, &[])));
+    let errors = vm.take_errors();
+    assert!(errors.is_empty(), "{errors:?}");
+    let src = vm.bx.heap.string_with(value, |_, s| s.to_string()).unwrap_or_default();
+    let varying = &src[src.find("struct VertexOut").unwrap()..];
+    let varying = &varying[..varying.find("};").unwrap()];
+    assert!(varying.contains("float4 packed_varying_0 : TEXCOORD0;") && !varying.contains("packed_varying_1"), "{varying}");
+    assert!(varying.contains("nointerpolation uint instance_record : TEXCOORD1;"), "{varying}");
+    validate_hlsl(&src);
+}
+
+/// FXC from the Windows SDK, when it is installed (`MAKEPAD_FXC` names another).
+fn fxc() -> Option<std::path::PathBuf> {
+    if let Some(p) = std::env::var_os("MAKEPAD_FXC") {
+        return Some(p.into());
+    }
+    let kits = std::path::Path::new(r"C:\Program Files (x86)\Windows Kits\10\bin");
+    let mut found: Vec<_> = std::fs::read_dir(kits).ok()?.filter_map(|e| Some(e.ok()?.path().join("x64").join("fxc.exe"))).filter(|p| p.exists()).collect();
+    found.sort();
+    found.pop()
+}
+
+/// Both stages compile as D3D11 compiles them (`vs_5_0` / `ps_5_0`), when FXC is at hand.
+fn validate_hlsl(src: &str) {
+    let Some(fxc) = fxc() else { return };
+    let path = std::env::temp_dir().join(format!("makepad-draw-{}-{}.hlsl", std::process::id(), src.len()));
+    std::fs::write(&path, src).unwrap();
+    for (profile, entry) in [("vs_5_0", "vertex_main"), ("ps_5_0", "pixel_main")] {
+        let out = std::process::Command::new(&fxc).args(["/nologo", "/T", profile, "/E", entry, "/Fo"]).arg(path.with_extension("dxbc")).arg(&path).output().unwrap();
+        assert!(out.status.success(), "fxc {profile}: {}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    }
 }
 
 #[test]

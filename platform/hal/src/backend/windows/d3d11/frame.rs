@@ -573,7 +573,9 @@ impl D3d11 {
                         Some(v) => Some(v.clone()),
                         None => self.word_arena.words.clone(),
                     };
-                    ctx.VSSetShaderResources(slot, Some(&[view]));
+                    // the pixel stage reads instance values from it too (no varyings)
+                    ctx.VSSetShaderResources(slot, Some(&[view.clone()]));
+                    ctx.PSSetShaderResources(slot, Some(&[view]));
                 }
                 for (_, count, base_cb) in &sc.ranges[p.ranges.clone()] {
                     if p.program.instance_slot().is_some() {
