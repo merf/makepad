@@ -48,10 +48,10 @@ const AREA_EPS: f32 = 1e-4;
 /// A ResNet BasicBlock (`model/utils/resnet.py`), its BatchNorms folded:
 /// relu(conv2(relu(conv1(x))) + residual), the residual through `downsample` (1x1 with the
 /// stride, + BN) where the shape changes.
-struct BasicBlock {
-    conv1: Conv2d,
-    conv2: Conv2d,
-    downsample: Option<Conv2d>,
+pub(crate) struct BasicBlock {
+    pub(crate) conv1: Conv2d,
+    pub(crate) conv2: Conv2d,
+    pub(crate) downsample: Option<Conv2d>,
 }
 
 impl BasicBlock {
@@ -79,11 +79,11 @@ impl BasicBlock {
 }
 
 /// A ResNet stage (`layer1`..`layer3`): its BasicBlocks in order, the first carrying the stride.
-struct ResStage {
+pub(crate) struct ResStage {
     /// The stage's module name in `CUTIE` (`mask_encoder.layer1`): its taps are `net.{name}.{i}`
     /// after each block and `net.{name}` after the last.
     name: String,
-    blocks: Vec<BasicBlock>,
+    pub(crate) blocks: Vec<BasicBlock>,
 }
 
 impl ResStage {
@@ -113,12 +113,12 @@ impl ResStage {
 /// features) and its sensory deep update.
 pub(crate) struct MaskEncoder {
     /// conv1 (7x7 s2 p3, 5 -> 64) with bn1 folded in.
-    conv1: Conv2d,
-    layers: [ResStage; 3],
-    fuser: FusionBlock,
+    pub(crate) conv1: Conv2d,
+    pub(crate) layers: [ResStage; 3],
+    pub(crate) fuser: FusionBlock,
     /// SensoryDeepUpdater's `transform`: 3x3 p1 on [value, sensory] (512 -> 768: the forget,
     /// update and new-value gates).
-    sensory_transform: Conv2d,
+    pub(crate) sensory_transform: Conv2d,
 }
 
 impl MaskEncoder {

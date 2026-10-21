@@ -4,7 +4,8 @@
 //!
 //! `<oracle-dir>` is a clip's folder of RationalVisions' `corpus/cutie-oracle` (made by
 //! `tools/cutie-oracle`). Stages: ops, encoder, mask, transformer, decoder, memory, run, all (the
-//! default). The weights default to `<oracle-dir>/../../cutie/weights/cutie-base-mega.pth` (the
+//! default); `bench` times the oracle's run instead (not part of all; `MAKEPAD_CUTIE_BENCH_PASSES`
+//! passes, 5 unless set). The weights default to `<oracle-dir>/../../cutie/weights/cutie-base-mega.pth` (the
 //! same checkout's Cutie), or `MAKEPAD_CUTIE_WEIGHTS`. Exits 1 when any comparison fails.
 
 use makepad_ai_cutie::{validate, VALIDATE_STAGES};

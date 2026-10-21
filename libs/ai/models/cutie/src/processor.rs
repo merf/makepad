@@ -451,15 +451,15 @@ fn record_schedule(
 
 /// What the worker gives Cutie in the oracle's run besides the frames: masks as label maps
 /// (`frame_index_mask`), one-hot without the background (`index_numpy_to_one_hot_torch`, `[1:]`).
-struct WorkerMasks {
+pub(crate) struct WorkerMasks {
     objects: usize,
     plane: usize,
     /// The seed masks as a label map (a later object over an earlier one).
-    seed: Vec<u8>,
+    pub(crate) seed: Vec<u8>,
 }
 
 impl WorkerMasks {
-    fn new(oracle: &Oracle) -> Result<Self> {
+    pub(crate) fn new(oracle: &Oracle) -> Result<Self> {
         let (objects, plane) = (oracle.objects, oracle.width * oracle.height);
         let masks = oracle.seed()?;
         if masks.len() != objects * plane {
@@ -477,7 +477,7 @@ impl WorkerMasks {
     }
 
     /// A label map one-hot: objects x plane.
-    fn one_hot(&self, labels: &[u8]) -> Vec<f32> {
+    pub(crate) fn one_hot(&self, labels: &[u8]) -> Vec<f32> {
         let mut one_hot = vec![0.0f32; self.objects * self.plane];
         for (i, &l) in labels.iter().enumerate() {
             if l > 0 {

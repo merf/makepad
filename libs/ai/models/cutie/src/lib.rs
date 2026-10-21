@@ -20,6 +20,7 @@ pub use makepad_ai_common::backend;
 pub use makepad_ai_common::torch_pth;
 pub use makepad_ai_common::{DiffusionError, Result};
 
+mod bench;
 mod decoder;
 mod encoder;
 mod mask;
@@ -110,8 +111,9 @@ pub fn unload_cutie() -> Result<usize> {
     Ok(evicted)
 }
 
-/// The validation stages, in the port's order.
-pub const VALIDATE_STAGES: [&str; 8] = ["ops", "encoder", "mask", "transformer", "decoder", "memory", "run", "all"];
+/// The validation stages, in the port's order, then "all" (every stage) and "bench" (timings, not
+/// part of "all": `bench.rs`).
+pub const VALIDATE_STAGES: [&str; 9] = ["ops", "encoder", "mask", "transformer", "decoder", "memory", "run", "all", "bench"];
 
 /// What `validate` found.
 pub struct ValidateSummary {
@@ -150,6 +152,11 @@ pub fn validate(oracle_dir: &Path, weights_path: &Path, stages: &[String]) -> Re
             report.fail(stage, "-", "(stage)", e.to_string());
         }
         report.note(format!("stage {stage}: {:.3} s", started.elapsed().as_secs_f64()));
+    }
+    if stages.iter().any(|s| s == "bench") {
+        if let Err(e) = crate::bench::run(&oracle, weights_path, &mut report) {
+            report.fail("bench", "-", "(stage)", e.to_string());
+        }
     }
     report.print();
     let summary = ValidateSummary { comparisons: report.rows.len(), failures: report.failures };
