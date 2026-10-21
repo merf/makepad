@@ -22,29 +22,36 @@
 //! area = each summary's weights summed; summaries = [sums, area] [16, 257] per object.
 
 use crate::model::{add, dev, relu, Conv2d, CutieNet, Feat, FusionBlock, Linear, Tap, Weights};
-use crate::oracle::{Comparer, Oracle, Report, Tol, STEPS};
+use crate::oracle::{Comparer, Oracle, OracleTap, Report, Tol, STEPS};
 use crate::{DiffusionError, Result};
 use makepad_ai_common::gpu::{
     cutie_conv_out, gpu_add, gpu_birefnet_relu, gpu_concat_cols, gpu_concat_rows_many, gpu_cutie_gru, gpu_cutie_matmul,
-    gpu_cutie_maxpool3x3s2, gpu_cutie_others, gpu_cutie_sigmoid, gpu_mul, gpu_pixal_pool, gpu_planar_tokens_transpose,
-    gpu_realesrgan_scale_add, gpu_reshape, gpu_rife_fill, gpu_slice_rows, gpu_upload, GpuTensor,
+    gpu_cutie_maxpool3x3s2, gpu_cutie_others, gpu_cutie_sigmoid, gpu_download, gpu_mul, gpu_pixal_pool,
+    gpu_planar_tokens_transpose, gpu_realesrgan_scale_add, gpu_reshape, gpu_rife_fill, gpu_slice_rows, gpu_upload, GpuTensor,
 };
 use std::cell::RefCell;
+use std::collections::HashMap;
 
-/// The width of the pixel features, the value and the sensory memory (`model/base.yaml`).
+/// The pixel features' width (`model/base.yaml`).
 const PIXEL_DIM: usize = 256;
+/// The value's width.
 const VALUE_DIM: usize = 256;
+/// The sensory memory's width.
 const SENSORY_DIM: usize = 256;
 /// The mask encoder's last stage's width (`mask_encoder.final_dim`).
 const FINAL_DIM: usize = 256;
-/// The object summarizer's width and its summaries per object: the first half pool over the
-/// mask, the second over its complement.
+/// The object summarizer's width.
 const EMBED_DIM: usize = 256;
+/// Summaries per object: the first half pool over the mask, the second over its complement.
 const NUM_SUMMARIES: usize = 16;
-/// The summarizer's positional encoding (`pixel_pe_scale`; the temperature is in the
-/// checkpoint's `inv_freq`) and PositionalEncoding's epsilon.
+/// The summarizer's positional encoding's scale (`pixel_pe_scale`; the temperature is in the
+/// checkpoint's `inv_freq`).
 const PE_SCALE: f32 = 32.0;
+/// PositionalEncoding's epsilon, added to the last position before normalising by it.
 const PE_EPS: f32 = 1e-6;
+/// What the object transformer adds to a summary's area before dividing its sums by it
+/// (`object_transformer.py`: `obj_sums / (obj_area + 1e-4)`).
+const AREA_EPS: f32 = 1e-4;
 
 /// A ResNet BasicBlock (`model/utils/resnet.py`), its BatchNorms folded:
 /// relu(conv2(relu(conv1(x))) + residual), the residual through `downsample` (1x1 with the
@@ -199,6 +206,10 @@ impl MaskEncoder {
         &self, summarizer: &ObjectSummarizer, image: &Feat, pix_feat: &Feat, sensory: &Feat, masks: &Feat, deep_update: bool,
         tap: &mut Tap,
     ) -> Result<(Feat, Feat, GpuTensor)> {
+        if masks.n == 0 {
+            // PyTorch never gets here: InferenceCore._add_memory returns early with no objects.
+            return Err(DiffusionError::model("cutie encode_mask: no objects (the processor skips memorising then)"));
+        }
         if image.n != 1 || image.c != 3 || pix_feat.n != 1 || pix_feat.c != PIXEL_DIM || masks.c != 1 {
             return Err(DiffusionError::model("cutie encode_mask: wants one 3-channel image, one pix_feat and 1-channel masks"));
         }
@@ -229,9 +240,10 @@ pub(crate) struct ObjectSummarizer {
     weights_pred: [Linear; 2],
     /// The positional encoding's frequencies (`pos_enc.inv_freq`: 1 / 128^(2i/128), 64 of them).
     inv_freq: Vec<f32>,
-    /// The positional encoding of the last grid asked for (w, h, [h*w, 256]), as
-    /// PositionalEncoding caches it.
-    pe_cache: RefCell<Option<(usize, usize, GpuTensor)>>,
+    /// The positional encoding of each grid asked for ([h*w, 256] by (w, h)), made once a size as
+    /// PositionalEncoding caches it. Every size is kept (PyTorch keeps the last), so processors
+    /// sharing the network at different sizes do not remake each other's.
+    pe_cache: RefCell<HashMap<(usize, usize), GpuTensor>>,
 }
 
 impl ObjectSummarizer {
@@ -247,8 +259,22 @@ impl ObjectSummarizer {
                 w.linear("object_summarizer.weights_pred.2", EMBED_DIM, NUM_SUMMARIES, true)?,
             ],
             inv_freq: w.f32("object_summarizer.pos_enc.inv_freq", &[EMBED_DIM / 4])?,
-            pe_cache: RefCell::new(None),
+            pe_cache: RefCell::new(HashMap::new()),
         })
+    }
+
+    /// What the object transformer reads from summaries [.., 257] (sums, then area): each
+    /// summary's sums divided by its area + 1e-4, [.., 256], in f32 as `object_transformer.py`
+    /// does (summed over memory frames first; one frame here). For the check: the summaries with
+    /// small areas are the ones this magnifies.
+    fn normalised(summaries: &[f32]) -> Vec<f32> {
+        summaries
+            .chunks_exact(EMBED_DIM + 1)
+            .flat_map(|row| {
+                let area = row[EMBED_DIM] + AREA_EPS;
+                row[..EMBED_DIM].iter().map(move |s| s / area)
+            })
+            .collect()
     }
 
     /// `ObjectSummarizer.forward`: `masks` (n images of 1 channel, each object's probability at
@@ -321,12 +347,12 @@ impl ObjectSummarizer {
     /// token-major [h*w, 256], in f32 in PyTorch's order: each axis' positions divided by (the
     /// last position + 1e-6) then scaled by 32, times each frequency, sin and cos interleaved; x's
     /// encoding in the first 128 channels, y's in the next 128. It depends only on the grid, so it
-    /// is made on the host once a size and kept.
+    /// is made on the host once a size and kept. The angles are PyTorch's to the bit, but sin and
+    /// cos are the host's where PyTorch's are CUDA's sinf and cosf: about 14% of entries differ
+    /// by 1 ulp (at most 6e-8).
     fn position_encoding(&self, w: usize, h: usize) -> Result<GpuTensor> {
-        if let Some((cw, ch, pe)) = self.pe_cache.borrow().as_ref() {
-            if (*cw, *ch) == (w, h) {
-                return gpu_slice_rows(pe, 0, pe.rows()).map_err(|e| dev("summary encoding", e));
-            }
+        if let Some(pe) = self.pe_cache.borrow().get(&(w, h)) {
+            return gpu_slice_rows(pe, 0, pe.rows()).map_err(|e| dev("summary encoding", e));
         }
         let half = self.inv_freq.len() * 2;
         if 2 * half != EMBED_DIM {
@@ -355,7 +381,7 @@ impl ObjectSummarizer {
         }
         let pe = gpu_upload(&pe, h * w, EMBED_DIM).map_err(|e| dev("summary encoding", e))?;
         let view = gpu_slice_rows(&pe, 0, pe.rows()).map_err(|e| dev("summary encoding", e))?;
-        *self.pe_cache.borrow_mut() = Some((w, h, pe));
+        self.pe_cache.borrow_mut().insert((w, h), pe);
         Ok(view)
     }
 }
@@ -380,8 +406,7 @@ impl CutieNet {
 }
 
 /// An oracle tap shaped [.., h, w] as `n` images of `c` channels.
-fn oracle_feat(oracle: &Oracle, step: &str, name: &str, n: usize, c: usize) -> Result<Feat> {
-    let tap = oracle.tap(step, name)?;
+fn oracle_feat(tap: &OracleTap, step: &str, name: &str, n: usize, c: usize) -> Result<Feat> {
     let dims = &tap.shape;
     if dims.len() < 2 || tap.values.len() != n * c * dims[dims.len() - 2] * dims[dims.len() - 1] {
         return Err(DiffusionError::model(format!("cutie oracle {step}/{name}: {dims:?} is not {n} images of {c} channels")));
@@ -392,27 +417,64 @@ fn oracle_feat(oracle: &Oracle, step: &str, name: &str, n: usize, c: usize) -> R
 /// Stage `mask`: for every oracle step with `encode_mask` taps, the oracle's inputs
 /// (`encode_image.normalised`, `encode_mask.in.*`) through `encode_mask`, every tap compared.
 /// The deep update runs where the oracle's did (where it has `net.mask_encoder.sensory_update`).
+///
+/// The `encode_mask.in.*` taps are the oracle's own inputs read back, so they are not compared
+/// here. The summaries are compared as they are and also as the object transformer reads them,
+/// sums / (area + 1e-4): compared whole, the first is measured against the largest areas and
+/// cannot see an error in a summary with a small one, which the division magnifies.
 pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights) -> Result<()> {
+    const INPUTS: [&str; 4] = ["encode_image.normalised", "encode_mask.in.pix_feat", "encode_mask.in.sensory", "encode_mask.in.masks"];
+    const SUMMARIES: &str = "encode_mask.out.obj_summaries";
     let encoder = MaskEncoder::load(weights)?;
     let summarizer = ObjectSummarizer::load(weights)?;
     let tol = |_: &str| Tol::STAGE;
     let n = oracle.objects;
-    let mut steps = 0;
+    // Each step's inputs, to say where a step repeats an earlier one's encode.
+    let mut encoded: Vec<(&str, bool, Vec<Vec<f32>>)> = Vec::new();
+    let mut distinct = 0;
     for step in STEPS {
         if !oracle.has(step, "encode_mask.in.masks") {
             continue;
         }
-        let image = oracle_feat(oracle, step, "encode_image.normalised", 1, 3)?;
-        let pix_feat = oracle_feat(oracle, step, "encode_mask.in.pix_feat", 1, PIXEL_DIM)?;
-        let sensory = oracle_feat(oracle, step, "encode_mask.in.sensory", n, SENSORY_DIM)?;
-        let masks = oracle_feat(oracle, step, "encode_mask.in.masks", n, 1)?;
+        let [image, pix_feat, sensory, masks] = INPUTS.map(|name| oracle.tap(step, name));
+        let taps = [image?, pix_feat?, sensory?, masks?];
+        let image = oracle_feat(&taps[0], step, INPUTS[0], 1, 3)?;
+        let pix_feat = oracle_feat(&taps[1], step, INPUTS[1], 1, PIXEL_DIM)?;
+        let sensory = oracle_feat(&taps[2], step, INPUTS[2], n, SENSORY_DIM)?;
+        let masks = oracle_feat(&taps[3], step, INPUTS[3], n, 1)?;
         let deep_update = oracle.has(step, "net.mask_encoder.sensory_update");
-        let mut comparer = Comparer::new(oracle, report, "mask", step, &tol);
-        comparer.with(|tap| encoder.encode_mask(&summarizer, &image, &pix_feat, &sensory, &masks, deep_update, tap))?;
-        steps += 1;
+        let inputs: Vec<Vec<f32>> = taps.into_iter().map(|t| t.values).collect();
+        match encoded.iter().find(|(_, d, v)| *d == deep_update && *v == inputs) {
+            Some((earlier, ..)) => report.note(format!("mask/{step}: the same inputs as {earlier}, so the same encode again")),
+            None => distinct += 1,
+        }
+        encoded.push((step, deep_update, inputs));
+
+        let summaries = {
+            let mut comparer = Comparer::new(oracle, report, "mask", step, &tol);
+            let mut sink = |name: &str, t: &GpuTensor| if INPUTS.contains(&name) { Ok(()) } else { comparer.take(name, t) };
+            let mut tap = Tap::new(&mut sink);
+            encoder.encode_mask(&summarizer, &image, &pix_feat, &sensory, &masks, deep_update, &mut tap)?.2
+        };
+
+        let actual = gpu_download(&summaries).map_err(|e| dev("mask check", e))?;
+        let expected = oracle.tap(step, SUMMARIES)?;
+        let expected = OracleTap {
+            shape: vec![expected.values.len() / (EMBED_DIM + 1), EMBED_DIM],
+            dtype: expected.dtype,
+            values: ObjectSummarizer::normalised(&expected.values),
+        };
+        let name = format!("{SUMMARIES} sums / (area + 1e-4)");
+        report.compare("mask", step, &name, &ObjectSummarizer::normalised(&actual), &expected, Tol::STAGE);
     }
-    if steps == 0 {
+    if encoded.is_empty() {
         report.fail("mask", "-", "(stage)", "no oracle step encodes a mask");
+    } else {
+        report.note(format!(
+            "mask: {} encodes, {distinct} distinct; encode_mask.in.* not compared (the oracle's own inputs read back); \
+             net.mask_encoder.conv1 not compared (bn1 is folded into it: its output is net.mask_encoder.bn1)",
+            encoded.len()
+        ));
     }
     Ok(())
 }
