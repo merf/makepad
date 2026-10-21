@@ -15,8 +15,9 @@
 //!
 //! The references share the kernels' reading of PyTorch's semantics, so a few results are also
 //! pinned to PyTorch's own (`pinned`): values torch 2.11 computed on CUDA for inputs where its
-//! summation order differs from a sequential one, where nvcc contracts its bilinear resize into
-//! FMAs, and where CUDA's sinf and cosf are not correctly rounded.
+//! summation order differs from a sequential one, where its bilinear resize (as the oracle runs
+//! it, deterministic algorithms on: torch._decomp's lerps) differs from the default CUDA kernel's
+//! fused sums, and where CUDA's sinf and cosf are not correctly rounded.
 
 use crate::model::{dev, CUTIE_NAMESPACE};
 use crate::oracle::{OracleTap, Report, Tol};
@@ -123,15 +124,17 @@ const PINNED_TOPK: [u32; 32] = [
     0x2f8ed5d0, 0x3674ac11, 0x3d519159, 0x322b4d39, 0x3912b797, 0x00000000, 0x34cd70fd, 0x3baff50f,
 ];
 
-/// torch 2.11 (CUDA, fp32) `F.interpolate(x, size=(8, 5), mode='bilinear', align_corners=False)`
-/// of x = golden(35) as [1, 1, 5, 7]: 7x5 down to 5 wide and up to 8 high, where nvcc's FMAs in
-/// PyTorch's kernel round differently from separate products and sums.
+/// torch 2.11 (CUDA, fp32, deterministic algorithms on, as the oracle runs it)
+/// `F.interpolate(x, size=(8, 5), mode='bilinear', align_corners=False)` of x = golden(35) as
+/// [1, 1, 5, 7]: 7x5 down to 5 wide and up to 8 high. Torch then runs torch._decomp's
+/// `_upsample_linear` (lerps, each its own fp32 op); its default CUDA kernel, whose weighted sums
+/// nvcc fuses, gives entries 4, 24, 29, 38 and 39 1 ulp apart from these.
 const PINNED_RESIZE: [u32; 40] = [
-    0x3e31c5fb, 0x3ee0b187, 0x3f67733a, 0x3ebd1b60, 0x3f2274f3, 0x3ea1f6cd, 0x3f14e2aa, 0x3f1bfd20,
+    0x3e31c5fb, 0x3ee0b187, 0x3f67733a, 0x3ebd1b60, 0x3f2274f2, 0x3ea1f6cd, 0x3f14e2aa, 0x3f1bfd20,
     0x3f031798, 0x3edaca84, 0x3f01faec, 0x3f42aefb, 0x3e805fac, 0x3f2db0b8, 0x3e399322, 0x3f162da2,
     0x3f36e1ae, 0x3ee8c524, 0x3f01e36d, 0x3ec52ef7, 0x3ef4c0ae, 0x3f1b1464, 0x3f289549, 0x3ecc2c42,
-    0x3f06ca2b, 0x3e3a4c2a, 0x3ede8e36, 0x3f5cc7fb, 0x3eb491a8, 0x3f1afcd8, 0x3eabf1e0, 0x3f19e02f,
-    0x3f00faa4, 0x3f08151e, 0x3eb1925f, 0x3ef505a6, 0x3f3e6a0e, 0x3e561200, 0x3f2c9eff, 0x3e0ee607,
+    0x3f06ca2c, 0x3e3a4c2a, 0x3ede8e36, 0x3f5cc7fb, 0x3eb491a8, 0x3f1afcd9, 0x3eabf1e0, 0x3f19e02f,
+    0x3f00faa4, 0x3f08151e, 0x3eb1925f, 0x3ef505a6, 0x3f3e6a0e, 0x3e561200, 0x3f2c9f00, 0x3e0ee608,
 ];
 
 /// torch 2.11 (CUDA) Cutie's `PositionalEncoding(16, scale=32, temperature=128)` at 3x2 ([1, 2,
@@ -701,7 +704,8 @@ impl OpsCheck<'_> {
     // --- PyTorch's own results ---
 
     /// The kernels against PyTorch's values (`PINNED_*`) where its order over objects and picks
-    /// is not sequential, where its bilinear resize is contracted into FMAs, and where its sin
+    /// is not sequential, where its bilinear resize is lerps (deterministic algorithms on, as the
+    /// oracle runs it) rather than the default kernel's fused sums, and where its sin
     /// and cos are not correctly rounded: exactly (the same fp32 operations in the same order,
     /// CUDA's own expf, logf, sinf and cosf). The references too: exactly where they only add,
     /// multiply and fuse, within `TIGHT` where they call the host's exp, ln, sin or cos.

@@ -1104,33 +1104,41 @@ pub fn gpu_cutie_rgb_planes_reference(rgb: &[u8], plane: usize, scale: f32) -> R
     gpu_upload(&planes, 3, plane)
 }
 
-/// One axis of `gpu_cutie_resize_bilinear` as PyTorch's CUDA kernel computes it in f32
-/// (`area_pixel_compute_scale` and `_source_index`, size given, align_corners false): for each
-/// output index, its lower and upper source indices and their weights.
-fn cutie_bilinear_axis(size_in: usize, size_out: usize) -> Vec<(usize, usize, f32, f32)> {
-    let scale = size_in as f32 / size_out as f32;
+/// `gpu_cutie_resize_bilinear`'s scale for one axis: Python's in / out (a double), made f32 as
+/// PyTorch's CUDA multiply takes a scalar.
+fn cutie_bilinear_scale(size_in: usize, size_out: usize) -> f32 {
+    (size_in as f64 / size_out as f64) as f32
+}
+
+/// One axis of `gpu_cutie_resize_bilinear` as torch._decomp's `_upsample_linear` computes it in
+/// f32 (size given, align_corners false): for each output index, its lower and upper source
+/// indices and the upper one's lambda.
+fn cutie_bilinear_axis(size_in: usize, size_out: usize) -> Vec<(usize, usize, f32)> {
+    let scale = cutie_bilinear_scale(size_in, size_out);
     (0..size_out)
         .map(|dst| {
-            let source = scale.mul_add(dst as f32 + 0.5, -0.5);
+            let source = scale * (dst as f32 + 0.5) - 0.5;
             let source = if source < 0.0 { 0.0 } else { source };
             let lower = source as usize;
             let upper = if lower + 1 < size_in { lower + 1 } else { lower };
-            let w_upper = source - lower as f32;
-            (lower, upper, 1.0 - w_upper, w_upper)
+            (lower, upper, source - lower as f32)
         })
         .collect()
 }
 
 /// `F.interpolate(mode='bilinear', align_corners=False)` of planar [planes, in_h*in_w] to
-/// [planes, out_h*out_w], bit for bit as PyTorch's CUDA kernel (`upsample_bilinear2d_out_frame`)
-/// gives it: scale = in / out in f32; source = fma(scale, dst + 0.5, -0.5) (nvcc contracts the
-/// kernel's `scale * (dst + 0.5) - 0.5`) clamped at 0; the lower index the source truncated, the
-/// upper the next one but at the edge; weights source - lower and 1 minus that; each output
-/// fma(h0, fma(w0, a, w1 * b), h1 * fma(w0, c, w1 * d)), as nvcc contracts the kernel's sum (a and
-/// b from the first source row, c and d from the second). The reference was bit-exact against
-/// PyTorch 2.11's CUDA output on random data at 1920x1080 to 1777x1000 and back, 1080x1920 to
-/// 1000x1777, 3840x2160 and 1440x1080 down. `gpu_birefnet_resize_bilinear` computes the source
-/// position in another order, up to 1.2e-4 off on 0..1 data.
+/// [planes, out_h*out_w], bit for bit as PyTorch computes it with deterministic algorithms on, as
+/// the oracle runs it: F.interpolate on CUDA then runs torch._decomp's `_upsample_linear`, every
+/// step its own fp32 op. Scale = in / out (a double made f32); source = scale * (dst + 0.5) -
+/// 0.5, not fused, clamped at 0; the lower index the source truncated, the upper the next one
+/// but at the edge; the lambda source - lower; then lerps a + (b - a) * t, along the width first
+/// (each source row), then the height. Bit-exact against torch 2.11's deterministic CUDA output
+/// on random data at 1920x1080 to 1777x1000 and back, 384x216 to 320x180 (the oracle
+/// Solege-03-resize's), the decoder's x2 and x4, 7x5 to 5x8 and odd sizes, and against every
+/// resize in the oracles. Torch's default CUDA kernel (`upsample_bilinear2d_out_frame`, its sums
+/// of weighted taps fused by nvcc), which the worker runs without deterministic algorithms,
+/// differs by a few ulps on about a fifth of the entries. `gpu_birefnet_resize_bilinear` computes
+/// the source position in another order, up to 1.2e-4 off on 0..1 data.
 pub fn gpu_cutie_resize_bilinear(x: &GpuTensor, in_w: usize, in_h: usize, out_w: usize, out_h: usize) -> Result<GpuTensor, String> {
     let op = "gpu_cutie_resize_bilinear";
     cutie_check_f32(op, x)?;
@@ -1139,7 +1147,7 @@ pub fn gpu_cutie_resize_bilinear(x: &GpuTensor, in_w: usize, in_h: usize, out_w:
     }
     let d = |v: usize| cutie_u32(op, v);
     let (planes, iw, ih, ow, oh) = (d(x.rows)?, d(in_w)?, d(in_h)?, d(out_w)?, d(out_h)?);
-    let (scale_x, scale_y) = (in_w as f32 / out_w as f32, in_h as f32 / out_h as f32);
+    let (scale_x, scale_y) = (cutie_bilinear_scale(in_w, out_w), cutie_bilinear_scale(in_h, out_h));
     with_dense_linear_backend(|backend| {
         backend.prepare_device()?;
         let out = GpuTensor::from_pool(x.rows, out_w * out_h)?;
@@ -1158,17 +1166,16 @@ pub fn gpu_cutie_resize_bilinear_reference(x: &GpuTensor, in_w: usize, in_h: usi
         return Err("gpu_cutie_resize_bilinear shape mismatch".into());
     }
     let (ax, ay) = (cutie_bilinear_axis(in_w, out_w), cutie_bilinear_axis(in_h, out_h));
+    let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
     let src = gpu_download(x)?;
     let (in_plane, out_plane) = (in_w * in_h, out_w * out_h);
     let mut out = vec![0.0f32; x.rows * out_plane];
     for (p, dst) in out.chunks_exact_mut(out_plane).enumerate() {
         let src = &src[p * in_plane..(p + 1) * in_plane];
-        for (&(y0, y1, h0, h1), dst) in ay.iter().zip(dst.chunks_exact_mut(out_w)) {
+        for (&(y0, y1, h), dst) in ay.iter().zip(dst.chunks_exact_mut(out_w)) {
             let (row0, row1) = (&src[y0 * in_w..][..in_w], &src[y1 * in_w..][..in_w]);
-            for (&(x0, x1, w0, w1), d) in ax.iter().zip(dst.iter_mut()) {
-                let top = w0.mul_add(row0[x0], w1 * row0[x1]);
-                let bottom = w0.mul_add(row1[x0], w1 * row1[x1]);
-                *d = h0.mul_add(top, h1 * bottom);
+            for (&(x0, x1, w), d) in ax.iter().zip(dst.iter_mut()) {
+                *d = lerp(lerp(row0[x0], row0[x1], w), lerp(row1[x0], row1[x1], w), h);
             }
         }
     }

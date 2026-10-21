@@ -4,7 +4,8 @@
 //! A step (`step(image, mask, force_permanent, end)`), with `curr_ti` counting steps since the
 //! last clear and `last_mem_ti` the last memorised one:
 //! - resize the image (and mask) when its shorter side exceeds `max_internal_size` (bilinear,
-//!   align_corners false, bit for bit as PyTorch's CUDA kernel: `gpu_cutie_resize_bilinear`),
+//!   align_corners false, bit for bit as the oracle's PyTorch, deterministic algorithms on:
+//!   `gpu_cutie_resize_bilinear`),
 //!   then pad to a multiple of 16, centred (left = (W'-W)/2 rounded down, the rest right;
 //!   likewise top and bottom), the mask too;
 //! - `curr_ti += 1`; memorise when `curr_ti - last_mem_ti >= mem_every` or a mask is given, and

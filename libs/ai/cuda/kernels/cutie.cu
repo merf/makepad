@@ -794,19 +794,26 @@ extern "C" cudaError_t makepad_cuda_cutie_rgb_planes_f32(const uint8_t* rgb, flo
 }
 
 // F.interpolate(mode='bilinear', align_corners=False) of planar [planes, in_h*in_w] to out_w x
-// out_h, as PyTorch's CUDA upsample_bilinear2d_out_frame computes it: the source position
-// fma(scale, dst + 0.5, -0.5) clamped at 0 (nvcc contracts the kernel's scale * (dst + 0.5) -
-// 0.5), the lower index truncated, the upper one past it but at the edge, lambdas l1 = src -
-// lower and l0 = 1 - l1; then fma(h0, fma(w0, a, w1 * b), h1 * fma(w0, c, w1 * d)), which is
-// how nvcc contracts its h0 * (w0 * a + w1 * b) + h1 * (w0 * c + w1 * d).
+// out_h, as PyTorch computes it with deterministic algorithms on (the oracle's strict mode): on
+// CUDA, F.interpolate then runs torch._decomp's `_upsample_linear`, each step its own fp32 op.
+// The source position (scale * (dst + 0.5)) - 0.5, not fused, clamped at 0; the lower index
+// truncated, the upper one past it but at the edge; the lambda src - lower; then lerps, the
+// width first: top = a + (b - a) * w, bottom = c + (d - c) * w, out = top + (bottom - top) * h
+// (a and b from the lower source row, c and d from the upper). Torch's default CUDA kernel
+// (`upsample_bilinear2d_out_frame`, fma'd weighted sums) differs from this by a few ulps on
+// about a fifth of the entries.
 static __device__ __forceinline__ void cutie_bilinear_source(
-    float scale, uint32_t dst, uint32_t in, uint32_t& lower, uint32_t& upper, float& l0, float& l1) {
-    float src = __fmaf_rn(scale, __fadd_rn(float(dst), 0.5f), -0.5f);
+    float scale, uint32_t dst, uint32_t in, uint32_t& lower, uint32_t& upper, float& lambda) {
+    float src = __fsub_rn(__fmul_rn(scale, __fadd_rn(float(dst), 0.5f)), 0.5f);
     src = src < 0.0f ? 0.0f : src;
     lower = uint32_t(src);
     upper = lower + (lower < in - 1 ? 1u : 0u);
-    l1 = __fsub_rn(src, float(lower));
-    l0 = __fsub_rn(1.0f, l1);
+    lambda = __fsub_rn(src, float(lower));
+}
+
+// a + (b - a) * t in three fp32 ops (the decomposition's `v1 + torch.mul(v2 - v1, xscale)`).
+static __device__ __forceinline__ float cutie_lerp(float a, float b, float t) {
+    return __fadd_rn(a, __fmul_rn(__fsub_rn(b, a), t));
 }
 
 static __global__ void cutie_resize_bilinear_kernel(
@@ -817,15 +824,15 @@ static __global__ void cutie_resize_bilinear_kernel(
         const size_t p = i / out_plane, at = i % out_plane;
         const uint32_t oy = uint32_t(at / out_w), ox = uint32_t(at % out_w);
         uint32_t y0, y1, x0, x1;
-        float h0, h1, w0, w1;
-        cutie_bilinear_source(scale_y, oy, in_h, y0, y1, h0, h1);
-        cutie_bilinear_source(scale_x, ox, in_w, x0, x1, w0, w1);
+        float h, w;
+        cutie_bilinear_source(scale_y, oy, in_h, y0, y1, h);
+        cutie_bilinear_source(scale_x, ox, in_w, x0, x1, w);
         const float* src = x + p * in_plane;
         const float* row0 = src + size_t(y0) * in_w;
         const float* row1 = src + size_t(y1) * in_w;
-        const float top = __fmaf_rn(w0, row0[x0], __fmul_rn(w1, row0[x1]));
-        const float bottom = __fmaf_rn(w0, row1[x0], __fmul_rn(w1, row1[x1]));
-        out[i] = __fmaf_rn(h0, top, __fmul_rn(h1, bottom));
+        const float top = cutie_lerp(row0[x0], row0[x1], w);
+        const float bottom = cutie_lerp(row1[x0], row1[x1], w);
+        out[i] = cutie_lerp(top, bottom, h);
     }
 }
 
