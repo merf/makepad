@@ -16,7 +16,7 @@
 //! either way, so this always runs them all at once (Cutie's fast path).
 
 use crate::model::{add, dev, relu, Conv2d, CutieNet, Feat, GroupResBlock, ImageFeatures, Tap, Weights};
-use crate::oracle::{Comparer, Oracle, Report, Tol, STEPS};
+use crate::oracle::{Comparer, Oracle, OracleTap, Report, Tol, STEPS};
 use crate::{DiffusionError, Result};
 use makepad_ai_common::gpu::{
     gpu_birefnet_resize_bilinear, gpu_cutie_aggregate, gpu_cutie_gru, gpu_cutie_sigmoid, gpu_cutie_softmax_axis0,
@@ -186,13 +186,104 @@ fn oracle_feat(oracle: &Oracle, step: &str, name: &str) -> Result<Feat> {
     Feat::upload(&tap.values, n, c, w, h)
 }
 
+/// Which entries of `segment.out.logits` the decoder check compares with `Tol::STAGE`.
+///
+/// `aggregate` takes log(q / (1 - q)) in fp32 of each object's q = sigmoid(pred) and of the
+/// background prod(1 - q). Where a q is within a few 1e-5 of 1 (pred above about 10), or the
+/// background is (every pred below about -10), 1 - q has only a few fp32 rounding steps left
+/// (2^-24 each), and one step more or less, from a sigmoid rounded the other way (PyTorch's CUDA
+/// expf against the port's) or a 1e-6 difference in pred that crosses a rounding boundary, moves
+/// the logit by up to a few tenths against the 16.1 the clamp allows. That is the arithmetic's
+/// conditioning, not the port: with pred perturbed by 1e-6, as the port's is, the whole tensor
+/// reaches rel 6e-3 on the oracle's own steps, while the entries kept here stay below 1e-4. The
+/// entries left out are compared through what they feed, `segment.out.prob` (the softmax squashes
+/// their difference: with pred perturbed so, prob stays below rel 1.1e-4), and the whole tensor
+/// is reported with `Tol::INFO`.
+struct LogitCheck {
+    /// One per logit [n+1, 4h*4w], background first: whether it is compared.
+    keep: Vec<bool>,
+}
+
+impl LogitCheck {
+    /// fp32's rounding step just below 1 (2^-24).
+    const ROUNDING_STEP: f64 = 1.0 / 16_777_216.0;
+    /// The largest change one rounding step in `aggregate` may make to a compared logit: a few
+    /// such steps stay far below `Tol::STAGE` (1e-3 of about 16).
+    const LIMIT: f64 = 1e-3;
+
+    /// From the oracle's `net.mask_decoder.pred` [n, 1, h, w], what `aggregate` and the bilinear
+    /// x4 (align_corners false) after it were given: a logit is kept when every one of the up to
+    /// four stride-4 logits it is interpolated from is well conditioned.
+    fn from_pred(pred: &OracleTap) -> Result<Self> {
+        let (n, h, w) = match pred.shape[..] {
+            [n, 1, h, w] => (n, h, w),
+            _ => return Err(DiffusionError::model(format!("cutie decoder check: pred shape {:?}", pred.shape))),
+        };
+        let plane = w * h;
+        // Per row and stride-4 pixel: the logit's change from one rounding step, at most LIMIT.
+        let mut ok = vec![false; (n + 1) * plane];
+        for i in 0..plane {
+            let (mut bg, mut bg_rel_step) = (1.0f64, 0.0f64);
+            for o in 0..n {
+                let q = 1.0 / (1.0 + (-(pred.values[o * plane + i] as f64)).exp());
+                // A step in q (2^-24 above 0.5, at most q * 2^-23 below) over q(1 - q).
+                ok[(o + 1) * plane + i] = 2.0 * Self::ROUNDING_STEP / (1.0 - q) <= Self::LIMIT;
+                // Each 1 - q carries a step into the background, relative to its own size.
+                bg *= 1.0 - q;
+                bg_rel_step += Self::ROUNDING_STEP / (1.0 - q);
+            }
+            ok[i] = bg_rel_step / (1.0 - bg) <= Self::LIMIT;
+        }
+        // PyTorch's source pixels for x4 with align_corners false: (o + 0.5) / 4 - 0.5, clamped
+        // at 0, and the next one (the last pixel repeats).
+        let sources = |out: usize, len: usize| -> Vec<(usize, usize)> {
+            (0..out)
+                .map(|o| {
+                    let i0 = ((o as f64 + 0.5) / 4.0 - 0.5).max(0.0) as usize;
+                    (i0, (i0 + 1).min(len - 1))
+                })
+                .collect()
+        };
+        let (rows, cols) = (sources(h * 4, h), sources(w * 4, w));
+        let mut keep = Vec::with_capacity((n + 1) * rows.len() * cols.len());
+        for k in 0..=n {
+            let ok = &ok[k * plane..(k + 1) * plane];
+            for &(y0, y1) in &rows {
+                for &(x0, x1) in &cols {
+                    keep.push(ok[y0 * w + x0] && ok[y0 * w + x1] && ok[y1 * w + x0] && ok[y1 * w + x1]);
+                }
+            }
+        }
+        Ok(Self { keep })
+    }
+
+    /// Compares the kept entries of the port's logits with the oracle's `segment.out.logits`.
+    fn compare(&self, report: &mut Report, step: &str, actual: &[f32], expected: &OracleTap) {
+        let name = "segment.out.logits (well conditioned)";
+        if actual.len() != self.keep.len() || expected.values.len() != self.keep.len() {
+            report.fail("decoder", step, name, format!("{} values, oracle {:?}, pred gives {}", actual.len(), expected.shape, self.keep.len()));
+            return;
+        }
+        let pick = |v: &[f32]| -> Vec<f32> { v.iter().zip(&self.keep).filter(|(_, keep)| **keep).map(|(x, _)| *x).collect() };
+        let kept = OracleTap { shape: vec![self.keep.iter().filter(|k| **k).count()], dtype: expected.dtype.clone(), values: pick(&expected.values) };
+        report.compare("decoder", step, name, &pick(actual), &kept, Tol::STAGE);
+        report.note(format!(
+            "decoder/{step}: segment.out.logits compared with Tol::STAGE on {} of {} entries; the rest are within a few fp32 rounding steps of 1 in aggregate and are compared through segment.out.prob",
+            kept.values.len(),
+            self.keep.len()
+        ));
+    }
+}
+
 /// Stage `decoder`: for every oracle step that segments, the oracle's `encode_image.out.f8`,
-/// `.f4` and `segment.in.*` through `segment`, every tap compared. The sensory memory is updated
-/// where the oracle's was (it tapped `net.mask_decoder.sensory_update`); where it was, the step
-/// runs again without the update too, against the same outputs.
+/// `.f4` and `segment.in.*` through `segment`, every tap compared (`segment.in.*` come back as
+/// they went in, so they check only that those taps name the right tensors), and
+/// `segment.out.logits` with `Tol::STAGE` where it is well conditioned (`LogitCheck`). The
+/// sensory memory is updated where the oracle's was (it tapped `net.mask_decoder.sensory_update`);
+/// there the step runs again without the update, which must leave everything else as it was.
 pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights) -> Result<()> {
     let decoder = MaskDecoder::load(weights)?;
-    let tol = |_: &str| Tol::STAGE;
+    let tol = |name: &str| if name == "segment.out.logits" { Tol::INFO } else { Tol::STAGE };
     let mut steps = 0;
     for step in STEPS {
         if !oracle.has(step, "segment.in.memory_readout") {
@@ -205,18 +296,43 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
         let sensory = oracle_feat(oracle, step, "segment.in.sensory")?;
         let update_sensory = oracle.has(step, "net.mask_decoder.sensory_update");
         let mut cmp = Comparer::new(oracle, report, "decoder", step, &tol);
-        cmp.with(|tap| decoder.segment(&f8, &f4, &readout, &sensory, update_sensory, tap).map(|_| ()))?;
+        let (_, logits, prob) = cmp.with(|tap| decoder.segment(&f8, &f4, &readout, &sensory, update_sensory, tap))?;
+        let logits = gpu_download(&logits).map_err(|e| dev("download", e))?;
+        LogitCheck::from_pred(&oracle.tap(step, "net.mask_decoder.pred")?)?.compare(report, step, &logits, &oracle.tap(step, "segment.out.logits")?);
         if update_sensory {
-            // The oracle updates the sensory memory on every step it segments (the worker's
-            // stagger set is every step). Without the update (Cutie's `end` frame) the logits and
-            // probabilities are the same and the sensory memory comes back as it went in.
-            let (kept, logits, prob) = decoder.segment(&f8, &f4, &readout, &sensory, false, &mut Tap::none())?;
-            let logits = gpu_download(&logits).map_err(|e| dev("download", e))?;
-            let prob = gpu_download(&prob).map_err(|e| dev("download", e))?;
-            let expected_sensory = oracle.tap(step, "segment.in.sensory")?;
-            report.compare("decoder", step, "segment.out.sensory (no update)", &kept.download()?, &expected_sensory, Tol::STAGE);
-            report.compare("decoder", step, "segment.out.logits (no update)", &logits, &oracle.tap(step, "segment.out.logits")?, Tol::STAGE);
-            report.compare("decoder", step, "segment.out.prob (no update)", &prob, &oracle.tap(step, "segment.out.prob")?, Tol::STAGE);
+            // Cutie skips the update when the frames since the last memory frame are not in its
+            // stagger set (with the worker's mem_every 5 and stagger_updates 5, only on the first
+            // step after a memory clear) and on an `end` frame; the oracle never does. So the step
+            // runs again without it: the update must not run, the sensory memory must come back
+            // as it went in, and the logits and probabilities, made before the update by a
+            // deterministic decoder, must be the first pass's bit for bit.
+            let mut names = Vec::new();
+            let mut sink = |name: &str, _: &GpuTensor| -> Result<()> {
+                names.push(name.to_string());
+                Ok(())
+            };
+            let (kept, logits_kept, prob_kept) = decoder.segment(&f8, &f4, &readout, &sensory, false, &mut Tap::new(&mut sink))?;
+            let same_bits = |a: &[f32], b: &[f32]| a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
+            let mut wrong = Vec::new();
+            if names.iter().any(|n| n == "net.mask_decoder.sensory_update") {
+                wrong.push("the sensory update ran");
+            }
+            if !same_bits(&kept.download()?, &sensory.download()?) {
+                wrong.push("the sensory memory changed");
+            }
+            if !same_bits(&gpu_download(&logits_kept).map_err(|e| dev("download", e))?, &logits) {
+                wrong.push("the logits differ from the updating pass's");
+            }
+            if !same_bits(&gpu_download(&prob_kept).map_err(|e| dev("download", e))?, &gpu_download(&prob).map_err(|e| dev("download", e))?) {
+                wrong.push("the probabilities differ from the updating pass's");
+            }
+            if wrong.is_empty() {
+                report.note(format!(
+                    "decoder/{step}: without the sensory update the update did not run, the sensory memory came back unchanged, and the logits and probabilities were the updating pass's bit for bit"
+                ));
+            } else {
+                report.fail("decoder", step, "segment without the sensory update", wrong.join("; "));
+            }
         }
     }
     if steps == 0 {
