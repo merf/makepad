@@ -4770,6 +4770,9 @@ mod imp {
     }
 
     pub fn gpu_pool_cap_override(_bytes: Option<usize>) {}
+
+    // Cutie's device ops without CUDA kernels (cuda/src/cutie_ops.rs).
+    include!("gpu_cutie_stubs.rs");
 }
 
 #[cfg(not(all(any(target_os = "linux", target_os = "windows"), makepad_ai_cuda_kernels)))]
