@@ -32,11 +32,11 @@ use crate::model::{add, dev, relu, CAResBlock, Conv2d, CutieNet, Feat, FusionBlo
 use crate::oracle::{Comparer, Oracle, OracleTap, Report, Tol, STEPS};
 use crate::{DiffusionError, Result};
 use makepad_ai_common::gpu::{
-    gpu_add, gpu_attention_packed_cross_bias, gpu_attention_packed_cross_f32, gpu_birefnet_relu, gpu_concat_rows_many,
-    gpu_cutie_attn_mask, gpu_cutie_others, gpu_download, gpu_pixal_pool, gpu_planar_tokens_transpose, gpu_reshape, gpu_slice_cols,
-    gpu_slice_rows, gpu_upload, GpuTensor,
+    gpu_add, gpu_add_cols_broadcast, gpu_attention_packed_cross_bias, gpu_attention_packed_cross_f32, gpu_birefnet_relu,
+    gpu_concat_cols, gpu_concat_rows_many, gpu_cutie_attn_mask, gpu_cutie_others, gpu_download, gpu_pixal_pool,
+    gpu_planar_tokens_transpose, gpu_reshape, gpu_slice_cols, gpu_slice_rows, gpu_upload, GpuTensor,
 };
-use std::cell::{Ref, RefCell};
+use std::cell::RefCell;
 
 /// The object transformer's width (`embed_dim`, also the pixel and value width), heads, queries
 /// (`num_queries`, also the object summaries), blocks and FFN width (`config/model/base.yaml`).
@@ -51,6 +51,8 @@ const FF_DIM: usize = 2048;
 const PE_SCALE: f32 = 32.0;
 /// PositionalEncoding's eps on the last position.
 const PE_EPS: f32 = 1e-6;
+/// How many sizes' pixel PE are kept (processors at different sizes may share the network).
+const PE_SIZES: usize = 4;
 /// Added to each summary's area before dividing by it (`QueryTransformer.forward`).
 const AREA_EPS: f32 = 1e-4;
 
@@ -183,13 +185,15 @@ impl Block {
         let n = pixel.n;
         let name = |part: &str| format!("net.object_transformer.blocks.{b}.{part}");
         let pixel_flat = to_tokens(pixel)?;
+        // The block's input pixels plus their PE: read_from_pixel's k and read_from_query's q
+        // (PyTorch adds them twice, to the same values).
+        let pixel_with_pe = add_tokens(&pixel_flat, pixel_pe)?;
 
         // read_from_pixel (CrossAttention): the queries normalised; q = that + PE, k = pixels +
         // PE, v = pixels; the residual is the normalised queries.
         let xn = self.read_from_pixel_norm.forward(x)?;
         let q = add_tokens(&xn, query_pe)?;
-        let k = add_tokens(&pixel_flat, pixel_pe)?;
-        let x = add_tokens(&xn, &self.read_from_pixel.forward(&q, &k, &pixel_flat, n, Some(mask))?)?;
+        let x = add_tokens(&xn, &self.read_from_pixel.forward(&q, &pixel_with_pe, &pixel_flat, n, Some(mask))?)?;
         put_tokens(tap, &name("read_from_pixel.0"), &x, n)?;
 
         // self_attn (SelfAttention): normalised; q = k = that + PE, v = that; the residual is
@@ -207,9 +211,8 @@ impl Block {
 
         // read_from_query (CrossAttention without a norm): q = pixels + PE, k = queries + PE, v =
         // queries; the residual is the pixels.
-        let q = add_tokens(&pixel_flat, pixel_pe)?;
         let k = add_tokens(&x, query_pe)?;
-        let pixel_flat = add_tokens(&pixel_flat, &self.read_from_query.forward(&q, &k, &x, n, None)?)?;
+        let pixel_flat = add_tokens(&pixel_flat, &self.read_from_query.forward(&pixel_with_pe, &k, &x, n, None)?)?;
         put_tokens(tap, &name("read_from_query.0"), &pixel_flat, n)?;
 
         // pixel_ffn (PixelFFN): the CAResBlock on read_from_query's pixels (the block's input
@@ -222,23 +225,11 @@ impl Block {
     }
 }
 
-/// What the object transformer uses at one size and object count, made on first use: the pixel
-/// PE (the sine encoding [h*w, 256], each position's row repeated per object: interleaved) and
-/// the learnt query init and embedding repeated per object (interleaved, [16*n, 256]).
-struct Constants {
-    w: usize,
-    h: usize,
-    n: usize,
-    spatial_pe: GpuTensor,
-    query_init: GpuTensor,
-    query_emb: GpuTensor,
-}
-
 /// `QueryTransformer`.
 pub(crate) struct QueryTransformer {
-    /// The learnt `query_init` and `query_emb` [16, 256].
-    query_init: Vec<f32>,
-    query_emb: Vec<f32>,
+    /// The learnt `query_init` and `query_emb` [16, 256], shared by the objects.
+    query_init: GpuTensor,
+    query_emb: GpuTensor,
     summary_to_query_init: Linear,
     summary_to_query_emb: Linear,
     pixel_init_proj: Conv2d,
@@ -249,15 +240,21 @@ pub(crate) struct QueryTransformer {
     /// `mask_pred[i]`'s 1x1 conv (256 -> 1), after a ReLU; one before the blocks and one after
     /// each.
     mask_pred: Vec<Conv2d>,
-    constants: RefCell<Option<Constants>>,
+    /// The sine encoding at the last few sizes used (w, h, planar [256, h*w]), made on the host
+    /// once a size, as PyTorch caches it; the oldest goes when a new size comes.
+    spatial_pe: RefCell<Vec<(usize, usize, GpuTensor)>>,
 }
 
 impl QueryTransformer {
     pub(crate) fn load(w: &mut Weights) -> Result<Self> {
         let p = "object_transformer";
+        let mut embedding = |name: &str| -> Result<GpuTensor> {
+            let values = w.f32(&format!("{p}.{name}.weight"), &[QUERIES, EMBED])?;
+            gpu_upload(&values, QUERIES, EMBED).map_err(|e| dev("object transformer", e))
+        };
         Ok(Self {
-            query_init: w.f32(&format!("{p}.query_init.weight"), &[QUERIES, EMBED])?,
-            query_emb: w.f32(&format!("{p}.query_emb.weight"), &[QUERIES, EMBED])?,
+            query_init: embedding("query_init")?,
+            query_emb: embedding("query_emb")?,
             summary_to_query_init: w.linear(&format!("{p}.summary_to_query_init"), EMBED, EMBED, true)?,
             summary_to_query_emb: w.linear(&format!("{p}.summary_to_query_emb"), EMBED, EMBED, true)?,
             pixel_init_proj: w.conv(&format!("{p}.pixel_init_proj"), EMBED, EMBED, 1, 0, 1, true)?,
@@ -265,7 +262,7 @@ impl QueryTransformer {
             inv_freq: w.f32(&format!("{p}.spatial_pe.inv_freq"), &[EMBED / 4])?,
             blocks: (0..BLOCKS).map(|b| Block::load(w, &format!("{p}.blocks.{b}"))).collect::<Result<_>>()?,
             mask_pred: (0..=BLOCKS).map(|i| w.conv(&format!("{p}.mask_pred.{i}.1"), EMBED, 1, 1, 0, 1, true)).collect::<Result<_>>()?,
-            constants: RefCell::new(None),
+            spatial_pe: RefCell::new(Vec::new()),
         })
     }
 
@@ -282,7 +279,6 @@ impl QueryTransformer {
         if let Some(masks) = forced_masks.filter(|m| m.len() != BLOCKS) {
             return Err(DiffusionError::model(format!("cutie object transformer: {} forced masks for {BLOCKS} blocks", masks.len())));
         }
-        let constants = self.constants(pixel.w, pixel.h, n)?;
         let p = "net.object_transformer";
 
         // The queries and their PE from the object memory.
@@ -291,16 +287,19 @@ impl QueryTransformer {
         put_tokens(tap, &format!("{p}.summary_to_query_init"), &init, n)?;
         let emb = self.summary_to_query_emb.forward(&values)?;
         put_tokens(tap, &format!("{p}.summary_to_query_emb"), &emb, n)?;
-        let mut x = add_tokens(&constants.query_init, &init)?;
-        let query_pe = add_tokens(&constants.query_emb, &emb)?;
+        let mut x = add_tokens(&per_object(&self.query_init, n)?, &init)?;
+        let query_pe = add_tokens(&per_object(&self.query_emb, n)?, &emb)?;
 
-        // The pixels and their PE.
+        // The pixels and their PE: the sine encoding added to every object's pixel_emb while
+        // planar, where it is one row added to each object's [256*h*w] (the same single add as
+        // PyTorch's on tokens), then made tokens.
         let pixel_init = self.pixel_init_proj.forward(pixel)?;
         tap.put(&format!("{p}.pixel_init_proj"), &pixel_init.t)?;
         let pixel_emb = self.pixel_emb_proj.forward(pixel)?;
         tap.put(&format!("{p}.pixel_emb_proj"), &pixel_emb.t)?;
-        put_tokens(tap, &format!("{p}.spatial_pe"), &constants.spatial_pe, n)?;
-        let pixel_pe = add_tokens(&constants.spatial_pe, &to_tokens(&pixel_emb)?)?;
+        let spatial_pe = self.spatial_pe(pixel.w, pixel.h)?;
+        put_spatial_pe(tap, &format!("{p}.spatial_pe"), &spatial_pe, n)?;
+        let pixel_pe = to_tokens(&add_planar_pe(&pixel_emb, &spatial_pe)?)?;
 
         // The blocks, each masked by the aux logits before it. (PyTorch also makes a mask from
         // the last aux logits; nothing reads it, so it is not made here.)
@@ -330,23 +329,23 @@ impl QueryTransformer {
         Ok(logits.t)
     }
 
-    /// The constants for w x h and n objects, made again when those change.
-    fn constants(&self, w: usize, h: usize, n: usize) -> Result<Ref<'_, Constants>> {
-        let fresh = matches!(&*self.constants.borrow(), Some(c) if (c.w, c.h, c.n) == (w, h, n));
-        if !fresh {
-            let fail = |e: String| dev("object transformer constants", e);
-            let pe = spatial_pe(&self.inv_freq, w, h);
-            let made = Constants {
-                w,
-                h,
-                n,
-                spatial_pe: gpu_upload(&repeat_rows(&pe, n), w * h * n, EMBED).map_err(fail)?,
-                query_init: gpu_upload(&repeat_rows(&self.query_init, n), QUERIES * n, EMBED).map_err(fail)?,
-                query_emb: gpu_upload(&repeat_rows(&self.query_emb, n), QUERIES * n, EMBED).map_err(fail)?,
-            };
-            *self.constants.borrow_mut() = Some(made);
-        }
-        Ref::filter_map(self.constants.borrow(), |c| c.as_ref()).map_err(|_| DiffusionError::model("cutie object transformer: no constants"))
+    /// The sine encoding at w x h, planar [256, h*w] (a view of the cached one; made on the host
+    /// the first time a size comes, then kept with the last few sizes').
+    fn spatial_pe(&self, w: usize, h: usize) -> Result<GpuTensor> {
+        let fail = |e: String| dev("spatial pe", e);
+        let mut cache = self.spatial_pe.borrow_mut();
+        let i = match cache.iter().position(|&(cw, ch, _)| (cw, ch) == (w, h)) {
+            Some(i) => i,
+            None => {
+                let tokens = gpu_upload(&sine_encoding(&self.inv_freq, w, h), w * h, EMBED).map_err(fail)?;
+                if cache.len() == PE_SIZES {
+                    cache.remove(0);
+                }
+                cache.push((w, h, gpu_planar_tokens_transpose(&tokens).map_err(fail)?));
+                cache.len() - 1
+            }
+        };
+        gpu_slice_rows(&cache[i].2, 0, EMBED).map_err(fail)
     }
 }
 
@@ -354,7 +353,7 @@ impl QueryTransformer {
 /// y*w + x): the x encoding in channels 0..128 and the y encoding in 128..256, each sin, cos
 /// interleaved per frequency, positions i / (last + 1e-6) * 32, every step in PyTorch's fp32
 /// order (sin and cos rounded from f64).
-fn spatial_pe(inv_freq: &[f32], w: usize, h: usize) -> Vec<f32> {
+fn sine_encoding(inv_freq: &[f32], w: usize, h: usize) -> Vec<f32> {
     let encode = |len: usize| -> Vec<f32> {
         let last = len.saturating_sub(1) as f32 + PE_EPS;
         let mut out = Vec::with_capacity(len * inv_freq.len() * 2);
@@ -380,9 +379,32 @@ fn spatial_pe(inv_freq: &[f32], w: usize, h: usize) -> Vec<f32> {
     pe
 }
 
-/// Each row of 256 repeated `n` times in place: object-shared rows as interleaved tokens.
-fn repeat_rows(rows: &[f32], n: usize) -> Vec<f32> {
-    rows.chunks(EMBED).flat_map(|row| std::iter::repeat(row).take(n).flatten().copied()).collect()
+/// Object-shared rows [len, 256] as interleaved tokens [len*n, 256], each row repeated per object
+/// (n copies side by side are [len, n*256]); a view for one object.
+fn per_object(rows: &GpuTensor, n: usize) -> Result<GpuTensor> {
+    let fail = |e: String| dev("per object", e);
+    let wide = if n == 1 { gpu_slice_rows(rows, 0, rows.rows()) } else { gpu_concat_cols(&vec![rows; n]) }.map_err(fail)?;
+    gpu_reshape(wide, rows.rows() * n, EMBED).map_err(fail)
+}
+
+/// A planar batch (n images of 256 channels) plus the sine encoding (planar [256, h*w]) in each
+/// image: read as [n, 256*h*w], the encoding is one row added to every row.
+fn add_planar_pe(x: &Feat, pe: &GpuTensor) -> Result<Feat> {
+    let fail = |e: String| dev("add pe", e);
+    let rows = gpu_reshape(gpu_slice_rows(&x.t, 0, x.t.rows()).map_err(fail)?, x.n, x.c * x.plane()).map_err(fail)?;
+    let sum = gpu_add_cols_broadcast(&rows, pe).map_err(fail)?;
+    Feat::new(gpu_reshape(sum, x.n * x.c, x.plane()).map_err(fail)?, x.n, x.c, x.w, x.h)
+}
+
+/// Puts the sine encoding (planar [256, h*w]) as the oracle has it, one copy an object [n, h, w,
+/// 256] (made only while a check runs).
+fn put_spatial_pe(tap: &mut Tap, name: &str, pe: &GpuTensor, n: usize) -> Result<()> {
+    if !tap.active() {
+        return Ok(());
+    }
+    let fail = |e: String| dev("tap", e);
+    let tokens = gpu_planar_tokens_transpose(pe).map_err(fail)?;
+    tap.put(name, &gpu_concat_rows_many(&vec![&tokens; n]).map_err(fail)?)
 }
 
 /// The queries' source: each summary's sums over its area, `obj_sums / (obj_area + 1e-4)`, from
@@ -460,7 +482,10 @@ fn put_tokens(tap: &mut Tap, name: &str, t: &GpuTensor, n: usize) -> Result<()> 
 impl CutieNet {
     /// `CUTIE.pixel_fusion`: `pix_feat` (one image, 256 at stride 16), `visual_readout` (n, 256
     /// at stride 16), `sensory` (n, 256), `last_mask` (n images of 1 channel at the padded H, W:
-    /// each object's probability last frame). Out (n, 256 at stride 16).
+    /// each object's probability last frame). Out (n, 256 at stride 16). The n objects are the
+    /// whole set each object's others are taken over: one bucket, in one chunk (PyTorch's
+    /// `MemoryManager.read` passes each `chunk_size` chunk alone; the port always passes every
+    /// object, as `chunk_size` -1 does).
     ///
     /// Taps: `pixel_fusion.in.visual_readout`, `.in.sensory`, `.in.last_mask`,
     /// `net.pixel_fuser.sensory_compress`, `net.pixel_fuser.fuser.distributor`, `.block1`,
@@ -471,7 +496,9 @@ impl CutieNet {
 
     /// `CUTIE.readout_query`: the object transformer on `pixel` (n, 256 at stride 16) with
     /// `obj_memory` [n*16, 257] (each object's summed summaries, then the area). Out: the pixels
-    /// (n, 256 at stride 16) and the aux logits of each prediction ([n, h*w], 4 of them).
+    /// (n, 256 at stride 16) and the aux logits of each prediction ([n, h*w], 4 of them). The n
+    /// objects are the whole set the attention masks' aggregate is taken over, as for
+    /// `pixel_fusion`: one bucket, in one chunk.
     ///
     /// Taps: `object_transformer.in.pixel`, `.in.obj_memory`,
     /// `net.object_transformer.summary_to_query_init`, `_emb`, `.pixel_init_proj`,
@@ -487,13 +514,15 @@ impl CutieNet {
 
 // --- The check ---
 
-/// Stages `fusion` and `transformer`: for every oracle step that segments (`prop_f1`, `prop_f5`,
-/// `prop_f40`, `prop_f41`), the oracle's `pixel_fusion.in.*` (and `encode_image.out.pix_feat`)
-/// through `pixel_fusion` (rows `fusion`), and `object_transformer.in.*` through `readout_query`
-/// (rows `transformer`), every tap compared. The attention masks are compared exactly; the
-/// transformer runs again with the oracle's own mask fed to each block (rows `oracle-mask`), its
-/// native masks still compared, which separates a flipped mask bit (a near-tie in the aux
-/// logits) from a wrong block.
+/// Stage `transformer`: for every oracle step that segments (`prop_f1`, `prop_f5`, `prop_f40`,
+/// `prop_f41`), the oracle's `pixel_fusion.in.*` (and `encode_image.out.pix_feat`) through
+/// `pixel_fusion` (rows `fusion`), and `object_transformer.in.*` through `readout_query` (rows
+/// `transformer`), every tap compared. The attention masks are compared exactly; the transformer
+/// runs again with the oracle's own mask fed to each block (rows `oracle-mask`), its native
+/// masks still compared, which separates a flipped mask bit (a near-tie in the aux logits) from
+/// a wrong block; and once with a mask row that would block every pixel (row `edge`, under
+/// `transformer`). The `*.in.*` rows are the fed inputs put back: they check layout and shape,
+/// not the port.
 pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights) -> Result<()> {
     let fuser = PixelFuser::load(weights)?;
     let transformer = QueryTransformer::load(weights)?;
