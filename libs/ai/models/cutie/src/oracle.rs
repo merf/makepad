@@ -103,7 +103,8 @@ impl Oracle {
                 .and_then(|v| v.trim().parse().ok())
                 .ok_or_else(|| io(&meta_path, format!("no {key}")))
         };
-        let config = Self::read_config(&meta).map_err(|e| io(&meta_path, e))?;
+        let objects = get("objects")?;
+        let config = Self::read_config(&meta, objects).map_err(|e| io(&meta_path, e))?;
         let schedule = Self::read_schedule(dir)?;
         let mut manifests = HashMap::new();
         for step in schedule.iter().filter_map(|r| r.tap.as_deref()) {
@@ -127,7 +128,7 @@ impl Oracle {
             frames: get("frames")?,
             width: get("width")?,
             height: get("height")?,
-            objects: get("objects")?,
+            objects,
             config,
             schedule,
             manifests,
@@ -136,10 +137,14 @@ impl Oracle {
 
     /// The settings in `meta.txt`'s `config.<key>=<value>` lines over the defaults (an oracle
     /// without them ran with the defaults). Settings that do not change what Cutie computes (the
-    /// device, the weights' file names, `amp`, which the oracle runs in fp32 anyway, `chunk_size`,
-    /// `save_aux`) are passed over; one the port does not do (`flip_aug`), or does not know, is
-    /// an error rather than a check of something else.
-    fn read_config(meta: &str) -> std::result::Result<CutieConfig, String> {
+    /// device, the weights' file names, `amp`, which the oracle runs in fp32 anyway, `save_aux`)
+    /// are passed over; one the port does not do (`flip_aug`), or does not know, is an error
+    /// rather than a check of something else. So is a `chunk_size` from 1 to fewer than the
+    /// `objects`: PyTorch's memory read then runs pixel fusion and the object transformer a chunk
+    /// of objects at a time, each object's others and the attention masks' aggregate taken over
+    /// its chunk only, while the port always passes every object (as `chunk_size` -1, the
+    /// worker's, does; a chunk of every object or more is the same).
+    fn read_config(meta: &str, objects: usize) -> std::result::Result<CutieConfig, String> {
         let mut config = CutieConfig::default();
         for (key, value) in meta.lines().filter_map(|l| l.strip_prefix("config.")).filter_map(|l| l.split_once('=')) {
             let value = value.trim();
@@ -150,8 +155,14 @@ impl Oracle {
                 _ => Err(format!("config.{key}={value}: not true or false")),
             };
             match key {
-                "device" | "weights" | "ritm_weights" | "amp" | "chunk_size" | "save_aux" => {}
+                "device" | "weights" | "ritm_weights" | "amp" | "save_aux" => {}
                 "flip_aug" if !flag()? => {}
+                "chunk_size" => {
+                    let chunk = value.parse::<i64>().map_err(|e| format!("config.{key}={value}: {e}"))?;
+                    if chunk >= 1 && (chunk as usize) < objects {
+                        return Err(format!("config.{key}={value}: chunks of fewer than the {objects} objects, which the port does not do"));
+                    }
+                }
                 // Cutie resizes only when this is positive.
                 "max_internal_size" => {
                     config.max_internal_size = value.parse::<i64>().map_err(|e| format!("config.{key}={value}: {e}"))?.max(0) as usize
@@ -288,7 +299,7 @@ impl Oracle {
 /// How close a tap must be: the largest difference relative to the expected tensor's largest
 /// magnitude, and the cosine similarity. Boolean taps (attention masks) are compared exactly,
 /// `bool_mismatch` the fraction of entries allowed to differ.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Tol {
     pub(crate) rel: f32,
     pub(crate) cos: f64,
@@ -296,8 +307,15 @@ pub(crate) struct Tol {
 }
 
 impl Tol {
-    /// A stage fed the oracle's own inputs (teacher-forced): only fp32 rounding apart.
-    pub(crate) const STAGE: Tol = Tol { rel: 1e-3, cos: 0.99999, bool_mismatch: 0.0 };
+    /// A stage fed the oracle's own inputs (teacher-forced): only fp32 rounding apart, and tight
+    /// enough to tell TF32 from fp32. Over the seven oracles fp32 rounding reaches rel 4.8e-5
+    /// (the decoder's `segment.out.sensory` and well-conditioned logits, the end of a long chain;
+    /// most taps 1e-7 to 5e-6) and 1 - cosine 1.5e-11 (`Report::margins` prints each stage's).
+    /// One layer in TF32 (its weights and input rounded to 10-bit mantissas) gives rel 2e-4 to
+    /// 1e-3 and 1 - cosine about 2e-8: the cosine bound fails it by 20 times while leaving fp32
+    /// 60 times of room. (Was rel 1e-3, cosine 0.99999, which TF32 in the pixel fuser and the key
+    /// projection passed.)
+    pub(crate) const STAGE: Tol = Tol { rel: 2e-4, cos: 1.0 - 1e-9, bool_mismatch: 0.0 };
     /// After many steps of the native pipeline's own state: top-k picks near ties differently,
     /// and a swapped pick moves that pixel's readout and sensory memory locally by up to about a
     /// tenth of their range (YouTubeComp-15 at 960x540: 7%, cosine 0.9999997). The whole tensor
@@ -319,6 +337,8 @@ pub(crate) struct Row {
     pub(crate) cos: f64,
     pub(crate) pass: bool,
     pub(crate) note: String,
+    /// The tolerance a tensor comparison was judged by (None for `record` rows).
+    pub(crate) tol: Option<Tol>,
 }
 
 /// Every comparison made, and anything else a check wants to say.
@@ -343,6 +363,7 @@ impl Report {
             cos: 1.0,
             pass: true,
             note: String::new(),
+            tol: Some(tol),
         };
         if actual.len() != expected.values.len() {
             row.pass = false;
@@ -358,7 +379,9 @@ impl Report {
             let mut nonfinite = 0usize;
             for (&a, &e) in actual.iter().zip(&expected.values) {
                 if !a.is_finite() || !e.is_finite() {
-                    if a.is_finite() != e.is_finite() || (a.is_nan() != e.is_nan()) {
+                    // A pair with a non-finite side matches only as two NaNs or the same
+                    // infinity (+inf against -inf differs).
+                    if !(a.is_nan() && e.is_nan()) && a != e {
                         nonfinite += 1;
                     }
                     continue;
@@ -371,8 +394,10 @@ impl Report {
             }
             row.rel = row.max_abs / row.max_ref.max(1e-12);
             row.cos = if na == 0.0 && ne == 0.0 { 1.0 } else { dot / (na.sqrt() * ne.sqrt()).max(1e-300) };
-            let tiny = row.max_ref < 1e-6 && row.max_abs < 1e-6;
-            row.pass = nonfinite == 0 && (tiny || (row.rel <= tol.rel && row.cos >= tol.cos));
+            // Where the oracle is all zeros, no relative measure exists: a result within 1e-6 of
+            // zero passes. Anything else is relative, however small (life counts start at 1e-7).
+            let zeros = row.max_ref == 0.0 && row.max_abs < 1e-6;
+            row.pass = nonfinite == 0 && (zeros || (row.rel <= tol.rel && row.cos >= tol.cos));
             if nonfinite > 0 {
                 row.note = format!("{nonfinite} non-finite entries differ");
             }
@@ -406,6 +431,7 @@ impl Report {
             cos: f64::NAN,
             pass,
             note: note.into(),
+            tol: None,
         });
     }
 
@@ -413,19 +439,54 @@ impl Report {
         self.record(stage, step, name, false, why);
     }
 
-    /// One line a comparison (rows that are not one show no numbers), then the notes.
+    /// One line a comparison (rows that are not one show no numbers), then the notes, then each
+    /// stage's margin under `Tol::STAGE` (`margins`).
     pub(crate) fn print(&self) {
         for r in &self.rows {
             let numbers = if r.max_abs.is_nan() && r.cos.is_nan() {
-                format!("{:<10} {:<19} {:<15} {:<16}", "n=-", "max_abs=-", "rel=-", "cos=-")
+                format!("{:<10} {:<19} {:<15} {:<19}", "n=-", "max_abs=-", "rel=-", "cos=-")
             } else {
-                format!("n={:<8} max_abs={:<11.4e} rel={:<11.4e} cos={:<12.9}", r.n, r.max_abs, r.rel, r.cos)
+                format!("n={:<8} max_abs={:<11.4e} rel={:<11.4e} cos={:<15.12}", r.n, r.max_abs, r.rel, r.cos)
             };
             println!("{} {:<11} {:<9} {:<64} {numbers} {}", if r.pass { "PASS" } else { "FAIL" }, r.stage, r.step, r.name, r.note);
         }
         for n in &self.notes {
             println!("NOTE {n}");
         }
+        for m in self.margins() {
+            println!("NOTE {m}");
+        }
+    }
+
+    /// Per stage, the rows judged by `Tol::STAGE` that came closest to it: the largest rel and
+    /// the largest 1 - cosine, with where. How much room fp32 rounding leaves under the
+    /// tolerance, which must stay tight enough to tell TF32 or fp16 from fp32.
+    pub(crate) fn margins(&self) -> Vec<String> {
+        let mut stages: Vec<&str> = Vec::new();
+        for r in self.rows.iter().filter(|r| r.tol == Some(Tol::STAGE)) {
+            if !stages.contains(&r.stage.as_str()) {
+                stages.push(&r.stage);
+            }
+        }
+        stages
+            .into_iter()
+            .map(|stage| {
+                let rows: Vec<&Row> = self.rows.iter().filter(|r| r.stage == stage && r.tol == Some(Tol::STAGE) && r.cos.is_finite()).collect();
+                let worst_rel = rows.iter().max_by(|a, b| a.rel.total_cmp(&b.rel));
+                let worst_cos = rows.iter().min_by(|a, b| a.cos.total_cmp(&b.cos));
+                let at = |r: Option<&&Row>| r.map_or("-".to_string(), |r| format!("{}/{}", r.step, r.name));
+                format!(
+                    "margin {stage}: {} rows at Tol::STAGE (rel {:.0e}, 1-cos {:.0e}); largest rel {:.3e} at {}; largest 1-cos {:.3e} at {}",
+                    rows.len(),
+                    Tol::STAGE.rel,
+                    1.0 - Tol::STAGE.cos,
+                    worst_rel.map_or(0.0, |r| r.rel),
+                    at(worst_rel),
+                    worst_cos.map_or(0.0, |r| 1.0 - r.cos),
+                    at(worst_cos),
+                )
+            })
+            .collect()
     }
 }
 
@@ -476,6 +537,25 @@ impl<'a> Comparer<'a> {
             put.extend((1..count).map(|i| format!("{name}#{i}")));
         }
         put
+    }
+
+    /// Fails, under this comparer's stage and step, every oracle tap under `owned` that nothing
+    /// put (but those in `not_compared`: names the stage owns and does not compare, such as inputs
+    /// it feeds and does not put back), and every name put that the oracle lacks. So a renamed
+    /// tap, on either side, or a regenerated oracle cannot drop comparisons and still pass:
+    /// `take` alone only notes a name the oracle lacks.
+    pub(crate) fn check_coverage(&mut self, owned: &[&str], not_compared: &[&str]) {
+        let (stage, step) = (self.stage.clone(), self.step.clone());
+        for name in self.uncompared(owned) {
+            if !not_compared.contains(&name.as_str()) {
+                self.report.fail(&stage, &step, &name, "in the oracle, not put by the port");
+            }
+        }
+        let mut extra: Vec<String> = self.put_names().into_iter().filter(|name| !self.oracle.has(&step, name)).collect();
+        extra.sort();
+        for name in extra {
+            self.report.fail(&stage, &step, &name, "put by the port, not in the oracle");
+        }
     }
 
     /// The step's oracle taps under any of `prefixes` ("" for all) that nothing put, in the

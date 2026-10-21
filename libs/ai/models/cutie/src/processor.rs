@@ -238,7 +238,10 @@ impl<'a> CutieProcessor<'a> {
     /// One frame: `image` RGB bytes, `height` x `width` x 3; `mask` each object's probability
     /// (objects x height x width) when the frame is given one; `force_permanent` memorises it as
     /// a memory frame (Cutie's permanent memory); `end` skips memorising. Out: the probability of
-    /// background then each object, (objects + 1) x height x width.
+    /// background then each object, (objects + 1) x height x width (`labels` makes the masks).
+    ///
+    /// A frame whose size inside Cutie differs from the memory's is refused before anything
+    /// changes; an error later in the step may leave the counters advanced (the crate's Errors).
     pub fn step(&mut self, image: &[u8], width: usize, height: usize, mask: Option<&[f32]>, force_permanent: bool, end: bool) -> Result<Vec<f32>> {
         self.step_tapped(image, width, height, mask, force_permanent, end, &mut Tap::none())
     }
@@ -255,6 +258,16 @@ impl<'a> CutieProcessor<'a> {
         if mask.is_some_and(|m| m.len() != n * width * height) {
             return Err(DiffusionError::model(format!("cutie step: the mask is not {n} objects at {width}x{height}")));
         }
+        // Checked before anything changes: a frame of another size would fail deep inside the
+        // memory read, the counters already advanced.
+        let (pw, ph) = frame.padded();
+        if let Some((mw, mh)) = self.memory.frame_size().filter(|&size| size != (pw / PAD_TO, ph / PAD_TO)) {
+            return Err(DiffusionError::model(format!(
+                "cutie step: a {width}x{height} frame is {pw}x{ph} inside Cutie, but the memory holds frames of {}x{}: clear_memory first",
+                mw * PAD_TO,
+                mh * PAD_TO
+            )));
+        }
         if tap.active() {
             self.dump("state.before", tap)?;
         }
@@ -266,7 +279,6 @@ impl<'a> CutieProcessor<'a> {
         }
 
         let plan = self.schedule.next(mask.is_some(), end);
-        let (pw, ph) = frame.padded();
         let image = Feat::new(frame.to_internal(&image)?, 1, 3, pw, ph)?;
         tap.put("encode_image.in.image", &image.t)?;
         let feats = self.net.encode_image(&image, tap)?;
@@ -347,9 +359,11 @@ impl<'a> CutieProcessor<'a> {
         gpu_upload(&labels, 1, plane).map_err(|e| dev("step labels", e))
     }
 
-    /// Each pixel's class (0 the background), the first of equal probabilities
-    /// (`torch.argmax`): `prob` is classes x plane.
-    pub(crate) fn labels(prob: &[f32], classes: usize, plane: usize) -> Vec<u8> {
+    /// Each pixel's class from a step's output, as the worker's masks are made from it
+    /// (`torch_prob_to_numpy_mask`, an argmax): 0 the background, else the object's number, the
+    /// first of equal probabilities (`torch.argmax`). `prob` is classes x plane (`step`'s output:
+    /// classes = objects + 1, plane = width * height).
+    pub fn labels(prob: &[f32], classes: usize, plane: usize) -> Vec<u8> {
         (0..plane)
             .map(|i| {
                 let mut best = 0;
@@ -651,6 +665,17 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
     }
     let ms = untapped_time.as_secs_f64() * 1e3;
     report.note(format!("run: {untapped} steps without taps in {ms:.1} ms, {:.2} ms a step", ms / untapped.max(1) as f64));
+
+    // A frame of another size than the memory's is refused before the step changes anything.
+    let (sw, sh) = (w / 2, h / 2);
+    let before = (processor.schedule.curr_ti, processor.schedule.last_mem_ti, processor.memory.sizes());
+    let result = processor.step(&vec![0u8; sw * sh * 3], sw, sh, None, false, false);
+    let after = (processor.schedule.curr_ti, processor.schedule.last_mem_ti, processor.memory.sizes());
+    let note = match &result {
+        Err(e) => format!("refused: {e}; counters and memory {}", if before == after { "unchanged" } else { "CHANGED" }),
+        Ok(_) => "accepted".to_string(),
+    };
+    report.record("run", "edge", &format!("a {sw}x{sh} frame"), result.is_err() && before == after, note);
     Ok(())
 }
 

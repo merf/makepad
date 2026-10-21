@@ -180,6 +180,13 @@ fn cutie_topk_key(v: f32) -> u32 {
     x ^ if x & 0x8000_0000 != 0 { u32::MAX } else { 0x8000_0000 }
 }
 
+/// Whether Cutie's ops run here: this build has their CUDA kernels (this file; the stubs say
+/// false) and a CUDA device is present. `gpu_device_available` alone is not enough: without the
+/// kernels on macOS it reports Metal's device, on which these ops do not run.
+pub fn gpu_cutie_available() -> bool {
+    gpu_device_available()
+}
+
 /// A convolution's output size along one axis (PyTorch's floor rule).
 pub fn cutie_conv_out(size: usize, k: usize, pad: usize, stride: usize) -> usize {
     (size + 2 * pad - k) / stride + 1
@@ -854,15 +861,16 @@ pub fn gpu_cutie_similarity_reference(mk: &GpuTensor, ms: Option<&GpuTensor>, qk
 ///
 /// The kernel splits each column's rows into slices, keeps each slice's top k (one thread a
 /// column and slice, reads coalesced across columns), merges them per column, then the softmax
-/// and the usage.
+/// and the usage. It keeps at most 64 a column in registers: a larger k (after k = min(k, m)) is
+/// an error rather than the reference, which would take the whole similarity through the host
+/// every frame (gigabytes with a full memory at 1000p). Cutie's top_k is 30.
 pub fn gpu_cutie_topk_softmax(sim: &GpuTensor, k: usize) -> Result<(GpuTensor, GpuTensor), String> {
     let op = "gpu_cutie_topk_softmax";
     cutie_check_f32(op, sim)?;
     let (m, p) = (sim.rows, sim.cols);
     let k = k.min(m);
     if k > CUTIE_TOPK_MAX {
-        // Never for Cutie (top_k 30): the kernel keeps at most 64 a column in registers.
-        return gpu_cutie_topk_softmax_reference(sim, k);
+        return Err(format!("{op}: top {k} of {m} rows; the kernel takes at most {CUTIE_TOPK_MAX} (Cutie's top_k is 30)"));
     }
     let (m_u, p_u, k_u) = (cutie_u32(op, m)?, cutie_u32(op, p)?, k as u32);
     with_dense_linear_backend(|backend| {

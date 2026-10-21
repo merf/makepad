@@ -197,8 +197,9 @@ struct LogitCheck {
 impl LogitCheck {
     /// fp32's rounding step just below 1 (2^-24).
     const ROUNDING_STEP: f64 = 1.0 / 16_777_216.0;
-    /// The largest change one rounding step in `aggregate` may make to a compared logit: a few
-    /// such steps stay far below `Tol::STAGE` (1e-3 of about 16).
+    /// The largest change one rounding step in `aggregate` may make to a compared logit: three
+    /// such steps stay below `Tol::STAGE` (2e-4 of about 16, 3.2e-3); the oracles' worst compared
+    /// logit is 7.6e-4 off (rel 4.8e-5), under one.
     const LIMIT: f64 = 1e-3;
 
     /// From the oracle's `net.mask_decoder.pred` [n, 1, h, w], what `aggregate` and the bilinear
@@ -267,7 +268,8 @@ impl LogitCheck {
 
 /// Stage `decoder`: for every oracle step that segments, the oracle's `encode_image.out.f8`,
 /// `.f4` and `segment.in.*` through `segment`, every tap compared (`segment.in.*` come back as
-/// they went in, so they check only that those taps name the right tensors), and
+/// they went in, so they check only that those taps name the right tensors) and the names checked
+/// both ways (`Comparer::check_coverage`), and
 /// `segment.out.logits` with `Tol::STAGE` where it is well conditioned (`LogitCheck`). The
 /// sensory memory is updated where the oracle's was (it tapped `net.mask_decoder.sensory_update`);
 /// there the step runs again without the update, which must leave everything else as it was.
@@ -277,6 +279,10 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
     let mut steps = 0;
     for step in oracle.steps() {
         if !oracle.has(step, "segment.in.memory_readout") {
+            // A step with the decoder's taps but not its input has lost the stage's coverage.
+            if oracle.names(step).iter().any(|name| name.starts_with("segment.") || name.starts_with("net.mask_decoder.")) {
+                report.fail("decoder", step, "segment.in.memory_readout", "not in the oracle, which segments here");
+            }
             continue;
         }
         steps += 1;
@@ -287,6 +293,7 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
         let update_sensory = oracle.has(step, "net.mask_decoder.sensory_update");
         let mut cmp = Comparer::new(oracle, report, "decoder", step, &tol);
         let (_, logits, prob) = cmp.with(|tap| decoder.segment(&f8, &f4, &readout, &sensory, update_sensory, tap))?;
+        cmp.check_coverage(&["segment.", "net.mask_decoder."], &[]);
         let logits = gpu_download(&logits).map_err(|e| dev("download", e))?;
         LogitCheck::from_pred(&oracle.tap(step, "net.mask_decoder.pred")?)?.compare(report, step, &logits, &oracle.tap(step, "segment.out.logits")?);
         if update_sensory {

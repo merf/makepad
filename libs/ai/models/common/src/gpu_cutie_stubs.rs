@@ -1,6 +1,12 @@
 // Cutie's device ops for builds without CUDA kernels: the signatures of cuda/src/cutie_ops.rs,
 // each unavailable. Included inside gpu.rs's stub `mod imp`.
 
+/// Cutie's ops never run without their CUDA kernels, whatever device this build has (on macOS,
+/// `gpu_device_available` is Metal's).
+pub fn gpu_cutie_available() -> bool {
+    false
+}
+
 /// A convolution's output size along one axis (PyTorch's floor rule).
 pub fn cutie_conv_out(size: usize, k: usize, pad: usize, stride: usize) -> usize {
     (size + 2 * pad - k) / stride + 1

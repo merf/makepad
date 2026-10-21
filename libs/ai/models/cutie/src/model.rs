@@ -49,14 +49,21 @@ pub(crate) fn not_ported(what: &str) -> DiffusionError {
 /// shape. The `num_batches_tracked` int64 entries are never read.
 pub(crate) struct Weights {
     dict: PthStateDict,
-    /// Prefixes every device cache key, so two checkpoints never share a cached weight.
+    /// Prefixes every device cache key: the checkpoint's canonical path, size and modification
+    /// time. The cache reuses an entry by its key and size alone, so two checkpoints, or one
+    /// replaced on disk while the process runs, must never share a key (the convolutions would run
+    /// the old weights beside the new linears), and one file named two ways should share them.
     pub(crate) key_prefix: String,
 }
 
 impl Weights {
     pub(crate) fn load(path: &Path) -> Result<Self> {
-        let dict = PthStateDict::load(path).map_err(|e| DiffusionError::model(format!("{}: {e}", path.display())))?;
-        Ok(Self { dict, key_prefix: format!("{}:", path.display()) })
+        let fail = |e: &dyn std::fmt::Display| DiffusionError::model(format!("{}: {e}", path.display()));
+        let dict = PthStateDict::load(path).map_err(|e| fail(&e))?;
+        let canonical = std::fs::canonicalize(path).map_err(|e| fail(&e))?;
+        let meta = std::fs::metadata(&canonical).map_err(|e| fail(&e))?;
+        let modified = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos());
+        Ok(Self { dict, key_prefix: format!("{}@{}@{modified}:", canonical.display(), meta.len()) })
     }
 
     pub(crate) fn has(&self, name: &str) -> bool {

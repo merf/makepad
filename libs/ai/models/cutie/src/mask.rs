@@ -350,7 +350,8 @@ impl CutieNet {
 }
 
 /// Stage `mask`: for every oracle step with `encode_mask` taps, the oracle's inputs
-/// (`encode_image.normalised`, `encode_mask.in.*`) through `encode_mask`, every tap compared.
+/// (`encode_image.normalised`, `encode_mask.in.*`) through `encode_mask`, every tap compared and
+/// the names checked both ways (`Comparer::check_coverage`).
 /// The deep update runs where the oracle's did (where it has `net.mask_encoder.sensory_update`).
 ///
 /// The `encode_mask.in.*` taps are the oracle's own inputs read back, so they are not compared
@@ -369,6 +370,10 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
     let mut distinct = 0;
     for step in oracle.steps() {
         if !oracle.has(step, "encode_mask.in.masks") {
+            // A step with the mask encoder's taps but not its input has lost the stage's coverage.
+            if oracle.names(step).iter().any(|name| name.starts_with("encode_mask.") || name.starts_with("net.mask_encoder.")) {
+                report.fail("mask", step, "encode_mask.in.masks", "not in the oracle, which encodes a mask here");
+            }
             continue;
         }
         let [image, pix_feat, sensory, masks] = INPUTS.map(|name| oracle.tap(step, name));
@@ -390,9 +395,15 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
 
         let summaries = {
             let mut comparer = Comparer::new(oracle, report, "mask", step, &tol);
-            let mut sink = |name: &str, t: &GpuTensor| if INPUTS.contains(&name) { Ok(()) } else { comparer.take(name, t) };
-            let mut tap = Tap::new(&mut sink);
-            encoder.encode_mask(&summarizer, &image, &pix_feat, &sensory, &masks, deep_update, &mut tap)?.2
+            let summaries = {
+                let mut sink = |name: &str, t: &GpuTensor| if INPUTS.contains(&name) { Ok(()) } else { comparer.take(name, t) };
+                let mut tap = Tap::new(&mut sink);
+                encoder.encode_mask(&summarizer, &image, &pix_feat, &sensory, &masks, deep_update, &mut tap)?.2
+            };
+            // Every oracle tap of the mask encoder compared, every tap put in the oracle: but the
+            // inputs fed, and conv1 before bn1 (folded into it here).
+            comparer.check_coverage(&["encode_mask.", "net.mask_encoder."], &[INPUTS[1], INPUTS[2], INPUTS[3], "net.mask_encoder.conv1"]);
+            summaries
         };
 
         let actual = gpu_download(&summaries).map_err(|e| dev("mask check", e))?;

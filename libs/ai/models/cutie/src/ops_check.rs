@@ -34,7 +34,8 @@ use makepad_ai_common::gpu::{
     gpu_cutie_rgb_planes_reference, gpu_cutie_sigmoid, gpu_cutie_sigmoid_reference, gpu_cutie_similarity,
     gpu_cutie_similarity_reference, gpu_cutie_sine_encoding, gpu_cutie_sine_encoding_reference, gpu_cutie_softmax_axis0,
     gpu_cutie_softmax_axis0_reference, gpu_cutie_topk_softmax, gpu_cutie_topk_softmax_reference, gpu_download,
-    gpu_synchronize, gpu_upload, gpu_weight_cache_evict_prefix, GpuTensor,
+    gpu_attention_packed_cross_bias, gpu_attention_packed_cross_f32, gpu_linear_f32_resident, gpu_synchronize, gpu_upload,
+    gpu_weight_cache_evict_prefix, GpuTensor,
 };
 use std::time::Instant;
 
@@ -557,6 +558,17 @@ impl OpsCheck<'_> {
         Ok(())
     }
 
+    /// A k over the kernel's 64 is refused (an error), not taken through the host.
+    fn topk_refused(&mut self, m: usize, p: usize, k: usize) -> Result<()> {
+        let sim = up(&self.similarities(m * p), m, p)?;
+        let case = format!("m{m} p{p} k{k} refused");
+        match gpu_cutie_topk_softmax(&sim, k) {
+            Err(e) => self.report.record(STAGE, "topk", &case, true, e),
+            Ok(_) => self.report.record(STAGE, "topk", &case, false, "accepted a k over the kernel's 64"),
+        }
+        Ok(())
+    }
+
     /// Similarities as Cutie's are: negative, spread over a few tens.
     fn similarities(&mut self, n: usize) -> Vec<f32> {
         self.rng.uniforms(n, -25.0, 0.0)
@@ -753,6 +765,81 @@ impl OpsCheck<'_> {
         Ok(())
     }
 
+    // --- The object transformer's linears and attention ---
+
+    /// A result against values computed on the host here (in f64, rounded to f32 at the end).
+    fn compare_host(&mut self, op: &str, case: &str, actual: &GpuTensor, expected: Vec<f32>, tol: Tol) -> Result<()> {
+        let tap = OracleTap { shape: vec![actual.rows(), actual.cols()], dtype: "f32".into(), values: expected };
+        self.report.compare(STAGE, op, case, &down(actual)?, &tap, tol);
+        Ok(())
+    }
+
+    /// `gpu_linear_f32_resident` (every Linear of the object transformer: x @ W^T + b, cuBLAS
+    /// SGEMM on the backend's handle) against the product summed in f64 on the host: fp32
+    /// rounding apart (`TIGHT`). The ops above have their own references; this one and
+    /// `attention` are shared Makepad ops that the stages judge only at `Tol::STAGE`, where a
+    /// single layer in TF32 (10-bit mantissas in the products, rel 1e-4 to 1e-3) might pass: here
+    /// it misses by orders of magnitude, so a change of cuBLAS's math mode shows.
+    fn linear(&mut self, rows: usize, in_f: usize, out_f: usize, bias: bool) -> Result<()> {
+        let x = self.rng.normals(rows * in_f, 1.0);
+        let w = self.rng.normals(out_f * in_f, 1.0 / (in_f as f32).sqrt());
+        let b = if bias { self.rng.normals(out_f, 0.1) } else { vec![0.0; out_f] };
+        let case = format!("{rows}x{in_f} -> {out_f}{}", if bias { "" } else { " nobias" });
+        let mut expected = Vec::with_capacity(rows * out_f);
+        for r in 0..rows {
+            for o in 0..out_f {
+                let dot: f64 = (0..in_f).map(|i| x[r * in_f + i] as f64 * w[o * in_f + i] as f64).sum();
+                expected.push((dot + b[o] as f64) as f32);
+            }
+        }
+        let bias = if bias { Some(up(&b, 1, out_f)?) } else { None };
+        let actual = gpu_linear_f32_resident(&up(&x, rows, in_f)?, &up(&w, out_f, in_f)?, bias.as_ref()).map_err(|e| dev(&case, e))?;
+        self.compare_host("linear", &case, &actual, expected, TIGHT)
+    }
+
+    /// The object transformer's attention (`gpu_attention_packed_cross_bias` with an additive mask,
+    /// -inf where blocked, else `gpu_attention_packed_cross_f32`; heads packed along the columns,
+    /// the mask [heads*q_len, kv_len]) against softmax(scale q k^T + mask) v in f64 on the host:
+    /// fp32 rounding apart, so TF32 in either GEMM shows (see `linear`).
+    fn attention(&mut self, heads: usize, q_len: usize, kv_len: usize, masked: bool) -> Result<()> {
+        const HEAD_DIM: usize = 32;
+        let hidden = heads * HEAD_DIM;
+        let q = self.rng.normals(q_len * hidden, 1.0);
+        let k = self.rng.normals(kv_len * hidden, 1.0);
+        let v = self.rng.normals(kv_len * hidden, 1.0);
+        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+        // Every 7th entry blocked, but never a row's first: no row is blocked everywhere.
+        let mask: Vec<f32> =
+            (0..heads * q_len * kv_len).map(|i| if masked && i % 7 == 3 && i % kv_len != 0 { f32::NEG_INFINITY } else { 0.0 }).collect();
+        let case = format!("heads{heads} q{q_len} kv{kv_len}{}", if masked { " masked" } else { "" });
+        let mut expected = vec![0.0f32; q_len * hidden];
+        for h in 0..heads {
+            for i in 0..q_len {
+                let scores: Vec<f64> = (0..kv_len)
+                    .map(|j| {
+                        let dot: f64 = (0..HEAD_DIM).map(|d| q[i * hidden + h * HEAD_DIM + d] as f64 * k[j * hidden + h * HEAD_DIM + d] as f64).sum();
+                        scale as f64 * dot + mask[(h * q_len + i) * kv_len + j] as f64
+                    })
+                    .collect();
+                let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let exps: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
+                let sum: f64 = exps.iter().sum();
+                for d in 0..HEAD_DIM {
+                    let out: f64 = (0..kv_len).map(|j| exps[j] / sum * v[j * hidden + h * HEAD_DIM + d] as f64).sum();
+                    expected[i * hidden + h * HEAD_DIM + d] = out as f32;
+                }
+            }
+        }
+        let (qt, kt, vt) = (up(&q, q_len, hidden)?, up(&k, kv_len, hidden)?, up(&v, kv_len, hidden)?);
+        let actual = if masked {
+            gpu_attention_packed_cross_bias(&qt, &kt, &vt, heads, scale, &up(&mask, heads * q_len, kv_len)?)
+        } else {
+            gpu_attention_packed_cross_f32(&qt, &kt, &vt, heads, scale)
+        }
+        .map_err(|e| dev(&case, e))?;
+        self.compare_host("attention", &case, &actual, expected, TIGHT)
+    }
+
     // --- PyTorch's own results ---
 
     /// The kernels against PyTorch's values (`PINNED_*`) where its order over objects and picks
@@ -919,6 +1006,7 @@ fn run(ck: &mut OpsCheck) -> Result<()> {
     }
     let v = ck.similarities(30000 * P16);
     ck.topk("long", 30000, P16, 64, v, true)?;
+    ck.topk_refused(100, 9, 65)?;
     let v = ck.similarities(3500 * 2500);
     ck.topk("big frame", 3500, 2500, 30, v, true)?;
     let v = ck.similarities(20 * 37);
@@ -1025,5 +1113,18 @@ fn run(ck: &mut OpsCheck) -> Result<()> {
     ck.layer_norm(16 * 3, 256, true)?;
     ck.layer_norm(16, 256, false)?;
     ck.layer_norm(7, 12, false)?;
+    // Its linears (the queries' and the FFN's, interleaved tokens of 2 objects: 32 queries, 336
+    // pixels; the summaries' projections) and its attention (8 heads an object: the queries
+    // reading the pixels through the mask, the queries' self-attention, the pixels reading the
+    // queries; 3 objects at 960x544's 2040 tokens), against host references in f64.
+    ck.linear(32, 256, 256, true)?;
+    ck.linear(32, 256, 2048, true)?;
+    ck.linear(32, 2048, 256, true)?;
+    ck.linear(2 * P16, 256, 256, true)?;
+    ck.linear(7, 13, 5, false)?;
+    ck.attention(16, 16, P16, true)?;
+    ck.attention(16, 16, 16, false)?;
+    ck.attention(16, P16, 16, false)?;
+    ck.attention(24, 16, 2040, true)?;
     Ok(())
 }

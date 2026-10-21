@@ -213,8 +213,12 @@ impl KeyValueStore {
     }
 
     /// `get_usage`: the temporary tokens' use counts normalised by their lives, downloaded for
-    /// the host's top-k (empty without counts).
+    /// the host's top-k (empty while the temporary part is). A store that does not count usage
+    /// has none to give (PyTorch raises too).
     pub(crate) fn usage(&self) -> Result<Vec<f32>> {
+        if !self.save_usage {
+            return Err(DiffusionError::model("cutie memory: this store does not count usage"));
+        }
         let (Some(use_count), Some(life_count)) = (&self.use_count, &self.life_count) else {
             return Ok(Vec::new());
         };
@@ -226,8 +230,9 @@ impl KeyValueStore {
     /// The indices of the `k` largest of `values`, largest first; equal values by lower index
     /// (`torch.topk(.., sorted=True)`). The tie rule copies what the oracle showed for the read's
     /// top-k; it is unverified here, the oracle having no tie or near tie at the prototypes' cut.
+    /// k 0 gives none, as torch.topk does; more than there are is an error, as there.
     pub(crate) fn most_used(values: &[f32], k: usize) -> Result<Vec<u32>> {
-        if k > values.len() || k == 0 {
+        if k > values.len() {
             return Err(DiffusionError::model(format!("cutie memory: top {k} of {} tokens", values.len())));
         }
         let mut order: Vec<u32> = (0..values.len() as u32).collect();
@@ -289,12 +294,18 @@ impl KeyValueStore {
     }
 
     /// `remove_obsolete_features` (long-term memory: no permanent part, no selection): keeps the
-    /// `max_size` most used tokens, most used first.
+    /// `max_size` most used tokens, most used first; none when `max_size` is 0 (torch.topk with
+    /// k 0: the store empties, and the consolidation after it adds its prototypes alone).
     pub(crate) fn remove_obsolete(&mut self, max_size: usize) -> Result<()> {
         if self.perm_end != 0 {
             return Err(DiffusionError::model("cutie memory: long-term memory has a permanent part"));
         }
         let survivors = Self::most_used(&self.usage()?, max_size)?;
+        if survivors.is_empty() {
+            // Device tensors cannot be empty: an empty store has none.
+            *self = Self::new(self.save_selection, self.save_usage);
+            return Ok(());
+        }
         let gather = |t: &Option<GpuTensor>| -> Result<Option<GpuTensor>> {
             t.as_ref().map(|t| gpu_gather_cols(t, &survivors)).transpose().map_err(|e| dev("memory survivors", e))
         };
@@ -343,8 +354,9 @@ pub(crate) struct MemoryManager {
     num_prototypes: usize,
     max_long_tokens: usize,
     buffer_tokens: usize,
-    /// Tokens a memorised frame has (h*w at stride 16), from the first add (`HW`).
-    plane: Option<usize>,
+    /// A memorised frame's size at stride 16 (w, h), from the first add or sensory memory (`H`,
+    /// `W`): every frame stepped must have it until the memory is cleared.
+    size: Option<(usize, usize)>,
     pub(crate) work: KeyValueStore,
     pub(crate) long: KeyValueStore,
     /// Every object's sensory memory (n, 256 at stride 16).
@@ -372,7 +384,7 @@ impl MemoryManager {
             num_prototypes: config.num_prototypes,
             max_long_tokens: config.max_long_tokens,
             buffer_tokens: config.buffer_tokens,
-            plane: None,
+            size: None,
             work: KeyValueStore::new(config.use_long_term, config.use_long_term),
             long: KeyValueStore::new(false, config.count_long_term_usage),
             sensory: None,
@@ -387,6 +399,12 @@ impl MemoryManager {
     /// Whether anything has been memorised.
     pub(crate) fn engaged(&self) -> bool {
         self.engaged
+    }
+
+    /// The stride-16 size (w, h) the memory holds frames at, once anything is memorised or the
+    /// sensory memory made (until `clear_memory`, which makes a new manager).
+    pub(crate) fn frame_size(&self) -> Option<(usize, usize)> {
+        self.size
     }
 
     /// Working memory's tokens, its permanent part's, and long-term memory's (the schedule's
@@ -463,7 +481,8 @@ impl MemoryManager {
     /// shrinkage as `.readout#n`).
     pub(crate) fn add_memory(&mut self, keys: &Keys, value: &Feat, obj_value: &GpuTensor, as_permanent: Permanence, tap: &mut Tap) -> Result<()> {
         self.engaged = true;
-        let plane = *self.plane.get_or_insert(value.plane());
+        let (w, h) = *self.size.get_or_insert((value.w, value.h));
+        let plane = w * h;
         self.objects = value.n;
         // The object memory: a running sum of each object's summaries and areas.
         self.obj_memory = Some(match &self.obj_memory {
@@ -476,7 +495,15 @@ impl MemoryManager {
             if self.work.non_perm_size() >= max_work_tokens {
                 let reserve = self.max_long_tokens.saturating_sub(self.num_prototypes);
                 if self.long.non_perm_size() >= reserve {
-                    self.long.remove_obsolete(reserve.saturating_sub(self.buffer_tokens))?;
+                    // What survives, max_num_tokens - num_prototypes - buffer_tokens, may be 0
+                    // (every token goes); below that torch.topk refuses, and so does this.
+                    let keep = self.max_long_tokens as i64 - self.num_prototypes as i64 - self.buffer_tokens as i64;
+                    let keep = usize::try_from(keep).map_err(|_| {
+                        DiffusionError::model(format!(
+                            "cutie memory: long-term memory would keep {keep} tokens (max_long_tokens under num_prototypes + buffer_tokens)"
+                        ))
+                    })?;
+                    self.long.remove_obsolete(keep)?;
                     self.obsolete_removals += 1;
                 }
                 self.consolidate(self.min_mem_frames * plane, tap)?;
@@ -524,6 +551,7 @@ impl MemoryManager {
             let zeros = gpu_rife_fill(objects * SENSORY_DIM, w * h, 0.0).map_err(|e| dev("sensory memory", e))?;
             self.sensory = Some(Feat::new(zeros, objects, SENSORY_DIM, w, h)?);
             self.objects = objects;
+            self.size.get_or_insert((w, h));
         }
         Ok(())
     }
@@ -597,7 +625,7 @@ impl OracleMemory {
         if let Some(work) = Self::store(oracle, step, "state.before.work_mem.b0", objects, save_selection, save_usage)? {
             m.work = work;
             m.engaged = true;
-            m.plane = Some(w * h);
+            m.size = Some((w, h));
         }
         let save_usage = m.long.save_usage;
         if let Some(long) = Self::store(oracle, step, "state.before.long_mem.b0", objects, false, save_usage)? {
@@ -675,6 +703,39 @@ impl OracleMemory {
     }
 }
 
+/// What no oracle reaches, on small stores (step `edge`): long-term memory told to keep no tokens
+/// (`long_term.max_num_tokens` = num_prototypes + buffer_tokens: torch.topk with k 0) empties,
+/// and the consolidation's prototypes then join it alone; told to keep fewer than none, the add
+/// fails, as torch.topk does.
+fn check_edges(report: &mut Report) -> Result<()> {
+    let fill = |rows: usize, cols: usize, value: f32| gpu_rife_fill(rows, cols, value).map_err(|e| dev("memory edge", e));
+    let mut long = KeyValueStore::new(false, true);
+    long.add(&fill(64, 5, 1.0)?, &fill(1, 5, 1.0)?, None, &fill(VALUE_DIM, 5, 0.5)?, Permanence::No)?;
+    long.remove_obsolete(0)?;
+    let emptied = long.size() == 0 && long.values.is_none() && long.use_count.is_none() && long.life_count.is_none();
+    long.add(&fill(64, 3, 2.0)?, &fill(1, 3, 1.0)?, None, &fill(VALUE_DIM, 3, 0.5)?, Permanence::No)?;
+    let refilled = long.size() == 3 && long.use_count.as_ref().map(|c| c.cols()) == Some(3);
+    let note = format!("emptied {emptied}, then {} tokens with {:?} counts", long.size(), long.use_count.as_ref().map(|c| c.cols()));
+    report.record("memory", "edge", "long-term memory keeping no tokens", emptied && refilled, note);
+
+    // max_num_tokens under num_prototypes + buffer_tokens: the add that consolidates fails.
+    let config = CutieConfig { max_mem_frames: 2, min_mem_frames: 1, num_prototypes: 2, max_long_tokens: 2, buffer_tokens: 1, ..CutieConfig::default() };
+    let mut m = MemoryManager::new(&config);
+    let keys = Keys {
+        key: Feat::new(fill(64, 4, 1.0)?, 1, 64, 2, 2)?,
+        shrinkage: Feat::new(fill(1, 4, 1.0)?, 1, 1, 2, 2)?,
+        selection: Feat::new(fill(64, 4, 0.5)?, 1, 64, 2, 2)?,
+    };
+    let value = Feat::new(fill(VALUE_DIM, 4, 0.5)?, 1, VALUE_DIM, 2, 2)?;
+    let obj_value = fill(16, 257, 1.0)?;
+    m.add_memory(&keys, &value, &obj_value, Permanence::All, &mut Tap::none())?;
+    // The first temporary frame consolidates (max_mem_frames 2: one temporary frame); long-term
+    // memory, empty, already counts as full (2 - 2 = 0 tokens).
+    let refused = m.add_memory(&keys, &value, &obj_value, Permanence::First, &mut Tap::none()).is_err();
+    report.record("memory", "edge", "long-term memory keeping fewer than none", refused, format!("the add refused: {refused}"));
+    Ok(())
+}
+
 /// Stage `memory`: from the oracle's `state.before.*` of each tapped step, the step's memory work
 /// with the oracle's own inputs: the read's memory half (similarity, top-k, usage counted,
 /// readout) on the oracle's `key.*`, compared with `memory.read.*`; the sensory and object memory
@@ -701,6 +762,7 @@ impl OracleMemory {
 /// similarity (up to 1.9e-5 off at that step) changes no column's top k on either clip. The
 /// margin is thin: a similarity kernel must keep near-tied entries within those 33 ulps.
 pub(crate) fn check(oracle: &Oracle, report: &mut Report, _weights: &mut Weights) -> Result<()> {
+    check_edges(report)?;
     let config = &oracle.config;
     let schedule = oracle.schedule();
     let objects = oracle.objects;
@@ -750,10 +812,9 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, _weights: &mut Weights
         }
         cmp.with(|tap| memory.dump("state.after", tap))?;
         // Every memory tap the oracle has must have been compared (the last mask is the
-        // processor's).
-        for name in cmp.uncompared(&["memory.", "state.after.work_mem.", "state.after.long_mem.", "state.after.sensory.", "state.after.obj_memory."]) {
-            cmp.report.fail("memory", step, &name, "never compared");
-        }
+        // processor's), and every tap put must be in the oracle: a store with counts or a
+        // selection where the oracle's has none (a permanent part made temporary) fails.
+        cmp.check_coverage(&["memory.", "state.after.work_mem.", "state.after.long_mem.", "state.after.sensory.", "state.after.obj_memory."], &[]);
         // The schedule's sizes after the step, and whether it consolidated and dropped long-term
         // memory's least used tokens (not compared where the oracle did not record it).
         let sizes = memory.sizes();

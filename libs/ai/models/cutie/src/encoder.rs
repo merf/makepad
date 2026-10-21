@@ -239,26 +239,11 @@ const OWNED: [&str; 5] = ["net.pix_feat_proj", "encode_image.", "net.pixel_encod
 /// Names the stage owns but does not compare: its input, and conv1 before bn1 (folded here).
 const NOT_COMPARED: [&str; 2] = ["encode_image.in.image", "net.pixel_encoder.conv1"];
 
-/// Fails every name the stage owns that one side has and the other lacks, so a renamed tap or a
-/// regenerated oracle cannot drop comparisons and still pass.
-fn check_coverage(comparer: &mut Comparer) {
-    let step = comparer.step.clone();
-    for name in comparer.uncompared(&OWNED) {
-        if !NOT_COMPARED.contains(&name.as_str()) {
-            comparer.report.fail("encoder", &step, &name, "in the oracle, not put by the port");
-        }
-    }
-    let mut extra: Vec<String> = comparer.put_names().into_iter().filter(|name| !comparer.oracle.has(&step, name)).collect();
-    extra.sort();
-    for name in extra {
-        comparer.report.fail("encoder", &step, &name, "put by the port, not in the oracle");
-    }
-}
-
 /// Stage `encoder`: for every oracle step, the oracle's `encode_image.in.image` through
 /// `encode_image` and the oracle's `encode_image.out.f16` through `transform_key`, every tap
-/// compared (`Tol::STAGE`) and the names checked both ways (`check_coverage`). The parts are
-/// loaded alone (not as a `CutieNet`), so the stage runs before the other parts are ported.
+/// compared (`Tol::STAGE`) and the names checked both ways (`Comparer::check_coverage`). The
+/// parts are loaded alone (not as a `CutieNet`), so the stage runs before the other parts are
+/// ported.
 pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights) -> Result<()> {
     let pixel_encoder = PixelEncoder::load(weights)?;
     let key_proj = KeyProjection::load(weights)?;
@@ -275,7 +260,7 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
         let mut comparer = Comparer::new(oracle, report, "encoder", step, &tol);
         comparer.with(|tap| pixel_encoder.encode(&image, tap))?;
         comparer.with(|tap| key_proj.forward(&f16, tap))?;
-        check_coverage(&mut comparer);
+        comparer.check_coverage(&OWNED, &NOT_COMPARED);
     }
     Ok(())
 }

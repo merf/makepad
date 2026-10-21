@@ -443,32 +443,57 @@ impl CutieNet {
 /// a wrong block; and once with a mask row that would block every pixel (row `edge`, under
 /// `transformer`). The `*.in.*` rows are the fed inputs put back: they check layout and shape,
 /// not the port.
+///
+/// Every step that segments (any with a `segment.*`, `pixel_fusion.*` or `object_transformer.*`
+/// tap) must have the transformer's inputs, every oracle tap under the stage's names must be
+/// compared and every tap put must be in the oracle (`Comparer::check_coverage`), and some step
+/// must have been checked: a renamed tap on either side fails instead of passing with fewer
+/// comparisons.
 pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights) -> Result<()> {
+    const FUSION: [&str; 2] = ["pixel_fusion.", "net.pixel_fuser."];
+    const TRANSFORMER: [&str; 2] = ["object_transformer.", "net.object_transformer."];
     let fuser = PixelFuser::load(weights)?;
     let transformer = QueryTransformer::load(weights)?;
     let n = oracle.objects;
     let tol = |_: &str| Tol::STAGE;
+    let mut checked = 0;
     for step in oracle.steps() {
-        if !oracle.has(step, "object_transformer.in.pixel") {
+        let segments = oracle.names(step).iter().any(|name| ["segment.", FUSION[0], FUSION[1], TRANSFORMER[0], TRANSFORMER[1]].iter().any(|p| name.starts_with(p)));
+        if !segments {
             continue;
         }
+        if !oracle.has(step, "object_transformer.in.pixel") {
+            report.fail("transformer", step, "object_transformer.in.pixel", "not in the oracle, which segments here");
+            continue;
+        }
+        checked += 1;
         let pix_feat = oracle.feat_as(step, "encode_image.out.pix_feat", 1, EMBED)?;
         let visual_readout = oracle.feat_as(step, "pixel_fusion.in.visual_readout", n, EMBED)?;
         let sensory = oracle.feat_as(step, "pixel_fusion.in.sensory", n, EMBED)?;
         let last_mask = oracle.feat_as(step, "pixel_fusion.in.last_mask", n, 1)?;
-        Comparer::new(oracle, report, "fusion", step, &tol).with(|tap| fuser.forward(&pix_feat, &visual_readout, &sensory, &last_mask, tap))?;
+        let mut cmp = Comparer::new(oracle, report, "fusion", step, &tol);
+        cmp.with(|tap| fuser.forward(&pix_feat, &visual_readout, &sensory, &last_mask, tap))?;
+        cmp.check_coverage(&FUSION, &[]);
 
         let pixel = oracle.feat_as(step, "object_transformer.in.pixel", n, EMBED)?;
         let memory = oracle.tap(step, "object_transformer.in.obj_memory")?;
         let obj_memory = gpu_upload(&memory.values, n * QUERIES, EMBED + 1).map_err(|e| dev("check", e))?;
-        Comparer::new(oracle, report, "transformer", step, &tol).with(|tap| transformer.forward(&pixel, &obj_memory, None, tap))?;
+        let mut cmp = Comparer::new(oracle, report, "transformer", step, &tol);
+        cmp.with(|tap| transformer.forward(&pixel, &obj_memory, None, tap))?;
+        cmp.check_coverage(&TRANSFORMER, &[]);
 
         let masks = (0..BLOCKS).map(|b| oracle_mask(oracle, step, b)).collect::<Result<Vec<_>>>()?;
-        Comparer::new(oracle, report, "oracle-mask", step, &tol).with(|tap| transformer.forward(&pixel, &obj_memory, Some(&masks), tap))?;
+        let mut cmp = Comparer::new(oracle, report, "oracle-mask", step, &tol);
+        cmp.with(|tap| transformer.forward(&pixel, &obj_memory, Some(&masks), tap))?;
+        cmp.check_coverage(&TRANSFORMER, &[]);
 
-        if step == "prop_f1" {
+        // On the first step checked (prop_f1 in every oracle so far).
+        if checked == 1 {
             check_open_rows(report, &transformer, &pixel, &obj_memory)?;
         }
+    }
+    if checked == 0 {
+        report.fail("transformer", "-", "(stage)", "no oracle step reads memory through the object transformer");
     }
     Ok(())
 }

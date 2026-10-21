@@ -7,10 +7,29 @@
 //! ```ignore
 //! let cutie = Cutie::load(Path::new("cutie-base-mega.pth"))?;
 //! let mut p = cutie.processor(objects);
-//! let prob = p.step(&rgb, w, h, Some(&masks), true, false)?; // a memory frame
+//! p.step(&rgb, w, h, Some(&masks), true, false)?;             // commit: a memory frame
+//! // A propagation starts from its memory frame: the sensory memory cleared, the memory frame
+//! // stepped again with its mask (which makes the sensory memory anew), then the frames after it
+//! // without one.
 //! p.clear_sensory_memory();
+//! p.step(&rgb, w, h, Some(&masks), false, false)?;
 //! let prob = p.step(&next_rgb, w, h, None, false, false)?;   // propagated
+//! let labels = CutieProcessor::labels(&prob, objects + 1, w * h); // each pixel's object (0: none)
 //! ```
+//!
+//! Stepping without a mask straight after `clear_sensory_memory` is an error: nothing has made
+//! the sensory memory again (PyTorch's `InferenceCore` fails there too).
+//!
+//! **Threads**: the device tensors, the weight cache and the activation pool belong to the thread
+//! that made them. Load, step and unload (`unload_cutie`, then `gpu_pool_clear` if wanted) on one
+//! thread kept for Cutie. A `Cutie` moved to another thread still works there, but uploads every
+//! convolution's weights again on that thread, and `unload_cutie` frees only the calling thread's
+//! copy. A `CutieProcessor` borrows its `Cutie` and stays on its thread (it is not `Send`).
+//!
+//! **Errors**: a step that fails part way (the device out of memory, a frame of another size than
+//! the memory's) may leave the processor's counters advanced and its usage counted, as
+//! PyTorch's `InferenceCore` does: after an error, `clear_memory` (and memorise again) or make a
+//! new processor.
 //!
 //! Click corrections (Cutie's RITM interaction) are not part of this.
 
@@ -42,7 +61,8 @@ use std::path::Path;
 pub struct CutieConfig {
     /// A frame is memorised every this many steps.
     pub mem_every: usize,
-    /// How many memory tokens each pixel reads from.
+    /// How many memory tokens each pixel reads from: at most 64 (the top-k kernel's limit; a
+    /// step with more is an error).
     pub top_k: usize,
     /// How many steps between memorised frames update the sensory memory.
     pub stagger_updates: usize,
@@ -90,9 +110,14 @@ pub struct Cutie {
 }
 
 impl Cutie {
+    /// Reads the checkpoint and builds the network on the device. Fails at once where Cutie's
+    /// device ops do not run: a build without their CUDA kernels (macOS, whose device tensors are
+    /// Metal's, or a host without nvcc) or no CUDA device (`gpu_cutie_available`).
     pub fn load(path: &Path) -> Result<Self> {
-        if !crate::backend::gpu_device_available() {
-            return Err(DiffusionError::model("cutie requires the CUDA device tensor backend; no device is available"));
+        if !makepad_ai_common::gpu::gpu_cutie_available() {
+            return Err(DiffusionError::model(
+                "cutie requires the CUDA device tensor backend with Cutie's kernels; this build or host has none",
+            ));
         }
         let mut weights = Weights::load(path)?;
         Ok(Self { net: CutieNet::load(&mut weights)?, config: CutieConfig::default() })
@@ -104,9 +129,12 @@ impl Cutie {
     }
 }
 
-/// Frees Cutie's cached device weights. Same thread as the model.
+/// Frees Cutie's cached device weights and the idle activation pool: the calling thread's, which
+/// must be the model's (see Threads above). A thread that never used the device has nothing to
+/// free, and no device context is made for it.
 pub fn unload_cutie() -> Result<usize> {
-    let evicted = crate::backend::gpu_weight_cache_evict_prefix(&format!("{CUTIE_NAMESPACE}::")).map_err(DiffusionError::model)?;
+    let evicted =
+        crate::backend::gpu_weight_cache_evict_prefix_if_loaded(&format!("{CUTIE_NAMESPACE}::")).map_err(DiffusionError::model)?;
     crate::backend::gpu_pool_clear();
     Ok(evicted)
 }
