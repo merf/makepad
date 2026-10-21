@@ -29,8 +29,32 @@ static __device__ __forceinline__ float cutie_logit(float q) {
     return logf(q / (1.0f - q));
 }
 
+// PyTorch's order for a sum or product over a dimension that is not the innermost (Cutie's
+// objects, the top-k picks): four accumulators, term o into o % 4, then ((a0 . a1) . a2) . a3
+// (Reduce.cuh's thread_reduce_impl with vt0 = 4, one thread an output, which holds for fewer than
+// 64 terms). From 5 terms on it rounds differently from a sequential sum.
+template <bool Product, typename Term>
+static __device__ __forceinline__ float cutie_reduce4(uint32_t n, Term term) {
+    const float ident = Product ? 1.0f : 0.0f;
+    float acc[4] = {ident, ident, ident, ident};
+    for (uint32_t o = 0; o < n; o += 4) {
+#pragma unroll
+        for (uint32_t j = 0; j < 4; ++j) {
+            if (o + j < n) acc[j] = Product ? __fmul_rn(acc[j], term(o + j)) : __fadd_rn(acc[j], term(o + j));
+        }
+    }
+    return Product ? __fmul_rn(__fmul_rn(__fmul_rn(acc[0], acc[1]), acc[2]), acc[3])
+                   : __fadd_rn(__fadd_rn(__fadd_rn(acc[0], acc[1]), acc[2]), acc[3]);
+}
+
+// The larger of two values, a NaN in either winning (PyTorch's max_propagate_nan).
+static __device__ __forceinline__ float cutie_max_nan(float a, float b) {
+    return b != b ? b : (a != a ? a : fmaxf(a, b));
+}
+
 // MaxPool2d(kernel 3, stride 2, padding 1) on planar [planes, height*width]: padding never wins
-// (PyTorch pads with -inf), so a window takes the max of its in-bounds taps.
+// (PyTorch pads with -inf), so a window takes the max of its in-bounds taps; a NaN tap wins, as
+// in PyTorch's max_pool2d (`val > maxval || isnan(val)`).
 static __global__ void cutie_maxpool3x3s2_kernel(
     const float* __restrict__ x, float* __restrict__ out,
     uint32_t width, uint32_t height, uint32_t ow, uint32_t oh, uint32_t planes) {
@@ -47,7 +71,8 @@ static __global__ void cutie_maxpool3x3s2_kernel(
         for (int kx = 0; kx < 3; ++kx) {
             const int xx = ox * 2 - 1 + kx;
             if (xx < 0 || xx >= int(width)) continue;
-            best = fmaxf(best, src[size_t(y) * width + xx]);
+            const float v = src[size_t(y) * width + xx];
+            if (v > best || v != v) best = v;
         }
     }
     out[i] = best;
@@ -255,12 +280,11 @@ extern "C" cudaError_t makepad_cuda_cutie_eca_f32(
     return cudaGetLastError();
 }
 
-// For each object's mask [n, p], the others' sum (summed in object order, then the object's own
-// subtracted), clamped to 0..1 with NaN passing through.
+// For each object's mask [n, p], the others' sum (all objects summed in PyTorch's order, then the
+// object's own subtracted), clamped to 0..1 with NaN passing through.
 static __global__ void cutie_others_kernel(const float* __restrict__ masks, float* __restrict__ out, uint32_t n, size_t p) {
     for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < p; i += size_t(gridDim.x) * blockDim.x) {
-        float sum = 0.0f;
-        for (uint32_t o = 0; o < n; ++o) sum = __fadd_rn(sum, masks[o * p + i]);
+        const float sum = cutie_reduce4<false>(n, [&](uint32_t o) { return masks[o * p + i]; });
         for (uint32_t o = 0; o < n; ++o) {
             const float d = __fsub_rn(sum, masks[o * p + i]);
             out[o * p + i] = d < 0.0f ? 0.0f : (d > 1.0f ? 1.0f : d);
@@ -366,10 +390,11 @@ extern "C" cudaError_t makepad_cuda_cutie_similarity_prep_f32(
 
 // The similarity from its GEMMs, in the reference's order: with a selection, `sim` holds a_sq
 // and `two_ab` mk^T (qk*qe): ((-a_sq + 2 two_ab) - b_sq); without, `sim` holds mk^T qk and
-// a_sq is per token: (-a_sq + 2 sim). Then * ms (when given) / scale. In place in `sim`.
+// a_sq is per token: (-a_sq + 2 sim). Then * ms (when given), then * inv_scale (PyTorch divides
+// by the scalar sqrt(CK) as a multiply by its reciprocal). In place in `sim`.
 static __global__ void cutie_similarity_epilogue_kernel(
     float* __restrict__ sim, const float* __restrict__ two_ab, const float* __restrict__ b_sq,
-    const float* __restrict__ a_sq, const float* __restrict__ ms, float scale, uint32_t p, size_t n) {
+    const float* __restrict__ a_sq, const float* __restrict__ ms, float inv_scale, uint32_t p, size_t n) {
     for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
         const size_t j = i / p, px = i % p;
         float s;
@@ -379,70 +404,86 @@ static __global__ void cutie_similarity_epilogue_kernel(
             s = __fadd_rn(-a_sq[j], __fmul_rn(2.0f, sim[i]));
         }
         if (ms) s = __fmul_rn(s, ms[j]);
-        sim[i] = __fdiv_rn(s, scale);
+        sim[i] = __fmul_rn(s, inv_scale);
     }
 }
 
 extern "C" cudaError_t makepad_cuda_cutie_similarity_epilogue_f32(
-    float* sim, const float* two_ab, const float* b_sq, const float* a_sq, const float* ms, float scale,
+    float* sim, const float* two_ab, const float* b_sq, const float* a_sq, const float* ms, float inv_scale,
     uint32_t m, uint32_t p, cudaStream_t stream) {
     const size_t n = size_t(m) * p;
     if (!n) return cudaSuccess;
-    cutie_similarity_epilogue_kernel<<<cutie_blocks(n, 256), 256, 0, stream>>>(sim, two_ab, b_sq, a_sq, ms, scale, p, n);
+    cutie_similarity_epilogue_kernel<<<cutie_blocks(n, 256), 256, 0, stream>>>(sim, two_ab, b_sq, a_sq, ms, inv_scale, p, n);
     return cudaGetLastError();
 }
 
-// Top-k down the columns of sim [m, p]. The order is the reference's total order: the larger
-// value first, equal values by the lower row.
+// Top-k down the columns of sim [m, p] in torch.topk's order: values compared by PyTorch's radix
+// key (TopKTypeConfig<float>::convert), so -0 ranks below +0 and every NaN above every number;
+// equal keys by the lower row, the rows torch.topk takes at the k-th place.
 #define CUTIE_TOPK_MAX 64
 #define CUTIE_TOPK_COLS 32
 #define CUTIE_TOPK_SLICES_PER_BLOCK 4
 #define CUTIE_TOPK_SLICE_ROWS 256
+// An empty place in a list: key 0 is below every float's key (-inf's is 0x007fffff), so every
+// row beats it and it is never chosen while k <= m.
+#define CUTIE_TOPK_EMPTY_KEY 0u
+#define CUTIE_TOPK_EMPTY_ROW 0xffffffffu
 
-static __device__ __forceinline__ bool cutie_topk_before(float a, uint32_t ia, float b, uint32_t ib) {
-    return a > b || (a == b && ia < ib);
+// A float's radix key: the keys' unsigned order is torch.topk's order of the values.
+static __device__ __forceinline__ uint32_t cutie_topk_key(float v) {
+    const uint32_t x = __float_as_uint(v);
+    if (v != v) return 0xffffffffu;
+    return x ^ ((x & 0x80000000u) ? 0xffffffffu : 0x80000000u);
+}
+
+// The value back from its key (every NaN comes back as the one NaN 0x7fffffff).
+static __device__ __forceinline__ float cutie_topk_value(uint32_t key) {
+    return __uint_as_float((key & 0x80000000u) ? (key ^ 0x80000000u) : ~key);
+}
+
+static __device__ __forceinline__ bool cutie_topk_before(uint32_t ka, uint32_t ia, uint32_t kb, uint32_t ib) {
+    return ka > kb || (ka == kb && ia < ib);
 }
 
 // Each thread takes one column's rows [slice*chunk, (slice+1)*chunk) and keeps the best K of
-// them in registers, sorted (a new entry is carried down the list, swapping past every entry
-// it beats); reads are coalesced across the 32 columns of a block row. The first k of each
-// list go to vals/idx [slices][k][p]. Empty places are (-inf, ~0), which every real entry
-// beats, so they are never chosen while k <= m.
+// them in registers as keys, sorted (a new entry is carried down the list, swapping past every
+// entry it beats); reads are coalesced across the 32 columns of a block row. The first k of
+// each list go to keys/idx [slices][k][p].
 template <int K>
 static __global__ void __launch_bounds__(CUTIE_TOPK_COLS * CUTIE_TOPK_SLICES_PER_BLOCK) cutie_topk_partial_kernel(
-    const float* __restrict__ sim, float* __restrict__ vals, uint32_t* __restrict__ idx,
+    const float* __restrict__ sim, uint32_t* __restrict__ keys, uint32_t* __restrict__ idx,
     uint32_t m, uint32_t p, uint32_t k, uint32_t chunk, uint32_t slices) {
     const uint32_t col = blockIdx.x * CUTIE_TOPK_COLS + threadIdx.x;
     const uint32_t slice = blockIdx.y * CUTIE_TOPK_SLICES_PER_BLOCK + threadIdx.y;
     if (col >= p || slice >= slices) return;
-    float tv[K];
+    uint32_t tk[K];
     uint32_t ti[K];
 #pragma unroll
     for (int t = 0; t < K; ++t) {
-        tv[t] = -CUDART_INF_F;
-        ti[t] = 0xffffffffu;
+        tk[t] = CUTIE_TOPK_EMPTY_KEY;
+        ti[t] = CUTIE_TOPK_EMPTY_ROW;
     }
     const uint32_t start = slice * chunk;
     const uint32_t end = min(m, start + chunk);
     const float* src = sim + col;
     // Rows are read four at a time so the loads are in flight together.
     for (uint32_t j = start; j < end; j += 4) {
-        float batch[4];
+        uint32_t batch[4];
 #pragma unroll
-        for (int u = 0; u < 4; ++u) batch[u] = j + u < end ? src[size_t(j + u) * p] : -CUDART_INF_F;
+        for (int u = 0; u < 4; ++u) batch[u] = j + u < end ? cutie_topk_key(src[size_t(j + u) * p]) : CUTIE_TOPK_EMPTY_KEY;
 #pragma unroll
         for (int u = 0; u < 4; ++u) {
             uint32_t row = j + u;
-            float x = batch[u];
-            if (row >= end || !cutie_topk_before(x, row, tv[K - 1], ti[K - 1])) continue;
+            uint32_t key = batch[u];
+            if (row >= end || !cutie_topk_before(key, row, tk[K - 1], ti[K - 1])) continue;
 #pragma unroll
             for (int t = 0; t < K; ++t) {
-                const bool before = cutie_topk_before(x, row, tv[t], ti[t]);
-                const float sv = tv[t];
+                const bool before = cutie_topk_before(key, row, tk[t], ti[t]);
+                const uint32_t sk = tk[t];
                 const uint32_t si = ti[t];
-                tv[t] = before ? x : sv;
+                tk[t] = before ? key : sk;
                 ti[t] = before ? row : si;
-                x = before ? sv : x;
+                key = before ? sk : key;
                 row = before ? si : row;
             }
         }
@@ -450,62 +491,66 @@ static __global__ void __launch_bounds__(CUTIE_TOPK_COLS * CUTIE_TOPK_SLICES_PER
 #pragma unroll
     for (int t = 0; t < K; ++t) {
         if (uint32_t(t) < k) {
-            vals[(size_t(slice) * k + t) * p + col] = tv[t];
+            keys[(size_t(slice) * k + t) * p + col] = tk[t];
             idx[(size_t(slice) * k + t) * p + col] = ti[t];
         }
     }
 }
 
 // One warp a column: lane l holds the heads of slices l and l+32. Each of the k picks is the
-// warp's best head (a shuffle reduction in the total order; rows are unique, so one lane owns
-// it and advances). Then the softmax as Cutie's do_softmax: exp of the picked values (no max
-// subtracted), summed in pick order (best first), normalised, scattered into aff [m, p]
-// (zeroed before).
+// warp's best head (a shuffle reduction in the key order; rows are unique, so one lane owns it
+// and advances). Then the softmax as Cutie's do_softmax: exp of the picked values (no max
+// subtracted), summed in PyTorch's order over the picks (best first, cutie_reduce4's four
+// accumulators), normalised, scattered into aff [m, p] (zeroed before).
 static __global__ void cutie_topk_merge_kernel(
-    const float* __restrict__ vals, const uint32_t* __restrict__ idx, float* __restrict__ aff,
-    uint32_t p, uint32_t k, uint32_t slices) {
+    const uint32_t* __restrict__ keys, const uint32_t* __restrict__ idx, float* __restrict__ aff,
+    uint32_t m, uint32_t p, uint32_t k, uint32_t slices) {
     const uint32_t col = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     const uint32_t lane = threadIdx.x % 32;
     if (col >= p) return;
     const uint32_t s0 = lane, s1 = lane + 32;
     uint32_t h0 = 0, h1 = 0;
-    float v0 = -CUDART_INF_F, v1 = -CUDART_INF_F;
-    uint32_t i0 = 0xffffffffu, i1 = 0xffffffffu;
+    uint32_t key0 = CUTIE_TOPK_EMPTY_KEY, key1 = CUTIE_TOPK_EMPTY_KEY;
+    uint32_t i0 = CUTIE_TOPK_EMPTY_ROW, i1 = CUTIE_TOPK_EMPTY_ROW;
     if (s0 < slices) {
-        v0 = vals[size_t(s0) * k * p + col];
+        key0 = keys[size_t(s0) * k * p + col];
         i0 = idx[size_t(s0) * k * p + col];
     }
     if (s1 < slices) {
-        v1 = vals[size_t(s1) * k * p + col];
+        key1 = keys[size_t(s1) * k * p + col];
         i1 = idx[size_t(s1) * k * p + col];
     }
     // Lane l keeps picks l and l+32: their exp and row.
     float e0 = 0.0f, e1 = 0.0f;
-    uint32_t r0 = 0, r1 = 0;
-    float sum = 0.0f;
+    uint32_t r0 = CUTIE_TOPK_EMPTY_ROW, r1 = CUTIE_TOPK_EMPTY_ROW;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
     for (uint32_t t = 0; t < k; ++t) {
-        const bool second = cutie_topk_before(v1, i1, v0, i0);
-        float bv = second ? v1 : v0;
+        const bool second = cutie_topk_before(key1, i1, key0, i0);
+        uint32_t bk = second ? key1 : key0;
         uint32_t bi = second ? i1 : i0;
         for (int offset = 16; offset > 0; offset >>= 1) {
-            const float ov = __shfl_xor_sync(0xffffffffu, bv, offset);
+            const uint32_t ok = __shfl_xor_sync(0xffffffffu, bk, offset);
             const uint32_t oi = __shfl_xor_sync(0xffffffffu, bi, offset);
-            if (cutie_topk_before(ov, oi, bv, bi)) {
-                bv = ov;
+            if (cutie_topk_before(ok, oi, bk, bi)) {
+                bk = ok;
                 bi = oi;
             }
         }
         if (bi == i0 && s0 < slices) {
             ++h0;
-            v0 = h0 < k ? vals[(size_t(s0) * k + h0) * p + col] : -CUDART_INF_F;
-            i0 = h0 < k ? idx[(size_t(s0) * k + h0) * p + col] : 0xffffffffu;
+            key0 = h0 < k ? keys[(size_t(s0) * k + h0) * p + col] : CUTIE_TOPK_EMPTY_KEY;
+            i0 = h0 < k ? idx[(size_t(s0) * k + h0) * p + col] : CUTIE_TOPK_EMPTY_ROW;
         } else if (bi == i1 && s1 < slices) {
             ++h1;
-            v1 = h1 < k ? vals[(size_t(s1) * k + h1) * p + col] : -CUDART_INF_F;
-            i1 = h1 < k ? idx[(size_t(s1) * k + h1) * p + col] : 0xffffffffu;
+            key1 = h1 < k ? keys[(size_t(s1) * k + h1) * p + col] : CUTIE_TOPK_EMPTY_KEY;
+            i1 = h1 < k ? idx[(size_t(s1) * k + h1) * p + col] : CUTIE_TOPK_EMPTY_ROW;
         }
-        const float e = expf(bv);
-        sum = __fadd_rn(sum, e);
+        const float e = expf(cutie_topk_value(bk));
+        const uint32_t slot = t & 3u;
+        a0 = slot == 0 ? __fadd_rn(a0, e) : a0;
+        a1 = slot == 1 ? __fadd_rn(a1, e) : a1;
+        a2 = slot == 2 ? __fadd_rn(a2, e) : a2;
+        a3 = slot == 3 ? __fadd_rn(a3, e) : a3;
         if (t % 32 == lane) {
             if (t < 32) {
                 e0 = e;
@@ -516,11 +561,14 @@ static __global__ void cutie_topk_merge_kernel(
             }
         }
     }
-    if (lane < k) aff[size_t(r0) * p + col] = e0 / sum;
-    if (lane + 32 < k) aff[size_t(r1) * p + col] = e1 / sum;
+    const float sum = __fadd_rn(__fadd_rn(__fadd_rn(a0, a1), a2), a3);
+    // A pick is always a real row while k <= m; the bound keeps a stray one off memory.
+    if (lane < k && r0 < m) aff[size_t(r0) * p + col] = e0 / sum;
+    if (lane + 32 < k && r1 < m) aff[size_t(r1) * p + col] = e1 / sum;
 }
 
-// The sum of each row of [rows, cols]: one warp a row.
+// The sum of each row of [rows, cols]: one warp a row. Not PyTorch's order for affinity.sum(dim=2)
+// (a vectorised innermost reduce), so the usage is fp32 rounding apart from PyTorch's.
 static __global__ void cutie_row_sum_kernel(const float* __restrict__ x, float* __restrict__ out, uint32_t rows, uint32_t cols) {
     const uint32_t row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
     const uint32_t lane = threadIdx.x % 32;
@@ -544,9 +592,9 @@ extern "C" size_t makepad_cuda_cutie_topk_scratch_entries(uint32_t m, uint32_t p
     return size_t(cutie_topk_slices(m)) * p * k;
 }
 
-// aff [m, p] must be zeroed; vals and idx hold makepad_cuda_cutie_topk_scratch_entries each.
+// aff [m, p] must be zeroed; keys and idx hold makepad_cuda_cutie_topk_scratch_entries each.
 extern "C" cudaError_t makepad_cuda_cutie_topk_softmax_f32(
-    const float* sim, float* aff, float* usage, float* vals, uint32_t* idx, uint32_t m, uint32_t p, uint32_t k,
+    const float* sim, float* aff, float* usage, uint32_t* keys, uint32_t* idx, uint32_t m, uint32_t p, uint32_t k,
     cudaStream_t stream) {
     if (k > CUTIE_TOPK_MAX || k > m) return cudaErrorInvalidValue;
     if (!m || !p) return cudaSuccess;
@@ -557,17 +605,19 @@ extern "C" cudaError_t makepad_cuda_cutie_topk_softmax_f32(
         const dim3 grid((p + CUTIE_TOPK_COLS - 1) / CUTIE_TOPK_COLS,
                         (slices + CUTIE_TOPK_SLICES_PER_BLOCK - 1) / CUTIE_TOPK_SLICES_PER_BLOCK, 1);
         if (k <= 32) {
-            cutie_topk_partial_kernel<32><<<grid, block, 0, stream>>>(sim, vals, idx, m, p, k, chunk, slices);
+            cutie_topk_partial_kernel<32><<<grid, block, 0, stream>>>(sim, keys, idx, m, p, k, chunk, slices);
         } else {
-            cutie_topk_partial_kernel<64><<<grid, block, 0, stream>>>(sim, vals, idx, m, p, k, chunk, slices);
+            cutie_topk_partial_kernel<64><<<grid, block, 0, stream>>>(sim, keys, idx, m, p, k, chunk, slices);
         }
-        cutie_topk_merge_kernel<<<(p + 3) / 4, 128, 0, stream>>>(vals, idx, aff, p, k, slices);
+        cutie_topk_merge_kernel<<<(p + 3) / 4, 128, 0, stream>>>(keys, idx, aff, m, p, k, slices);
     }
     cutie_row_sum_kernel<<<(m + 7) / 8, 256, 0, stream>>>(aff, usage, m, p);
     return cudaGetLastError();
 }
 
-// Softmax down each column of [m, p]: the max, exp(x - max) summed in row order, divided.
+// Softmax down each column of [m, p], one thread a column: the max, exp(x - max) summed in row
+// order, divided. PyTorch's spatial softmax over a few rows (the decoder's F.softmax over
+// background and objects) does exactly this.
 static __global__ void cutie_softmax_axis0_kernel(const float* __restrict__ x, float* __restrict__ out, uint32_t m, uint32_t p) {
     const uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;
     if (col >= p) return;
@@ -582,24 +632,71 @@ static __global__ void cutie_softmax_axis0_kernel(const float* __restrict__ x, f
     for (uint32_t j = 0; j < m; ++j) out[size_t(j) * p + col] = out[size_t(j) * p + col] / sum;
 }
 
+// The same for few columns over many rows (memory consolidation: candidates by 128 prototypes),
+// where a thread a column would leave the GPU idle: a block a tile of CUTIE_SOFTMAX_TILE_COLS
+// columns, its CUTIE_SOFTMAX_TILE_ROWS thread rows striding down them (each warp reads a few
+// rows' sectors), max and sum reduced across the thread rows in a fixed tree. PyTorch's own
+// order there (torch.sum over the candidates) is a multi-block reduce: fp32 rounding apart
+// either way.
+#define CUTIE_SOFTMAX_TILE_COLS 8
+#define CUTIE_SOFTMAX_TILE_ROWS 128
+static __global__ void __launch_bounds__(CUTIE_SOFTMAX_TILE_COLS * CUTIE_SOFTMAX_TILE_ROWS) cutie_softmax_axis0_tile_kernel(
+    const float* __restrict__ x, float* __restrict__ out, uint32_t m, uint32_t p) {
+    __shared__ float shared[CUTIE_SOFTMAX_TILE_ROWS][CUTIE_SOFTMAX_TILE_COLS];
+    const uint32_t tx = threadIdx.x, ty = threadIdx.y;
+    const uint32_t col = blockIdx.x * CUTIE_SOFTMAX_TILE_COLS + tx;
+    const bool live = col < p;
+    float max = -CUDART_INF_F;
+    if (live) {
+        for (uint32_t j = ty; j < m; j += CUTIE_SOFTMAX_TILE_ROWS) max = fmaxf(max, x[size_t(j) * p + col]);
+    }
+    shared[ty][tx] = max;
+    __syncthreads();
+    for (uint32_t s = CUTIE_SOFTMAX_TILE_ROWS / 2; s > 0; s >>= 1) {
+        if (ty < s) shared[ty][tx] = fmaxf(shared[ty][tx], shared[ty + s][tx]);
+        __syncthreads();
+    }
+    max = shared[0][tx];
+    __syncthreads();
+    float sum = 0.0f;
+    if (live) {
+        for (uint32_t j = ty; j < m; j += CUTIE_SOFTMAX_TILE_ROWS) {
+            const float e = expf(__fsub_rn(x[size_t(j) * p + col], max));
+            out[size_t(j) * p + col] = e;
+            sum = __fadd_rn(sum, e);
+        }
+    }
+    shared[ty][tx] = sum;
+    __syncthreads();
+    for (uint32_t s = CUTIE_SOFTMAX_TILE_ROWS / 2; s > 0; s >>= 1) {
+        if (ty < s) shared[ty][tx] = __fadd_rn(shared[ty][tx], shared[ty + s][tx]);
+        __syncthreads();
+    }
+    sum = shared[0][tx];
+    if (live) {
+        for (uint32_t j = ty; j < m; j += CUTIE_SOFTMAX_TILE_ROWS) out[size_t(j) * p + col] = out[size_t(j) * p + col] / sum;
+    }
+}
+
 extern "C" cudaError_t makepad_cuda_cutie_softmax_axis0_f32(const float* x, float* out, uint32_t m, uint32_t p, cudaStream_t stream) {
     if (!m || !p) return cudaSuccess;
-    cutie_softmax_axis0_kernel<<<(p + 127) / 128, 128, 0, stream>>>(x, out, m, p);
+    if (m > 64 && p < 8192) {
+        const dim3 block(CUTIE_SOFTMAX_TILE_COLS, CUTIE_SOFTMAX_TILE_ROWS, 1);
+        cutie_softmax_axis0_tile_kernel<<<(p + CUTIE_SOFTMAX_TILE_COLS - 1) / CUTIE_SOFTMAX_TILE_COLS, block, 0, stream>>>(x, out, m, p);
+    } else {
+        cutie_softmax_axis0_kernel<<<(p + 127) / 128, 128, 0, stream>>>(x, out, m, p);
+    }
     return cudaGetLastError();
 }
 
 // --- Objects ---
 
 // Cutie's aggregate: [n, p] probabilities to [n+1, p] logits, the background prod(1 - prob)
-// (multiplied in object order) first.
+// (multiplied in PyTorch's order) first.
 static __global__ void cutie_aggregate_kernel(const float* __restrict__ prob, float* __restrict__ out, uint32_t n, size_t p) {
     for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < p; i += size_t(gridDim.x) * blockDim.x) {
-        float bg = 1.0f;
-        for (uint32_t o = 0; o < n; ++o) {
-            const float v = prob[o * p + i];
-            bg = __fmul_rn(bg, __fsub_rn(1.0f, v));
-            out[(o + 1) * p + i] = cutie_logit(v);
-        }
+        const float bg = cutie_reduce4<true>(n, [&](uint32_t o) { return __fsub_rn(1.0f, prob[o * p + i]); });
+        for (uint32_t o = 0; o < n; ++o) out[(o + 1) * p + i] = cutie_logit(prob[o * p + i]);
         out[i] = cutie_logit(bg);
     }
 }
@@ -616,10 +713,10 @@ extern "C" cudaError_t makepad_cuda_cutie_aggregate_f32(const float* prob, float
 static __global__ void cutie_attn_foreground_kernel(
     const float* __restrict__ aux, uint32_t* __restrict__ fg, uint32_t* __restrict__ seen, uint32_t n, size_t p) {
     for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < p; i += size_t(gridDim.x) * blockDim.x) {
-        float bg = 1.0f;
-        for (uint32_t o = 0; o < n; ++o) bg = __fmul_rn(bg, __fsub_rn(1.0f, cutie_sigmoid(aux[o * p + i])));
-        float max = fmaxf(-CUDART_INF_F, cutie_logit(bg));
-        for (uint32_t o = 0; o < n; ++o) max = fmaxf(max, cutie_logit(cutie_sigmoid(aux[o * p + i])));
+        const float bg = cutie_reduce4<true>(n, [&](uint32_t o) { return __fsub_rn(1.0f, cutie_sigmoid(aux[o * p + i])); });
+        // A NaN anywhere makes the max NaN (logits.max propagates it), and then no row is >= it.
+        float max = cutie_logit(bg);
+        for (uint32_t o = 0; o < n; ++o) max = cutie_max_nan(max, cutie_logit(cutie_sigmoid(aux[o * p + i])));
         for (uint32_t o = 0; o < n; ++o) {
             const uint32_t is_fg = cutie_logit(cutie_sigmoid(aux[o * p + i])) >= max ? 1u : 0u;
             fg[o * p + i] = is_fg;

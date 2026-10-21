@@ -1,14 +1,21 @@
 //! Stage `ops`: each Cutie device op (cuda/src/cutie_ops.rs) against its host reference, on
-//! random inputs at Cutie's shapes (several objects, odd sizes, the padded oracle sizes) and the
-//! edge cases each op has (k > rows for top-k, ties, a mask row blocked everywhere, padding at
-//! every border for max-pool and the strided convs).
+//! seeded random inputs at Cutie's shapes (several objects, odd sizes, the padded oracle sizes)
+//! and the edge cases each op has (k > rows for top-k, ties, NaN, a mask row blocked everywhere,
+//! padding at every border for max-pool and the strided convs). The oracle is not read: every
+//! clip gives the same result.
 //!
 //! The shapes are the oracle's: frames 384x216 padded to 384x224, so strides 2, 4, 8 and 16 are
-//! 192x112, 96x56, 48x28 and 24x14 (336 tokens); 1 to 3 objects; memory of 336 to 3500 tokens.
+//! 192x112, 96x56, 48x28 and 24x14 (336 tokens); 1 to 3 objects, and 5 to 9 where PyTorch's
+//! order over objects stops being sequential; memory of 336 to 3500 tokens; and a few at the
+//! worker's max_internal_size (1000 on the short side: 1792x1008 padded).
 //! Ops that only move or compare values must match exactly; ops that sum or call exp, tanh or
 //! log must be within fp32 rounding (`TIGHT`); top-k must also choose the same set (the kernel
 //! breaks ties as the reference does: the lower row). Each op at a real shape is timed against
 //! its reference too (a note per case; indicative only, the GPU is shared).
+//!
+//! The references share the kernels' reading of PyTorch's semantics, so a few results are also
+//! pinned to PyTorch's own (`pinned`): values torch 2.11 computed on CUDA for inputs where its
+//! summation order differs from a sequential one.
 
 use crate::model::{dev, CUTIE_NAMESPACE};
 use crate::oracle::{OracleTap, Report, Tol};
@@ -67,6 +74,49 @@ impl Rng {
     }
 }
 
+/// Inputs where PyTorch's order over objects or picks (four accumulators) and a sequential one
+/// round differently: the golden-ratio sequence fract(i * 0.618034 + 0.05) in f32, as the probe
+/// that computed the `PINNED_*` values made it.
+fn golden(count: usize) -> Vec<f32> {
+    (0..count)
+        .map(|i| {
+            let x = i as f32 * 0.618034 + 0.05;
+            x - x.floor()
+        })
+        .collect()
+}
+
+/// torch 2.11 (CUDA, fp32) `(masks.sum(dim=1, keepdim=True) - masks).clamp(0, 1)` for 5 objects of
+/// 8 pixels, masks = golden(40) * 0.15 as [1, 5, 1, 8]; its sums differ from sequential ones at
+/// pixels 1, 4, 6 and 7.
+const PINNED_OTHERS: [u32; 40] = [
+    0x3f0be166, 0x3ea26bca, 0x3db452e1, 0x3eeaf0e2, 0x3e6b33b5, 0x3e99dc72, 0x3ebe1f02, 0x3e118ff0,
+    0x3ecf3da6, 0x3ea6b371, 0x3dc57181, 0x3eef3888, 0x3e73c302, 0x3e9e2419, 0x3ec266a8, 0x3e1a1f44,
+    0x3ed3854e, 0x3eaafb17, 0x3dd69021, 0x3ef38030, 0x3e7c5258, 0x3ea26bc1, 0x3ec6ae50, 0x3e22ae94,
+    0x3ed7ccf6, 0x3eaf42bf, 0x3de7aed4, 0x3ef7c7dd, 0x3e8270d4, 0x3e33cd38, 0x3ecaf602, 0x3e2b3dee,
+    0x3edc14a3, 0x3eb38a6c, 0x3df8cd61, 0x3efc0f8a, 0x3e86b880, 0x3e3c5c91, 0x3ecf3da5, 0x3e33cd34,
+];
+
+/// torch 2.11 (CUDA, fp32) Cutie's `aggregate(masks, dim=1)` of the same masks ([6, 8], the
+/// background first); its products differ from sequential ones at pixels 3, 4, 6 and 7.
+const PINNED_AGGREGATE: [u32; 48] = [
+    0x3e53501b, 0x3f1a73bc, 0x3ff98bf2, 0x3dfcb514, 0x3f7b3c0d, 0x3f63ccfa, 0x3ecfcf7f, 0x3fbee105,
+    0xc09c5493, 0xc00c7a06, 0xc046b4d8, 0xbfed14c0, 0xc01dc8f1, 0xc075cf30, 0xc0036771, 0xc034428c,
+    0xbfdee4be, 0xc012a4b0, 0xc055214a, 0xbff674d2, 0xc0259613, 0xc08b64db, 0xc008e402, 0xc03f1591,
+    0xbfe78730, 0xc019563b, 0xc06768bd, 0xc0002fcc, 0xc02e4d80, 0xc0ae2e6e, 0xc00ec698, 0xc04bde44,
+    0xbff09a43, 0xc020ab81, 0xc080479b, 0xc00574eb, 0xc038341c, 0xbfe2249c, 0xc01521f0, 0xc05b8c1e,
+    0xbffa2d2d, 0xc028cb95, 0xc094caba, 0xc00b1691, 0xc043b269, 0xbfeaf07e, 0xc01c0e21, 0xc06ff04a,
+];
+
+/// torch 2.11 (CUDA, fp32) Cutie's `do_softmax(sim, top_k=30)` of one column of 32, sim =
+/// golden(32) * -25 as [1, 32, 1]; its denominator differs from a sequential sum's.
+const PINNED_TOPK: [u32; 32] = [
+    0x3e9298b5, 0x336fa8db, 0x3a4d443f, 0x2f27c995, 0x360fb560, 0x3cf62bc4, 0x31c938fa, 0x38ac580b,
+    0x00000000, 0x347151c4, 0x3b4eb054, 0x3028f2d2, 0x3710b40f, 0x3df7e005, 0x32ca9d3d, 0x39ad8a3b,
+    0x2e8dda2c, 0x3572fd14, 0x3c501eee, 0x312a1e70, 0x3811b525, 0x3ef997ac, 0x33cc04aa, 0x3aaebe0b,
+    0x2f8ed5d0, 0x3674ac11, 0x3d519159, 0x322b4d39, 0x3912b797, 0x00000000, 0x34cd70fd, 0x3baff50f,
+];
+
 /// How long `f` takes on the device: after a warm run, the best of `rounds` rounds of 3 runs
 /// each (their mean, synchronised), since the GPU is shared and other work only adds time.
 fn time_ms<T>(rounds: usize, mut f: impl FnMut() -> std::result::Result<T, String>) -> Result<f64> {
@@ -104,6 +154,17 @@ impl OpsCheck<'_> {
     /// The kernel's result against the reference's, as an oracle tap would be.
     fn compare(&mut self, op: &str, case: &str, actual: &GpuTensor, expected: &GpuTensor, tol: Tol) -> Result<()> {
         let tap = OracleTap { shape: vec![expected.rows(), expected.cols()], dtype: "f32".into(), values: down(expected)? };
+        self.report.compare(STAGE, op, case, &down(actual)?, &tap, tol);
+        Ok(())
+    }
+
+    /// A result against values PyTorch computed (`PINNED_*`, as bits).
+    fn compare_pinned(&mut self, op: &str, case: &str, actual: &GpuTensor, bits: &[u32], tol: Tol) -> Result<()> {
+        let tap = OracleTap {
+            shape: vec![actual.rows(), actual.cols()],
+            dtype: "f32".into(),
+            values: bits.iter().map(|&b| f32::from_bits(b)).collect(),
+        };
         self.report.compare(STAGE, op, case, &down(actual)?, &tap, tol);
         Ok(())
     }
@@ -185,6 +246,11 @@ impl OpsCheck<'_> {
         // Several big images run as a strided batch (several small ones side by side, above):
         // a 1x1 there reads its input directly.
         self.conv("batched 1x1", 2, 64, 96, 56, 64, 1, 0, 1, true, false)?;
+        // Images whose columns outgrow the im2col scratch go through in groups: a frame at the
+        // worker's max_internal_size (1792x1008 padded), one image a GEMM; three images that fit
+        // two at a time (groups of 2, then 1).
+        self.conv("mask stem 1000p", 2, 5, 1792, 1008, 64, 7, 3, 2, true, true)?;
+        self.conv("grouped", 3, 64, 224, 192, 64, 3, 1, 1, true, false)?;
         // Odd sizes: strided windows past every border, k == stride, even k, padded 1x1, no bias.
         self.conv("odd", 2, 7, 13, 9, 5, 3, 1, 2, true, false)?;
         self.conv("odd", 1, 3, 17, 11, 4, 5, 2, 1, false, false)?;
@@ -200,9 +266,15 @@ impl OpsCheck<'_> {
 
     // --- Pooling and elementwise ---
 
-    fn maxpool(&mut self, planes: usize, w: usize, h: usize, timed: bool) -> Result<()> {
-        let x = up(&self.rng.normals(planes * w * h, 1.0), planes, w * h)?;
-        let case = format!("{planes} planes {w}x{h}");
+    /// Max-pool of random planes; `nan_every` puts a NaN at every so many taps (0: none), which
+    /// wins its windows as in PyTorch.
+    fn maxpool(&mut self, planes: usize, w: usize, h: usize, nan_every: usize, timed: bool) -> Result<()> {
+        let mut v = self.rng.normals(planes * w * h, 1.0);
+        if nan_every > 0 {
+            v.iter_mut().step_by(nan_every).for_each(|t| *t = f32::NAN);
+        }
+        let x = up(&v, planes, w * h)?;
+        let case = format!("{planes} planes {w}x{h}{}", if nan_every > 0 { " nan" } else { "" });
         let actual = gpu_cutie_maxpool3x3s2(&x, w, h).map_err(|e| dev(&case, e))?;
         let expected = gpu_cutie_maxpool3x3s2_reference(&x, w, h).map_err(|e| dev(&case, e))?;
         self.compare("maxpool", &case, &actual, &expected, EXACT)?;
@@ -452,9 +524,63 @@ impl OpsCheck<'_> {
         }
         Ok(())
     }
+
+    // --- PyTorch's own results ---
+
+    /// The kernels against PyTorch's values (`PINNED_*`) where its order over objects and picks
+    /// is not sequential: exactly (the same fp32 operations in the same order, CUDA's own expf
+    /// and logf). The references too: exactly where they only add and multiply, within `TIGHT`
+    /// where they call the host's exp or ln.
+    fn pinned(&mut self) -> Result<()> {
+        let masks: Vec<f32> = golden(40).iter().map(|v| v * 0.15).collect();
+        let masks = up(&masks, 5, 8)?;
+        let case = "torch n5 p8";
+        let others = gpu_cutie_others(&masks).map_err(|e| dev(case, e))?;
+        self.compare_pinned("others", &format!("{case} kernel"), &others, &PINNED_OTHERS, EXACT)?;
+        let others = gpu_cutie_others_reference(&masks).map_err(|e| dev(case, e))?;
+        self.compare_pinned("others", &format!("{case} reference"), &others, &PINNED_OTHERS, EXACT)?;
+        let agg = gpu_cutie_aggregate(&masks).map_err(|e| dev(case, e))?;
+        self.compare_pinned("aggregate", &format!("{case} kernel"), &agg, &PINNED_AGGREGATE, EXACT)?;
+        let agg = gpu_cutie_aggregate_reference(&masks).map_err(|e| dev(case, e))?;
+        self.compare_pinned("aggregate", &format!("{case} reference"), &agg, &PINNED_AGGREGATE, TIGHT)?;
+
+        let sim: Vec<f32> = golden(32).iter().map(|v| v * -25.0).collect();
+        let sim = up(&sim, 32, 1)?;
+        let case = "torch m32 p1 k30";
+        let (aff, _) = gpu_cutie_topk_softmax(&sim, 30).map_err(|e| dev(case, e))?;
+        self.compare_pinned("topk", &format!("{case} kernel"), &aff, &PINNED_TOPK, EXACT)?;
+        let (aff, _) = gpu_cutie_topk_softmax_reference(&sim, 30).map_err(|e| dev(case, e))?;
+        self.compare_pinned("topk", &format!("{case} reference"), &aff, &PINNED_TOPK, TIGHT)?;
+        Ok(())
+    }
+}
+
+/// Top-k similarities with the values torch.topk orders specially: [m, 8] columns of
+/// `similarities` except column 0 all NaN, column 1 NaN but for its first 10 rows (fewer finite
+/// rows than k), column 2 a negative and a positive NaN (both picked first), column 3 29 rows of
+/// 1 then -0 at row 3 and +0 at row 9 (the 30th pick is the +0: torch.topk's key puts it above
+/// -0), column 4 a +inf and a -inf (inf/inf is NaN), column 5 all -inf (0/0 is NaN).
+fn topk_specials(mut v: Vec<f32>, m: usize) -> Vec<f32> {
+    const P: usize = 8;
+    for j in 0..m {
+        v[j * P] = f32::NAN;
+        if j >= 10 {
+            v[j * P + 1] = f32::NAN;
+        }
+        v[j * P + 3] = if (100..129).contains(&j) { 1.0 } else { -1.0 };
+        v[j * P + 5] = f32::NEG_INFINITY;
+    }
+    v[5 * P + 2] = f32::from_bits(0xffc0_0000);
+    v[(m - 1) * P + 2] = f32::NAN;
+    v[3 * P + 3] = -0.0;
+    v[9 * P + 3] = 0.0;
+    v[7 * P + 4] = f32::INFINITY;
+    v[(m / 2) * P + 4] = f32::NEG_INFINITY;
+    v
 }
 
 pub(crate) fn check(report: &mut Report) -> Result<()> {
+    report.note("ops: seeded inputs against the host references and values pinned from torch; the oracle is not read");
     let mut ck = OpsCheck { report, rng: Rng(0x0dd_c0ffee_5eed), conv_cases: 0 };
     let result = run(&mut ck);
     // The conv cases' random weights leave the device cache whether or not they passed.
@@ -472,12 +598,15 @@ fn run(ck: &mut OpsCheck) -> Result<()> {
 
     ck.convs()?;
 
-    // Max-pool after both stems; odd sizes put the window past every border.
-    ck.maxpool(64, 192, 112, true)?;
-    ck.maxpool(192, 192, 112, false)?;
+    ck.pinned()?;
+
+    // Max-pool after both stems; odd sizes put the window past every border; NaN taps.
+    ck.maxpool(64, 192, 112, 0, true)?;
+    ck.maxpool(192, 192, 112, 0, false)?;
     for (planes, w, h) in [(5, 15, 9), (3, 1, 1), (2, 2, 3), (4, 16, 16), (2, 7, 1), (3, 1, 6)] {
-        ck.maxpool(planes, w, h, false)?;
+        ck.maxpool(planes, w, h, 0, false)?;
     }
+    ck.maxpool(4, 37, 23, 97, false)?;
 
     ck.sigmoid(3, FRAME, 4.0, true)?;
     ck.sigmoid(7, 33, 40.0, false)?;
@@ -493,10 +622,14 @@ fn run(ck: &mut OpsCheck) -> Result<()> {
     ck.eca(2, 7, 13, 3, false)?;
     ck.eca(1, 3, 9, 5, false)?;
 
+    // 1 to 3 objects, and 5, 6 and 9, where PyTorch's sum over objects is no longer sequential.
     for n in 1..=3 {
         ck.others(n, FRAME, n == 3)?;
     }
     ck.others(2, 37, false)?;
+    ck.others(5, FRAME, false)?;
+    ck.others(6, P16, false)?;
+    ck.others(9, 37, false)?;
 
     // The processor pads 384x216 to 384x224 (4 rows each side) and crops back.
     ck.pad(3, 384, 216, 0, 0, 4, 4, true)?;
@@ -551,6 +684,9 @@ fn run(ck: &mut OpsCheck) -> Result<()> {
     ck.topk("k 0", 50, 9, 0, v, false)?;
     let v: Vec<f32> = (0..300 * 64).map(|_| -0.5 * (ck.rng.next_u64() % 12) as f32).collect();
     ck.topk("ties", 300, 64, 30, v, false)?;
+    // NaN, signed zeros and infinities, over 3 slices of rows so the merge sees them too.
+    let v = topk_specials(ck.similarities(700 * 8), 700);
+    ck.topk("specials", 700, 8, 30, v, false)?;
 
     // The decoder's softmax over background and objects at the frame; consolidation's over
     // candidates; a single row.
@@ -558,12 +694,16 @@ fn run(ck: &mut OpsCheck) -> Result<()> {
         ck.softmax_axis0("frame", n + 1, FRAME, n == 3)?;
     }
     ck.softmax_axis0("consolidate", 1344, 128, false)?;
+    ck.softmax_axis0("consolidate 1000p", 5 * 112 * 63, 128, true)?;
     ck.softmax_axis0("one row", 1, 7, false)?;
 
     for n in 1..=3 {
         ck.aggregate(n, FRAME, n == 3)?;
     }
     ck.aggregate(2, P4, false)?;
+    ck.aggregate(5, FRAME, false)?;
+    ck.aggregate(6, P4, false)?;
+    ck.aggregate(9, 37, false)?;
 
     // The object transformer's masks (8 heads, 16 queries) for 1 to 3 objects; an object with
     // no foreground and one with no background (rows blocked everywhere, let through); objects
@@ -581,5 +721,16 @@ fn run(ck: &mut OpsCheck) -> Result<()> {
     ck.attn_mask("tied objects", 2, P16, 8, 16, aux, false)?;
     let aux = ck.rng.normals(2 * 37, 4.0);
     ck.attn_mask("odd", 2, 37, 3, 6, aux, false)?;
+    // 5, 6 and 9 objects (PyTorch's background product is no longer sequential); NaN logits
+    // (the pixel is no object's foreground).
+    for n in [5, 6] {
+        let aux = ck.rng.normals(n * P16, 4.0);
+        ck.attn_mask("aux", n, P16, 8, 16, aux, false)?;
+    }
+    let aux = ck.rng.normals(9 * 37, 4.0);
+    ck.attn_mask("odd", 9, 37, 3, 6, aux, false)?;
+    let mut aux = ck.rng.normals(2 * P16, 4.0);
+    aux.iter_mut().step_by(29).for_each(|v| *v = f32::NAN);
+    ck.attn_mask("nan", 2, P16, 8, 16, aux, false)?;
     Ok(())
 }

@@ -51,12 +51,12 @@ unsafe extern "C" {
         a_sq: *mut f32, ck: u32, m: u32, p: u32, stream: cudaStream_t,
     ) -> cudaError_t;
     fn makepad_cuda_cutie_similarity_epilogue_f32(
-        sim: *mut f32, two_ab: *const f32, b_sq: *const f32, a_sq: *const f32, ms: *const f32, scale: f32,
+        sim: *mut f32, two_ab: *const f32, b_sq: *const f32, a_sq: *const f32, ms: *const f32, inv_scale: f32,
         m: u32, p: u32, stream: cudaStream_t,
     ) -> cudaError_t;
     fn makepad_cuda_cutie_topk_scratch_entries(m: u32, p: u32, k: u32) -> usize;
     fn makepad_cuda_cutie_topk_softmax_f32(
-        sim: *const f32, aff: *mut f32, usage: *mut f32, vals: *mut f32, idx: *mut u32, m: u32, p: u32, k: u32,
+        sim: *const f32, aff: *mut f32, usage: *mut f32, keys: *mut u32, idx: *mut u32, m: u32, p: u32, k: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     fn makepad_cuda_cutie_softmax_axis0_f32(x: *const f32, out: *mut f32, m: u32, p: u32, stream: cudaStream_t) -> cudaError_t;
@@ -120,6 +120,48 @@ fn cutie_sgemm(
     .map_err(|e| e.to_string())
 }
 
+/// PyTorch's order for a sum or product over a dimension that is not the innermost (Cutie's
+/// objects, the top-k picks), as the kernels' `cutie_reduce4`: four accumulators from `ident`,
+/// term o into o % 4, then ((a0 op a1) op a2) op a3 (Reduce.cuh's thread_reduce_impl with
+/// vt0 = 4, one thread an output, which holds for fewer than 64 terms). From 5 terms on it rounds
+/// differently from a sequential sum, and PyTorch's results are this order's to the bit.
+fn cutie_reduce4(terms: impl IntoIterator<Item = f32>, ident: f32, op: impl Fn(f32, f32) -> f32) -> f32 {
+    let mut acc = [ident; 4];
+    for (o, t) in terms.into_iter().enumerate() {
+        acc[o % 4] = op(acc[o % 4], t);
+    }
+    op(op(op(acc[0], acc[1]), acc[2]), acc[3])
+}
+
+/// 1 / sqrt(ck) as PyTorch applies `x / math.sqrt(ck)` on CUDA (div_true with a CPU scalar): the
+/// reciprocal of the Python float taken in f64, rounded to f32, then a multiply (torch 2.11 gives
+/// exactly this for every ck tried; dividing by sqrt(ck) in f32 differs at every one but 64).
+fn cutie_inv_sqrt(ck: usize) -> f32 {
+    (1.0 / (ck as f64).sqrt()) as f32
+}
+
+/// The larger of two values, a NaN in either winning (PyTorch's `max_propagate_nan`).
+fn cutie_max_nan(a: f32, b: f32) -> f32 {
+    if b.is_nan() {
+        b
+    } else if a.is_nan() {
+        a
+    } else {
+        a.max(b)
+    }
+}
+
+/// PyTorch's radix key of a float (`TopKTypeConfig<float>::convert`), as the top-k kernel's: the
+/// keys' unsigned order is torch.topk's order of the values, so -0 ranks below +0 and every NaN
+/// (either sign) above every number.
+fn cutie_topk_key(v: f32) -> u32 {
+    if v.is_nan() {
+        return u32::MAX;
+    }
+    let x = v.to_bits();
+    x ^ if x & 0x8000_0000 != 0 { u32::MAX } else { 0x8000_0000 }
+}
+
 /// A convolution's output size along one axis (PyTorch's floor rule).
 pub fn cutie_conv_out(size: usize, k: usize, pad: usize, stride: usize) -> usize {
     (size + 2 * pad - k) / stride + 1
@@ -130,7 +172,8 @@ pub fn cutie_conv_out(size: usize, k: usize, pad: usize, stride: usize) -> usize
 /// Conv2d over a batch of planar images: `x` is [batch*in_channels, in_h*in_w], `weights` PyTorch's
 /// [out][in][k][k], `bias` per output channel (None: no bias). Square kernel, symmetric padding and
 /// stride. Out: [batch*out_channels, out_h*out_w], out_h = (in_h + 2*pad - k)/stride + 1. Weights
-/// are cached on the device under `cache_namespace::key` (one key per layer).
+/// then bias are cached on the device as one buffer under `{cache_namespace}::{key}::cutie_conv`
+/// (one key per layer).
 ///
 /// The images' columns (f32 im2col) times the [out, in*k*k] weights in cuBLAS (CUDA_R_32F,
 /// CUBLAS_COMPUTE_32F, so fp32 multiply-accumulate), then the bias. Several small images (stride
@@ -293,6 +336,7 @@ pub fn gpu_cutie_conv2d_reference(
 // --- Pooling ---
 
 /// MaxPool2d(3, stride 2, padding 1) on planar [planes, h*w]. Out [planes, oh*ow], oh = (h-1)/2+1.
+/// A NaN in a window wins, as in PyTorch.
 pub fn gpu_cutie_maxpool3x3s2(x: &GpuTensor, w: usize, h: usize) -> Result<GpuTensor, String> {
     cutie_check_f32("gpu_cutie_maxpool3x3s2", x)?;
     if x.cols != w * h || w == 0 || h == 0 {
@@ -330,7 +374,10 @@ pub fn gpu_cutie_maxpool3x3s2_reference(x: &GpuTensor, w: usize, h: usize) -> Re
                         if xx < 0 || xx >= w as isize {
                             continue;
                         }
-                        best = best.max(v[p * w * h + y as usize * w + xx as usize]);
+                        let tap = v[p * w * h + y as usize * w + xx as usize];
+                        if tap > best || tap.is_nan() {
+                            best = tap;
+                        }
                     }
                 }
                 out[p * ow * oh + oy * ow + ox] = best;
@@ -468,7 +515,8 @@ pub fn gpu_cutie_eca_reference(x: &GpuTensor, residual: &GpuTensor, n: usize, c:
 }
 
 /// For each object's mask in `masks` [n, p], the sum of the other objects' masks, clamped to 0..1
-/// (Cutie's `_get_others`).
+/// (Cutie's `_get_others`: all objects summed in PyTorch's order, `cutie_reduce4`, then the
+/// object's own subtracted).
 pub fn gpu_cutie_others(masks: &GpuTensor) -> Result<GpuTensor, String> {
     cutie_check_f32("gpu_cutie_others", masks)?;
     let n = cutie_u32("gpu_cutie_others", masks.rows)?;
@@ -486,10 +534,7 @@ pub fn gpu_cutie_others_reference(masks: &GpuTensor) -> Result<GpuTensor, String
     let v = gpu_download(masks)?;
     let mut out = vec![0.0f32; n * p];
     for i in 0..p {
-        let mut sum = 0.0f32;
-        for o in 0..n {
-            sum += v[o * p + i];
-        }
+        let sum = cutie_reduce4((0..n).map(|o| v[o * p + i]), 0.0, |a, b| a + b);
         for o in 0..n {
             out[o * p + i] = (sum - v[o * p + i]).clamp(0.0, 1.0);
         }
@@ -622,7 +667,10 @@ pub fn gpu_cutie_matmul_reference(a: &GpuTensor, trans_a: bool, b: &GpuTensor, t
 /// 2 mk . (qk*qe), b_sq = sum_c qe*qk^2 (without qe: a_sq = |mk|^2, two_ab = 2 mk . qk, no b_sq).
 ///
 /// As PyTorch forms it: a_sq and two_ab are GEMMs over the channels (cuBLAS SGEMM), each rounded
-/// before they are combined, so cancellation between them is PyTorch's own.
+/// before they are combined, so cancellation between them is PyTorch's own; the division by the
+/// Python scalar sqrt(ck) is PyTorch's multiply by its reciprocal (`cutie_inv_sqrt`), the same as
+/// dividing at Cutie's ck of 64. The channel sums (b_sq, and a_sq without qe) are
+/// sequential, PyTorch's split over warps: fp32 rounding apart.
 pub fn gpu_cutie_similarity(mk: &GpuTensor, ms: Option<&GpuTensor>, qk: &GpuTensor, qe: Option<&GpuTensor>) -> Result<GpuTensor, String> {
     let op = "gpu_cutie_similarity";
     cutie_check_f32(op, mk)?;
@@ -635,7 +683,7 @@ pub fn gpu_cutie_similarity(mk: &GpuTensor, ms: Option<&GpuTensor>, qk: &GpuTens
         return Err("gpu_cutie_similarity shape mismatch".into());
     }
     let (ck_u, m_u, p_u) = (cutie_u32(op, ck)?, cutie_u32(op, m)?, cutie_u32(op, p)?);
-    let scale = (ck as f32).sqrt();
+    let inv_scale = cutie_inv_sqrt(ck);
     with_dense_linear_backend(|backend| {
         backend.prepare_device()?;
         let out = GpuTensor::from_pool(m, p)?;
@@ -661,8 +709,8 @@ pub fn gpu_cutie_similarity(mk: &GpuTensor, ms: Option<&GpuTensor>, qk: &GpuTens
                 cutie_sgemm(backend, mk.device_ptr()?, m, true, qkqe.device_ptr()?, p, false, m, p, ck, two_ab.device_ptr()?)?;
                 gpu_check(unsafe {
                     makepad_cuda_cutie_similarity_epilogue_f32(
-                        out.device_ptr()?, two_ab.device_ptr()?, b_sq.device_ptr()?, std::ptr::null(), ms_ptr, scale, m_u,
-                        p_u, backend.stream,
+                        out.device_ptr()?, two_ab.device_ptr()?, b_sq.device_ptr()?, std::ptr::null(), ms_ptr, inv_scale,
+                        m_u, p_u, backend.stream,
                     )
                 })?;
             }
@@ -678,8 +726,8 @@ pub fn gpu_cutie_similarity(mk: &GpuTensor, ms: Option<&GpuTensor>, qk: &GpuTens
                 cutie_sgemm(backend, mk.device_ptr()?, m, true, qk.device_ptr()?, p, false, m, p, ck, out.device_ptr()?)?;
                 gpu_check(unsafe {
                     makepad_cuda_cutie_similarity_epilogue_f32(
-                        out.device_ptr()?, std::ptr::null(), std::ptr::null(), a_sq.device_ptr()?, ms_ptr, scale, m_u, p_u,
-                        backend.stream,
+                        out.device_ptr()?, std::ptr::null(), std::ptr::null(), a_sq.device_ptr()?, ms_ptr, inv_scale, m_u,
+                        p_u, backend.stream,
                     )
                 })?;
             }
@@ -698,7 +746,7 @@ pub fn gpu_cutie_similarity_reference(mk: &GpuTensor, ms: Option<&GpuTensor>, qk
     let qkv = gpu_download(qk)?;
     let qev = qe.map(gpu_download).transpose()?;
     let msv = ms.map(gpu_download).transpose()?;
-    let scale = (ck as f32).sqrt();
+    let inv_scale = cutie_inv_sqrt(ck);
     let mut out = vec![0.0f32; m * p];
     for j in 0..m {
         for i in 0..p {
@@ -721,8 +769,8 @@ pub fn gpu_cutie_similarity_reference(mk: &GpuTensor, ms: Option<&GpuTensor>, qk
                 -(a_sq as f32) + 2.0 * (two_ab as f32)
             };
             out[j * p + i] = match &msv {
-                Some(s) => sim * s[j] / scale,
-                None => sim / scale,
+                Some(s) => sim * s[j] * inv_scale,
+                None => sim * inv_scale,
             };
         }
     }
@@ -733,10 +781,17 @@ pub fn gpu_cutie_similarity_reference(mk: &GpuTensor, ms: Option<&GpuTensor>, qk
 /// exp normalised to sum 1 (no max subtracted, as Cutie's `do_softmax`), every other entry 0.
 /// Also each row's sum of the result ([1, m]): how much each memory token was used.
 ///
+/// The picks are torch.topk's: values in PyTorch's radix-key order (`cutie_topk_key`: -0 below
+/// +0, a NaN of either sign above every number, so a NaN similarity is picked and its column's
+/// affinities come out NaN, as PyTorch's do), equal keys by the lower row (torch 2.11 takes the
+/// same set at 336 to 30000 rows). The denominator sums the picks best first in PyTorch's order
+/// (`cutie_reduce4`), so for k under 64 (Cutie's is 30) the affinities are PyTorch's to the bit
+/// given the same similarities. The usage sums each row in another order than PyTorch's innermost
+/// reduce: fp32 rounding apart.
+///
 /// The kernel splits each column's rows into slices, keeps each slice's top k (one thread a
-/// column and slice, reads coalesced across columns), merges them per column in the
-/// reference's order (larger first, equal values by the lower row), then the softmax and the
-/// usage (each row of the result summed).
+/// column and slice, reads coalesced across columns), merges them per column, then the softmax
+/// and the usage.
 pub fn gpu_cutie_topk_softmax(sim: &GpuTensor, k: usize) -> Result<(GpuTensor, GpuTensor), String> {
     let op = "gpu_cutie_topk_softmax";
     cutie_check_f32(op, sim)?;
@@ -752,13 +807,14 @@ pub fn gpu_cutie_topk_softmax(sim: &GpuTensor, k: usize) -> Result<(GpuTensor, G
         let aff = GpuTensor::from_pool(m, p)?;
         let usage = GpuTensor::from_pool(1, m)?;
         cutie_zero(backend, aff.device_ptr()?, m * p)?;
+        // Each slice's best k per column: their keys and rows (u32 in f32-sized buffers).
         let entries = unsafe { makepad_cuda_cutie_topk_scratch_entries(m_u, p_u, k_u) }.max(1);
-        let vals = GpuTensor::from_pool(entries, 1)?;
+        let keys = GpuTensor::from_pool(entries, 1)?;
         let idx = GpuTensor::from_pool(entries, 1)?;
         gpu_check(unsafe {
             makepad_cuda_cutie_topk_softmax_f32(
-                sim.device_ptr()?, aff.device_ptr()?, usage.device_ptr()?, vals.device_ptr()?, idx.device_ptr()?.cast::<u32>(),
-                m_u, p_u, k_u, backend.stream,
+                sim.device_ptr()?, aff.device_ptr()?, usage.device_ptr()?, keys.device_ptr()?.cast::<u32>(),
+                idx.device_ptr()?.cast::<u32>(), m_u, p_u, k_u, backend.stream,
             )
         })?;
         Ok((aff, usage))
@@ -771,14 +827,14 @@ pub fn gpu_cutie_topk_softmax_reference(sim: &GpuTensor, k: usize) -> Result<(Gp
     let k = k.min(m);
     let v = gpu_download(sim)?;
     let mut aff = vec![0.0f32; m * p];
-    let mut col: Vec<(f32, usize)> = Vec::with_capacity(m);
+    let mut col: Vec<(u32, usize)> = Vec::with_capacity(m);
     for i in 0..p {
         col.clear();
-        col.extend((0..m).map(|j| (v[j * p + i], j)));
-        // Largest first; equal values by lower index.
-        col.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-        let exps: Vec<f32> = col[..k].iter().map(|&(s, _)| s.exp()).collect();
-        let sum: f32 = exps.iter().sum();
+        col.extend((0..m).map(|j| (cutie_topk_key(v[j * p + i]), j)));
+        // torch.topk's order: the largest key first, equal keys by the lower row.
+        col.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        let exps: Vec<f32> = col[..k].iter().map(|&(_, j)| v[j * p + i].exp()).collect();
+        let sum = cutie_reduce4(exps.iter().copied(), 0.0, |a, b| a + b);
         for (e, &(_, j)) in exps.iter().zip(&col[..k]) {
             aff[j * p + i] = e / sum;
         }
@@ -788,6 +844,11 @@ pub fn gpu_cutie_topk_softmax_reference(sim: &GpuTensor, k: usize) -> Result<(Gp
 }
 
 /// Softmax down each column of `x` [m, p] (over the rows), the max subtracted first.
+///
+/// Over a few rows (the decoder's softmax over background and objects) one thread a column sums
+/// in row order, as PyTorch's spatial softmax does. Over more than 64 rows and fewer than 8192
+/// columns (consolidation's candidates by prototypes) a block a tile of columns sums in a fixed
+/// tree: neither that nor PyTorch's order there is sequential, so it is fp32 rounding apart.
 pub fn gpu_cutie_softmax_axis0(x: &GpuTensor) -> Result<GpuTensor, String> {
     let op = "gpu_cutie_softmax_axis0";
     cutie_check_f32(op, x)?;
@@ -800,6 +861,9 @@ pub fn gpu_cutie_softmax_axis0(x: &GpuTensor) -> Result<GpuTensor, String> {
     })
 }
 
+/// Reference: exp(x - max) summed in f64 and rounded once, so it stands for the exact softmax
+/// whichever order the kernel sums in (a sequential f32 sum of 35k peaked terms is itself off
+/// by 5e-5).
 pub fn gpu_cutie_softmax_axis0_reference(x: &GpuTensor) -> Result<GpuTensor, String> {
     cutie_check_f32("gpu_cutie_softmax_axis0", x)?;
     let (m, p) = (x.rows, x.cols);
@@ -807,12 +871,13 @@ pub fn gpu_cutie_softmax_axis0_reference(x: &GpuTensor) -> Result<GpuTensor, Str
     let mut out = vec![0.0f32; m * p];
     for i in 0..p {
         let max = (0..m).map(|j| v[j * p + i]).fold(f32::NEG_INFINITY, f32::max);
-        let mut sum = 0.0f32;
+        let mut sum = 0.0f64;
         for j in 0..m {
             let e = (v[j * p + i] - max).exp();
             out[j * p + i] = e;
-            sum += e;
+            sum += e as f64;
         }
+        let sum = sum as f32;
         for j in 0..m {
             out[j * p + i] /= sum;
         }
@@ -823,8 +888,8 @@ pub fn gpu_cutie_softmax_axis0_reference(x: &GpuTensor) -> Result<GpuTensor, Str
 // --- Objects ---
 
 /// Cutie's `aggregate`: objects' probabilities `prob` [n, p] to logits with a background row first
-/// ([n+1, p]): the background is prod(1 - prob), every row clamped to 1e-7..1-1e-7, then
-/// log(q / (1 - q)).
+/// ([n+1, p]): the background is prod(1 - prob) (in PyTorch's order, `cutie_reduce4`), every row
+/// clamped to 1e-7..1-1e-7, then log(q / (1 - q)).
 pub fn gpu_cutie_aggregate(prob: &GpuTensor) -> Result<GpuTensor, String> {
     cutie_check_f32("gpu_cutie_aggregate", prob)?;
     let n = cutie_u32("gpu_cutie_aggregate", prob.rows)?;
@@ -846,10 +911,7 @@ pub fn gpu_cutie_aggregate_reference(prob: &GpuTensor) -> Result<GpuTensor, Stri
         (q / (1.0 - q)).ln()
     };
     for i in 0..p {
-        let mut bg = 1.0f32;
-        for o in 0..n {
-            bg *= 1.0 - v[o * p + i];
-        }
+        let bg = cutie_reduce4((0..n).map(|o| 1.0 - v[o * p + i]), 1.0, |a, b| a * b);
         out[i] = logit(bg);
         for o in 0..n {
             out[(o + 1) * p + i] = logit(v[o * p + i]);
@@ -860,7 +922,8 @@ pub fn gpu_cutie_aggregate_reference(prob: &GpuTensor) -> Result<GpuTensor, Stri
 
 /// The object transformer's attention mask from its auxiliary logits `aux` [n, p] (one row per
 /// object): sigmoid, aggregated with a background (as `gpu_cutie_aggregate`); a pixel is an
-/// object's foreground where its logit is the largest of all rows. For each object, each of
+/// object's foreground where its logit is the largest of all rows (a NaN makes the largest NaN,
+/// as `logits.max` does, and the pixel no object's foreground). For each object, each of
 /// `heads` heads and each of `queries` queries a row of p: the first half of the queries may only
 /// see the object's foreground, the second half only the rest; a row that would see nothing sees
 /// everything. Out [n*heads*queries, p], additive: 0 where seen, -inf where blocked.
@@ -891,7 +954,7 @@ pub fn gpu_cutie_attn_mask_reference(aux: &GpuTensor, heads: usize, queries: usi
     let agg = gpu_download(&gpu_cutie_aggregate_reference(&prob)?)?;
     let mut fg = vec![false; n * p];
     for i in 0..p {
-        let max = (0..=n).map(|r| agg[r * p + i]).fold(f32::NEG_INFINITY, f32::max);
+        let max = (0..=n).map(|r| agg[r * p + i]).fold(f32::NEG_INFINITY, cutie_max_nan);
         for o in 0..n {
             fg[o * p + i] = agg[(o + 1) * p + i] >= max;
         }
