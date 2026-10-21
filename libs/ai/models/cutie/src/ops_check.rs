@@ -34,8 +34,8 @@ use makepad_ai_common::gpu::{
     gpu_cutie_rgb_planes_reference, gpu_cutie_sigmoid, gpu_cutie_sigmoid_reference, gpu_cutie_similarity,
     gpu_cutie_similarity_reference, gpu_cutie_sine_encoding, gpu_cutie_sine_encoding_reference, gpu_cutie_softmax_axis0,
     gpu_cutie_softmax_axis0_reference, gpu_cutie_topk_softmax, gpu_cutie_topk_softmax_reference, gpu_download,
-    gpu_attention_packed_cross_bias, gpu_attention_packed_cross_f32, gpu_linear_f32_resident, gpu_synchronize, gpu_upload,
-    gpu_weight_cache_evict_prefix, GpuTensor,
+    gpu_attention_packed_cross_bias, gpu_attention_packed_cross_f32, gpu_cutie_available, gpu_linear_f32_resident, gpu_synchronize,
+    gpu_upload, gpu_weight_cache_evict_prefix, GpuTensor,
 };
 use std::time::Instant;
 
@@ -913,6 +913,9 @@ fn topk_specials(mut v: Vec<f32>, m: usize) -> Vec<f32> {
 
 pub(crate) fn check(report: &mut Report) -> Result<()> {
     report.note("ops: seeded inputs against the host references and values pinned from torch; the oracle is not read");
+    // What `Cutie::load` asks before anything else: these ops run here, so it must say so.
+    let available = gpu_cutie_available();
+    report.record(STAGE, "available", "gpu_cutie_available", available, format!("{available} (the stubs, without Cutie's kernels, say false)"));
     let mut ck = OpsCheck { report, rng: Rng(0x0dd_c0ffee_5eed), conv_cases: 0 };
     let result = run(&mut ck);
     // The conv cases' random weights leave the device cache whether or not they passed.
