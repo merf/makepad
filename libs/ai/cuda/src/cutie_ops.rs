@@ -1,11 +1,12 @@
-// Cutie's device ops (models/vision/src/cutie*.rs), included inside launch.rs's CUDA `mod imp` so
-// they can use its private helpers. The stubs for builds without kernels are in
+// Cutie's device ops (models/cutie), included inside launch.rs's CUDA `mod imp` so they can use
+// its private helpers. The stubs for builds without kernels are in
 // models/common/src/gpu_cutie_stubs.rs, with the same signatures.
 //
 // Every op is f32 with exact fp32 arithmetic: Cutie is checked against a PyTorch fp32 oracle with
 // TF32 off. Each `gpu_cutie_X` has a host reference `gpu_cutie_X_reference` (download, compute on
-// the host, upload): obviously correct and slow. `gpu_cutie_X` calls its reference until it has a
-// kernel in kernels/cutie.cu; a kernel must then match its reference (`cutie-validate ops`).
+// the host, upload): obviously correct and slow. `gpu_cutie_X` runs its kernel in
+// kernels/cutie.cu (or cuBLAS SGEMM, which on this backend's handle is never TF32: no math mode is
+// ever set); `cutie-validate ops` checks every kernel against its reference.
 //
 // Layouts: tensors are row-major [rows, cols]. A batch of planar images is [batch*channels,
 // height*width], each image's channels contiguous rows, which is the memory order of PyTorch's
@@ -16,13 +17,107 @@ unsafe extern "C" {
         x: *const f32, out: *mut f32, width: u32, height: u32, ow: u32, oh: u32, planes: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    fn makepad_cuda_cutie_im2col_f32(
+        x: *const f32, col: *mut f32, images: u32, channels: u32, width: u32, height: u32, ow: u32, oh: u32,
+        k: u32, pad: u32, stride: u32, side_by_side: u32, stream: cudaStream_t,
+    ) -> cudaError_t;
+    fn makepad_cuda_cutie_add_channel_bias_f32(
+        out: *mut f32, bias: *const f32, channels: u32, plane: usize, rows: usize, stream: cudaStream_t,
+    ) -> cudaError_t;
+    fn makepad_cuda_cutie_unstack_bias_f32(
+        src: *const f32, out: *mut f32, bias: *const f32, images: u32, channels: u32, plane: usize,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    fn makepad_cuda_cutie_sigmoid_f32(x: *const f32, out: *mut f32, n: usize, stream: cudaStream_t) -> cudaError_t;
+    fn makepad_cuda_cutie_gru_f32(
+        h: *const f32, values: *const f32, out: *mut f32, objects: u32, channels: u32, plane: usize,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    fn makepad_cuda_cutie_eca_f32(
+        x: *const f32, residual: *const f32, out: *mut f32, scratch: *mut f32, taps: *const f32, k: u32,
+        objects: u32, channels: u32, plane: usize, stream: cudaStream_t,
+    ) -> cudaError_t;
+    fn makepad_cuda_cutie_others_f32(masks: *const f32, out: *mut f32, n: u32, p: usize, stream: cudaStream_t) -> cudaError_t;
+    fn makepad_cuda_cutie_pad_f32(
+        x: *const f32, out: *mut f32, planes: u32, w: u32, h: u32, left: u32, right: u32, top: u32, bottom: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    fn makepad_cuda_cutie_crop_f32(
+        x: *const f32, out: *mut f32, planes: u32, w: u32, h: u32, left: u32, top: u32, out_w: u32, out_h: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    fn makepad_cuda_cutie_similarity_prep_f32(
+        mk: *const f32, qk: *const f32, qe: *const f32, mk_sq: *mut f32, qkqe: *mut f32, b_sq: *mut f32,
+        a_sq: *mut f32, ck: u32, m: u32, p: u32, stream: cudaStream_t,
+    ) -> cudaError_t;
+    fn makepad_cuda_cutie_similarity_epilogue_f32(
+        sim: *mut f32, two_ab: *const f32, b_sq: *const f32, a_sq: *const f32, ms: *const f32, scale: f32,
+        m: u32, p: u32, stream: cudaStream_t,
+    ) -> cudaError_t;
+    fn makepad_cuda_cutie_topk_scratch_entries(m: u32, p: u32, k: u32) -> usize;
+    fn makepad_cuda_cutie_topk_softmax_f32(
+        sim: *const f32, aff: *mut f32, usage: *mut f32, vals: *mut f32, idx: *mut u32, m: u32, p: u32, k: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    fn makepad_cuda_cutie_softmax_axis0_f32(x: *const f32, out: *mut f32, m: u32, p: u32, stream: cudaStream_t) -> cudaError_t;
+    fn makepad_cuda_cutie_aggregate_f32(prob: *const f32, out: *mut f32, n: u32, p: usize, stream: cudaStream_t) -> cudaError_t;
+    fn makepad_cuda_cutie_attn_mask_f32(
+        aux: *const f32, out: *mut f32, scratch: *mut u32, n: u32, p: usize, heads: u32, queries: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
 }
+
+/// The most taps `makepad_cuda_cutie_eca_f32` takes by value (Cutie's ECA has 3 or 5).
+const CUTIE_ECA_MAX_TAPS: usize = 15;
+/// The largest k of the top-k kernel (Cutie reads 30).
+const CUTIE_TOPK_MAX: usize = 64;
+/// The im2col scratch a convolution may hold at once; batches beyond it run in groups.
+const CUTIE_CONV_SCRATCH_BYTES: usize = 256 << 20;
+/// Batches of images this small (output pixels each) run as one GEMM, side by side.
+const CUTIE_CONV_SIDE_BY_SIDE_PIXELS: usize = 4096;
 
 fn cutie_check_f32(op: &str, x: &GpuTensor) -> Result<(), String> {
     if x.half {
         return Err(format!("{op} is f32-only"));
     }
     Ok(())
+}
+
+/// A dimension as the kernels take it.
+fn cutie_u32(op: &str, v: usize) -> Result<u32, String> {
+    u32::try_from(v).map_err(|_| format!("{op}: {v} does not fit the kernel's 32-bit sizes"))
+}
+
+/// Zeroes `count` f32 at `ptr` on the backend's stream.
+fn cutie_zero(backend: &CudaDenseLinearBackend, ptr: *mut f32, count: usize) -> Result<(), String> {
+    if count == 0 {
+        return Ok(());
+    }
+    let ptr = NonNull::new(ptr.cast::<c_void>()).ok_or("cutie zero: null pointer")?;
+    unsafe { crate::memset_async(ptr, 0, count * size_of::<f32>(), backend.stream) }.map_err(|e| e.to_string())
+}
+
+/// c [m, n] = op(a) @ op(b), every matrix row-major f32 on the device (`a_cols`, `b_cols` the
+/// stored widths): cuBLAS SGEMM, fp32 multiply-accumulate (the handle's default math mode,
+/// never TF32). Row-major C is column-major C^T = op(b)^T op(a)^T, so b goes first.
+#[allow(clippy::too_many_arguments)]
+fn cutie_sgemm(
+    backend: &CudaDenseLinearBackend, a: *const f32, a_cols: usize, trans_a: bool, b: *const f32, b_cols: usize,
+    trans_b: bool, m: usize, n: usize, k: usize, c: *mut f32,
+) -> Result<(), String> {
+    if m == 0 || n == 0 {
+        return Ok(());
+    }
+    if k == 0 {
+        return cutie_zero(backend, c, m * n);
+    }
+    let dim = |v: usize| i32::try_from(v).map_err(|_| format!("cutie sgemm: {v} exceeds cuBLAS's sizes"));
+    let op = |t: bool| if t { crate::CUBLAS_OP_T } else { crate::CUBLAS_OP_N };
+    crate::cublas_sgemm(
+        backend.blas, op(trans_b), op(trans_a), dim(n)?, dim(m)?, dim(k)?, &1.0f32, b, dim(b_cols)?, a, dim(a_cols)?,
+        &0.0f32, c, dim(n)?,
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// A convolution's output size along one axis (PyTorch's floor rule).
@@ -36,11 +131,127 @@ pub fn cutie_conv_out(size: usize, k: usize, pad: usize, stride: usize) -> usize
 /// [out][in][k][k], `bias` per output channel (None: no bias). Square kernel, symmetric padding and
 /// stride. Out: [batch*out_channels, out_h*out_w], out_h = (in_h + 2*pad - k)/stride + 1. Weights
 /// are cached on the device under `cache_namespace::key` (one key per layer).
+///
+/// The images' columns (f32 im2col) times the [out, in*k*k] weights in cuBLAS (CUDA_R_32F,
+/// CUBLAS_COMPUTE_32F, so fp32 multiply-accumulate), then the bias. Several small images (stride
+/// 8 and 16) go side by side through one GEMM, then back to their own planes; otherwise one
+/// strided-batched GEMM over the images (a 1x1 stride-1 convolution's input already is its
+/// columns).
 pub fn gpu_cutie_conv2d(
     x: &GpuTensor, batch: usize, in_w: usize, in_h: usize, cache_namespace: &str, key: &str,
     weights: &[f32], bias: Option<&[f32]>, out_channels: usize, k: usize, pad: usize, stride: usize,
 ) -> Result<GpuTensor, String> {
-    gpu_cutie_conv2d_reference(x, batch, in_w, in_h, cache_namespace, key, weights, bias, out_channels, k, pad, stride)
+    let op = "gpu_cutie_conv2d";
+    cutie_check_f32(op, x)?;
+    if batch == 0 || x.rows == 0 || x.rows % batch != 0 || x.cols != in_w * in_h || k == 0 || stride == 0 || in_w + 2 * pad < k || in_h + 2 * pad < k {
+        return Err(format!("{op} {key}: x {}x{} for batch {batch} at {in_w}x{in_h}, k {k} pad {pad} stride {stride}", x.rows, x.cols));
+    }
+    let in_channels = x.rows / batch;
+    let kdim = in_channels * k * k;
+    if weights.len() != out_channels * kdim || bias.is_some_and(|b| b.len() != out_channels) {
+        return Err(format!("{op} {key}: {} weights for {out_channels}x{in_channels}x{k}x{k}", weights.len()));
+    }
+    let (ow, oh) = (cutie_conv_out(in_w, k, pad, stride), cutie_conv_out(in_h, k, pad, stride));
+    let opix = ow * oh;
+    let dim = |v: usize| i32::try_from(v).map_err(|_| format!("{op} {key}: {v} exceeds cuBLAS's sizes"));
+    let (m, n, kd) = (dim(opix)?, dim(out_channels)?, dim(kdim)?);
+    let d = |v: usize| cutie_u32(op, v);
+    let (channels_u, w_u, h_u, ow_u, oh_u, k_u, pad_u, stride_u) =
+        (d(in_channels)?, d(in_w)?, d(in_h)?, d(ow)?, d(oh)?, d(k)?, d(pad)?, d(stride)?);
+    let (batch_u, out_channels_u) = (d(batch)?, d(out_channels)?);
+    with_dense_linear_backend(|backend| {
+        backend.prepare_device()?;
+        // Weights then bias, one cached buffer: no host upload after the first call.
+        let qualified_key = format!("{cache_namespace}::{key}::cutie_conv");
+        let floats = weights.len() + bias.map_or(0, |b| b.len());
+        backend.cached_weight_buffer(&qualified_key, floats * size_of::<f32>(), || {
+            let mut raw = Vec::with_capacity(floats * size_of::<f32>());
+            for v in weights.iter().chain(bias.into_iter().flatten()) {
+                raw.extend_from_slice(&v.to_le_bytes());
+            }
+            Ok(raw)
+        })?;
+        let w_ptr = backend
+            .weight_buffers
+            .get(&qualified_key)
+            .ok_or_else(|| format!("missing cached cutie conv weights {qualified_key}"))?
+            .ptr
+            .as_ptr()
+            .cast::<f32>();
+        let out = GpuTensor::from_pool(batch * out_channels, opix)?;
+        let x_ptr = x.device_ptr()?;
+        let out_ptr = out.device_ptr()?;
+        let bias_ptr = if bias.is_some() { unsafe { w_ptr.add(weights.len()) } } else { std::ptr::null() };
+        let per_image = kdim * opix;
+        let side_by_side =
+            batch > 1 && opix <= CUTIE_CONV_SIDE_BY_SIDE_PIXELS && batch * per_image * size_of::<f32>() <= CUTIE_CONV_SCRATCH_BYTES;
+        if side_by_side {
+            // Small images: one GEMM over every image's columns side by side keeps cuBLAS's
+            // tiles full, then each image's channels are put back in place with the bias.
+            let wide = dim(batch * opix)?;
+            let col = GpuTensor::from_pool(kdim, batch * opix)?;
+            let stacked = GpuTensor::from_pool(out_channels, batch * opix)?;
+            gpu_check(unsafe {
+                makepad_cuda_cutie_im2col_f32(
+                    x_ptr, col.device_ptr()?, batch_u, channels_u, w_u, h_u, ow_u, oh_u, k_u, pad_u, stride_u, 1,
+                    backend.stream,
+                )
+            })?;
+            unsafe {
+                crate::cublas_gemm_ex(
+                    backend.blas, crate::CUBLAS_OP_N, crate::CUBLAS_OP_N, wide, n, kd, &1.0f32,
+                    col.device_ptr()?.cast::<c_void>(), crate::CUDA_R_32F, wide, w_ptr.cast::<c_void>(), crate::CUDA_R_32F, kd,
+                    &0.0f32, stacked.device_ptr()?.cast::<c_void>(), crate::CUDA_R_32F, wide, crate::CUBLAS_COMPUTE_32F,
+                    crate::CUBLAS_GEMM_DEFAULT,
+                )
+            }
+            .map_err(|e| format!("{op} {key}: {e}"))?;
+            gpu_check(unsafe {
+                makepad_cuda_cutie_unstack_bias_f32(
+                    stacked.device_ptr()?, out_ptr, bias_ptr, batch_u, out_channels_u, opix, backend.stream,
+                )
+            })?;
+            return Ok(out);
+        }
+        let direct = k == 1 && stride == 1 && pad == 0;
+        // Images per GEMM: all of them, unless their columns outgrow the scratch.
+        let group = if direct { batch } else { (CUTIE_CONV_SCRATCH_BYTES / size_of::<f32>() / per_image.max(1)).clamp(1, batch) };
+        let col = if direct { None } else { Some(GpuTensor::from_pool(group * kdim, opix)?) };
+        let mut first = 0;
+        while first < batch {
+            let count = group.min(batch - first);
+            let src = unsafe { x_ptr.add(first * in_channels * in_w * in_h) };
+            let a = match &col {
+                Some(col) => {
+                    gpu_check(unsafe {
+                        makepad_cuda_cutie_im2col_f32(
+                            src, col.device_ptr()?, count as u32, channels_u, w_u, h_u, ow_u, oh_u, k_u, pad_u, stride_u, 0,
+                            backend.stream,
+                        )
+                    })?;
+                    col.device_ptr()?
+                }
+                None => src,
+            };
+            unsafe {
+                crate::cublas_gemm_strided_batched_ex(
+                    backend.blas, crate::CUBLAS_OP_N, crate::CUBLAS_OP_N, m, n, kd, &1.0f32,
+                    a.cast::<c_void>(), crate::CUDA_R_32F, m, per_image as i64,
+                    w_ptr.cast::<c_void>(), crate::CUDA_R_32F, kd, 0,
+                    &0.0f32, out_ptr.add(first * out_channels * opix).cast::<c_void>(), crate::CUDA_R_32F, m,
+                    (out_channels * opix) as i64, count as i32, crate::CUBLAS_COMPUTE_32F, crate::CUBLAS_GEMM_DEFAULT,
+                )
+            }
+            .map_err(|e| format!("{op} {key}: {e}"))?;
+            first += count;
+        }
+        if bias.is_some() {
+            gpu_check(unsafe {
+                makepad_cuda_cutie_add_channel_bias_f32(out_ptr, bias_ptr, out_channels_u, opix, batch * out_channels, backend.stream)
+            })?;
+        }
+        Ok(out)
+    })
 }
 
 /// Reference: the existing direct fp32 kernel (`gpu_conv2d_planar_strided`) once per image.
@@ -133,7 +344,13 @@ pub fn gpu_cutie_maxpool3x3s2_reference(x: &GpuTensor, w: usize, h: usize) -> Re
 
 /// 1 / (1 + exp(-x)), elementwise.
 pub fn gpu_cutie_sigmoid(x: &GpuTensor) -> Result<GpuTensor, String> {
-    gpu_cutie_sigmoid_reference(x)
+    cutie_check_f32("gpu_cutie_sigmoid", x)?;
+    with_dense_linear_backend(|backend| {
+        backend.prepare_device()?;
+        let out = GpuTensor::from_pool(x.rows, x.cols)?;
+        gpu_check(unsafe { makepad_cuda_cutie_sigmoid_f32(x.device_ptr()?, out.device_ptr()?, x.rows * x.cols, backend.stream) })?;
+        Ok(out)
+    })
 }
 
 pub fn gpu_cutie_sigmoid_reference(x: &GpuTensor) -> Result<GpuTensor, String> {
@@ -146,7 +363,20 @@ pub fn gpu_cutie_sigmoid_reference(x: &GpuTensor) -> Result<GpuTensor, String> {
 /// update and new-value rows (c each); `h` [n*c, p]. new_h = sigmoid(f)*h*(1-sigmoid(u)) +
 /// sigmoid(u)*tanh(v), evaluated in that order.
 pub fn gpu_cutie_gru(h: &GpuTensor, values: &GpuTensor, n: usize, c: usize) -> Result<GpuTensor, String> {
-    gpu_cutie_gru_reference(h, values, n, c)
+    cutie_check_f32("gpu_cutie_gru", h)?;
+    cutie_check_f32("gpu_cutie_gru", values)?;
+    if h.rows != n * c || values.rows != n * 3 * c || h.cols != values.cols {
+        return Err("gpu_cutie_gru shape mismatch".into());
+    }
+    let (n_u, c_u) = (cutie_u32("gpu_cutie_gru", n)?, cutie_u32("gpu_cutie_gru", c)?);
+    with_dense_linear_backend(|backend| {
+        backend.prepare_device()?;
+        let out = GpuTensor::from_pool(h.rows, h.cols)?;
+        gpu_check(unsafe {
+            makepad_cuda_cutie_gru_f32(h.device_ptr()?, values.device_ptr()?, out.device_ptr()?, n_u, c_u, h.cols, backend.stream)
+        })?;
+        Ok(out)
+    })
 }
 
 pub fn gpu_cutie_gru_reference(h: &GpuTensor, values: &GpuTensor, n: usize, c: usize) -> Result<GpuTensor, String> {
@@ -176,7 +406,29 @@ pub fn gpu_cutie_gru_reference(h: &GpuTensor, values: &GpuTensor, n: usize, c: u
 /// each channel, a 1-D convolution over channels (`conv_w`, odd length k, zero padding (k-1)/2,
 /// no bias), a sigmoid, then x * that + `residual` ([n*c, p]).
 pub fn gpu_cutie_eca(x: &GpuTensor, residual: &GpuTensor, n: usize, c: usize, conv_w: &[f32]) -> Result<GpuTensor, String> {
-    gpu_cutie_eca_reference(x, residual, n, c, conv_w)
+    cutie_check_f32("gpu_cutie_eca", x)?;
+    cutie_check_f32("gpu_cutie_eca", residual)?;
+    if x.rows != n * c || residual.rows != x.rows || residual.cols != x.cols || conv_w.len() % 2 == 0 {
+        return Err("gpu_cutie_eca shape mismatch".into());
+    }
+    if conv_w.len() > CUTIE_ECA_MAX_TAPS {
+        // Never for Cutie (3 or 5 taps): the kernel takes its taps by value.
+        return gpu_cutie_eca_reference(x, residual, n, c, conv_w);
+    }
+    let (n_u, c_u) = (cutie_u32("gpu_cutie_eca", n)?, cutie_u32("gpu_cutie_eca", c)?);
+    with_dense_linear_backend(|backend| {
+        backend.prepare_device()?;
+        let out = GpuTensor::from_pool(x.rows, x.cols)?;
+        // Each channel's mean, then its scale.
+        let scratch = GpuTensor::from_pool(2, x.rows.max(1))?;
+        gpu_check(unsafe {
+            makepad_cuda_cutie_eca_f32(
+                x.device_ptr()?, residual.device_ptr()?, out.device_ptr()?, scratch.device_ptr()?, conv_w.as_ptr(),
+                conv_w.len() as u32, n_u, c_u, x.cols, backend.stream,
+            )
+        })?;
+        Ok(out)
+    })
 }
 
 pub fn gpu_cutie_eca_reference(x: &GpuTensor, residual: &GpuTensor, n: usize, c: usize, conv_w: &[f32]) -> Result<GpuTensor, String> {
@@ -218,7 +470,14 @@ pub fn gpu_cutie_eca_reference(x: &GpuTensor, residual: &GpuTensor, n: usize, c:
 /// For each object's mask in `masks` [n, p], the sum of the other objects' masks, clamped to 0..1
 /// (Cutie's `_get_others`).
 pub fn gpu_cutie_others(masks: &GpuTensor) -> Result<GpuTensor, String> {
-    gpu_cutie_others_reference(masks)
+    cutie_check_f32("gpu_cutie_others", masks)?;
+    let n = cutie_u32("gpu_cutie_others", masks.rows)?;
+    with_dense_linear_backend(|backend| {
+        backend.prepare_device()?;
+        let out = GpuTensor::from_pool(masks.rows, masks.cols)?;
+        gpu_check(unsafe { makepad_cuda_cutie_others_f32(masks.device_ptr()?, out.device_ptr()?, n, masks.cols, backend.stream) })?;
+        Ok(out)
+    })
 }
 
 pub fn gpu_cutie_others_reference(masks: &GpuTensor) -> Result<GpuTensor, String> {
@@ -242,7 +501,21 @@ pub fn gpu_cutie_others_reference(masks: &GpuTensor) -> Result<GpuTensor, String
 
 /// Zero padding of planar [planes, h*w] by (left, right, top, bottom). Out [planes, (h+t+b)*(w+l+r)].
 pub fn gpu_cutie_pad(x: &GpuTensor, w: usize, h: usize, left: usize, right: usize, top: usize, bottom: usize) -> Result<GpuTensor, String> {
-    gpu_cutie_pad_reference(x, w, h, left, right, top, bottom)
+    cutie_check_f32("gpu_cutie_pad", x)?;
+    if x.cols != w * h {
+        return Err("gpu_cutie_pad shape mismatch".into());
+    }
+    let (nw, nh) = (w + left + right, h + top + bottom);
+    let d = |v: usize| cutie_u32("gpu_cutie_pad", v);
+    let (planes, wu, hu, l, r, t, b) = (d(x.rows)?, d(w)?, d(h)?, d(left)?, d(right)?, d(top)?, d(bottom)?);
+    d(nw)?;
+    d(nh)?;
+    with_dense_linear_backend(|backend| {
+        backend.prepare_device()?;
+        let out = GpuTensor::from_pool(x.rows, nw * nh)?;
+        gpu_check(unsafe { makepad_cuda_cutie_pad_f32(x.device_ptr()?, out.device_ptr()?, planes, wu, hu, l, r, t, b, backend.stream) })?;
+        Ok(out)
+    })
 }
 
 pub fn gpu_cutie_pad_reference(x: &GpuTensor, w: usize, h: usize, left: usize, right: usize, top: usize, bottom: usize) -> Result<GpuTensor, String> {
@@ -265,7 +538,18 @@ pub fn gpu_cutie_pad_reference(x: &GpuTensor, w: usize, h: usize, left: usize, r
 
 /// A window of planar [planes, h*w]: `out_w` x `out_h` from (`left`, `top`).
 pub fn gpu_cutie_crop(x: &GpuTensor, w: usize, h: usize, left: usize, top: usize, out_w: usize, out_h: usize) -> Result<GpuTensor, String> {
-    gpu_cutie_crop_reference(x, w, h, left, top, out_w, out_h)
+    cutie_check_f32("gpu_cutie_crop", x)?;
+    if x.cols != w * h || left + out_w > w || top + out_h > h {
+        return Err("gpu_cutie_crop shape mismatch".into());
+    }
+    let d = |v: usize| cutie_u32("gpu_cutie_crop", v);
+    let (planes, wu, hu, l, t, owu, ohu) = (d(x.rows)?, d(w)?, d(h)?, d(left)?, d(top)?, d(out_w)?, d(out_h)?);
+    with_dense_linear_backend(|backend| {
+        backend.prepare_device()?;
+        let out = GpuTensor::from_pool(x.rows, out_w * out_h)?;
+        gpu_check(unsafe { makepad_cuda_cutie_crop_f32(x.device_ptr()?, out.device_ptr()?, planes, wu, hu, l, t, owu, ohu, backend.stream) })?;
+        Ok(out)
+    })
 }
 
 pub fn gpu_cutie_crop_reference(x: &GpuTensor, w: usize, h: usize, left: usize, top: usize, out_w: usize, out_h: usize) -> Result<GpuTensor, String> {
@@ -290,7 +574,19 @@ pub fn gpu_cutie_crop_reference(x: &GpuTensor, w: usize, h: usize, left: usize, 
 /// op(a) @ op(b), op transposing when asked: op(a) [m, k], op(b) [k, n]; out [m, n]. fp32
 /// multiply-accumulate (no TF32).
 pub fn gpu_cutie_matmul(a: &GpuTensor, trans_a: bool, b: &GpuTensor, trans_b: bool) -> Result<GpuTensor, String> {
-    gpu_cutie_matmul_reference(a, trans_a, b, trans_b)
+    cutie_check_f32("gpu_cutie_matmul", a)?;
+    cutie_check_f32("gpu_cutie_matmul", b)?;
+    let (m, k) = if trans_a { (a.cols, a.rows) } else { (a.rows, a.cols) };
+    let (k2, n) = if trans_b { (b.cols, b.rows) } else { (b.rows, b.cols) };
+    if k != k2 {
+        return Err(format!("gpu_cutie_matmul inner dims {k} != {k2}"));
+    }
+    with_dense_linear_backend(|backend| {
+        backend.prepare_device()?;
+        let out = GpuTensor::from_pool(m, n)?;
+        cutie_sgemm(backend, a.device_ptr()?, a.cols, trans_a, b.device_ptr()?, b.cols, trans_b, m, n, k, out.device_ptr()?)?;
+        Ok(out)
+    })
 }
 
 pub fn gpu_cutie_matmul_reference(a: &GpuTensor, trans_a: bool, b: &GpuTensor, trans_b: bool) -> Result<GpuTensor, String> {
@@ -324,8 +620,72 @@ pub fn gpu_cutie_matmul_reference(a: &GpuTensor, trans_a: bool, b: &GpuTensor, t
 /// [1, m] (None: 1), query keys `qk` [ck, p], selection `qe` [ck, p] (None: plain L2 as STCN).
 /// Out [m, p]: (-a_sq + two_ab - b_sq) * ms / sqrt(ck), with a_sq = mk^2 . qe, two_ab =
 /// 2 mk . (qk*qe), b_sq = sum_c qe*qk^2 (without qe: a_sq = |mk|^2, two_ab = 2 mk . qk, no b_sq).
+///
+/// As PyTorch forms it: a_sq and two_ab are GEMMs over the channels (cuBLAS SGEMM), each rounded
+/// before they are combined, so cancellation between them is PyTorch's own.
 pub fn gpu_cutie_similarity(mk: &GpuTensor, ms: Option<&GpuTensor>, qk: &GpuTensor, qe: Option<&GpuTensor>) -> Result<GpuTensor, String> {
-    gpu_cutie_similarity_reference(mk, ms, qk, qe)
+    let op = "gpu_cutie_similarity";
+    cutie_check_f32(op, mk)?;
+    cutie_check_f32(op, qk)?;
+    for t in ms.iter().chain(qe.iter()) {
+        cutie_check_f32(op, t)?;
+    }
+    let (ck, m, p) = (mk.rows, mk.cols, qk.cols);
+    if qk.rows != ck || qe.is_some_and(|e| e.rows != ck || e.cols != p) || ms.is_some_and(|s| s.rows * s.cols != m) {
+        return Err("gpu_cutie_similarity shape mismatch".into());
+    }
+    let (ck_u, m_u, p_u) = (cutie_u32(op, ck)?, cutie_u32(op, m)?, cutie_u32(op, p)?);
+    let scale = (ck as f32).sqrt();
+    with_dense_linear_backend(|backend| {
+        backend.prepare_device()?;
+        let out = GpuTensor::from_pool(m, p)?;
+        let ms_ptr = match ms {
+            Some(s) => s.device_ptr()?.cast_const(),
+            None => std::ptr::null(),
+        };
+        let null = std::ptr::null_mut::<f32>();
+        match qe {
+            Some(qe) => {
+                let mk_sq = GpuTensor::from_pool(ck, m)?;
+                let qkqe = GpuTensor::from_pool(ck, p)?;
+                let b_sq = GpuTensor::from_pool(1, p)?;
+                let two_ab = GpuTensor::from_pool(m, p)?;
+                gpu_check(unsafe {
+                    makepad_cuda_cutie_similarity_prep_f32(
+                        mk.device_ptr()?, qk.device_ptr()?, qe.device_ptr()?, mk_sq.device_ptr()?, qkqe.device_ptr()?,
+                        b_sq.device_ptr()?, null, ck_u, m_u, p_u, backend.stream,
+                    )
+                })?;
+                // a_sq = (mk^2)^T qe into the output; two_ab's product mk^T (qk*qe) beside it.
+                cutie_sgemm(backend, mk_sq.device_ptr()?, m, true, qe.device_ptr()?, p, false, m, p, ck, out.device_ptr()?)?;
+                cutie_sgemm(backend, mk.device_ptr()?, m, true, qkqe.device_ptr()?, p, false, m, p, ck, two_ab.device_ptr()?)?;
+                gpu_check(unsafe {
+                    makepad_cuda_cutie_similarity_epilogue_f32(
+                        out.device_ptr()?, two_ab.device_ptr()?, b_sq.device_ptr()?, std::ptr::null(), ms_ptr, scale, m_u,
+                        p_u, backend.stream,
+                    )
+                })?;
+            }
+            None => {
+                let a_sq = GpuTensor::from_pool(1, m)?;
+                gpu_check(unsafe {
+                    makepad_cuda_cutie_similarity_prep_f32(
+                        mk.device_ptr()?, qk.device_ptr()?, std::ptr::null(), null, null, null, a_sq.device_ptr()?, ck_u,
+                        m_u, p_u, backend.stream,
+                    )
+                })?;
+                // mk^T qk into the output.
+                cutie_sgemm(backend, mk.device_ptr()?, m, true, qk.device_ptr()?, p, false, m, p, ck, out.device_ptr()?)?;
+                gpu_check(unsafe {
+                    makepad_cuda_cutie_similarity_epilogue_f32(
+                        out.device_ptr()?, std::ptr::null(), std::ptr::null(), a_sq.device_ptr()?, ms_ptr, scale, m_u, p_u,
+                        backend.stream,
+                    )
+                })?;
+            }
+        }
+        Ok(out)
+    })
 }
 
 pub fn gpu_cutie_similarity_reference(mk: &GpuTensor, ms: Option<&GpuTensor>, qk: &GpuTensor, qe: Option<&GpuTensor>) -> Result<GpuTensor, String> {
@@ -372,8 +732,37 @@ pub fn gpu_cutie_similarity_reference(mk: &GpuTensor, ms: Option<&GpuTensor>, qk
 /// Cutie's top-k softmax down each column of `sim` [m, p]: the k largest (k = min(k, m)), their
 /// exp normalised to sum 1 (no max subtracted, as Cutie's `do_softmax`), every other entry 0.
 /// Also each row's sum of the result ([1, m]): how much each memory token was used.
+///
+/// The kernel splits each column's rows into slices, keeps each slice's top k (one thread a
+/// column and slice, reads coalesced across columns), merges them per column in the
+/// reference's order (larger first, equal values by the lower row), then the softmax and the
+/// usage (each row of the result summed).
 pub fn gpu_cutie_topk_softmax(sim: &GpuTensor, k: usize) -> Result<(GpuTensor, GpuTensor), String> {
-    gpu_cutie_topk_softmax_reference(sim, k)
+    let op = "gpu_cutie_topk_softmax";
+    cutie_check_f32(op, sim)?;
+    let (m, p) = (sim.rows, sim.cols);
+    let k = k.min(m);
+    if k > CUTIE_TOPK_MAX {
+        // Never for Cutie (top_k 30): the kernel keeps at most 64 a column in registers.
+        return gpu_cutie_topk_softmax_reference(sim, k);
+    }
+    let (m_u, p_u, k_u) = (cutie_u32(op, m)?, cutie_u32(op, p)?, k as u32);
+    with_dense_linear_backend(|backend| {
+        backend.prepare_device()?;
+        let aff = GpuTensor::from_pool(m, p)?;
+        let usage = GpuTensor::from_pool(1, m)?;
+        cutie_zero(backend, aff.device_ptr()?, m * p)?;
+        let entries = unsafe { makepad_cuda_cutie_topk_scratch_entries(m_u, p_u, k_u) }.max(1);
+        let vals = GpuTensor::from_pool(entries, 1)?;
+        let idx = GpuTensor::from_pool(entries, 1)?;
+        gpu_check(unsafe {
+            makepad_cuda_cutie_topk_softmax_f32(
+                sim.device_ptr()?, aff.device_ptr()?, usage.device_ptr()?, vals.device_ptr()?, idx.device_ptr()?.cast::<u32>(),
+                m_u, p_u, k_u, backend.stream,
+            )
+        })?;
+        Ok((aff, usage))
+    })
 }
 
 pub fn gpu_cutie_topk_softmax_reference(sim: &GpuTensor, k: usize) -> Result<(GpuTensor, GpuTensor), String> {
@@ -400,7 +789,15 @@ pub fn gpu_cutie_topk_softmax_reference(sim: &GpuTensor, k: usize) -> Result<(Gp
 
 /// Softmax down each column of `x` [m, p] (over the rows), the max subtracted first.
 pub fn gpu_cutie_softmax_axis0(x: &GpuTensor) -> Result<GpuTensor, String> {
-    gpu_cutie_softmax_axis0_reference(x)
+    let op = "gpu_cutie_softmax_axis0";
+    cutie_check_f32(op, x)?;
+    let (m, p) = (cutie_u32(op, x.rows)?, cutie_u32(op, x.cols)?);
+    with_dense_linear_backend(|backend| {
+        backend.prepare_device()?;
+        let out = GpuTensor::from_pool(x.rows, x.cols)?;
+        gpu_check(unsafe { makepad_cuda_cutie_softmax_axis0_f32(x.device_ptr()?, out.device_ptr()?, m, p, backend.stream) })?;
+        Ok(out)
+    })
 }
 
 pub fn gpu_cutie_softmax_axis0_reference(x: &GpuTensor) -> Result<GpuTensor, String> {
@@ -429,7 +826,14 @@ pub fn gpu_cutie_softmax_axis0_reference(x: &GpuTensor) -> Result<GpuTensor, Str
 /// ([n+1, p]): the background is prod(1 - prob), every row clamped to 1e-7..1-1e-7, then
 /// log(q / (1 - q)).
 pub fn gpu_cutie_aggregate(prob: &GpuTensor) -> Result<GpuTensor, String> {
-    gpu_cutie_aggregate_reference(prob)
+    cutie_check_f32("gpu_cutie_aggregate", prob)?;
+    let n = cutie_u32("gpu_cutie_aggregate", prob.rows)?;
+    with_dense_linear_backend(|backend| {
+        backend.prepare_device()?;
+        let out = GpuTensor::from_pool(prob.rows + 1, prob.cols)?;
+        gpu_check(unsafe { makepad_cuda_cutie_aggregate_f32(prob.device_ptr()?, out.device_ptr()?, n, prob.cols, backend.stream) })?;
+        Ok(out)
+    })
 }
 
 pub fn gpu_cutie_aggregate_reference(prob: &GpuTensor) -> Result<GpuTensor, String> {
@@ -461,7 +865,23 @@ pub fn gpu_cutie_aggregate_reference(prob: &GpuTensor) -> Result<GpuTensor, Stri
 /// see the object's foreground, the second half only the rest; a row that would see nothing sees
 /// everything. Out [n*heads*queries, p], additive: 0 where seen, -inf where blocked.
 pub fn gpu_cutie_attn_mask(aux: &GpuTensor, heads: usize, queries: usize) -> Result<GpuTensor, String> {
-    gpu_cutie_attn_mask_reference(aux, heads, queries)
+    let op = "gpu_cutie_attn_mask";
+    cutie_check_f32(op, aux)?;
+    let (n, p) = (aux.rows, aux.cols);
+    let (n_u, heads_u, queries_u) = (cutie_u32(op, n)?, cutie_u32(op, heads)?, cutie_u32(op, queries)?);
+    with_dense_linear_backend(|backend| {
+        backend.prepare_device()?;
+        let out = GpuTensor::from_pool(n * heads * queries, p)?;
+        // Each object's foreground flags [n, p], then whether it has any foreground and any
+        // background (zeroed: the kernel only sets them).
+        let scratch = GpuTensor::from_pool(n * p + 2 * n, 1)?;
+        let scratch_ptr = scratch.device_ptr()?;
+        cutie_zero(backend, unsafe { scratch_ptr.add(n * p) }, 2 * n)?;
+        gpu_check(unsafe {
+            makepad_cuda_cutie_attn_mask_f32(aux.device_ptr()?, out.device_ptr()?, scratch_ptr.cast::<u32>(), n_u, p, heads_u, queries_u, backend.stream)
+        })?;
+        Ok(out)
+    })
 }
 
 pub fn gpu_cutie_attn_mask_reference(aux: &GpuTensor, heads: usize, queries: usize) -> Result<GpuTensor, String> {
