@@ -25,8 +25,6 @@ fn tensor(rows: usize, cols: usize, data: Vec<f32>) -> GpuTensor {
         cols,
         data: RefCell::new(data),
         #[cfg(target_os = "macos")]
-        u32s: RefCell::new(Vec::new()),
-        #[cfg(target_os = "macos")]
         id: std::cell::Cell::new(crate::gpu_types::fresh_tensor_id()),
     }
 }

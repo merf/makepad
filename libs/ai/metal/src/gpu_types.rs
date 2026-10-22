@@ -18,9 +18,8 @@ pub(crate) fn fresh_tensor_id() -> u64 {
 pub struct GpuTensor {
     pub(crate) rows: usize,
     pub(crate) cols: usize,
+    /// The values; a u32 tensor (`upload_u32`) holds its words here as f32 bits, as on CUDA.
     pub(crate) data: RefCell<Vec<f32>>,
-    #[cfg(target_os = "macos")]
-    pub(crate) u32s: RefCell<Vec<u32>>,
     /// Identity of the current contents: fresh at creation and after every
     /// in-place write, so device-side caches keyed by it can never serve a
     /// stale weight (a pointer can be reused; an id cannot).

@@ -7,9 +7,12 @@ pub mod backend_kind;
 pub mod gpu_types;
 #[cfg(target_os = "macos")]
 pub mod gpu_tensor;
+#[cfg(target_os = "macos")]
+mod objc_util;
 pub mod residency;
 pub mod runtime;
 pub mod shim;
+pub mod stream;
 pub mod rife;
 
 pub use affine::*;

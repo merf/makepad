@@ -16,12 +16,11 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-fn tensor(rows: usize, cols: usize, data: Vec<f32>) -> GpuTensor {
+pub(crate) fn tensor(rows: usize, cols: usize, data: Vec<f32>) -> GpuTensor {
     GpuTensor {
         rows,
         cols,
         data: RefCell::new(data),
-        u32s: RefCell::new(Vec::new()),
         id: std::cell::Cell::new(fresh_tensor_id()),
     }
 }
@@ -131,12 +130,14 @@ pub fn upload(values: &[f32], rows: usize, cols: usize) -> Result<GpuTensor, Str
     Ok(tensor(rows, cols, values.to_vec()))
 }
 
+/// u32 words as `[len, 1]` (at least one row, as on CUDA), held in `data` as f32 bits so the
+/// stream binds them like any tensor; `to_bits` reads them back unchanged.
 pub fn upload_u32(values: &[u32]) -> Result<GpuTensor, String> {
+    let words = values.iter().map(|&word| f32::from_bits(word)).collect();
     Ok(GpuTensor {
         rows: values.len().max(1),
         cols: 1,
-        data: RefCell::new(Vec::new()),
-        u32s: RefCell::new(values.to_vec()),
+        data: RefCell::new(words),
         id: std::cell::Cell::new(fresh_tensor_id()),
     })
 }
@@ -393,8 +394,11 @@ pub fn gather_rows_colblock(
     block_cols: usize,
 ) -> Result<GpuTensor, String> {
     let src_d = data(src)?;
-    let rows = row_idx.u32s.borrow();
-    let blocks = colblock_idx.map(|t| t.u32s.borrow());
+    let rows: Vec<u32> = data(row_idx)?.iter().map(|word| word.to_bits()).collect();
+    let blocks: Option<Vec<u32>> = match colblock_idx {
+        Some(t) => Some(data(t)?.iter().map(|word| word.to_bits()).collect()),
+        None => None,
+    };
     let out_rows = rows.len();
     let mut out = vec![0.0; out_rows * block_cols];
     let nblocks = src.cols / block_cols;
@@ -1110,9 +1114,3 @@ pub fn group_norm_planar(
         .ok_or_else(|| "metal group_norm failed".to_string())?;
     Ok(tensor(x.rows, width * height, out))
 }
-
-pub fn evict_prefix(_prefix: &str) -> Result<usize, String> {
-    Ok(0)
-}
-
-pub fn pool_clear() {}

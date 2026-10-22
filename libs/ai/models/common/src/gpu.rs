@@ -3036,7 +3036,26 @@ mod imp {
     }
 
     pub fn gpu_perf_stats(_reset: bool) -> GpuPerfStats {
-        GpuPerfStats::default()
+        // macOS: the calling thread's Metal stream (its pool and weight cache) and the device's
+        // memory; the counters CUDA keeps that the stream has no twin for stay 0.
+        #[cfg(target_os = "macos")]
+        {
+            let stats = makepad_ai_metal::stream::stats(_reset);
+            return GpuPerfStats {
+                weight_stream_bytes: stats.weight_bytes,
+                pool_oom_clears: stats.pool_oom_clears,
+                pool_fresh_alloc_count: stats.pool_fresh_alloc_count,
+                pool_fresh_alloc_bytes: stats.pool_fresh_alloc_bytes,
+                pool_overcap_free_bytes: stats.pool_overcap_free_bytes,
+                mem_free_bytes: stats.mem_free_bytes,
+                mem_total_bytes: stats.mem_total_bytes,
+                ..GpuPerfStats::default()
+            };
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            GpuPerfStats::default()
+        }
     }
 
     pub fn gpu_layer_norm_mod(
@@ -3230,7 +3249,7 @@ mod imp {
     pub fn gpu_synchronize() -> Result<(), String> {
         #[cfg(target_os = "macos")]
         {
-            return Ok(());
+            return makepad_ai_metal::stream::synchronize();
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -3535,7 +3554,7 @@ mod imp {
     pub fn gpu_weight_cache_evict_prefix(_prefix: &str) -> Result<usize, String> {
         #[cfg(target_os = "macos")]
         {
-            return makepad_ai_metal::gpu_tensor::evict_prefix(_prefix);
+            return makepad_ai_metal::stream::evict_weights(_prefix, false);
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -3544,7 +3563,15 @@ mod imp {
     }
 
     pub fn gpu_weight_cache_evict_prefix_if_loaded(_prefix: &str) -> Result<usize, String> {
-        Ok(0)
+        // macOS: never starts a Metal stream for it, as CUDA never makes a context.
+        #[cfg(target_os = "macos")]
+        {
+            return makepad_ai_metal::stream::evict_weights(_prefix, true);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(0)
+        }
     }
 
     pub fn gpu_runtime_trim() -> Result<(), String> {
@@ -4814,13 +4841,28 @@ mod imp {
         Err(GPU_UNAVAILABLE.to_string())
     }
 
-    pub fn gpu_pool_clear() {}
-
-    pub fn gpu_pool_trim() -> usize {
-        0
+    // macOS: the calling thread's Metal stream pool (its idle buffers, and the host binding's
+    // input copies).
+    pub fn gpu_pool_clear() {
+        #[cfg(target_os = "macos")]
+        makepad_ai_metal::stream::pool_clear();
     }
 
-    pub fn gpu_pool_cap_override(_bytes: Option<usize>) {}
+    pub fn gpu_pool_trim() -> usize {
+        #[cfg(target_os = "macos")]
+        {
+            return makepad_ai_metal::stream::pool_trim();
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            0
+        }
+    }
+
+    pub fn gpu_pool_cap_override(_bytes: Option<usize>) {
+        #[cfg(target_os = "macos")]
+        makepad_ai_metal::stream::pool_cap_override(_bytes);
+    }
 
     // Cutie's ops without CUDA kernels: the host references (cuda/src/cutie_ops.rs).
     include!("gpu_cutie_host.rs");
