@@ -2147,7 +2147,16 @@ mod imp {
 
     pub fn gpu_pixal_pool(
         _x: &GpuTensor, _width: usize, _height: usize, _out_width: usize, _out_height: usize,
-    ) -> Result<GpuTensor,String> { Err(GPU_UNAVAILABLE.to_string()) }
+    ) -> Result<GpuTensor,String> {
+        #[cfg(target_os = "macos")]
+        {
+            return makepad_ai_metal::gpu_tensor::pool_area(_x, _width, _height, _out_width, _out_height);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(GPU_UNAVAILABLE.to_string())
+        }
+    }
 
     pub fn gpu_skintokens_michelangelo_fourier(
         _condition: &GpuTensor,
@@ -2677,7 +2686,14 @@ mod imp {
         _bias: &[f32],
         _eps: f32,
     ) -> Result<GpuTensor, String> {
-        Err(GPU_UNAVAILABLE.to_string())
+        #[cfg(target_os = "macos")]
+        {
+            return makepad_ai_metal::gpu_tensor::layer_norm_pytorch(_x, _scale, _bias, _eps);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(GPU_UNAVAILABLE.to_string())
+        }
     }
 
     pub fn gpu_layer_norm_mul_add_grouped(
@@ -3212,7 +3228,14 @@ mod imp {
 
     // Fixed-workspace sequence operations (CUDA; distinct bf16 storage).
     pub fn gpu_synchronize() -> Result<(), String> {
-        Err(GPU_UNAVAILABLE.to_string())
+        #[cfg(target_os = "macos")]
+        {
+            return Ok(());
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(GPU_UNAVAILABLE.to_string())
+        }
     }
 
     pub fn gpu_alloc_bf16(_rows: usize, _cols: usize) -> Result<GpuBf16Buf, String> {
@@ -3714,7 +3737,14 @@ mod imp {
         _head_count: usize,
         _scale: f32,
     ) -> Result<GpuTensor, String> {
-        Err(GPU_UNAVAILABLE.to_string())
+        #[cfg(target_os = "macos")]
+        {
+            return makepad_ai_metal::gpu_tensor::attention_packed_cross_f32(_q, _k, _v, _head_count, _scale);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(GPU_UNAVAILABLE.to_string())
+        }
     }
 
     pub fn gpu_attention_packed_bf16(
@@ -3927,7 +3957,14 @@ mod imp {
     }
 
     pub fn gpu_slice_cols(_x: &GpuTensor, _start: usize, _len: usize) -> Result<GpuTensor, String> {
-        Err(GPU_UNAVAILABLE.to_string())
+        #[cfg(target_os = "macos")]
+        {
+            return makepad_ai_metal::gpu_tensor::slice_cols(_x, _start, _len);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(GPU_UNAVAILABLE.to_string())
+        }
     }
 
     pub fn gpu_snake_cols(_x: &GpuTensor, _alpha: &GpuTensor) -> Result<GpuTensor, String> {
@@ -4293,7 +4330,14 @@ mod imp {
         _delta: &GpuTensor,
         _scale: f32,
     ) -> Result<GpuTensor, String> {
-        Err(GPU_UNAVAILABLE.to_string())
+        #[cfg(target_os = "macos")]
+        {
+            return makepad_ai_metal::gpu_tensor::scale_add(_base, _delta, _scale);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(GPU_UNAVAILABLE.to_string())
+        }
     }
 
     pub fn gpu_realesrgan_alloc_f16(_rows: usize, _cols: usize) -> Result<GpuTensor, String> {
@@ -4538,7 +4582,14 @@ mod imp {
     }
 
     pub fn gpu_planar_tokens_transpose(_x: &GpuTensor) -> Result<GpuTensor, String> {
-        Err(GPU_UNAVAILABLE.to_string())
+        #[cfg(target_os = "macos")]
+        {
+            return makepad_ai_metal::gpu_tensor::transpose(_x);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(GPU_UNAVAILABLE.to_string())
+        }
     }
 
     pub fn gpu_paint_ref_attn_wide_v(
@@ -4771,8 +4822,8 @@ mod imp {
 
     pub fn gpu_pool_cap_override(_bytes: Option<usize>) {}
 
-    // Cutie's device ops without CUDA kernels (cuda/src/cutie_ops.rs).
-    include!("gpu_cutie_stubs.rs");
+    // Cutie's ops without CUDA kernels: the host references (cuda/src/cutie_ops.rs).
+    include!("gpu_cutie_host.rs");
 }
 
 #[cfg(not(all(any(target_os = "linux", target_os = "windows"), makepad_ai_cuda_kernels)))]

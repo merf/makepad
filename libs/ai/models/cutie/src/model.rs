@@ -21,7 +21,7 @@ use crate::torch_pth::PthStateDict;
 use crate::{DiffusionError, Result};
 use makepad_ai_common::gpu::{
     cutie_conv_out, gpu_add, gpu_birefnet_relu, gpu_concat_rows_many, gpu_cutie_add_broadcast, gpu_cutie_conv2d_fused, gpu_cutie_eca,
-    gpu_cutie_layer_norm, gpu_cutie_sine_encoding, gpu_download, gpu_linear_f32_resident, gpu_planar_tokens_transpose,
+    gpu_cutie_layer_norm, gpu_cutie_sine_encoding, gpu_cutie_linear, gpu_download, gpu_planar_tokens_transpose,
     gpu_slice_rows, gpu_upload, GpuTensor,
 };
 use std::cell::RefCell;
@@ -285,7 +285,7 @@ impl Linear {
     }
 
     pub(crate) fn forward(&self, x: &GpuTensor) -> Result<GpuTensor> {
-        gpu_linear_f32_resident(x, &self.weight, self.bias.as_ref()).map_err(|e| dev("linear", e))
+        gpu_cutie_linear(x, &self.weight, self.bias.as_ref()).map_err(|e| dev("linear", e))
     }
 }
 

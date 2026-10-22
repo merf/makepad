@@ -34,7 +34,7 @@ use makepad_ai_common::gpu::{
     gpu_cutie_rgb_planes_reference, gpu_cutie_sigmoid, gpu_cutie_sigmoid_reference, gpu_cutie_similarity,
     gpu_cutie_similarity_reference, gpu_cutie_sine_encoding, gpu_cutie_sine_encoding_reference, gpu_cutie_softmax_axis0,
     gpu_cutie_softmax_axis0_reference, gpu_cutie_topk_softmax, gpu_cutie_topk_softmax_reference, gpu_download,
-    gpu_attention_packed_cross_bias, gpu_attention_packed_cross_f32, gpu_cutie_available, gpu_linear_f32_resident, gpu_synchronize,
+    gpu_attention_packed_cross_bias, gpu_attention_packed_cross_f32, gpu_cutie_available, gpu_cutie_linear, gpu_synchronize, GPU_CUTIE_KERNELS,
     gpu_upload, gpu_weight_cache_evict_prefix, GpuTensor,
 };
 use std::time::Instant;
@@ -45,6 +45,16 @@ const STAGE: &str = "ops";
 const EXACT: Tol = Tol { rel: 0.0, cos: 1.0 - 1e-12, bool_mismatch: 0.0 };
 /// Ops that sum, or call exp, tanh or log: fp32 rounding apart.
 const TIGHT: Tol = Tol { rel: 1e-5, cos: 0.9999999, bool_mismatch: 0.0 };
+
+/// What a kernel is held to against PyTorch's pinned values: its bits where the ops are kernels
+/// of their own (CUDA), else the reference's tolerance, since the ops then are the references.
+fn kernel_tol(reference: Tol) -> Tol {
+    if GPU_CUTIE_KERNELS {
+        EXACT
+    } else {
+        reference
+    }
+}
 
 /// The conv and layer norm cases' weight cache keys start with this (under Cutie's namespace),
 /// each case its own key: random weights under a reused key would read a stale cached copy.
@@ -774,7 +784,7 @@ impl OpsCheck<'_> {
         Ok(())
     }
 
-    /// `gpu_linear_f32_resident` (every Linear of the object transformer: x @ W^T + b, cuBLAS
+    /// `gpu_cutie_linear` (every Linear of the object transformer: x @ W^T + b, cuBLAS
     /// SGEMM on the backend's handle) against the product summed in f64 on the host: fp32
     /// rounding apart (`TIGHT`). The ops above have their own references; this one and
     /// `attention` are shared Makepad ops that the stages judge only at `Tol::STAGE`, where a
@@ -793,7 +803,7 @@ impl OpsCheck<'_> {
             }
         }
         let bias = if bias { Some(up(&b, 1, out_f)?) } else { None };
-        let actual = gpu_linear_f32_resident(&up(&x, rows, in_f)?, &up(&w, out_f, in_f)?, bias.as_ref()).map_err(|e| dev(&case, e))?;
+        let actual = gpu_cutie_linear(&up(&x, rows, in_f)?, &up(&w, out_f, in_f)?, bias.as_ref()).map_err(|e| dev(&case, e))?;
         self.compare_host("linear", &case, &actual, expected, TIGHT)
     }
 
@@ -857,7 +867,7 @@ impl OpsCheck<'_> {
         let others = gpu_cutie_others_reference(&masks).map_err(|e| dev(case, e))?;
         self.compare_pinned("others", &format!("{case} reference"), &others, &PINNED_OTHERS, EXACT)?;
         let agg = gpu_cutie_aggregate(&masks).map_err(|e| dev(case, e))?;
-        self.compare_pinned("aggregate", &format!("{case} kernel"), &agg, &PINNED_AGGREGATE, EXACT)?;
+        self.compare_pinned("aggregate", &format!("{case} kernel"), &agg, &PINNED_AGGREGATE, kernel_tol(TIGHT))?;
         let agg = gpu_cutie_aggregate_reference(&masks).map_err(|e| dev(case, e))?;
         self.compare_pinned("aggregate", &format!("{case} reference"), &agg, &PINNED_AGGREGATE, TIGHT)?;
 
@@ -865,7 +875,7 @@ impl OpsCheck<'_> {
         let sim = up(&sim, 32, 1)?;
         let case = "torch m32 p1 k30";
         let (aff, _) = gpu_cutie_topk_softmax(&sim, 30).map_err(|e| dev(case, e))?;
-        self.compare_pinned("topk", &format!("{case} kernel"), &aff, &PINNED_TOPK, EXACT)?;
+        self.compare_pinned("topk", &format!("{case} kernel"), &aff, &PINNED_TOPK, kernel_tol(TIGHT))?;
         let (aff, _) = gpu_cutie_topk_softmax_reference(&sim, 30).map_err(|e| dev(case, e))?;
         self.compare_pinned("topk", &format!("{case} reference"), &aff, &PINNED_TOPK, TIGHT)?;
 
@@ -880,7 +890,7 @@ impl OpsCheck<'_> {
         let inv_freq: Vec<f32> = PINNED_SINE_FREQS.iter().map(|&b| f32::from_bits(b)).collect();
         let case = "torch dim 16 at 3x2";
         let pe = gpu_cutie_sine_encoding(&inv_freq, 3, 2, 32.0, 1e-6).map_err(|e| dev(case, e))?;
-        self.compare_pinned("sine", &format!("{case} kernel"), &pe, &PINNED_SINE, EXACT)?;
+        self.compare_pinned("sine", &format!("{case} kernel"), &pe, &PINNED_SINE, kernel_tol(TIGHT))?;
         let pe = gpu_cutie_sine_encoding_reference(&inv_freq, 3, 2, 32.0, 1e-6).map_err(|e| dev(case, e))?;
         self.compare_pinned("sine", &format!("{case} reference"), &pe, &PINNED_SINE, TIGHT)?;
         Ok(())
@@ -915,7 +925,10 @@ pub(crate) fn check(report: &mut Report) -> Result<()> {
     report.note("ops: seeded inputs against the host references and values pinned from torch; the oracle is not read");
     // What `Cutie::load` asks before anything else: these ops run here, so it must say so.
     let available = gpu_cutie_available();
-    report.record(STAGE, "available", "gpu_cutie_available", available, format!("{available} (the stubs, without Cutie's kernels, say false)"));
+    report.record(STAGE, "available", "gpu_cutie_available", available, format!("{available} (where nothing runs them, false)"));
+    if !GPU_CUTIE_KERNELS {
+        report.note("ops: this build has no Cutie kernels; each op is its host reference, so kernel against reference compares the reference with itself");
+    }
     let mut ck = OpsCheck { report, rng: Rng(0x0dd_c0ffee_5eed), conv_cases: 0 };
     let result = run(&mut ck);
     // The conv cases' random weights leave the device cache whether or not they passed.

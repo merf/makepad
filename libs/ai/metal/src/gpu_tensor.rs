@@ -248,6 +248,75 @@ pub fn relu(x: &GpuTensor) -> Result<GpuTensor, String> {
     Ok(tensor(x.rows, x.cols, out))
 }
 
+/// `base + scale * delta`, elementwise (CUDA's `gpu_realesrgan_scale_add`).
+pub fn scale_add(base: &GpuTensor, delta: &GpuTensor, scale: f32) -> Result<GpuTensor, String> {
+    if base.rows != delta.rows || base.cols != delta.cols {
+        return Err(format!("metal scale_add {}x{} vs {}x{}", base.rows, base.cols, delta.rows, delta.cols));
+    }
+    let out = data(base)?.iter().zip(data(delta)?.iter()).map(|(&b, &d)| b + scale * d).collect();
+    Ok(tensor(base.rows, base.cols, out))
+}
+
+/// `[rows, cols]` to `[cols, rows]`: planar `[C, HW]` and tokens `[HW, C]` (CUDA's
+/// `gpu_planar_tokens_transpose`).
+pub fn transpose(x: &GpuTensor) -> Result<GpuTensor, String> {
+    let xd = data(x)?;
+    let mut out = vec![0.0; x.rows * x.cols];
+    for r in 0..x.rows {
+        for c in 0..x.cols {
+            out[c * x.rows + r] = xd[r * x.cols + c];
+        }
+    }
+    Ok(tensor(x.cols, x.rows, out))
+}
+
+/// Adaptive average pooling of planar `[channels, height*width]` to `[channels, oh*ow]`, each
+/// output the mean of its window `[floor(i*in/out), ceil((i+1)*in/out))`, summed in row order
+/// (CUDA's `gpu_pixal_pool`, `pixal_pool_kernel`).
+pub fn pool_area(x: &GpuTensor, width: usize, height: usize, ow: usize, oh: usize) -> Result<GpuTensor, String> {
+    if width == 0 || height == 0 || ow == 0 || oh == 0 || width * height != x.cols {
+        return Err("metal pool_area shape mismatch".into());
+    }
+    let xd = data(x)?;
+    let mut out = vec![0.0f32; x.rows * ow * oh];
+    for c in 0..x.rows {
+        for py in 0..oh {
+            let (y0, y1) = (py * height / oh, ((py + 1) * height + oh - 1) / oh);
+            for px in 0..ow {
+                let (x0, x1) = (px * width / ow, ((px + 1) * width + ow - 1) / ow);
+                let mut sum = 0.0f32;
+                for y in y0..y1 {
+                    for xx in x0..x1 {
+                        sum += xd[(c * height + y) * width + xx];
+                    }
+                }
+                out[c * ow * oh + py * ow + px] = sum / ((x1 - x0) * (y1 - y0)) as f32;
+            }
+        }
+    }
+    Ok(tensor(x.rows, ow * oh, out))
+}
+
+/// nn.LayerNorm over each row: `(x - mean) * rsqrt(var + eps) * gamma + beta`, the biased
+/// variance. The moments are taken in f64 and rounded once, so within fp32 rounding of CUDA's
+/// `gpu_layer_norm_pytorch` (PyTorch's Welford order) rather than bit for bit.
+pub fn layer_norm_pytorch(x: &GpuTensor, gamma: &[f32], beta: &[f32], eps: f32) -> Result<GpuTensor, String> {
+    if gamma.len() != x.cols || beta.len() != x.cols || x.cols == 0 {
+        return Err("metal layer_norm_pytorch width mismatch".into());
+    }
+    let xd = data(x)?;
+    let mut out = vec![0.0f32; x.rows * x.cols];
+    for (row, dst) in xd.chunks_exact(x.cols).zip(out.chunks_exact_mut(x.cols)) {
+        let mean = row.iter().map(|&v| v as f64).sum::<f64>() / x.cols as f64;
+        let var = row.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / x.cols as f64;
+        let (mean, rstd) = (mean as f32, (1.0 / (var + eps as f64).sqrt()) as f32);
+        for (i, (&v, o)) in row.iter().zip(dst.iter_mut()).enumerate() {
+            *o = (v - mean) * rstd * gamma[i] + beta[i];
+        }
+    }
+    Ok(tensor(x.rows, x.cols, out))
+}
+
 pub fn slice_rows(x: &GpuTensor, start: usize, count: usize) -> Result<GpuTensor, String> {
     let xd = data(x)?;
     let end = start.saturating_add(count);
@@ -475,6 +544,43 @@ pub fn attention_packed(
     Ok(tensor(q.rows, q.cols, out))
 }
 
+/// `x @ w^T + bias` in fp32 on the host (Accelerate's sgemm): `linear_f32_resident` without
+/// its half-staged tiles, for models checked against an fp32 oracle (Cutie).
+pub fn linear_f32_exact(x: &GpuTensor, w: &GpuTensor, bias: Option<&GpuTensor>) -> Result<GpuTensor, String> {
+    let (m, k, n) = (x.rows, x.cols, w.rows);
+    if w.cols != k {
+        return Err(format!("metal linear_f32_exact k mismatch: x {}x{}, w {}x{}", x.rows, x.cols, w.rows, w.cols));
+    }
+    extern "C" {
+        fn cblas_sgemm(
+            order: i32, trans_a: i32, trans_b: i32, m: i32, n: i32, k: i32, alpha: f32, a: *const f32, lda: i32,
+            b: *const f32, ldb: i32, beta: f32, c: *mut f32, ldc: i32,
+        );
+    }
+    const ROW_MAJOR: i32 = 101;
+    const NO_TRANS: i32 = 111;
+    const TRANS: i32 = 112;
+    let mut out = vec![0.0f32; m * n];
+    if m * n > 0 && k > 0 {
+        let (xd, wd) = (data(x)?, data(w)?);
+        unsafe {
+            cblas_sgemm(
+                ROW_MAJOR, NO_TRANS, TRANS, m as i32, n as i32, k as i32, 1.0, xd.as_ptr(), k as i32, wd.as_ptr(),
+                k as i32, 0.0, out.as_mut_ptr(), n as i32,
+            );
+        }
+    }
+    if let Some(bias) = bias {
+        let bd = data(bias)?;
+        for row in out.chunks_exact_mut(n) {
+            for (o, &b) in row.iter_mut().zip(bd.iter()) {
+                *o += b;
+            }
+        }
+    }
+    Ok(tensor(m, n, out))
+}
+
 pub fn attention_packed_cross_bias(
     q: &GpuTensor,
     k: &GpuTensor,
@@ -484,11 +590,35 @@ pub fn attention_packed_cross_bias(
     bias: &GpuTensor,
 ) -> Result<GpuTensor, String> {
     // Biased decoder path is small; stay on host so the additive RPB is exact.
+    let bd = data(bias)?;
+    attention_packed_cross_host(q, k, v, heads, scale, Some(&bd))
+}
+
+/// Cross-attention in f32 on the host, as `attention_packed_cross_bias` without the bias: the
+/// fp32 contract of CUDA's `gpu_attention_packed_cross_f32` (Cutie's object transformer), which
+/// the flash kernel's fast-math exp would not keep.
+pub fn attention_packed_cross_f32(
+    q: &GpuTensor,
+    k: &GpuTensor,
+    v: &GpuTensor,
+    heads: usize,
+    scale: f32,
+) -> Result<GpuTensor, String> {
+    attention_packed_cross_host(q, k, v, heads, scale, None)
+}
+
+fn attention_packed_cross_host(
+    q: &GpuTensor,
+    k: &GpuTensor,
+    v: &GpuTensor,
+    heads: usize,
+    scale: f32,
+    bd: Option<&[f32]>,
+) -> Result<GpuTensor, String> {
     let d = q.cols / heads;
     let qd = data(q)?;
     let kd = data(k)?;
     let vd = data(v)?;
-    let bd = data(bias)?;
     let q_len = q.rows;
     let kv_len = k.rows;
     let mut out = vec![0.0; q_len * q.cols];
@@ -501,7 +631,7 @@ pub fn attention_packed_cross_bias(
                 for c in 0..d {
                     dot += qd[qi * q.cols + h * d + c] * kd[ki * k.cols + h * d + c];
                 }
-                let s = dot * scale + bd[h * q_len * kv_len + qi * kv_len + ki];
+                let s = dot * scale + bd.map_or(0.0, |b| b[h * q_len * kv_len + qi * kv_len + ki]);
                 scores[ki] = s;
                 max = max.max(s);
             }
