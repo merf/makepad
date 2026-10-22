@@ -83,7 +83,18 @@ kernel void gemm_naive_f32(constant GemmParams& p [[buffer(0)]],
 }
 
 // A threadgroup a 32x32 tile of one batch's output: (x, y, z) = (column tile, row tile, batch).
-// 128 threads, four SIMD groups of 32 (gemm.rs refuses another SIMD width).
+// 128 threads, four SIMD groups of 32 (gemm.rs refuses another SIMD width). Staging: each thread
+// loads the same rows of op(A) and the same column of op(B) at every step of k, from addresses it
+// works out once, into rows padded by 4 floats (rows 16 or 32 floats apart would put the rows of
+// an 8x8 load in the same few banks). The padding moves values, never sums, so it changes no bit.
+#define GEMM_T_A_LD (GEMM_TILE_K + 4u)
+#define GEMM_T_B_LD (GEMM_TILE + 4u)
+#define GEMM_T_A_ROWS_PER_PASS (GEMM_TILED_THREADS / GEMM_TILE_K)
+#define GEMM_T_A_PASSES (GEMM_TILE / GEMM_T_A_ROWS_PER_PASS)
+#define GEMM_T_B_ROWS_PER_PASS (GEMM_TILED_THREADS / GEMM_TILE)
+#define GEMM_T_B_PASSES (GEMM_TILE_K / GEMM_T_B_ROWS_PER_PASS)
+// The staged blocks with their padding (1216 floats), larger than the 32x32 result (1024).
+#define GEMM_T_STAGE (GEMM_TILE * GEMM_T_A_LD + GEMM_TILE_K * GEMM_T_B_LD)
 kernel void gemm_tiled_f32(constant GemmParams& p [[buffer(0)]],
                            device const float* a [[buffer(1)]],
                            device const float* b [[buffer(2)]],
@@ -91,17 +102,26 @@ kernel void gemm_tiled_f32(constant GemmParams& p [[buffer(0)]],
                            uint3 tile [[threadgroup_position_in_grid]],
                            uint tid [[thread_index_in_threadgroup]],
                            uint sg [[simdgroup_index_in_threadgroup]]) {
-    // op(A)'s 32x16 block then op(B)'s 16x32 block, each row-major; after the k loop the same
-    // memory holds the 32x32 result for the epilogue.
-    threadgroup float tiles[GEMM_TILE * GEMM_TILE];
+    // op(A)'s 32x16 block then op(B)'s 16x32 block, each row-major with padded rows; after the k
+    // loop the same memory holds the 32x32 result for the epilogue.
+    threadgroup float tiles[GEMM_T_STAGE];
     threadgroup float* a_tile = tiles;
-    threadgroup float* b_tile = tiles + GEMM_TILE * GEMM_TILE_K;
+    threadgroup float* b_tile = tiles + GEMM_TILE * GEMM_T_A_LD;
 
     const uint row0 = tile.y * GEMM_TILE;
     const uint col0 = tile.x * GEMM_TILE;
     const ulong batch = tile.z;
     device const float* a_batch = a + (ulong(p.a_offset) + batch * p.a_batch_stride);
     device const float* b_batch = b + (ulong(p.b_offset) + batch * p.b_batch_stride);
+
+    // This thread's part of the staging: op(A) column a_kk of rows a_r + 8 * pass, op(B) column
+    // b_j of rows b_kk + 4 * pass.
+    const uint a_kk = tid % GEMM_TILE_K;
+    const uint a_r = tid / GEMM_TILE_K;
+    const uint b_j = tid % GEMM_TILE;
+    const uint b_kk = tid / GEMM_TILE;
+    const bool b_in = col0 + b_j < p.n;
+    device const float* b_col = b_batch + ulong(col0 + b_j) * p.b_col_stride;
 
     // SIMD group sg multiplies the tile's rows (sg / 2) * 16 and columns (sg % 2) * 16, 16x16:
     // acc[2 * r + q] is its 8x8 block at row half r, column half q.
@@ -113,28 +133,30 @@ kernel void gemm_tiled_f32(constant GemmParams& p [[buffer(0)]],
     }
 
     for (uint k0 = 0; k0 < p.k; k0 += GEMM_TILE_K) {
-        for (uint e = tid; e < GEMM_TILE * GEMM_TILE_K; e += GEMM_TILED_THREADS) {
-            const uint i = row0 + e / GEMM_TILE_K;
-            const uint kk = k0 + e % GEMM_TILE_K;
-            a_tile[e] = (i < p.m && kk < p.k)
-                ? a_batch[ulong(i) * p.a_row_stride + ulong(kk) * p.a_col_stride]
+        const uint kk_a = k0 + a_kk;
+        const ulong a_col_at = ulong(kk_a) * p.a_col_stride;
+#pragma clang loop unroll(full)
+        for (uint pass = 0; pass < GEMM_T_A_PASSES; ++pass) {
+            const uint r = a_r + pass * GEMM_T_A_ROWS_PER_PASS;
+            const uint i = row0 + r;
+            a_tile[r * GEMM_T_A_LD + a_kk] = (i < p.m && kk_a < p.k)
+                ? a_batch[ulong(i) * p.a_row_stride + a_col_at]
                 : 0.0f;
         }
-        for (uint e = tid; e < GEMM_TILE_K * GEMM_TILE; e += GEMM_TILED_THREADS) {
-            const uint kk = k0 + e / GEMM_TILE;
-            const uint j = col0 + e % GEMM_TILE;
-            b_tile[e] = (kk < p.k && j < p.n)
-                ? b_batch[ulong(kk) * p.b_row_stride + ulong(j) * p.b_col_stride]
-                : 0.0f;
+#pragma clang loop unroll(full)
+        for (uint pass = 0; pass < GEMM_T_B_PASSES; ++pass) {
+            const uint kr = b_kk + pass * GEMM_T_B_ROWS_PER_PASS;
+            const uint kk = k0 + kr;
+            b_tile[kr * GEMM_T_B_LD + b_j] = (b_in && kk < p.k) ? b_col[ulong(kk) * p.b_row_stride] : 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint s = 0; s < GEMM_TILE_K; s += 8) {
             simdgroup_float8x8 am[2];
             simdgroup_float8x8 bm[2];
-            simdgroup_load(am[0], a_tile + (sub_row + 0) * GEMM_TILE_K + s, GEMM_TILE_K);
-            simdgroup_load(am[1], a_tile + (sub_row + 8) * GEMM_TILE_K + s, GEMM_TILE_K);
-            simdgroup_load(bm[0], b_tile + s * GEMM_TILE + sub_col + 0, GEMM_TILE);
-            simdgroup_load(bm[1], b_tile + s * GEMM_TILE + sub_col + 8, GEMM_TILE);
+            simdgroup_load(am[0], a_tile + (sub_row + 0) * GEMM_T_A_LD + s, GEMM_T_A_LD);
+            simdgroup_load(am[1], a_tile + (sub_row + 8) * GEMM_T_A_LD + s, GEMM_T_A_LD);
+            simdgroup_load(bm[0], b_tile + s * GEMM_T_B_LD + sub_col + 0, GEMM_T_B_LD);
+            simdgroup_load(bm[1], b_tile + s * GEMM_T_B_LD + sub_col + 8, GEMM_T_B_LD);
             simdgroup_multiply_accumulate(acc[0], am[0], bm[0], acc[0]);
             simdgroup_multiply_accumulate(acc[1], am[0], bm[1], acc[1]);
             simdgroup_multiply_accumulate(acc[2], am[1], bm[0], acc[2]);
