@@ -665,7 +665,8 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
                 }
                 let prob = cmp.with(|tap| processor.step_tapped(&frame, w, h, mask.as_deref(), row.force_permanent, false, tap))?;
                 if let Some(judgement) = cmp.read_ties.take().and_then(|ties| ties.judgement) {
-                    cmp.report.record("run", tapped, "memory.read.affinity ties", true, judgement.note(oracle.config.top_k));
+                    let (order, k) = (oracle.tie_order, oracle.config.top_k);
+                    cmp.report.record("run", tapped, "memory.read.affinity ties", judgement.pass(order, false), judgement.note(k, order));
                 }
                 // Taps no part puts (e.g. a convolution whose BatchNorm is folded) are noted.
                 let missing = cmp.uncompared(&[""]);
@@ -737,10 +738,12 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
 ///   (one swapped pick is an entry's whole weight, YouTubeComp-15 at 960x540 rel 7%, cosine
 ///   0.99996); the readout judges them too. Where the oracle's similarity has an exact tie at the
 ///   cut (the first frame held twice) they are first aligned to the oracle's picks among the tied
-///   tokens (`ReadTies`, with a row `memory.read.affinity ties` saying how many), so what is left
-///   is the near ties; not with long-term memory, whose rows are in the native run's order. The
-///   readout is not aligned: the tied tokens are the same frame's, with the same values, and
-///   `Tol::RUN` takes a swapped pick anyway.
+///   tokens (`ReadTies`, with a row `memory.read.affinity ties` saying how many, which fails on an
+///   oracle made on CUDA where a column was moved: the native run's twins tie exactly too, and
+///   CUDA's torch keeps the lower index, as the port does), so what is left is the near ties;
+///   not with long-term memory, whose rows are in the native run's order. The readout is not
+///   aligned: the tied tokens are the same frame's, with the same values, and `Tol::RUN` takes a
+///   swapped pick anyway.
 fn run_tol(name: &str, long_term: bool) -> Tol {
     const PROTOTYPE_ORDER: [&str; 5] = [
         "memory.consolidate.query_key",

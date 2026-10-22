@@ -44,8 +44,10 @@
 //! keeps the lower index first. That is what the oracles made on CUDA did wherever equal
 //! similarities met at the read's k-th place: working memory holds the first frame twice (the
 //! commit's permanent memory, then the propagation's first temporary frame), so pairs of
-//! identical keys tie. Oracles made on the CPU keep either token of a pair (about half the
-//! higher), which is as right: the memory check judges the read's picks at an exact tie as a set
+//! identical keys tie. The memory check holds the read to it on those oracles: its row
+//! `memory.read.affinity ties` fails where the port kept another of a tied pair
+//! (`oracle::TieOrder`). Oracles made on the CPU keep either token of a pair (about half the
+//! higher), which is as right: there the read's picks at an exact tie are judged as a set
 //! (`oracle::TopKTies`). The oracles have no tie among the prototypes or survivors (the first
 //! frame's permanent copy has no counts, so it never ties there), so the rule is unverified there.
 //! Long-term memory's survivors are checked by Solege-03-long (`long_term.max_num_tokens=700`,
@@ -893,15 +895,21 @@ fn check_edges(report: &mut Report) -> Result<()> {
 /// Every tap at `Tol::STAGE`, the affinity too. Where the oracle's own similarity has an exact
 /// tie at the top k's cut (the first frame held twice: `TopKTies`), the port's picks among the
 /// tied tokens are judged as a set: where it kept others than the oracle (CPU torch breaks those
-/// ties in an order of its own; CUDA's oracles keep the lower index, as the port does), its
-/// weights are moved onto the oracle's tokens before the affinity and usage are compared, and the
-/// usage counted and the readout go on from them, so the consolidation after them is checked
-/// against the oracle's own picks. A row a read, `memory.read.affinity ties`, says how many
-/// columns were tied and how many were moved. Every other column, and every token outside a tie,
-/// is compared as it is. The closest pair at the k-th place that is not an exact tie is 33 ulps
-/// apart (3.9e-6, Solege-03 prop_f40); the native similarity (up to 1.9e-5 off at that step)
-/// changes no column's top k on either clip. The margin is thin: a similarity kernel must keep
-/// near-tied entries within those 33 ulps. The top-k by usage (the consolidation's prototypes,
+/// ties in an order of its own), its weights are moved onto the oracle's tokens before the
+/// affinity and usage are compared, and the usage counted and the readout go on from them, so the
+/// consolidation after them is checked against the oracle's own picks. A row a read,
+/// `memory.read.affinity ties`, says how many columns were tied and how many were moved. On an
+/// oracle made on CUDA, whose torch.topk keeps the lower index as the port does, that row fails
+/// where any column was moved or kept another number of the tied tokens (`TieOrder`), so the
+/// port's rule stays checked against CUDA's torch. Every other column, and every token outside a
+/// tie, is compared as it is: a near tie is judged strictly. The closest pairs at the k-th place
+/// that are not exact ties are 15 ulps apart in the CUDA oracles (7.2e-6 at -5.93, lawn_cut
+/// prop_f5; 33 ulps, 3.9e-6, at Solege-03 prop_f40) and as close as 3 ulps in oracles made on the
+/// CPU (1.4e-6, the PC's CPU lawn_cut prop_f5); the port's similarity (up to 1.5e-5 off in this
+/// stage) changes no column's top k in any of the five CUDA oracles, nor in the PC's CPU ones. The
+/// margin is thin: a similarity kernel must keep near-tied entries within those few ulps, and a
+/// read failing on a CPU oracle at a near tie is to be checked against the oracle's gap there
+/// before it is taken for the port's error. The top-k by usage (the consolidation's prototypes,
 /// long-term memory's survivors) is recorded likewise (`OracleMemory::record_usage_ties`) and
 /// judged strictly.
 pub(crate) fn check(oracle: &Oracle, report: &mut Report, _weights: &mut Weights) -> Result<()> {
@@ -946,7 +954,8 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, _weights: &mut Weights
                 memory.read_values(&affinity, &keys, tap)?;
                 Ok(judgement)
             })?;
-            cmp.report.record("memory", step, "memory.read.affinity ties", true, judgement.note(config.top_k));
+            let order = oracle.tie_order;
+            cmp.report.record("memory", step, "memory.read.affinity ties", judgement.pass(order, true), judgement.note(config.top_k, order));
             if plan.update_sensory {
                 memory.update_sensory(oracle.feat_as(step, "segment.out.sensory", objects, SENSORY_DIM)?)?;
             }

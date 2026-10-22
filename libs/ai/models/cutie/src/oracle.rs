@@ -39,6 +39,8 @@ pub(crate) struct Oracle {
     pub(crate) objects: usize,
     /// The settings Cutie ran with (`config.*` in `raw/meta.txt`; the defaults where absent).
     pub(crate) config: CutieConfig,
+    /// How the oracle's `torch.topk` broke exact ties, from the device it ran on (`TieOrder`).
+    pub(crate) tie_order: TieOrder,
     /// Every processor step of the run (`raw/schedule.tsv`).
     schedule: Vec<ScheduleRow>,
     manifests: HashMap<String, Vec<(String, String, Vec<usize>)>>,
@@ -135,6 +137,13 @@ impl Oracle {
         };
         let objects = get("objects")?;
         let config = Self::read_config(&meta, objects).map_err(|e| io(&meta_path, e))?;
+        // Oracles from before meta.txt carried the settings record the device in oracle.json
+        // only (read only then: it is large).
+        let json = match Self::device_in(&meta, None) {
+            Some(_) => None,
+            None => fs::read_to_string(dir.join("oracle.json")).ok(),
+        };
+        let tie_order = TieOrder::of_device(Self::device_in(&meta, json.as_deref()).as_deref());
         let schedule = Self::read_schedule(dir)?;
         let mut manifests = HashMap::new();
         for step in schedule.iter().filter_map(|r| r.tap.as_deref()) {
@@ -160,9 +169,25 @@ impl Oracle {
             height: get("height")?,
             objects,
             config,
+            tie_order,
             schedule,
             manifests,
         })
+    }
+
+    /// The device the oracle ran on: `meta.txt`'s `config.device`, else the top-level `"device"`
+    /// of `oracle.json` (`json`, written with one space of indent; the settings' own `"device"`,
+    /// deeper, may say `auto`), which every oracle has, older ones without `config.*` lines too.
+    /// None when neither names one.
+    fn device_in(meta: &str, json: Option<&str>) -> Option<String> {
+        let named = |v: &str| -> Option<String> {
+            let v = v.trim().trim_end_matches(',').trim().trim_matches('"');
+            (!v.is_empty() && v != "auto").then(|| v.to_string())
+        };
+        meta.lines()
+            .find_map(|l| l.strip_prefix("config.device="))
+            .and_then(named)
+            .or_else(|| json?.lines().find_map(|l| l.strip_prefix(" \"device\":")).and_then(named))
     }
 
     /// The settings in `meta.txt`'s `config.<key>=<value>` lines over the defaults (an oracle
@@ -551,6 +576,27 @@ impl Report {
     }
 }
 
+/// How an oracle's `torch.topk` broke exact ties, which PyTorch leaves open: from the device it
+/// ran on (`Oracle::device_in`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TieOrder {
+    /// CUDA's: the lower index first, as the port's top-ks (`gpu_cutie_topk_softmax`). On such an
+    /// oracle the port is held to it: a tie it broke otherwise fails (`TieJudgement::pass`).
+    LowerIndex,
+    /// CPU torch's (or the device is not recorded): an order of its own, so the picks at an exact
+    /// tie are judged as a set.
+    Open,
+}
+
+impl TieOrder {
+    fn of_device(device: Option<&str>) -> Self {
+        match device {
+            Some(d) if d.starts_with("cuda") => TieOrder::LowerIndex,
+            _ => TieOrder::Open,
+        }
+    }
+}
+
 /// Exact ties at the cut of a top-k taken down each column of a score matrix: the memory read's
 /// similarity [N, h*w], each pixel keeping its k best memory tokens. `torch.topk` leaves open
 /// which of equal values it keeps: CUDA's keeps the lower index, as the port does
@@ -562,7 +608,9 @@ impl Report {
 /// YouTubeComp-15's, 40 of lawn_cut's 432; in the edits, 100 at `back_f9` and 98 at `prop2_f11`.
 /// So where the oracle's own k-th and (k+1)-th scores are exactly equal, a top-k's output is
 /// judged with its picks among the tied tokens taken as a set (`align`); every other column, and
-/// every token outside the tie, exactly as before.
+/// every token outside the tie, exactly as before. On an oracle made on CUDA (`TieOrder::
+/// LowerIndex`) the picks are still aligned, but a column moved fails the judgement's row, so the
+/// port's lower-index rule stays checked against CUDA's torch.
 pub(crate) struct TopKTies {
     rows: usize,
     cols: usize,
@@ -673,10 +721,27 @@ impl TieJudgement {
         }
     }
 
+    /// Whether the judgement's row passes, the oracle having broken ties in `order`. Where it kept
+    /// the lower index (CUDA's torch.topk, as the port's top-k does), the port must have kept the
+    /// oracle's own tied tokens: a column `moved` fails, and so does one `unmatched` where
+    /// `unmatched_fails` (stage `memory`, which reads with the oracle's own keys; stage `run`
+    /// reads its own, whose near ties may move the cut, as its affinity row allows). Anywhere else
+    /// the picks at a tie are judged as sets and the row passes, saying what was moved.
+    pub(crate) fn pass(&self, order: TieOrder, unmatched_fails: bool) -> bool {
+        match order {
+            TieOrder::LowerIndex => self.moved == 0 && (!unmatched_fails || self.unmatched == 0),
+            TieOrder::Open => true,
+        }
+    }
+
     /// What was judged, for a report row.
-    pub(crate) fn note(&self, k: usize) -> String {
+    pub(crate) fn note(&self, k: usize, order: TieOrder) -> String {
+        let rule = match order {
+            TieOrder::LowerIndex => "a CUDA oracle: the lower index must be kept",
+            TieOrder::Open => "not a CUDA oracle: tied picks judged as sets",
+        };
         format!(
-            "{} of {} columns tied at the top {k}'s cut in the oracle's scores; {} kept other tied tokens than the oracle (judged as sets, {} weights moved), {} another number of them",
+            "{} of {} columns tied at the top {k}'s cut in the oracle's scores; {} kept other tied tokens than the oracle ({} weights moved onto the oracle's), {} another number of them ({rule})",
             self.tied,
             self.columns,
             self.moved,
@@ -883,5 +948,38 @@ mod tests {
         assert_eq!((judgement.tied, judgement.moved, judgement.unmatched), (1, 0, 0));
         let mut short = vec![0.0; 4];
         assert_eq!(ties.align(&mut short, &expected).unmatched, 1, "another size is not judged");
+    }
+
+    #[test]
+    fn a_cuda_oracle_holds_the_port_to_the_lower_index() {
+        let s = scores(&[&[5.0, 4.0, 4.0, 1.0, 0.0]]);
+        let ties = TopKTies::find(&s, 2).unwrap();
+        let lower = kept(5, &[&[0, 1]], 0.5);
+        let (cuda, cpu) = (TieOrder::LowerIndex, TieOrder::Open);
+        // The port kept the higher of the twins, CUDA's oracle the lower: moved, which fails there.
+        let moved = ties.align(&mut kept(5, &[&[0, 2]], 0.5), &lower);
+        assert_eq!(moved.moved, 1);
+        assert!(!moved.pass(cuda, true) && !moved.pass(cuda, false));
+        assert!(moved.pass(cpu, true));
+        // Both twins kept: another number, failing on the oracle's own keys only.
+        let unmatched = ties.align(&mut kept(5, &[&[1, 2]], 0.5), &lower);
+        assert_eq!((unmatched.moved, unmatched.unmatched), (0, 1));
+        assert!(!unmatched.pass(cuda, true) && unmatched.pass(cuda, false) && unmatched.pass(cpu, true));
+        let same = ties.align(&mut lower.clone(), &lower);
+        assert!(same.pass(cuda, true));
+    }
+
+    #[test]
+    fn the_device_gives_the_tie_order() {
+        let order = |meta: &str, json: Option<&str>| TieOrder::of_device(Oracle::device_in(meta, json).as_deref());
+        let json = |device: &str| format!("{{\n \"what\": \"oracle\",\n \"device\": \"{device}\",\n \"settings\": {{\n  \"device\": \"auto\"\n }}\n}}\n");
+        assert_eq!(order("frames=42\nconfig.device=cuda\n", None), TieOrder::LowerIndex);
+        assert_eq!(order("frames=42\nconfig.device=cpu\n", Some(&json("cuda"))), TieOrder::Open, "meta.txt first");
+        // Older oracles: no config lines, the device in oracle.json, not its settings' "auto".
+        assert_eq!(order("frames=42\n", Some(&json("cuda"))), TieOrder::LowerIndex);
+        assert_eq!(order("frames=42\n", Some(&json("cpu"))), TieOrder::Open);
+        assert_eq!(order("config.device=auto\n", Some(&json("cuda"))), TieOrder::LowerIndex);
+        assert_eq!(order("frames=42\n", Some("{\n \"settings\": {\n  \"device\": \"cuda\"\n }\n}\n")), TieOrder::Open);
+        assert_eq!(order("frames=42\n", None), TieOrder::Open, "not recorded");
     }
 }
