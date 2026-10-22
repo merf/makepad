@@ -12,12 +12,16 @@
 using namespace metal;
 
 // ==== Contraction (step 7, the Mac) ====
-// Exactness (D8): every library compiles with fast math off. Whether a*b+c written in a kernel is
-// still contracted into an fma, and which setting stops it (MSL 3.2's `#pragma METAL fp
-// contract(off)`, else math mode Safe, else fast math off alone), is what step 7's probe finds
-// (probe.metal and probe_contract.metal, run by tests/stream_probe.rs); the chosen setting goes
-// here. Until then, a kernel that must not contract writes its products and sums so that
-// contraction cannot change them, or calls fma() where nvcc contracts.
+// Exactness (D8), from step 7's probe on an M5 (macOS 26.6.2, MSL 4.0; tests/stream_probe.rs):
+// with fast math off alone, a*b+c written in a kernel is contracted into an fma (probe_mad: all
+// 1048576 as fused), and math mode Safe changes nothing; MSL 3.2's `#pragma METAL fp
+// contract(off)` stops it (probe_mad_contract_off: all as separate). So every library that
+// includes this header is compiled with contraction off, and a kernel calls fma() where nvcc
+// contracts (CUDA's own fmaf, or a product it fuses), which the pragma leaves alone. Also found:
+// denormals are flushed to zero (products and sums), fmax(+0, -0) is -0 (the host's max gives +0),
+// fmax with one NaN gives the other operand, and precise:: exp is within 1 ulp, log and tanh 2,
+// sin and cos 3.
+#pragma METAL fp contract(off)
 // ==== End of contraction ====
 
 // ==== Helpers (step 8, the PC) ====
