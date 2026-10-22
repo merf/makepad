@@ -348,7 +348,7 @@ fn packed_heads_are_read_and_written_in_place() {
 #[test]
 fn alpha_beta_and_k_zero() {
     let mut rng = Rng(0x6e44_0004);
-    for mode in [GemmMode::Naive, GemmMode::Tiled, GemmMode::Auto, GemmMode::Mps] {
+    for mode in [GemmMode::Naive, GemmMode::Tiled, GemmMode::Kernels, GemmMode::Mps] {
         let _mode = ModeGuard::new(mode);
         for (m, n, k) in [(7, 5, 3), (40, 33, 65)] {
             // alpha and beta, C an InOut whose padding must come back unchanged.
@@ -578,7 +578,7 @@ fn linear_f64(x: &[f32], w: &[f32], b: Option<&[f32]>, rows: usize, in_f: usize,
 #[test]
 fn linear_matches_f64_as_the_ops_check_judges_it() {
     let mut rng = Rng(0x6e44_0007);
-    for mode in [GemmMode::Naive, GemmMode::Tiled, GemmMode::Auto, GemmMode::Mps] {
+    for mode in [GemmMode::Naive, GemmMode::Tiled, GemmMode::Kernels, GemmMode::Mps] {
         let _mode = ModeGuard::new(mode);
         // Cutie's object transformer (256 wide, 2048 in its FFN), Body-like odd sizes, and edges.
         for (rows, in_f, out_f, bias) in
@@ -690,7 +690,7 @@ fn attention_matches_f64_as_the_ops_check_judges_it() {
     const HEAD_DIM: usize = 32;
     let mut rng = Rng(0x6e44_0009);
     let scale = 1.0 / (HEAD_DIM as f32).sqrt();
-    for mode in [GemmMode::Naive, GemmMode::Tiled, GemmMode::Auto, GemmMode::Mps] {
+    for mode in [GemmMode::Naive, GemmMode::Tiled, GemmMode::Kernels, GemmMode::Mps] {
         let _mode = ModeGuard::new(mode);
         // Cutie's object transformer (8 heads, 16 queries, 336 pixels and back), one key, one
         // query, and past 1024 keys (the softmax's 1024 threads).

@@ -1,6 +1,7 @@
-//! The GEMM on Metal Performance Shaders (`MPSMatrixMultiplication`), for
-//! MAKEPAD_METAL_GEMM=mps: Apple's fp32 matrix multiply, about twice the tiled kernel's speed on
-//! an M5 at Cutie's shapes (RationalVisions docs/cutie-metal.md §11, step 15). It is encoded on
+//! The GEMM on Metal Performance Shaders (`MPSMatrixMultiplication`), the default on macOS
+//! (MAKEPAD_METAL_GEMM unset, auto or mps; `kernels` for `gemm.metal`'s): Apple's fp32 matrix
+//! multiply, about twice the tiled kernel's speed on an M5 at Cutie's shapes, 15 to 26% off a
+//! Cutie frame (RationalVisions docs/cutie-metal.md §11). It is encoded on
 //! the stream's open command buffer between its compute encoders (`StreamCtx::begin_buffer_work`),
 //! so it is ordered with the kernels around it as any dispatch is. Its sums are MPS's own, not
 //! the tiled kernel's, so results move by rounding: judged by `cutie-validate all` within
