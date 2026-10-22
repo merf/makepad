@@ -27,6 +27,7 @@ use super::{MetalResult, StreamStats, UNWRITTEN_BITS};
 use crate::gpu_types::{fresh_tensor_id, GpuTensor};
 use crate::objc_util::{AutoreleasePool, MtlBuf};
 use crate::residency::{env_usize, Storage};
+use makepad_objc_sys::runtime::ObjcId;
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::marker::PhantomData;
@@ -423,6 +424,64 @@ impl MetalStream<'_> {
     pub fn gemm(&mut self, g: &Gemm<'_>) -> MetalResult<()> {
         let op = self.op;
         super::gemm::run(self, op, g)
+    }
+
+    /// A GEMM `gemm::run` has checked and planned, on MPS (MAKEPAD_METAL_GEMM=mps): its tensors
+    /// claimed and stamped as a launch's are, then one `MPSMatrixMultiplication` a batch encoded on
+    /// the open command buffer between its compute encoders.
+    pub(crate) fn gemm_mps(&mut self, g: &Gemm<'_>, shape: &super::gemm::GemmPlan) -> MetalResult<()> {
+        let op = self.op;
+        let binds = [g.a.src, g.b.src, g.c];
+        let plans: Vec<SlotPlan> = binds.iter().map(Bind::plan).collect();
+        check_slots(op, "MPSMatrixMultiplication", 0, &plans)?;
+        // Each operand's buffer and the byte offset its binding starts at.
+        let mut used: Vec<(&MtlStorage, bool)> = Vec::with_capacity(3);
+        let mut bound = Vec::with_capacity(3);
+        for bind in binds {
+            let (id, base) = match bind {
+                Bind::In(t) => {
+                    self.claim(t, true)?;
+                    used.push((&t.storage, false));
+                    (t.storage.buf().as_id(), t.offset * 4)
+                }
+                Bind::Out(t) | Bind::InOut(t) => {
+                    self.claim(t, matches!(bind, Bind::InOut(_)))?;
+                    used.push((&t.storage, true));
+                    (t.storage.buf().as_id(), t.offset * 4)
+                }
+                Bind::Weights(weights, offset) => (weights.buf.as_id(), offset * 4),
+                _ => return Err(format!("{op}: an MPS gemm binds tensors or weights")),
+            };
+            bound.push((id, base));
+        }
+        let device = self.ctx.device();
+        let (cb, serial) = self.ctx.begin_buffer_work(op).map_err(|e| format!("{op}: {e}"))?;
+        for (storage, writes) in used {
+            if writes {
+                storage.mark_write(serial);
+            } else {
+                storage.mark_use(serial);
+            }
+        }
+        let (a_rows, a_cols) = if shape.a.trans { (shape.k, shape.m) } else { (shape.m, shape.k) };
+        let (b_rows, b_cols) = if shape.b.trans { (shape.n, shape.k) } else { (shape.k, shape.n) };
+        let matrix = |(id, base): (ObjcId, usize), o: &super::gemm::OperandPlan, rows, cols, batch: usize| super::mps::MpsMatrix {
+            buffer: id,
+            offset: (base + (o.offset + batch * o.batch_stride) * 4) as u64,
+            rows,
+            cols,
+            row_bytes: o.ld * 4,
+        };
+        for i in 0..shape.batch {
+            let a = matrix(bound[0], &shape.a, a_rows, a_cols, i);
+            let b = matrix(bound[1], &shape.b, b_rows, b_cols, i);
+            let c = matrix(bound[2], &shape.c, shape.m, shape.n, i);
+            self.ctx
+                .mps
+                .encode(device, cb, (shape.a.trans, shape.b.trans), (shape.m, shape.n, shape.k), (shape.alpha, shape.beta), &a, &b, &c)
+                .map_err(|e| format!("{op}: {e}"))?;
+        }
+        Ok(())
     }
 
     /// "{namespace}::{key}::{suffix}"; `fill` runs only on a miss or a size change, writing

@@ -3,7 +3,9 @@
 //! offset and batch stride (CUDA's strided-batched GemmEx covers packed heads and row views the
 //! same way). Two kernels in `gemm.metal` sit behind the one call: a naive one (one thread an
 //! output, an fma at a time down k: the correctness baseline) and a tiled one (simdgroup_float8x8
-//! over fp32 tiles), chosen by shape, or by MAKEPAD_METAL_GEMM=naive|tiled|auto.
+//! over fp32 tiles), chosen by shape (MAKEPAD_METAL_GEMM=kernels), or by naive|tiled. On macOS
+//! the default runs the product on Metal Performance Shaders instead (`mps.rs`, auto or mps),
+//! after the same checks: fp32 too, but MPS's own order of sums, so not the kernels' bits.
 //!
 //! The checks and the plan (which kernel, its params and grid) are platform-free and unit-tested
 //! anywhere; the launch is macOS's. A GEMM is refused before anything is encoded when:
@@ -114,12 +116,17 @@ pub struct GemmSoftmaxRows {
 // SAFETY: #[repr(C)], 16 bytes, no pointers; `GemmSoftmaxRows` in MSL.
 unsafe impl KernelParams for GemmSoftmaxRows {}
 
-/// Which kernel a GEMM runs on: MAKEPAD_METAL_GEMM=naive|tiled|auto (auto, the default, chooses
-/// by shape), or [`set_mode_override`] on the calling thread.
+/// Which kernel a GEMM runs on: MAKEPAD_METAL_GEMM=naive|tiled|kernels|mps|auto, or
+/// [`set_mode_override`] on the calling thread. `kernels` chooses between `gemm.metal`'s two by
+/// shape; `mps` is Metal Performance Shaders' `MPSMatrixMultiplication` (`mps.rs`); `auto`, the
+/// default, is `mps` on macOS (measured on an M5: 15 to 26% off a Cutie frame, RationalVisions
+/// docs/cutie-metal.md §11) and `kernels` elsewhere. Step 11's golden is `kernels`' bits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GemmMode {
     Naive,
     Tiled,
+    Kernels,
+    Mps,
     Auto,
 }
 
@@ -129,35 +136,51 @@ impl GemmMode {
         match value.trim() {
             "naive" => Ok(GemmMode::Naive),
             "tiled" => Ok(GemmMode::Tiled),
+            "kernels" => Ok(GemmMode::Kernels),
+            "mps" => Ok(GemmMode::Mps),
             "auto" | "" => Ok(GemmMode::Auto),
-            other => Err(format!("MAKEPAD_METAL_GEMM={other}: expected naive, tiled or auto")),
+            other => Err(format!("MAKEPAD_METAL_GEMM={other}: expected naive, tiled, kernels, mps or auto")),
+        }
+    }
+
+    /// `Auto` as it is on this OS: `Mps` on macOS, `Kernels` elsewhere; other modes as they are.
+    pub fn resolved(self) -> GemmMode {
+        match self {
+            GemmMode::Auto if cfg!(target_os = "macos") => GemmMode::Mps,
+            GemmMode::Auto => GemmMode::Kernels,
+            mode => mode,
         }
     }
 }
 
-/// The kernel a GEMM runs on.
+/// What a GEMM runs on: one of `gemm.metal`'s kernels, or MPS.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GemmVariant {
     Naive,
     Tiled,
+    Mps,
 }
 
 impl GemmVariant {
-    pub fn kernel(self) -> &'static Kernel {
+    /// The `gemm.metal` kernel it runs on; `None` for MPS.
+    pub fn kernel(self) -> Option<&'static Kernel> {
         match self {
-            GemmVariant::Naive => &GEMM_NAIVE,
-            GemmVariant::Tiled => &GEMM_TILED,
+            GemmVariant::Naive => Some(&GEMM_NAIVE),
+            GemmVariant::Tiled => Some(&GEMM_TILED),
+            GemmVariant::Mps => None,
         }
     }
 
-    /// The kernel `mode` gives an m x n x k product in `batch` batches: auto takes the tiled one
+    /// What `mode` gives an m x n x k product in `batch` batches: kernels takes the tiled kernel
     /// for enough work with both sides at least 8, the naive one otherwise (and for k = 0, which
-    /// only writes beta·C).
+    /// only writes beta·C; mps too, so MPS always multiplies). Auto is as `GemmMode::resolved`.
     pub fn choose(mode: GemmMode, m: usize, n: usize, k: usize, batch: usize) -> GemmVariant {
-        match mode {
+        match mode.resolved() {
             GemmMode::Naive => GemmVariant::Naive,
             GemmMode::Tiled => GemmVariant::Tiled,
-            GemmMode::Auto => {
+            GemmMode::Mps if k > 0 => GemmVariant::Mps,
+            GemmMode::Mps => GemmVariant::Naive,
+            GemmMode::Kernels | GemmMode::Auto => {
                 let work = m.saturating_mul(n).saturating_mul(k).saturating_mul(batch);
                 if k > 0 && m >= TILED_MIN_SIDE && n >= TILED_MIN_SIDE && work >= TILED_MIN_WORK {
                     GemmVariant::Tiled
@@ -319,7 +342,8 @@ pub(crate) fn plan(op: &str, g: &GemmPlan, mode: GemmMode) -> MetalResult<GemmLa
     };
     let variant = GemmVariant::choose(mode, g.m, g.n, params.k as usize, g.batch);
     let grid = match variant {
-        GemmVariant::Naive => Grid::cover([g.n, g.m, g.batch], NAIVE_THREADS)?,
+        // MPS launches its own; the grid only says whether there is anything to do.
+        GemmVariant::Naive | GemmVariant::Mps => Grid::cover([g.n, g.m, g.batch], NAIVE_THREADS)?,
         GemmVariant::Tiled => Grid::groups([g.n.div_ceil(TILE), g.m.div_ceil(TILE), g.batch], [TILED_THREADS, 1, 1])?,
     };
     Ok(GemmLaunch { variant, params, grid })
@@ -359,7 +383,9 @@ pub(crate) fn run(s: &mut MetalStream<'_>, op: &'static str, g: &Gemm<'_>) -> Me
     let c = OperandPlan { floats: c_floats, offset: g.c_offset, ld: g.ldc, trans: false, batch_stride: g.c_batch_stride };
     let shape = GemmPlan { m: g.m, n: g.n, k: g.k, batch: g.batch, alpha: g.alpha, beta: g.beta, a, b, c, c_reads };
     let launch = plan(op, &shape, mode().map_err(|e| format!("{op}: {e}"))?)?;
-    let kernel = launch.variant.kernel();
+    let Some(kernel) = launch.variant.kernel() else {
+        return if launch.grid.is_empty() { Ok(()) } else { s.gemm_mps(g, &shape) };
+    };
     if launch.variant == GemmVariant::Tiled {
         check_simd_width(s, op, kernel)?;
     }
@@ -463,14 +489,19 @@ mod tests {
     }
 
     #[test]
-    fn mode_parses_its_three_values_and_nothing_else() {
+    fn mode_parses_its_five_values_and_nothing_else() {
         assert_eq!(GemmMode::parse("naive"), Ok(GemmMode::Naive));
         assert_eq!(GemmMode::parse("tiled"), Ok(GemmMode::Tiled));
+        assert_eq!(GemmMode::parse("kernels"), Ok(GemmMode::Kernels));
         assert_eq!(GemmMode::parse("auto"), Ok(GemmMode::Auto));
+        assert_eq!(GemmMode::parse("mps"), Ok(GemmMode::Mps));
         assert_eq!(GemmMode::parse(" tiled\n"), Ok(GemmMode::Tiled));
         assert_eq!(GemmMode::parse(""), Ok(GemmMode::Auto));
-        let err = GemmMode::parse("mps").unwrap_err();
-        assert!(err.contains("MAKEPAD_METAL_GEMM=mps") && err.contains("naive, tiled or auto"), "{err}");
+        let err = GemmMode::parse("cublas").unwrap_err();
+        assert!(err.contains("MAKEPAD_METAL_GEMM=cublas") && err.contains("naive, tiled, kernels, mps or auto"), "{err}");
+        let auto_is = if cfg!(target_os = "macos") { GemmMode::Mps } else { GemmMode::Kernels };
+        assert_eq!(GemmMode::Auto.resolved(), auto_is);
+        assert_eq!(GemmMode::Tiled.resolved(), GemmMode::Tiled);
     }
 
     #[test]
@@ -488,9 +519,9 @@ mod tests {
     }
 
     #[test]
-    fn auto_tiles_products_that_fill_tiles() {
+    fn kernels_tiles_products_that_fill_tiles() {
         use GemmVariant::*;
-        let auto = |m, n, k, batch| GemmVariant::choose(GemmMode::Auto, m, n, k, batch);
+        let auto = |m, n, k, batch| GemmVariant::choose(GemmMode::Kernels, m, n, k, batch);
         assert_eq!(auto(256, 256, 256, 1), Tiled);
         assert_eq!(auto(32, 32, 32, 1), Tiled);
         assert_eq!(auto(16, 336, 32, 8), Tiled, "attention's scores: 16 queries, 8 heads");
@@ -502,8 +533,13 @@ mod tests {
         assert_eq!(auto(usize::MAX, usize::MAX, 2, 1), Tiled, "the work saturates");
         assert_eq!(GemmVariant::choose(GemmMode::Naive, 256, 256, 256, 1), Naive);
         assert_eq!(GemmVariant::choose(GemmMode::Tiled, 1, 1, 0, 1), Tiled);
-        assert_eq!(Naive.kernel().function, "gemm_naive_f32");
-        assert_eq!(Tiled.kernel().function, "gemm_tiled_f32");
+        assert_eq!(GemmVariant::choose(GemmMode::Mps, 7, 3, 5, 1), Mps, "MPS takes every shape");
+        assert_eq!(GemmVariant::choose(GemmMode::Mps, 256, 256, 0, 1), Naive, "k = 0 only writes beta C");
+        let auto_on_this_os = if cfg!(target_os = "macos") { Mps } else { Tiled };
+        assert_eq!(GemmVariant::choose(GemmMode::Auto, 256, 256, 256, 1), auto_on_this_os);
+        assert_eq!(Naive.kernel().unwrap().function, "gemm_naive_f32");
+        assert_eq!(Tiled.kernel().unwrap().function, "gemm_tiled_f32");
+        assert!(Mps.kernel().is_none());
     }
 
     #[test]
