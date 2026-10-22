@@ -25,9 +25,9 @@ using namespace metal;
 // ==== End of contraction ====
 
 // ==== Helpers (step 8, the PC) ====
-// Empty: cutie_reduce4 (PyTorch's order, cuda/kernels/cutie.cu), the top-k radix key and max_nan
-// are kept in each family's own namespace (cutie_elementwise.metal, cutie_softmax_norm.metal,
-// cutie_topk_mask.metal) until one copy moves here.
+// Empty: cutie_reduce4 (PyTorch's order, cuda/kernels/cutie.cu) is written out where it is used
+// (cutie_others_f32, cutie_aggregate_f32, topk_mask's background), and the top-k radix key and
+// max_nan are in cutie_topk_mask.metal's namespace topk_mask, until one copy moves here.
 // ==== End of helpers ====
 
 #endif

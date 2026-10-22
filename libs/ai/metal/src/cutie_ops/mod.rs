@@ -55,8 +55,8 @@ pub static CUTIE_LIBRARIES: &[&KernelLib] = &[
 
 /// Every library Cutie's ops launch: its own ([`CUTIE_LIBRARIES`]), the generic ops' it calls
 /// (`generic_ops::GENERIC_OPS`), the GEMM's (`stream::gemm::GEMM`: matmul, similarity, the
-/// convolutions, the linear and the cross-attentions) and the stream's fills, copies, adds and
-/// ReLU (`stream::kernels::TENSOR`). What [`cutie_ready`] compiles.
+/// convolutions, the linear and the cross-attentions) and the stream's fills, copies, adds, muls
+/// and ReLU (`stream::kernels::TENSOR`). What [`cutie_ready`] compiles.
 pub fn libraries_cutie_launches() -> impl Iterator<Item = &'static KernelLib> {
     CUTIE_LIBRARIES.iter().copied().chain([
         &crate::generic_ops::GENERIC_OPS,
