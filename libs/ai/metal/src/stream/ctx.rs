@@ -1,23 +1,22 @@
 //! The calling thread's Metal stream (cutie-metal.md §3): its own device handle and queue, the
 //! kernel libraries and pipelines it compiled, the command buffer it is encoding into (one serial
 //! compute encoder, so dispatch order is execution order), the ring of command buffers it
-//! committed, its weight cache, and the host binding's device copies of tensors.
+//! committed, and its weight cache.
 //!
 //! Separate from the shim's context (D1): the shim waits after every op and its batches serve the
 //! host-slice `try_*` users; the stream batches and waits only where it must.
 
 use super::grid::{Grid, KernelLimits};
 use super::kernel::{consts_match, FnConst, FnConstKey, Kernel, KernelLib};
-use super::mirror::{Lru, DEFAULT_MIRROR_CAP_MB};
 use super::plan::{ArgKind, KernelArgs};
 use super::source::{kernels_src_dir, library_source};
-use super::storage::{self, MtlStorage};
+use super::storage;
 use super::weight_map::WeightMap;
 use super::MetalWeights;
 use crate::objc_util::{
     ns_error_string, responds_to, set_label, system_device, AutoreleasePool, MtlBuf, StrongId,
 };
-use crate::residency::{env_usize, CbStatus, CommandBuf, Ring};
+use crate::residency::{env_usize, CbStatus, CommandBuf, Ring, StreamClock};
 use makepad_objc_sys::runtime::{nil, ObjcId, Object, Sel, NO};
 use makepad_objc_sys::{class, msg_send, sel, sel_impl};
 use std::collections::HashMap;
@@ -166,8 +165,6 @@ pub(crate) struct StreamCtx {
     pub(crate) weight_bytes: u64,
     /// Bound at `Bind::Absent` and at an empty `Bind::Bytes`, so slot indices never shift.
     dummy: MtlBuf,
-    /// The host binding's device copies of input tensors, by content id.
-    pub(crate) mirror: Lru<Arc<MtlStorage>>,
     budget: usize,
     sync: bool,
     /// MAKEPAD_METAL_MATH_MODE, as `MTLMathMode`: `None` leaves the compiler's default (fast math
@@ -185,7 +182,7 @@ impl StreamCtx {
         let dummy = MtlBuf::new_shared(device.as_id(), 16).ok_or("could not allocate the 16-byte dummy buffer")?;
         let max_threadgroup_bytes: u64 = unsafe { msg_send![device.as_id(), maxThreadgroupMemoryLength] };
         let ring = Ring::from_env();
-        storage::attach(ring.clock().id(), &device);
+        storage::attach(ring.clock(), &device);
         Ok(StreamCtx {
             device,
             queue,
@@ -198,7 +195,6 @@ impl StreamCtx {
             weights: WeightMap::new(),
             weight_bytes: 0,
             dummy,
-            mirror: Lru::new(env_usize("MAKEPAD_METAL_MIRROR_CAP_MB", DEFAULT_MIRROR_CAP_MB).saturating_mul(1 << 20)),
             budget: env_usize("MAKEPAD_METAL_STREAM_OPS", DEFAULT_STREAM_OPS).max(1),
             sync: env_usize("MAKEPAD_METAL_STREAM_SYNC", 0) != 0,
             math_mode: math_mode_from_env(),
@@ -305,11 +301,31 @@ impl StreamCtx {
         self.ring.wait_all()
     }
 
-    /// Ends the stickiness of a failure the caller has just been given (`Ring::acknowledge`).
-    /// Everything it may have touched has been committed and waited for.
-    pub(crate) fn acknowledge_failure(&mut self) {
-        // The caller already holds the error; it is returned here once more only to be dropped.
-        let _ = self.ring.acknowledge();
+    /// The stream's clock: its id, and the watermark other threads read.
+    pub(crate) fn clock(&self) -> &Arc<StreamClock> {
+        self.ring.clock()
+    }
+
+    /// Whether storage last written by command buffer `serial` may be read (`Ring::check_written`):
+    /// `Err` while a failure at or before it is unacknowledged, or when it ran between a failure
+    /// and its acknowledgement. Does not wait.
+    pub(crate) fn check_written(&self, serial: u64) -> Result<(), String> {
+        self.ring.check_written(serial)
+    }
+
+    /// The serial of the command buffer being encoded, if one is open.
+    pub(crate) fn open_serial(&self) -> Option<u64> {
+        self.open.as_ref().map(|open| open.serial)
+    }
+
+    /// The serial of the last command buffer committed; 0 before the first.
+    pub(crate) fn last_committed(&self) -> u64 {
+        self.ring.last_committed()
+    }
+
+    /// Command buffers committed and not yet retired.
+    pub(crate) fn in_flight(&self) -> usize {
+        self.ring.in_flight()
     }
 
     /// Commits the open command buffer, waits for everything, and returns a failure not yet
@@ -364,8 +380,6 @@ impl Drop for StreamCtx {
                 eprintln!("[metal stream] at thread exit: {e}");
             }
         }
-        let copies = self.mirror.clear();
-        drop(copies);
         self.weights.clear();
     }
 }

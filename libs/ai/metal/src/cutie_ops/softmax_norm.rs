@@ -822,7 +822,7 @@ mod tests {
     }
 }
 
-/// The ops on the Mac against the host, in the host binding: each against f64 (or the host's
+/// The ops on the Mac against the host: each against f64 (or the host's
 /// libm) within fp32 rounding, the cached layer norm against `gpu_layer_norm_pytorch` bit for bit,
 /// and the errors CUDA's wrappers give. `cargo test -p makepad-ai-metal --lib
 /// cutie_ops::softmax_norm`, and again with MAKEPAD_METAL_MISALIGN=1.

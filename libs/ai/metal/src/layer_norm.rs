@@ -323,7 +323,7 @@ mod tests {
     }
 }
 
-/// The op on the Mac against f64, in the host binding, and the errors CUDA's wrapper gives.
+/// The op on the Mac against f64, and the errors CUDA's wrapper gives.
 /// `cargo test -p makepad-ai-metal --lib layer_norm`, and again with MAKEPAD_METAL_MISALIGN=1.
 /// Cutie's cached layer norm against this one, bit for bit, is `cutie_ops::softmax_norm`'s.
 #[cfg(all(test, target_os = "macos"))]

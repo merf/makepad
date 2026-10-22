@@ -615,6 +615,23 @@ fn storage_whose_owner_is_gone_is_adopted() {
 }
 
 #[test]
+fn a_host_write_in_place_makes_the_contents_the_hosts_and_keeps_the_last_use() {
+    let device = Device::new();
+    let mut ring: Ring<FakeCb> = Ring::new(8);
+    set_home(ring.clock().id(), usize::MAX);
+    let storage = home(|h| h.take_gpu(1024, |b| device.alloc(b))).unwrap();
+    let cb = commit(&mut ring, 1);
+    storage.mark_write(1);
+    cb.finish(CbStatus::Failed("fault".to_string()));
+    ring.retire();
+    assert!(ring.check_written(storage.last_write()).is_err(), "written by the failed buffer");
+    storage.mark_host_write();
+    assert_eq!((storage.last_use(), storage.last_write()), (1, 0));
+    ring.check_written(storage.last_write()).unwrap();
+    assert!(storage.written(0) && !storage.host_idle(0), "readable at once; the GPU's use still counts");
+}
+
+#[test]
 fn in_place_writes_need_storage_no_view_shares() {
     let device = Device::new();
     set_home(9, usize::MAX);

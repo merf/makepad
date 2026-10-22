@@ -1,8 +1,9 @@
 // The generic gpu_* ops' own kernels (metal/src/generic_ops.rs names and launches them; slices and
-// concatenations of columns use tensor.metal's copy): CUDA's pixal_pool_kernel
-// (cuda/kernels/pixal.cu), makepad_cuda_paint_transpose_f32_kernel (paint_extras.cu) and
-// makepad_cuda_realesrgan_scale_add_f32_kernel (diffusion_ops.cu), one thread an output with
-// CUDA's indexing and CUDA's arithmetic, so each result is CUDA's to the bit. Tensors are bound at
+// concatenations of rows and columns use tensor.metal's copy): CUDA's pixal_pool_kernel
+// (cuda/kernels/pixal.cu), makepad_cuda_paint_transpose_f32_kernel (paint_extras.cu),
+// makepad_cuda_realesrgan_scale_add_f32_kernel, makepad_cuda_add_cols_broadcast_f32_kernel and
+// makepad_cuda_gather_cols_f32_kernel (diffusion_ops.cu), one thread an output with CUDA's
+// indexing and CUDA's arithmetic, so each result is CUDA's to the bit. Tensors are bound at
 // any 4-byte offset, so they are `device` pointers, never `constant`, read one word at a time.
 // Nothing narrower than fp32 anywhere (D8).
 #include "makepad_common.h"
@@ -24,6 +25,17 @@ struct GenericTranspose {
 struct GenericScaleAdd {
     uint n;
     float scale;
+};
+
+struct GenericAddColsBroadcast {
+    uint cols;
+    uint n;
+};
+
+struct GenericGatherCols {
+    uint cols;
+    uint count;
+    uint n;
 };
 
 // Adaptive average pooling of planar [channels, height*width] to [channels, out_height*out_width]:
@@ -80,4 +92,31 @@ kernel void generic_scale_add_f32(constant GenericScaleAdd& p [[buffer(0)]],
     if (i < p.n) {
         out[i] = fma(p.scale, delta[i], base[i]);
     }
+}
+
+// x [rows, cols] plus bias[col] on every row: one IEEE add, nothing to contract. cols is not 0
+// when n is not (the host checks), so the modulo is defined for every thread that reaches it.
+kernel void generic_add_cols_broadcast_f32(constant GenericAddColsBroadcast& p [[buffer(0)]],
+                                           device const float* x [[buffer(1)]],
+                                           device const float* bias [[buffer(2)]],
+                                           device float* out [[buffer(3)]],
+                                           uint i [[thread_position_in_grid]]) {
+    if (i < p.n) {
+        out[i] = x[i] + bias[i % p.cols];
+    }
+}
+
+// Columns idx[0..count) of x [rows, cols], in that order, into [rows, count]: a word moved, so
+// every bit pattern arrives unchanged. Every index is below cols (the host checks, as CUDA's does).
+kernel void generic_gather_cols_u32(constant GenericGatherCols& p [[buffer(0)]],
+                                    device const uint* x [[buffer(1)]],
+                                    device const uint* idx [[buffer(2)]],
+                                    device uint* out [[buffer(3)]],
+                                    uint i [[thread_position_in_grid]]) {
+    if (i >= p.n) {
+        return;
+    }
+    const uint r = i / p.count;
+    const uint j = i - r * p.count;
+    out[i] = x[ulong(r) * ulong(p.cols) + ulong(idx[j])];
 }

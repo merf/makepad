@@ -1,13 +1,16 @@
-//! The Metal stream's bring-up on the Mac (RationalVisions docs/cutie-metal.md, step 7), in the
-//! host binding: every library and pipeline compiles; fill, copy, add, mul and relu match the host
-//! bit for bit; every kind of binding, function constants, threadgroup memory and the weight cache
-//! work; an output written in parts keeps every part; empty grids encode nothing; and the seam's
-//! rules come back as errors, not panics: a launch that leaves out something its kernel reads
-//! (from the pipeline's reflection), and host ops inside an op.
+//! The Metal stream on the Mac (RationalVisions docs/cutie-metal.md, steps 7 and 13), in the
+//! resident binding: every library and pipeline compiles; fill, copy, add, mul and relu match the
+//! host bit for bit; every kind of binding, function constants, threadgroup memory and the weight
+//! cache work; an output written in parts keeps every part; empty grids encode nothing; and the
+//! seam's rules come back as errors, not panics: a launch that leaves out something its kernel
+//! reads (from the pipeline's reflection), and host ops inside an op. Residency itself (pool reuse
+//! over many ops, pending reads and writes, threads, views, the in-flight cap) is
+//! `tests/residency.rs`.
 //!
-//! `cargo test -p makepad-ai-metal --test stream`, and again with MAKEPAD_METAL_MISALIGN=1 (inputs
-//! bound 4 bytes in). The forced command-buffer failure is `--test stream_fault` (a process of its
-//! own), the probe `--test stream_probe -- --nocapture`.
+//! `cargo test -p makepad-ai-metal --test stream`, again with MAKEPAD_METAL_MISALIGN=1 (tensors the
+//! host writes start a word into their buffers) and with MAKEPAD_METAL_STREAM_SYNC=1. The forced
+//! command-buffer failure is `--test stream_fault` (a process of its own), the probe
+//! `--test stream_probe -- --nocapture`.
 #![cfg(target_os = "macos")]
 
 use makepad_ai_metal::stream::kernels::*;
@@ -199,7 +202,7 @@ fn empty_grids_encode_nothing() {
         let stats = stream::stats(false);
         assert_eq!(stats.commits, 0, "an empty grid must not commit a command buffer");
         assert!(stats.mem_total_bytes > 0, "the stream started: {stats:?}");
-        // The same op with one element commits once and waits once (the host binding).
+        // The same op with one element commits once, when its download waits for it.
         let one = stream::upload(&[2.0], 1, 1).unwrap();
         assert_eq!(stream::download(&tensor_ops::add(&one, &one).unwrap()).unwrap(), vec![4.0]);
         let stats = stream::stats(false);
@@ -249,7 +252,7 @@ fn an_op_can_write_a_tensor_then_read_and_write_it_again() {
     let (tstart, tx) = (upload(&start), upload(&x));
     let io = with_metal_stream("bring-up: inout", |s| {
         let io = GpuTensor::alloc(n, 1)?;
-        s.copy(&tstart, &io)?; // Out: io now holds `start` under a new content id
+        s.copy(&tstart, &io)?; // Out: io now holds `start`
         s.launch(&PROBE_INOUT, &[], &TensorCount { n: n as u32 }, &[Bind::In(&tx), Bind::InOut(&io)], Grid::linear(n, 128)?)?;
         Ok(io)
     })
@@ -297,30 +300,38 @@ fn an_output_written_in_parts_keeps_every_part() {
     .unwrap();
 }
 
-/// The host binding only: a new tensor is NaN (`UNWRITTEN_BITS`) until written, so an op that
-/// leaves part of its output unwritten shows it. From step 12 a new tensor is a pooled buffer as
-/// it was left, and this test goes (or moves behind a switch that poisons pooled buffers).
+/// With poisoned allocations (MAKEPAD_METAL_POISON=1, or `set_poison_allocs` on a thread) a new
+/// tensor is NaN (`UNWRITTEN_BITS`) until written, so an op that leaves part of its output
+/// unwritten shows it; otherwise it is a pooled buffer as it was left.
 #[test]
-fn what_an_op_leaves_unwritten_is_nan_in_the_host_binding() {
-    let a: Vec<f32> = (0..400).map(|i| i as f32 - 200.0).collect();
-    let ta = upload(&a);
-    let out = with_metal_stream("bring-up: unwritten", |s| {
-        let out = GpuTensor::alloc(1000, 1)?;
-        copy_part(s, &ta, &out, 0)?;
-        Ok(out)
+fn what_an_op_leaves_unwritten_is_nan_with_poisoned_allocations() {
+    std::thread::spawn(|| {
+        stream::set_poison_allocs(Some(true));
+        let a: Vec<f32> = (0..400).map(|i| i as f32 - 200.0).collect();
+        let ta = upload(&a);
+        // Twice: the second output reuses the first's buffer, which holds what the first left.
+        for round in 0..2 {
+            let out = with_metal_stream("bring-up: unwritten", |s| {
+                let out = GpuTensor::alloc(1000, 1)?;
+                copy_part(s, &ta, &out, 0)?;
+                Ok(out)
+            })
+            .unwrap();
+            let words = stream::download_u32(&out).unwrap();
+            assert_eq!(words[..400], bits(&a)[..]);
+            if let Some(i) = (400..1000).find(|&i| words[i] != stream::UNWRITTEN_BITS) {
+                panic!("round {round}: word {i}, never written, is {:#010x}, not alloc's {:#010x}", words[i], stream::UNWRITTEN_BITS);
+            }
+        }
     })
+    .join()
     .unwrap();
-    let words = stream::download_u32(&out).unwrap();
-    assert_eq!(words[..400], bits(&a)[..]);
-    if let Some(i) = (400..1000).find(|&i| words[i] != stream::UNWRITTEN_BITS) {
-        panic!("word {i}, never written, is {:#010x}, not alloc's {:#010x}", words[i], stream::UNWRITTEN_BITS);
-    }
 }
 
 #[test]
 fn a_launch_must_give_the_kernel_everything_it_reads() {
-    // Checked against the pipeline's reflection: once dispatches share an encoder (step 12), what a
-    // launch leaves out would be read from the dispatch before it. If this Mac's Metal gives no
+    // Checked against the pipeline's reflection: dispatches share an encoder, so what a launch
+    // leaves out would be read from the dispatch before it. If this Mac's Metal gives no
     // reflection, the stream logs "no argument reflection" and these launches are not refused.
     let x = upload(&[1.0, 2.0, 3.0, 4.0]);
     let no_output = with_metal_stream("bring-up: no output", |s| {
@@ -357,7 +368,7 @@ fn a_launch_must_give_the_kernel_everything_it_reads() {
 
 #[test]
 fn host_ops_inside_an_op_are_errors() {
-    // As they will be once a host read waits for the stream (step 12): host data comes into an op
+    // A host read waits for the stream, whose context the op holds: host data comes into an op
     // through weights, upload_bytes or Bind::Bytes, and results leave it after the op.
     let x = upload(&[1.0, -2.0]);
     let y = upload(&[0.0, 0.0]);
@@ -366,7 +377,8 @@ fn host_ops_inside_an_op_are_errors() {
             ("gpu_tensor::upload", gpu_tensor::upload(&[1.0], 1, 1).map(|_| ())),
             ("gpu_tensor::upload_u32", gpu_tensor::upload_u32(&[1]).map(|_| ())),
             ("gpu_tensor::download", gpu_tensor::download(&x).map(|_| ())),
-            ("gpu_tensor::relu (a host op)", gpu_tensor::relu(&x).map(|_| ())),
+            ("gpu_tensor::transpose (a host op)", gpu_tensor::transpose(&x).map(|_| ())),
+            ("tensor_ops::relu (an op)", tensor_ops::relu(&x).map(|_| ())),
             ("gpu_tensor::upload_into", gpu_tensor::upload_into(&y, &[1.0, 2.0])),
             ("gpu_tensor::copy_into", gpu_tensor::copy_into(&x, &y)),
             ("stream::upload", stream::upload(&[1.0], 1, 1).map(|_| ())),
@@ -585,19 +597,22 @@ fn u32_words_and_bytes_round_trip() {
 }
 
 #[test]
-fn the_pool_reuses_buffers_and_inputs_are_copied_once() {
+fn the_pool_reuses_buffers_and_inputs_are_bound_where_they_lie() {
     std::thread::spawn(|| {
+        stream::set_poison_allocs(Some(false));
         let mut rng = Rng(0x5eed_0006);
         let (a, b) = (upload(&rng.values(5000)), upload(&rng.values(5000)));
-        let first = tensor_ops::add(&a, &b).unwrap();
+        let first = tensor_ops::add(&a, &b).unwrap().host();
         let after_first = stream::stats(false);
-        assert_eq!(after_first.pool_fresh_alloc_count, 3, "two input copies and the output: {after_first:?}");
-        let second = tensor_ops::add(&a, &b).unwrap();
+        assert_eq!(after_first.pool_fresh_alloc_count, 3, "the two uploads and the output: {after_first:?}");
+        // The first output dropped with its download: the second takes its buffer, and the inputs
+        // are bound where they lie, copied nowhere.
+        let second = tensor_ops::add(&a, &b).unwrap().host();
         let after_second = stream::stats(false);
-        assert_eq!(after_second.pool_fresh_alloc_count, 3, "the inputs' copies are kept, the output's buffer pooled");
-        assert_eq!(bits(&first.host()), bits(&second.host()));
+        assert_eq!(after_second.pool_fresh_alloc_count, 3, "the output's buffer pooled and taken again: {after_second:?}");
+        assert_eq!(bits(&first), bits(&second));
         assert!(after_second.gpu_ms >= 0.0 && after_second.commits == 2 && after_second.waits == 2, "{after_second:?}");
-        assert!(stream::pool_trim() > 0, "the input copies and the idle output buffer");
+        assert!(stream::pool_trim() > 0, "the idle output buffer");
         stream::pool_clear();
         assert_eq!(stream::pool_trim(), 0);
     })

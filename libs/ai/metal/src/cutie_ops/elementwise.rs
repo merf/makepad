@@ -603,7 +603,7 @@ mod tests {
     }
 }
 
-/// The ops on the Mac against the host, in the host binding: exact where CUDA's kernels only move,
+/// The ops on the Mac against the host: exact where CUDA's kernels only move,
 /// add, multiply or divide (the ops check's EXACT), within a few ulps where they call exp or tanh
 /// (precise:: against the host's libm). `cargo test -p makepad-ai-metal --lib cutie_ops::elementwise`,
 /// and again with MAKEPAD_METAL_MISALIGN=1.

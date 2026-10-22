@@ -26,7 +26,8 @@
 //! layer norm (its truth is in f64), and for the scale add where MAKEPAD_CUTIE_METAL_REF puts it on
 //! macOS's host version, which rounds twice. Their rows are named after their `gpu_` functions.
 //! No case asks an op to refuse what CUDA refuses (an index past the columns, a slice past the
-//! end): `gpu_gather_cols` on macOS checks no index yet (cutie-metal.md step 12).
+//! end), though since cutie-metal.md's step 12 macOS checks the same, `gpu_gather_cols`' indices
+//! among them.
 //!
 //! `MAKEPAD_CUTIE_OPS=row,row` runs only those rows (the labels this report prints, or a family
 //! of them: [`OPS_FAMILIES`], Metal's kernel families); a name it does not know is an error that
@@ -1359,7 +1360,7 @@ pub(crate) fn check(report: &mut Report) -> Result<()> {
         }
     }
     if cfg!(target_os = "macos") {
-        report.note("ops: Metal's kernels (MAKEPAD_CUTIE_METAL_REF=all, or ops by name or by this report's row label, runs those ops as their host references: their rows are marked (reference forced)); PyTorch's pins at TIGHT where CUDA's expf, logf, sinf and cosf give its bits; gather_cols, add_cols_broadcast, birefnet_relu and rife_fill are host code on macOS");
+        report.note("ops: Metal's kernels (MAKEPAD_CUTIE_METAL_REF=all, or ops by name or by this report's row label, runs those ops as their host references: their rows are marked (reference forced)); PyTorch's pins at TIGHT where CUDA's expf, logf, sinf and cosf give its bits; rife_fill is host code on macOS (a host fill, as RIFE's probe wants)");
     } else if !GPU_CUTIE_KERNELS {
         report.note("ops: this build has no Cutie kernels; each op is its host reference, so kernel against reference compares the reference with itself");
     }

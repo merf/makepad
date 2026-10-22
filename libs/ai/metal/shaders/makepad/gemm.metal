@@ -17,7 +17,7 @@
 //
 // Exactness (D8): the multiply-accumulate is an explicit fma, and the epilogue is alpha * acc
 // then one explicit fma with beta * C, so no contraction setting changes them. With beta 0, C is
-// never read (an Out's contents are undefined, NaN in the host binding); with k 0 there is no
+// never read (an Out's contents are undefined, NaN with poisoned allocations); with k 0 there is no
 // product and C becomes beta * C, as BLAS (gemm.rs passes k 0 for alpha 0 too).
 #include "makepad_common.h"
 

@@ -126,7 +126,7 @@ enum MetalReference {
 
 /// Every op MAKEPAD_CUTIE_METAL_REF can name: Cutie's own (`gpu_cutie_X`), then the generic ops
 /// that run Makepad's kernels on macOS (`gpu_X`), whose references are the host versions they had
-/// before (for `linear_f32_resident`, ggml's half-staged GEMM).
+/// before (for `linear_f32_resident`, Accelerate's fp32 sgemm, `gpu_tensor::linear_f32_exact`).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const METAL_REFERENCE_OPS: &[&str] = &[
     "add_broadcast",
@@ -152,9 +152,12 @@ const METAL_REFERENCE_OPS: &[&str] = &[
     "sine_encoding",
     "softmax_axis0",
     "topk_softmax",
+    "add_cols_broadcast",
     "attention_packed_cross_bias",
     "attention_packed_cross_f32",
+    "birefnet_relu",
     "concat_cols",
+    "gather_cols",
     "layer_norm_pytorch",
     "linear_f32_resident",
     "pixal_pool",
@@ -3093,7 +3096,10 @@ mod imp {
     pub fn gpu_gather_cols(_x: &GpuTensor, _indices: &[u32]) -> Result<GpuTensor, String> {
         #[cfg(target_os = "macos")]
         {
-            return makepad_ai_metal::gpu_tensor::gather_cols(_x, _indices);
+            if super::cutie_metal_ref("gather_cols")? {
+                return makepad_ai_metal::gpu_tensor::gather_cols(_x, _indices);
+            }
+            return makepad_ai_metal::generic_ops::gather_cols(_x, _indices);
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -3123,7 +3129,7 @@ mod imp {
     pub fn gpu_reshape(_x: GpuTensor, _rows: usize, _cols: usize) -> Result<GpuTensor, String> {
         #[cfg(target_os = "macos")]
         {
-            return makepad_ai_metal::gpu_tensor::reshape(&_x, _rows, _cols);
+            return makepad_ai_metal::gpu_tensor::reshape(_x, _rows, _cols);
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -3727,7 +3733,7 @@ mod imp {
         #[cfg(target_os = "macos")]
         {
             if super::cutie_metal_ref("linear_f32_resident")? {
-                return makepad_ai_metal::gpu_tensor::linear_f32_resident(_x, _weight, _bias);
+                return makepad_ai_metal::gpu_tensor::linear_f32_exact(_x, _weight, _bias);
             }
             return makepad_ai_metal::linear::linear_f32_resident(_x, _weight, _bias);
         }
@@ -4170,7 +4176,10 @@ mod imp {
     pub fn gpu_add_cols_broadcast(_x: &GpuTensor, _bias: &GpuTensor) -> Result<GpuTensor, String> {
         #[cfg(target_os = "macos")]
         {
-            return makepad_ai_metal::gpu_tensor::add_cols_broadcast(_x, _bias);
+            if super::cutie_metal_ref("add_cols_broadcast")? {
+                return makepad_ai_metal::gpu_tensor::add_cols_broadcast(_x, _bias);
+            }
+            return makepad_ai_metal::generic_ops::add_cols_broadcast(_x, _bias);
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -4286,7 +4295,7 @@ mod imp {
         }
     }
 
-    // macOS: one host copy until tensors are resident (CUDA makes adjacent parts a view).
+    // macOS: parts adjacent in one storage are a view of it, as on CUDA; otherwise copy kernels.
     pub fn gpu_concat_rows(_a: &GpuTensor, _b: &GpuTensor) -> Result<GpuTensor, String> {
         #[cfg(target_os = "macos")]
         {
@@ -4606,7 +4615,10 @@ mod imp {
     pub fn gpu_birefnet_relu(_x: &GpuTensor) -> Result<GpuTensor, String> {
         #[cfg(target_os = "macos")]
         {
-            return makepad_ai_metal::gpu_tensor::relu(_x);
+            if super::cutie_metal_ref("birefnet_relu")? {
+                return makepad_ai_metal::gpu_tensor::relu(_x);
+            }
+            return makepad_ai_metal::stream::tensor_ops::relu(_x);
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -4876,7 +4888,7 @@ mod imp {
     pub fn gpu_birefnet_tokens_to_planar(_x: &GpuTensor) -> Result<GpuTensor, String> {
         #[cfg(target_os = "macos")]
         {
-            return makepad_ai_metal::gpu_tensor::tokens_to_planar(_x);
+            return makepad_ai_metal::generic_ops::tokens_to_planar(_x);
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -5120,8 +5132,7 @@ mod imp {
         Err(GPU_UNAVAILABLE.to_string())
     }
 
-    // macOS: the calling thread's Metal stream pool (its idle buffers, and the host binding's
-    // input copies).
+    // macOS: the calling thread's Metal stream pool (its idle buffers).
     pub fn gpu_pool_clear() {
         #[cfg(target_os = "macos")]
         makepad_ai_metal::stream::pool_clear();

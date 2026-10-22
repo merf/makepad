@@ -1,5 +1,5 @@
-//! The fp32 GEMM and its users on the Mac (RationalVisions docs/cutie-metal.md, step 9), in the
-//! host binding: `MetalStream::gemm` on both kernels against products summed in f64 (transposes,
+//! The fp32 GEMM and its users on the Mac (RationalVisions docs/cutie-metal.md, step 9):
+//! `MetalStream::gemm` on both kernels against products summed in f64 (transposes,
 //! leading dimensions past the columns, offsets, batch strides and broadcast operands, k = 0,
 //! alpha and beta, odd sizes, NaN and inf), the refusals before anything is encoded, and
 //! `linear_f32_resident` and the fp32 attention against f64 as Cutie's ops check judges them
@@ -9,8 +9,8 @@
 //! matrix shows as a NaN in the result; every float of an InOut C outside the matrix must come
 //! back with its bits.
 //!
-//! `cargo test -p makepad-ai-metal --test gemm`, again with MAKEPAD_METAL_MISALIGN=1 (inputs bound
-//! 4 bytes in). The kernels are chosen per test (`gemm::set_mode_override`), whatever
+//! `cargo test -p makepad-ai-metal --test gemm`, again with MAKEPAD_METAL_MISALIGN=1 (uploaded
+//! inputs start 4 bytes into their buffers). The kernels are chosen per test (`gemm::set_mode_override`), whatever
 //! MAKEPAD_METAL_GEMM says.
 #![cfg(target_os = "macos")]
 
@@ -618,7 +618,7 @@ fn linears_bias_is_one_add_after_the_product() {
                 assert_eq!(got.to_bits(), (p + b[i % out_f]).to_bits(), "{mode:?} element {i}");
             }
         }
-        // And the same call twice gives the same bits (the weight's device copy is reused).
+        // And the same call twice gives the same bits (W read where it lies both times).
         assert_eq!(download(&linear::linear_f32_resident(&tx, &tw, None).unwrap()), plain);
     }
 }

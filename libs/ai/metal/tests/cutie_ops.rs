@@ -1,5 +1,5 @@
-//! Cutie's kernel libraries on the Mac (RationalVisions docs/cutie-metal.md, steps 9 and 10), in
-//! the host binding: every Cutie library (the layer norm's among them) and the generic ops'
+//! Cutie's kernel libraries on the Mac (RationalVisions docs/cutie-metal.md, steps 9 and 10):
+//! every Cutie library (the layer norm's among them) and the generic ops'
 //! library compile, and every one of their kernels makes a pipeline. The GEMM's are
 //! `tests/gemm.rs`'s. Families (a) and (c), the layer norm and the generic ops also have unit
 //! tests against the host (`cargo test -p makepad-ai-metal --lib cutie_ops::elementwise`,

@@ -1,11 +1,10 @@
 //! The stream's platform-free parts, on any OS: grids, function-constant keys, library sources
-//! and the override folder, the launch checks, the host binding's mirror and the weight map. The
-//! stream itself is checked on the Mac (`tests/stream.rs`, `stream_fault.rs`, `stream_probe.rs`).
+//! and the override folder, the launch checks and the weight map. The stream itself is checked on
+//! the Mac (`tests/stream.rs`, `residency.rs`, `stream_fault.rs`, `stream_probe.rs`).
 
 use super::grid::check_grid;
 use super::kernel::consts_match;
 use super::kernels::*;
-use super::mirror::Lru;
 use super::plan::{check_args, check_slots, ArgKind, KernelArgs, SlotKind, SlotPlan};
 use super::source::{library_source, splice_header, COMMON_HEADER};
 use super::weight_map::WeightMap;
@@ -124,6 +123,7 @@ fn params_structs_have_their_msl_sizes() {
     assert_eq!(std::mem::size_of::<TensorCopy2d>(), 24);
     assert_eq!(std::mem::size_of::<ProbeBinds>(), 8);
     assert_eq!(std::mem::size_of::<ProbeFault>(), 8);
+    assert_eq!(std::mem::size_of::<ProbeSpin>(), 8);
     assert_eq!(std::mem::size_of::<()>(), 0);
 }
 
@@ -279,31 +279,6 @@ fn a_launch_gives_every_threadgroup_index_its_memory() {
     // Memory at an index the kernel does not use is harmless.
     let none = KernelArgs { threadgroups: 0, ..args };
     assert!(check_args("op", "k", &none, 4, 2, &half.threadgroup_bytes).is_ok());
-}
-
-#[test]
-fn mirror_keeps_the_most_recently_used_under_its_cap() {
-    let mut lru = Lru::new(100);
-    assert!(lru.insert(1, "a", 40).is_empty());
-    assert!(lru.insert(2, "b", 40).is_empty());
-    assert_eq!(lru.get(1), Some(&"a")); // 1 is now more recent than 2
-    let dropped = lru.insert(3, "c", 40);
-    assert_eq!(dropped, vec!["b"]);
-    assert_eq!(lru.get(2), None);
-    assert_eq!(lru.bytes(), 80);
-    // Replacing a key gives the old value back; the bytes follow.
-    assert_eq!(lru.insert(1, "a2", 10), vec!["a"]);
-    assert_eq!(lru.bytes(), 50);
-    // A value alone over the cap is not kept.
-    assert_eq!(lru.insert(4, "huge", 101), vec!["huge"]);
-    assert_eq!(lru.get(4), None);
-    // Room for a big one: everything older goes, least recently used first.
-    lru.get(3);
-    let dropped = lru.insert(5, "e", 90);
-    assert_eq!(dropped, vec!["a2", "c"]);
-    assert_eq!(lru.len(), 1);
-    assert_eq!(lru.clear(), vec!["e"]);
-    assert_eq!((lru.len(), lru.bytes()), (0, 0));
 }
 
 #[test]

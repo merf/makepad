@@ -134,3 +134,26 @@ kernel void probe_fault(constant ProbeFault& p [[buffer(0)]],
                         uint i [[thread_position_in_grid]]) {
     out[p.far_words + i] = 1.0f;
 }
+
+struct ProbeSpin {
+    uint n;
+    uint iterations;
+};
+
+// Slow on purpose, for the residency tests (tests/residency.rs): `iterations` dependent steps of
+// v = v * 0.5 + 1, which reach 2 exactly and stay there, then out = x + (v - 2), which is x (for x
+// not -0). So the result is the input's bits, and a command buffer holding it stays pending for as
+// long as the iterations take.
+kernel void probe_spin(constant ProbeSpin& p [[buffer(0)]],
+                       device const float* x [[buffer(1)]],
+                       device float* out [[buffer(2)]],
+                       uint i [[thread_position_in_grid]]) {
+    if (i >= p.n) {
+        return;
+    }
+    float v = float(i & 1023u);
+    for (uint k = 0; k < p.iterations; ++k) {
+        v = v * 0.5f + 1.0f;
+    }
+    out[i] = x[i] + (v - 2.0f);
+}

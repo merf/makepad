@@ -3,12 +3,13 @@
 //! (the same as CUDA's in cuda/src/launch.rs), with CUDA's checks and messages:
 //! - `slice_cols` and `concat_cols`: copies of blocks of words (`tensor.metal`'s
 //!   `tensor_copy2d_u32`, CUDA's `makepad_cuda_copy_submatrix_f32`);
-//! - `pixal_pool`, `planar_tokens_transpose` and `realesrgan_scale_add`: `generic_ops.metal`,
-//!   ported from CUDA's kernels with their arithmetic, so every result is CUDA's to the bit (moves
-//!   are moves, the pool sums its window in row order and divides once, the scale add is CUDA's
-//!   one `fmaf`);
-//! - `concat_rows` and `concat_rows_many`: one host copy, until step 12 makes adjacent parts a
-//!   view and the rest copy kernels.
+//! - `pixal_pool`, `planar_tokens_transpose` (and BiRefNet's `tokens_to_planar`, the same
+//!   transpose), `realesrgan_scale_add`, `add_cols_broadcast` and `gather_cols`:
+//!   `generic_ops.metal`, ported from CUDA's kernels with their arithmetic, so every result is
+//!   CUDA's to the bit (moves are moves, the pool sums its window in row order and divides once,
+//!   the scale add is CUDA's one `fmaf`, the broadcast add one IEEE add);
+//! - `concat_rows` and `concat_rows_many`: parts adjacent in one storage, in order, are a view of
+//!   it, as on CUDA; otherwise one copy (`tensor_copy2d_u32`) a part into a new tensor.
 //!
 //! The library is apart from `tensor.metal`, so that until the Mac has compiled it a fault in it
 //! breaks these ops alone, not the stream's fills and copies. models/common's gpu.rs calls them on
@@ -25,9 +26,11 @@ use crate::stream::{Grid, Kernel, KernelLib, KernelParams, MetalResult};
 #[cfg(target_os = "macos")]
 use crate::stream::kernels::TENSOR_COPY2D;
 #[cfg(target_os = "macos")]
-use crate::stream::{from_host, with_host, with_metal_stream, Bind};
+use crate::stream::{view, with_metal_stream, Bind};
 #[cfg(target_os = "macos")]
 use crate::GpuTensor;
+#[cfg(target_os = "macos")]
+use std::sync::Arc;
 
 /// The pool, the transpose and the scale add (`generic_ops.metal`).
 pub static GENERIC_OPS: KernelLib = KernelLib {
@@ -41,9 +44,20 @@ pub static GENERIC_PIXAL_POOL: Kernel = Kernel { lib: &GENERIC_OPS, function: "g
 pub static GENERIC_TRANSPOSE: Kernel = Kernel { lib: &GENERIC_OPS, function: "generic_transpose_u32" };
 /// `fma(scale, delta, base)` ([`GenericScaleAdd`]).
 pub static GENERIC_SCALE_ADD: Kernel = Kernel { lib: &GENERIC_OPS, function: "generic_scale_add_f32" };
+/// `x + bias[col]` over `[rows, cols]` ([`GenericAddColsBroadcast`]).
+pub static GENERIC_ADD_COLS_BROADCAST: Kernel =
+    Kernel { lib: &GENERIC_OPS, function: "generic_add_cols_broadcast_f32" };
+/// Columns of `[rows, cols]` by an index table, a word moved a thread ([`GenericGatherCols`]).
+pub static GENERIC_GATHER_COLS: Kernel = Kernel { lib: &GENERIC_OPS, function: "generic_gather_cols_u32" };
 
 /// Every kernel above, for the bring-up test that compiles them all.
-pub static GENERIC_KERNELS: &[&Kernel] = &[&GENERIC_PIXAL_POOL, &GENERIC_TRANSPOSE, &GENERIC_SCALE_ADD];
+pub static GENERIC_KERNELS: &[&Kernel] = &[
+    &GENERIC_PIXAL_POOL,
+    &GENERIC_TRANSPOSE,
+    &GENERIC_SCALE_ADD,
+    &GENERIC_ADD_COLS_BROADCAST,
+    &GENERIC_GATHER_COLS,
+];
 
 /// Threads to a threadgroup for the one-thread-an-output kernels.
 const THREADS: u32 = 256;
@@ -86,6 +100,29 @@ pub struct GenericScaleAdd {
 }
 // SAFETY: #[repr(C)], 8 bytes, no pointers; `GenericScaleAdd` in MSL.
 unsafe impl KernelParams for GenericScaleAdd {}
+
+/// `generic_add_cols_broadcast_f32`'s params: the columns (the bias's length) and the element
+/// count.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GenericAddColsBroadcast {
+    pub cols: u32,
+    pub n: u32,
+}
+// SAFETY: #[repr(C)], 8 bytes, no pointers; `GenericAddColsBroadcast` in MSL.
+unsafe impl KernelParams for GenericAddColsBroadcast {}
+
+/// `generic_gather_cols_u32`'s params: the input's columns, the indices' count (the output's
+/// columns) and the output's element count.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GenericGatherCols {
+    pub cols: u32,
+    pub count: u32,
+    pub n: u32,
+}
+// SAFETY: #[repr(C)], 12 bytes, no pointers; `GenericGatherCols` in MSL.
+unsafe impl KernelParams for GenericGatherCols {}
 
 /// A size as the kernels take it (the message of CUDA's `cutie_u32`).
 fn kernel_u32(op: &str, v: usize) -> MetalResult<u32> {
@@ -204,6 +241,54 @@ fn transpose_params(rows: usize, cols: usize) -> MetalResult<GenericTranspose> {
     Ok(GenericTranspose { rows: rows as u32, cols: cols as u32, n })
 }
 
+/// `gpu_add_cols_broadcast`'s params for `x` `[rows, cols]` and a bias of `bias` (rows, cols),
+/// after CUDA's check: as many bias values as `x` has columns.
+fn add_cols_broadcast_params(x: (usize, usize), bias: (usize, usize)) -> MetalResult<GenericAddColsBroadcast> {
+    if bias.0.checked_mul(bias.1) != Some(x.1) {
+        return Err(format!(
+            "gpu_add_cols_broadcast shape mismatch {}x{} half=false vs bias {}x{} half=false",
+            x.0, x.1, bias.0, bias.1
+        ));
+    }
+    let n = kernel_count("gpu_add_cols_broadcast", x.0, x.1)?;
+    // The columns are at most the element count, which fits a u32 (just checked), or there are no
+    // rows and nothing runs.
+    let cols = kernel_u32("gpu_add_cols_broadcast", x.1)?;
+    Ok(GenericAddColsBroadcast { cols, n })
+}
+
+/// `gpu_gather_cols`'s params for `x` `[rows, cols]` and `indices`, after CUDA's checks, in its
+/// order and with its messages: a table, and every index inside the columns.
+fn gather_cols_params(rows: usize, cols: usize, indices: &[u32]) -> MetalResult<GenericGatherCols> {
+    if indices.is_empty() {
+        return Err("gpu_gather_cols: empty index table".to_string());
+    }
+    if let Some(&index) = indices.iter().find(|&&index| index as usize >= cols) {
+        return Err(format!("gpu_gather_cols index {index} out of range (cols {cols})"));
+    }
+    let op = "gpu_gather_cols";
+    kernel_count(op, rows, cols)?;
+    let n = kernel_count(op, rows, indices.len())?;
+    Ok(GenericGatherCols { cols: kernel_u32(op, cols)?, count: kernel_u32(op, indices.len())?, n })
+}
+
+/// `gpu_concat_rows_many`'s plan for parts of these row counts, all `cols` wide: one copy a part
+/// into its rows of the output (an empty grid for a part with no rows).
+fn concat_rows_plan(op: &str, cols: usize, rows: &[usize]) -> MetalResult<Vec<CopyBlock>> {
+    let total = rows
+        .iter()
+        .try_fold(0usize, |total, &r| total.checked_add(r))
+        .ok_or_else(|| format!("{op}: the parts' rows overflow"))?;
+    kernel_count(op, total, cols)?;
+    let mut at = 0;
+    let mut copies = Vec::with_capacity(rows.len());
+    for &r in rows {
+        copies.push(copy_block(op, r, cols, cols, 0, cols, at * cols)?);
+        at += r;
+    }
+    Ok(copies)
+}
+
 /// `gpu_realesrgan_scale_add`'s params for `base` and `delta` of these shapes, after CUDA's check.
 fn scale_add_params(base: (usize, usize), delta: (usize, usize), scale: f32) -> MetalResult<GenericScaleAdd> {
     if base != delta {
@@ -273,9 +358,21 @@ pub fn pixal_pool(
 /// `gpu_planar_tokens_transpose`).
 #[cfg(target_os = "macos")]
 pub fn planar_tokens_transpose(x: &GpuTensor) -> MetalResult<GpuTensor> {
-    let op = "gpu_planar_tokens_transpose";
+    transpose("gpu_planar_tokens_transpose", x)
+}
+
+/// BiRefNet's tokens `[HW, C]` to planar `[C, HW]` (CUDA's `gpu_birefnet_tokens_to_planar`): the
+/// same transpose.
+#[cfg(target_os = "macos")]
+pub fn tokens_to_planar(x: &GpuTensor) -> MetalResult<GpuTensor> {
+    transpose("gpu_birefnet_tokens_to_planar", x)
+}
+
+/// `x` transposed, named `op`.
+#[cfg(target_os = "macos")]
+fn transpose(op: &'static str, x: &GpuTensor) -> MetalResult<GpuTensor> {
     if x.is_half() {
-        return Err("gpu_planar_tokens_transpose is f32-only".to_string());
+        return Err(format!("{op} is f32-only"));
     }
     let params = transpose_params(x.rows(), x.cols())?;
     let grid = Grid::linear(params.n as usize, THREADS)?;
@@ -303,41 +400,91 @@ pub fn realesrgan_scale_add(base: &GpuTensor, delta: &GpuTensor, scale: f32) -> 
     })
 }
 
-/// `a`'s rows, then `b`'s (CUDA's `gpu_concat_rows`), copied on the host in one pass.
+/// `x` [rows, cols] plus `bias` (`cols` values, any shape) on every row (CUDA's
+/// `gpu_add_cols_broadcast`).
+#[cfg(target_os = "macos")]
+pub fn add_cols_broadcast(x: &GpuTensor, bias: &GpuTensor) -> MetalResult<GpuTensor> {
+    let op = "gpu_add_cols_broadcast";
+    let params = add_cols_broadcast_params((x.rows(), x.cols()), (bias.rows(), bias.cols()))?;
+    let grid = Grid::linear(params.n as usize, THREADS)?;
+    with_metal_stream(op, |s| {
+        let out = GpuTensor::alloc(x.rows(), x.cols())?;
+        s.launch(&GENERIC_ADD_COLS_BROADCAST, &[], &params, &[Bind::In(x), Bind::In(bias), Bind::Out(&out)], grid)?;
+        Ok(out)
+    })
+}
+
+/// Columns `indices` of `x` [rows, cols], in that order, into [rows, indices.len()] (CUDA's
+/// `gpu_gather_cols`); every index is checked first.
+#[cfg(target_os = "macos")]
+pub fn gather_cols(x: &GpuTensor, indices: &[u32]) -> MetalResult<GpuTensor> {
+    let op = "gpu_gather_cols";
+    if x.is_half() {
+        return Err("gpu_gather_cols is f32-only".to_string());
+    }
+    let params = gather_cols_params(x.rows(), x.cols(), indices)?;
+    let grid = Grid::linear(params.n as usize, THREADS)?;
+    let table: Vec<u8> = indices.iter().flat_map(|index| index.to_le_bytes()).collect();
+    with_metal_stream(op, |s| {
+        let idx = s.upload_bytes(&table)?;
+        let out = GpuTensor::alloc(x.rows(), indices.len())?;
+        s.launch(&GENERIC_GATHER_COLS, &[], &params, &[Bind::In(x), Bind::In(&idx), Bind::Out(&out)], grid)?;
+        Ok(out)
+    })
+}
+
+/// `a`'s rows, then `b`'s (CUDA's `gpu_concat_rows`): a view when `b` follows `a` in one storage,
+/// otherwise a copy of each.
 #[cfg(target_os = "macos")]
 pub fn concat_rows(a: &GpuTensor, b: &GpuTensor) -> MetalResult<GpuTensor> {
     if a.cols() != b.cols() || a.is_half() != b.is_half() {
         return Err("gpu_concat_rows shape mismatch".to_string());
     }
-    stack_rows(&[a, b])
+    stack_rows("gpu_concat_rows", &[a, b])
 }
 
-/// `parts`' rows one after another (CUDA's `gpu_concat_rows_many`), copied on the host in one pass:
-/// CUDA makes parts adjacent in one storage a view, which the host binding has no twin for.
+/// `parts`' rows one after another (CUDA's `gpu_concat_rows_many`): one part is a view of it;
+/// parts adjacent in one storage, in order, are a view of it; otherwise one copy a part.
 #[cfg(target_os = "macos")]
 pub fn concat_rows_many(parts: &[&GpuTensor]) -> MetalResult<GpuTensor> {
     let Some(first) = parts.first() else {
         return Err("gpu_concat_rows_many empty".to_string());
     };
+    if parts.len() == 1 {
+        return crate::stream::slice_rows(first, 0, first.rows());
+    }
     if parts.iter().any(|part| part.cols() != first.cols() || part.is_half() != first.is_half()) {
         return Err("gpu_concat_rows_many shape mismatch".to_string());
     }
-    stack_rows(parts)
+    stack_rows("gpu_concat_rows_many", parts)
 }
 
-/// `parts` (all as wide) stacked, copied on the host.
+/// `parts` (all as wide) stacked: a view of their storage when each starts where the one before
+/// it ends there, else a new tensor with one copy a part.
 #[cfg(target_os = "macos")]
-fn stack_rows(parts: &[&GpuTensor]) -> MetalResult<GpuTensor> {
-    let cols = parts[0].cols();
-    let rows = parts.iter().map(|part| part.rows()).sum();
-    from_host(rows, cols, |dst| {
-        let mut at = 0;
-        for part in parts {
-            let floats = part.rows() * cols;
-            with_host(part, |values| dst[at..at + floats].copy_from_slice(&values[..floats]))?;
-            at += floats;
+fn stack_rows(op: &'static str, parts: &[&GpuTensor]) -> MetalResult<GpuTensor> {
+    let first = parts[0];
+    let cols = first.cols();
+    let mut next = first.offset;
+    let adjacent = parts.iter().all(|part| {
+        let follows = Arc::ptr_eq(&part.storage, &first.storage) && part.offset == next;
+        next = part.offset + part.rows() * cols;
+        follows
+    });
+    if adjacent {
+        // They lie one after another in one storage, so their rows add up inside it.
+        let total = parts.iter().map(|part| part.rows()).sum();
+        return Ok(view(first, 0, total, cols));
+    }
+    let rows: Vec<usize> = parts.iter().map(|part| part.rows()).collect();
+    let copies = concat_rows_plan(op, cols, &rows)?;
+    let total: usize = rows.iter().sum();
+    with_metal_stream(op, |s| {
+        let out = GpuTensor::alloc(total, cols)?;
+        for (part, copy) in parts.iter().zip(&copies) {
+            s.launch(&TENSOR_COPY2D, &[], &copy.params, &[Bind::In(part), Bind::Out(&out)], copy.grid)?;
         }
-        Ok(())
+        Ok(out)
     })
 }
 
@@ -404,6 +551,13 @@ mod tests {
         );
         assert_eq!(std::mem::size_of::<GenericScaleAdd>(), 8);
         assert_eq!(msl_struct_fields(source, "GenericScaleAdd"), fields(&[("uint", "n"), ("float", "scale")]));
+        assert_eq!(std::mem::size_of::<GenericAddColsBroadcast>(), 8);
+        assert_eq!(msl_struct_fields(source, "GenericAddColsBroadcast"), fields(&[("uint", "cols"), ("uint", "n")]));
+        assert_eq!(std::mem::size_of::<GenericGatherCols>(), 12);
+        assert_eq!(
+            msl_struct_fields(source, "GenericGatherCols"),
+            fields(&[("uint", "cols"), ("uint", "count"), ("uint", "n")])
+        );
     }
 
     #[test]
@@ -461,6 +615,31 @@ mod tests {
         assert_eq!(scale_add_params((2, 3), (3, 2), 1.0).unwrap_err(), "gpu_realesrgan_scale_add 2x3 vs 3x2");
         let p = scale_add_params((2, 3), (2, 3), -1.0).unwrap();
         assert_eq!((p.n, p.scale.to_bits()), (6, (-1.0f32).to_bits()));
+    }
+
+    #[test]
+    fn the_broadcast_add_and_the_gather_check_as_cuda_does() {
+        let err = add_cols_broadcast_params((4, 3), (1, 4)).unwrap_err();
+        assert_eq!(err, "gpu_add_cols_broadcast shape mismatch 4x3 half=false vs bias 1x4 half=false");
+        assert_eq!(add_cols_broadcast_params((4, 3), (3, 1)).unwrap(), GenericAddColsBroadcast { cols: 3, n: 12 });
+        assert_eq!(add_cols_broadcast_params((0, 3), (1, 3)).unwrap().n, 0, "no rows: an empty grid");
+        let big = add_cols_broadcast_params((1 << 20, 1 << 12), (1, 1 << 12)).unwrap_err();
+        assert!(big.contains("does not fit the kernel's 32-bit sizes"), "{big}");
+
+        assert_eq!(gather_cols_params(2, 5, &[]).unwrap_err(), "gpu_gather_cols: empty index table");
+        assert_eq!(gather_cols_params(2, 5, &[0, 5, 9]).unwrap_err(), "gpu_gather_cols index 5 out of range (cols 5)");
+        assert_eq!(gather_cols_params(2, 5, &[4, 0, 4]).unwrap(), GenericGatherCols { cols: 5, count: 3, n: 6 });
+        assert_eq!(gather_cols_params(0, 5, &[1]).unwrap().n, 0);
+    }
+
+    #[test]
+    fn concatenated_rows_copy_each_part_below_the_one_before() {
+        let copies = concat_rows_plan("gpu_concat_rows_many", 7, &[2, 0, 3]).unwrap();
+        let fields: Vec<[u32; 6]> = copies.iter().map(|c| copy_fields(&c.params)).collect();
+        assert_eq!(fields, [[2, 7, 7, 7, 0, 0], [0, 7, 7, 7, 0, 14], [3, 7, 7, 7, 0, 14]]);
+        assert!(copies[1].grid.is_empty(), "a part with no rows launches nothing");
+        let wide = concat_rows_plan("gpu_concat_rows", 1 << 16, &[1 << 15, 1 << 15]).unwrap_err();
+        assert_eq!(wide, "gpu_concat_rows: 4294967296 does not fit the kernel's 32-bit sizes");
     }
 
     /// `generic_pixal_pool_f32` as the MSL writes it, thread by thread, in u32 arithmetic (a
@@ -649,5 +828,33 @@ mod metal_tests {
             let want: Vec<f32> = bs.iter().zip(&ds).map(|(&b, &d)| scale.mul_add(d, b)).collect();
             assert_bits_any_nan(&format!("scale add {scale}"), &got, &want);
         }
+    }
+
+    #[test]
+    fn the_broadcast_add_the_gather_and_tokens_to_planar_are_cudas() {
+        let (rows, cols) = (37, 29);
+        let xs = values(rows * cols, 7);
+        let x = upload(&xs, rows, cols).unwrap();
+        for bias_rows in [1, 29] {
+            let bs = values(cols, 8);
+            let bias = upload(&bs, bias_rows, cols / bias_rows).unwrap();
+            let got = download(&add_cols_broadcast(&x, &bias).unwrap()).unwrap();
+            let want: Vec<f32> = (0..rows * cols).map(|i| xs[i] + bs[i % cols]).collect();
+            assert_bits_any_nan(&format!("add_cols_broadcast, bias {bias_rows} rows"), &got, &want);
+        }
+        let bad = upload(&values(cols + 1, 9), 1, cols + 1).unwrap();
+        assert!(add_cols_broadcast(&x, &bad).err().unwrap().starts_with("gpu_add_cols_broadcast shape mismatch"));
+
+        let indices = [28u32, 0, 13, 13, 5];
+        let got = download(&gather_cols(&x, &indices).unwrap()).unwrap();
+        let want: Vec<f32> = (0..rows).flat_map(|r| indices.iter().map(move |&j| (r, j as usize))).map(|(r, j)| xs[r * cols + j]).collect();
+        assert_bits("gather_cols", &got, &want);
+        assert_eq!(gather_cols(&x, &[3, 29]).err().unwrap(), "gpu_gather_cols index 29 out of range (cols 29)");
+        assert_eq!(gather_cols(&x, &[]).err().unwrap(), "gpu_gather_cols: empty index table");
+
+        let t = tokens_to_planar(&x).unwrap();
+        assert_eq!((t.rows(), t.cols()), (cols, rows));
+        let want: Vec<f32> = (0..cols).flat_map(|c| (0..rows).map(move |r| (r, c))).map(|(r, c)| xs[r * cols + c]).collect();
+        assert_bits("tokens_to_planar", &download(&t).unwrap(), &want);
     }
 }

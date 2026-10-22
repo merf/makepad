@@ -1,11 +1,14 @@
 //! THE Metal store: shaders + metallib build, device/runtime, try_* shims,
-//! and the host GpuTensor path. Compiled-graph execution lives in
+//! and the GpuTensor path. Compiled-graph execution lives in
 //! makepad-ai-llm (the graph is that model).
 //!
-//! Makepad's own kernels run on the Metal stream (`stream`): Cutie's ops
-//! (`cutie_ops`), the generic ops Cutie calls (`generic_ops`), PyTorch's
-//! layer norm (`layer_norm`), and the fp32 GEMM's users, `linear` and
-//! `attention` (RationalVisions docs/cutie-metal.md).
+//! On macOS a `GpuTensor` is GPU-resident (`gpu_types`): pooled Shared
+//! storage plus an offset, written by Makepad's own kernels on the Metal
+//! stream (`stream`): Cutie's ops (`cutie_ops`), the generic ops Cutie calls
+//! (`generic_ops`), PyTorch's layer norm (`layer_norm`), and the fp32 GEMM's
+//! users, `linear` and `attention` (RationalVisions docs/cutie-metal.md).
+//! The legacy ops (`gpu_tensor`, `rife`) read their inputs on the host where
+//! they lie and write their results into new tensors.
 
 pub mod affine;
 #[cfg(target_os = "macos")]

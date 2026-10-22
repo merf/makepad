@@ -1,5 +1,6 @@
 //! The stream's own kernel libraries (`shaders/makepad/`), their kernels and their params structs,
-//! each field for field its MSL twin. Cutie's libraries join them in step 8.
+//! each field for field its MSL twin. Cutie's libraries are `cutie_ops`', the generic ops'
+//! `generic_ops`', the GEMM's `stream::gemm`'s.
 
 use super::kernel::{Kernel, KernelLib, KernelParams};
 
@@ -44,6 +45,9 @@ pub static PROBE_THREADGROUP_SUM: Kernel = Kernel { lib: &PROBE, function: "prob
 pub static PROBE_BINDS: Kernel = Kernel { lib: &PROBE, function: "probe_binds" };
 pub static PROBE_INOUT: Kernel = Kernel { lib: &PROBE, function: "probe_inout" };
 pub static PROBE_FAULT: Kernel = Kernel { lib: &PROBE, function: "probe_fault" };
+/// `iterations` dependent steps a thread, then `x` back unchanged ([`ProbeSpin`]): a kernel slow
+/// enough to keep a command buffer pending, for the residency tests.
+pub static PROBE_SPIN: Kernel = Kernel { lib: &PROBE, function: "probe_spin" };
 pub static PROBE_MAD_CONTRACT_OFF: Kernel = Kernel { lib: &PROBE_CONTRACT, function: "probe_mad_contract_off" };
 
 /// Every kernel above, for the bring-up test that compiles them all.
@@ -62,6 +66,7 @@ pub static ALL_KERNELS: &[&Kernel] = &[
     &PROBE_BINDS,
     &PROBE_INOUT,
     &PROBE_FAULT,
+    &PROBE_SPIN,
     &PROBE_MAD_CONTRACT_OFF,
 ];
 
@@ -112,3 +117,12 @@ pub struct ProbeFault {
 }
 // SAFETY: #[repr(C)], 8 bytes, no pointers; `ProbeFault` in MSL (ulong).
 unsafe impl KernelParams for ProbeFault {}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ProbeSpin {
+    pub n: u32,
+    pub iterations: u32,
+}
+// SAFETY: #[repr(C)], 8 bytes, no pointers; `ProbeSpin` in MSL.
+unsafe impl KernelParams for ProbeSpin {}

@@ -117,6 +117,12 @@ impl<B: ThreadHome> Storage<B> {
         self.last_write.store(serial, Ordering::Release);
     }
 
+    /// Records that the host has just written it in place (`upload_into` into idle storage): its
+    /// contents are the host's again, trusted whatever wrote them before, and its last use stands.
+    pub fn mark_host_write(&self) {
+        self.last_write.store(0, Ordering::Release);
+    }
+
     /// True when no queued work uses it any more, given the owner's watermark `completed`: the
     /// host may write it.
     pub fn host_idle(&self, completed: u64) -> bool {

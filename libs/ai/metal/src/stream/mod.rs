@@ -2,15 +2,15 @@
 //! own kernels (`shaders/makepad/`) launched on a per-thread stream of command buffers, written
 //! once against this seam and run unchanged by both of its bindings.
 //!
-//! - **Host binding** (now, until step 12): tensors are today's host `GpuTensor`s. An input is
-//!   copied into a Shared buffer (kept by content id, so a weight is copied once), an output
-//!   (`Out` or `InOut`) gets a copy of its tensor, and every launch commits, waits and copies its
-//!   outputs back. Correct and slow: one wait a launch.
+//! - **Host binding** (steps 6 to 11, gone since step 12): tensors were host `Vec`s copied into
+//!   Shared buffers for each launch, and every launch committed, waited and copied its outputs
+//!   back. Correct and slow: one wait a launch. Step 11's reports from it are the golden the
+//!   resident binding is held to, bit for bit.
 //! - **Resident binding** (step 12 on): a tensor is storage plus an offset, bound where it lies;
-//!   ops enqueue and return, and only a read of the host side waits.
+//!   ops enqueue and return, and only a read of the host side waits, for that tensor's writer.
 //!
-//! The two fail alike: a launch is checked against what its kernel reads (from the pipeline's
-//! reflection) as well as its own bindings, and host calls inside an op are `Err` in both.
+//! A launch is checked against what its kernel reads (from the pipeline's reflection) as well as
+//! its own bindings, and host calls inside an op are `Err`.
 //!
 //! The kernel-side types (libraries, kernels, function constants, params, grids) and the checks a
 //! launch makes compile on every OS and are unit-tested anywhere; the stream itself is macOS only
@@ -24,8 +24,9 @@
 //! 2. Write only tensors this op allocated ([`GpuTensor::alloc`] inside the op), each bound
 //!    `Out` or `InOut`. A launch may write part of an output; later launches in the op see what
 //!    it wrote.
-//! 3. A new tensor's contents are undefined (NaN in the host binding): write every element before
-//!    it is read, and fill before accumulating.
+//! 3. A new tensor's contents are undefined (a pooled buffer as it was left; NaN with
+//!    MAKEPAD_METAL_POISON=1): write every element before it is read, and fill before
+//!    accumulating.
 //! 4. Bind every buffer the kernel reads (`Bind::Absent` for a slot it does not), pass params when
 //!    it reads `[[buffer(0)]]`, and give every `[[threadgroup(i)]]` it uses its memory.
 //! 5. Inputs may be views at any 4-byte offset; use `float4` only behind `is_aligned16()`
@@ -49,8 +50,6 @@ pub mod kernels;
 pub mod source;
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-mod mirror;
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod plan;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod weight_map;
@@ -60,7 +59,7 @@ mod ctx;
 #[cfg(target_os = "macos")]
 mod seam;
 #[cfg(target_os = "macos")]
-mod storage;
+pub(crate) mod storage;
 #[cfg(target_os = "macos")]
 pub mod tensor_ops;
 
@@ -73,20 +72,23 @@ pub use plan::{MAX_BINDS, MAX_SET_BYTES};
 
 #[cfg(target_os = "macos")]
 pub use seam::{
-    available, download, download_u32, evict_weights, from_host, library_available, pool_cap_override,
-    pool_clear, pool_trim, stats, synchronize, upload, upload_u32, with_host, with_metal_stream, Bind, Gemm,
-    GemmOperand, MetalStream, MetalWeights,
+    available, copy_into, download, download_u32, evict_weights, from_host, library_available,
+    pool_cap_override, pool_clear, pool_trim, reshape, slice_rows, stats, synchronize, upload, upload_into,
+    upload_u32, with_host, with_metal_stream, Bind, Gemm, GemmOperand, HostSlice, MetalStream, MetalWeights,
 };
 #[cfg(target_os = "macos")]
-pub(crate) use seam::host_call;
+#[doc(hidden)]
+pub use seam::{flush, ring_state, residency, set_poison_allocs, Residency, RingState};
+#[cfg(target_os = "macos")]
+pub(crate) use seam::{host_slice, upload_as, view};
 
 /// What every stream call returns: `Err` carries a message naming the op.
 pub type MetalResult<T> = Result<T, String>;
 
-/// The word `GpuTensor::alloc` fills a new tensor with in the host binding: a quiet NaN (payload
-/// 0xdead), so a kernel that reads an element before writing it, or an op that leaves one
-/// unwritten, shows NaN where a 0 would have looked right. The resident binding's tensors start
-/// as their pooled buffer was left.
+/// The word `GpuTensor::alloc` fills a new tensor with when allocations are poisoned
+/// (MAKEPAD_METAL_POISON=1, `set_poison_allocs`): a quiet NaN (payload 0xdead), so a kernel that
+/// reads an element before writing it, or an op that leaves one unwritten, shows NaN where a 0
+/// would have looked right. Otherwise a new tensor starts as its pooled buffer was left.
 pub const UNWRITTEN_BITS: u32 = 0x7fc0_dead;
 
 /// The stream's counters since they were last reset, and the device's memory. Pool and ring

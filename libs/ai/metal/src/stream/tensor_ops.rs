@@ -1,7 +1,8 @@
-//! Tensor ops on the stream's own kernels (`tensor.metal`): fills and copies, and the `add`, `mul`
-//! and `relu` that `gpu_tensor.rs`'s ggml and host versions become in step 12. Shapes are checked
-//! before anything is encoded, with CUDA's rules and messages (`add` and `mul` take equal shapes:
-//! no broadcast, no truncation).
+//! Tensor ops on the stream's own kernels (`tensor.metal`): fills and copies, and `gpu_add`,
+//! `gpu_mul` and `gpu_birefnet_relu` on macOS for every caller (since step 12; ggml's add and mul
+//! and a host ReLU before). Shapes are checked before anything is encoded, with CUDA's rules (`add`
+//! and `mul` take equal shapes: no broadcast, no truncation). One IEEE operation an element, so the
+//! bits are CUDA's and the host's.
 
 use super::kernels::{TensorCount, TENSOR_ADD, TENSOR_MUL, TENSOR_RELU};
 use super::seam::element_count;
