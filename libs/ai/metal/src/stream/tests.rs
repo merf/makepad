@@ -6,7 +6,7 @@ use super::grid::check_grid;
 use super::kernel::consts_match;
 use super::kernels::*;
 use super::mirror::Lru;
-use super::plan::{check_slots, SlotKind, SlotPlan};
+use super::plan::{check_args, check_slots, ArgKind, KernelArgs, SlotKind, SlotPlan};
 use super::source::{library_source, splice_header, COMMON_HEADER};
 use super::weight_map::WeightMap;
 use super::*;
@@ -107,7 +107,11 @@ fn every_kernel_is_in_its_library_and_every_library_includes_the_header() {
     for lib in [&TENSOR, &PROBE, &PROBE_CONTRACT] {
         assert!(lib.source.contains("#include \"makepad_common.h\""), "{} does not include the header", lib.name);
         let spliced = library_source(lib, None).unwrap();
-        assert!(!spliced.lines().any(|line| line.trim() == "#include \"makepad_common.h\""));
+        assert!(
+            !spliced.lines().any(|line| line.trim_start().starts_with("#include") && line.contains("makepad_common.h")),
+            "{} still includes the header after splicing",
+            lib.name
+        );
         assert!(spliced.contains("#include <metal_stdlib>"));
         assert!(spliced.contains("MAKEPAD_COMMON_H"));
     }
@@ -135,6 +139,16 @@ fn splice_keeps_line_numbers_for_the_compiler() {
     let spliced = splice_header("demo", "#include \"makepad_common.h\"\r\nx\r\n", "H");
     assert_eq!(spliced, "#line 1 \"makepad_common.h\"\nH\n#line 2 \"demo.metal\"\nx\n");
     assert_eq!(splice_header("demo", "x\ny\n", "H"), "x\ny\n");
+    // A comment after the include, as cutie-metal.md's example writes it, and indentation.
+    let commented = "x\n  #include \"makepad_common.h\"   // contraction, cutie_reduce4\ny\n";
+    assert_eq!(
+        splice_header("demo", commented, "H\n"),
+        "x\n#line 1 \"makepad_common.h\"\nH\n#line 3 \"demo.metal\"\ny\n"
+    );
+    // Not the header: left alone.
+    for other in ["#include \"makepad_common.h.bak\"", "#include \"makepad_common.h\" x", "#include <metal_stdlib>"] {
+        assert_eq!(splice_header("demo", other, "H"), format!("{other}\n"));
+    }
     assert!(COMMON_HEADER.contains("#ifndef MAKEPAD_COMMON_H"));
 }
 
@@ -193,6 +207,78 @@ fn launch_writes_only_tensors_the_op_allocated_through_one_slot() {
     assert!(aliased.contains("bound again"), "{aliased}");
     assert!(check_slots("op", "k", 0, &[out, out]).is_err(), "written twice");
     assert!(check_slots("op", "k", 0, &[slot(SlotKind::InOut, 2, true), x]).is_ok());
+}
+
+/// What `tensor_add_f32` reads, as its reflection lists it: params of 4 bytes, three buffers.
+fn add_args() -> KernelArgs {
+    let mut args = KernelArgs::default();
+    args.add(ArgKind::Buffer, 0, true, 4);
+    for index in 1..=3 {
+        args.add(ArgKind::Buffer, index, true, 4);
+    }
+    args
+}
+
+#[test]
+fn the_unwritten_word_is_a_quiet_nan_that_arithmetic_keeps() {
+    let unwritten = f32::from_bits(UNWRITTEN_BITS);
+    assert!(unwritten.is_nan());
+    assert_ne!(UNWRITTEN_BITS & 0x0040_0000, 0, "quiet, so no FP exception and no change on a copy");
+    assert!((unwritten * 0.0 + 1.0).is_nan(), "accumulating onto it stays NaN");
+}
+
+#[test]
+fn kernel_args_keep_what_the_kernel_uses() {
+    assert_eq!(add_args(), KernelArgs { buffers: 0b1111, params_bytes: 4, threadgroups: 0 });
+    let mut args = KernelArgs::default();
+    args.add(ArgKind::Buffer, 3, false, 4); // declared, never read
+    args.add(ArgKind::Buffer, 2, true, 4);
+    args.add(ArgKind::Threadgroup, 1, true, 4);
+    args.add(ArgKind::Threadgroup, 2, false, 4);
+    args.add(ArgKind::Other, 0, true, 0);
+    assert_eq!(args, KernelArgs { buffers: 0b100, params_bytes: 0, threadgroups: 0b10 });
+    // Indices past what a launch can bind keep the highest bit, which no launch satisfies.
+    let mut far = KernelArgs::default();
+    far.add(ArgKind::Buffer, 200, true, 4);
+    far.add(ArgKind::Threadgroup, 40, true, 4);
+    assert_eq!((far.buffers, far.threadgroups), (1 << 63, 1 << 31));
+    assert!(check_args("op", "k", &far, 0, MAX_BINDS, &[16; 4]).is_err());
+}
+
+#[test]
+fn a_launch_gives_the_kernel_everything_it_reads() {
+    let args = add_args();
+    assert!(check_args("op", "k", &args, 4, 3, &[0; 4]).is_ok());
+    assert!(check_args("op", "k", &args, 8, 5, &[0; 4]).is_ok(), "bigger params and extra bindings are fine");
+    let none = check_args("op", "k", &args, 0, 3, &[0; 4]).unwrap_err();
+    assert!(none.starts_with("op (k)") && none.contains("[[buffer(0)]]") && none.contains("passes none"), "{none}");
+    let mut wide = add_args();
+    wide.params_bytes = 24;
+    let small = check_args("op", "k", &wide, 8, 3, &[0; 4]).unwrap_err();
+    assert!(small.contains("8 bytes of params") && small.contains("is 24 bytes"), "{small}");
+    let missing = check_args("op", "k", &args, 4, 2, &[0; 4]).unwrap_err();
+    assert!(missing.contains("[[buffer(3)]]") && missing.contains("binds only 2"), "{missing}");
+    // A kernel that reads no params needs none; one whose struct size is unknown needs some.
+    let no_params = KernelArgs { buffers: 0b10, params_bytes: 0, threadgroups: 0 };
+    assert!(check_args("op", "k", &no_params, 0, 1, &[0; 4]).is_ok());
+    let unknown = KernelArgs { buffers: 0b11, params_bytes: 0, threadgroups: 0 };
+    assert!(check_args("op", "k", &unknown, 4, 1, &[0; 4]).is_ok());
+    assert!(check_args("op", "k", &unknown, 0, 1, &[0; 4]).is_err());
+}
+
+#[test]
+fn a_launch_gives_every_threadgroup_index_its_memory() {
+    let args = KernelArgs { buffers: 0b111, params_bytes: 4, threadgroups: 0b1001 };
+    let grid = Grid::linear(64, 64).unwrap();
+    let err = check_args("op", "k", &args, 4, 2, &grid.threadgroup_bytes).unwrap_err();
+    assert!(err.contains("[[threadgroup(0)]]") && err.contains("Grid::threadgroup"), "{err}");
+    let half = grid.threadgroup(0, 256);
+    let err = check_args("op", "k", &args, 4, 2, &half.threadgroup_bytes).unwrap_err();
+    assert!(err.contains("[[threadgroup(3)]]"), "{err}");
+    assert!(check_args("op", "k", &args, 4, 2, &half.threadgroup(3, 4).threadgroup_bytes).is_ok());
+    // Memory at an index the kernel does not use is harmless.
+    let none = KernelArgs { threadgroups: 0, ..args };
+    assert!(check_args("op", "k", &none, 4, 2, &half.threadgroup_bytes).is_ok());
 }
 
 #[test]

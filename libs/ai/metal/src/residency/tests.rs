@@ -372,19 +372,56 @@ fn a_wait_blocks_up_to_its_serial_only() {
 }
 
 #[test]
-fn a_failure_is_returned_by_the_next_wait_with_its_label() {
+fn a_failure_is_returned_by_every_wait_after_it_until_acknowledged() {
     let mut ring: Ring<FakeCb> = Ring::new(8);
-    let cbs: Vec<_> = (1..=3).map(|serial| commit(&mut ring, serial)).collect();
-    cbs[0].finish(CbStatus::Failed("first".into()));
-    cbs[1].finish(CbStatus::Failed("second".into()));
-    // Retired without blocking: the buffers it bound are free again, the error is kept.
+    let cbs: Vec<_> = (1..=4).map(|serial| commit(&mut ring, serial)).collect();
+    cbs[0].finish(CbStatus::Completed);
+    cbs[1].finish(CbStatus::Failed("first".into()));
+    cbs[2].finish(CbStatus::Failed("second".into()));
+    // Retired without blocking: the buffers they bound are free again, the error is kept.
     ring.retire();
-    assert_eq!(ring.completed(), 2);
-    let error = ring.wait(3).err().unwrap();
-    assert!(error.contains("command buffer 1 (op 1) failed: first"), "{error}");
     assert_eq!(ring.completed(), 3);
-    // Returned once; the second failure is not the first.
-    ring.wait(3).unwrap();
+    // Work committed before the failure is fine.
+    ring.wait(1).unwrap();
+    ring.wait(0).unwrap();
+    ring.check_written(1).unwrap();
+    let error = ring.wait(2).err().unwrap();
+    assert!(error.contains("command buffer 2 (op 2) failed: first"), "{error}");
+    assert!(error.contains("1 more command buffer"), "the second failure is counted: {error}");
+    // Sticky: every later wait returns it, and what the failed buffers and the ones after them
+    // wrote is not trusted.
+    assert_eq!(ring.wait(4).err().as_deref(), Some(error.as_str()));
+    assert_eq!(ring.completed(), 4);
+    assert_eq!(ring.wait(3).err().as_deref(), Some(error.as_str()));
+    assert!(ring.check_written(4).is_err());
+    // Acknowledged (a synchronize): reported once more, then the waits are Ok again...
+    assert_eq!(ring.acknowledge().err().as_deref(), Some(error.as_str()));
+    ring.acknowledge().unwrap();
+    ring.wait(4).unwrap();
+    ring.wait_all().unwrap();
+    // ... but what was written from the failure up to the acknowledgement stays untrusted.
+    for serial in 2..=4 {
+        let untrusted = ring.check_written(serial).err().unwrap();
+        assert!(untrusted.contains(&format!("command buffer {serial} is not trusted")), "{untrusted}");
+        assert!(untrusted.contains("2 to 4") && untrusted.contains("failed: first"), "{untrusted}");
+    }
+    ring.check_written(1).unwrap();
+    ring.check_written(0).unwrap();
+    // Work committed after the acknowledgement is trusted.
+    let next = commit(&mut ring, 5);
+    next.finish(CbStatus::Completed);
+    ring.wait(5).unwrap();
+    ring.check_written(5).unwrap();
+    // A later failure starts a span of its own.
+    let failing = commit(&mut ring, 6);
+    failing.finish(CbStatus::Failed("third".into()));
+    let third = ring.wait_all().err().unwrap();
+    assert!(third.contains("command buffer 6 (op 6) failed: third") && !third.contains("more"), "{third}");
+    ring.check_written(5).unwrap();
+    assert!(ring.check_written(6).is_err());
+    assert!(ring.acknowledge().is_err());
+    assert!(ring.check_written(6).err().unwrap().contains("third"));
+    assert!(ring.check_written(3).err().unwrap().contains("first"));
 }
 
 #[test]

@@ -1,6 +1,7 @@
 //! The probe of RationalVisions docs/cutie-metal.md, step 7: what this Mac's GPU and Metal
 //! compiler do with fast math off, for D8 and `makepad_common.h`. It records, it does not judge:
-//! every line starts with PROBE, and only a kernel that fails to run fails the test.
+//! every line starts with PROBE, and only a probe that did not run fails the test, once every line
+//! has printed (its line says "did not run" and why).
 //!
 //! - which MSL version the libraries compile as;
 //! - whether `a*b+c` written in a kernel is contracted into an fma: as compiled, and under
@@ -77,27 +78,38 @@ fn ulps(a: f32, b: f32) -> u64 {
     (ordered(a) - ordered(b)).unsigned_abs()
 }
 
+/// Prints a probe's "did not run" line and keeps it for the end of the test.
+fn did_not_run(missed: &mut Vec<String>, line: String) {
+    println!("{line}");
+    missed.push(line);
+}
+
 #[test]
 fn probe_report() {
     println!(
         "PROBE math_mode {}",
         std::env::var("MAKEPAD_METAL_MATH_MODE").unwrap_or_else(|_| "(default: fast math off only)".to_string())
     );
+    let mut missed = Vec::new();
     let version = with_metal_stream("stream-probe version", |s| {
         let out = GpuTensor::alloc_u32(1)?;
         s.launch(&PROBE_VERSION, &[], &(), &[Bind::Out(&out)], Grid::linear(1, 1)?)?;
         Ok(out)
     })
     .and_then(|t| stream::download_u32(&t));
-    println!("PROBE msl_version {version:?}");
+    match version {
+        Ok(words) => println!("PROBE msl_version {}", words[0]),
+        Err(e) => did_not_run(&mut missed, format!("PROBE msl_version: did not run: {e}")),
+    }
 
-    contraction();
-    transcendentals();
-    fmax_and_relu();
-    denormals();
+    contraction(&mut missed);
+    transcendentals(&mut missed);
+    fmax_and_relu(&mut missed);
+    denormals(&mut missed);
+    assert!(missed.is_empty(), "{} probe(s) did not run:\n{}", missed.len(), missed.join("\n"));
 }
 
-fn contraction() {
+fn contraction(missed: &mut Vec<String>) {
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     let a: Vec<f32> = (0..N).map(|_| rng.normal()).collect();
     let b: Vec<f32> = (0..N).map(|_| rng.normal()).collect();
@@ -124,12 +136,12 @@ fn contraction() {
                 };
                 println!("PROBE contract {name}: {verdict}: as separate {as_separate}, as fused {as_fused}, neither {neither}");
             }
-            Err(e) => println!("PROBE contract {name}: did not run: {e}"),
+            Err(e) => did_not_run(missed, format!("PROBE contract {name}: did not run: {e}")),
         }
     }
 }
 
-fn transcendentals() {
+fn transcendentals(missed: &mut Vec<String>) {
     let mut rng = Rng(0x2545_f491_4f6c_dd1d);
     type Reference = fn(f64) -> f64;
     let cases: [(u32, &str, f64, f64, bool, Reference); 7] = [
@@ -156,7 +168,7 @@ fn transcendentals() {
         let got = match run(&PROBE_UNARY, &[FnConst::U32(0, function)], &[&upload(&x)], N) {
             Ok(got) => got,
             Err(e) => {
-                println!("PROBE precise::{name}: did not run: {e}");
+                did_not_run(missed, format!("PROBE precise::{name}: did not run: {e}"));
                 continue;
             }
         };
@@ -189,7 +201,7 @@ fn transcendentals() {
     }
 }
 
-fn fmax_and_relu() {
+fn fmax_and_relu(missed: &mut Vec<String>) {
     let nan = f32::NAN;
     let snan = f32::from_bits(0x7f80_0001);
     let pairs: [(&str, f32, f32); 8] = [
@@ -217,7 +229,7 @@ fn fmax_and_relu() {
                 );
             }
         }
-        Err(e) => println!("PROBE fmax: did not run: {e}"),
+        Err(e) => did_not_run(missed, format!("PROBE fmax: did not run: {e}")),
     }
     let x = [-0.0f32, nan, -nan, snan, -1.0];
     match tensor_ops::relu(&upload(&x)).and_then(|t| stream::download(&t)) {
@@ -231,22 +243,22 @@ fn fmax_and_relu() {
                 );
             }
         }
-        Err(e) => println!("PROBE relu: did not run: {e}"),
+        Err(e) => did_not_run(missed, format!("PROBE relu: did not run: {e}")),
     }
 }
 
-fn denormals() {
+fn denormals(missed: &mut Vec<String>) {
     // 2^-70 * 2^-70 = 2^-140, a denormal; 2^-140 + 2^-140 from denormal inputs.
     let small = 2f32.powi(-70);
     let tiny = f32::from_bits(1 << 9); // 2^-140
     let product = tensor_ops::mul(&upload(&[small]), &upload(&[small])).and_then(|t| stream::download(&t));
     let sum = tensor_ops::add(&upload(&[tiny]), &upload(&[tiny])).and_then(|t| stream::download(&t));
-    let describe = |got: Result<Vec<f32>, String>, want: f32| match got {
-        Ok(v) if v[0].to_bits() == want.to_bits() => format!("kept ({:e})", v[0]),
-        Ok(v) if v[0] == 0.0 => "flushed to zero".to_string(),
-        Ok(v) => format!("other: {:e} ({:#010x}), want {:e}", v[0], v[0].to_bits(), want),
-        Err(e) => format!("did not run: {e}"),
-    };
-    println!("PROBE denormal product 2^-70 * 2^-70: {}", describe(product, small * small));
-    println!("PROBE denormal sum 2^-140 + 2^-140: {}", describe(sum, tiny + tiny));
+    for (what, got, want) in [("product 2^-70 * 2^-70", product, small * small), ("sum 2^-140 + 2^-140", sum, tiny + tiny)] {
+        match got {
+            Ok(v) if v[0].to_bits() == want.to_bits() => println!("PROBE denormal {what}: kept ({:e})", v[0]),
+            Ok(v) if v[0] == 0.0 => println!("PROBE denormal {what}: flushed to zero"),
+            Ok(v) => println!("PROBE denormal {what}: other: {:e} ({:#010x}), want {want:e}", v[0], v[0].to_bits()),
+            Err(e) => did_not_run(missed, format!("PROBE denormal {what}: did not run: {e}")),
+        }
+    }
 }

@@ -3,23 +3,28 @@
 //! resident, and needs no change then.
 //!
 //! In the host binding an `In` is copied into a Shared buffer (kept by the tensor's content id in
-//! the context's mirror, so weights are copied once), an `Out` gets a pooled buffer, an `InOut` a
-//! host-written one, and every launch commits, waits, and copies `Out` and `InOut` back into their
-//! tensors (giving each a new content id). `is_aligned16()` is always true.
+//! the context's mirror, so weights are copied once). An `Out` or `InOut` gets a host-written copy
+//! of its tensor, so what a launch does not write keeps its value, as it will when the tensor's own
+//! storage is bound. Every launch commits, waits, and copies `Out` and `InOut` back into their
+//! tensors (giving each a new content id); a GPU failure is the launch's `Err`, with nothing copied
+//! back. `alloc` fills a tensor with [`UNWRITTEN_BITS`], a NaN. `is_aligned16()` is true, unless
+//! MAKEPAD_METAL_MISALIGN=1 binds every input 4 bytes into its buffer to try kernels' unaligned
+//! paths.
 
 use super::ctx::{encode_dispatch, Slot, StreamCtx};
 use super::grid::{check_grid, Grid, KernelLimits};
 use super::kernel::{FnConst, Kernel, KernelLib, KernelParams};
 use super::kernels::{TensorCopy2d, TensorFill, TENSOR_COPY2D, TENSOR_FILL};
-use super::plan::{check_slots, SlotKind, SlotPlan};
+use super::plan::{check_args, check_slots, SlotKind, SlotPlan};
 use super::storage::{self, MtlStorage};
-use super::{MetalResult, StreamStats};
+use super::{MetalResult, StreamStats, UNWRITTEN_BITS};
 use crate::gpu_tensor;
 use crate::gpu_types::{fresh_tensor_id, GpuTensor};
 use crate::objc_util::{AutoreleasePool, MtlBuf};
+use crate::residency::env_usize;
 use std::cell::RefCell;
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// The calling thread's stream: not started yet, unavailable (with the reason), or running.
 enum StreamState {
@@ -101,12 +106,21 @@ fn inside_op() -> bool {
 }
 
 /// `Err` when called inside `with_metal_stream`: host calls wait for the stream in the resident
-/// binding, so they are refused here too, where they would have worked.
-fn host_call(op: &str) -> MetalResult<()> {
+/// binding, so they are refused here too, where they would have worked. The seam's host side and
+/// the host ops on `GpuTensor` (`gpu_tensor.rs`, `rife.rs`) all ask.
+pub(crate) fn host_call(op: &str) -> MetalResult<()> {
     if inside_op() {
         return Err(format!("{op}: a host call inside with_metal_stream; make it before or after the op"));
     }
     Ok(())
+}
+
+/// MAKEPAD_METAL_MISALIGN=1: the host binding binds every input 4 bytes into its buffer and
+/// `is_aligned16()` is false, so kernels' unaligned paths run, and are checked, before residency
+/// makes real views. Read once.
+fn misaligned_inputs() -> bool {
+    static MISALIGN: OnceLock<bool> = OnceLock::new();
+    *MISALIGN.get_or_init(|| env_usize("MAKEPAD_METAL_MISALIGN", 0) != 0)
 }
 
 /// `t`'s element count as a kernel's u32, or `Err` naming `op`.
@@ -155,16 +169,20 @@ impl MetalWeights {
     }
 }
 
-/// Buffer arguments at [[buffer(1)]], [[buffer(2)]], ... in slice order.
+/// Buffer arguments at [[buffer(1)]], [[buffer(2)]], ... in slice order. Every one but `Bytes` is a
+/// `device` pointer in the kernel, never `constant`: tensors and weights are bound at any 4-byte
+/// offset, and Metal wants a `constant` buffer's offset 256-byte aligned on macOS.
 #[derive(Clone, Copy)]
 pub enum Bind<'a> {
     /// Read at the tensor's offset.
     In(&'a GpuTensor),
-    /// Written; must be a tensor this op allocated.
+    /// Written; must be a tensor this op allocated. A launch may write part of it (a GEMM's
+    /// `c_offset`, one part of a concat): the rest keeps what earlier launches wrote, or `alloc`'s
+    /// undefined contents.
     Out(&'a GpuTensor),
     /// Read and written; allocated by this op.
     InOut(&'a GpuTensor),
-    /// Read, at a float offset (a bias after its weights).
+    /// Read, at a float offset (a bias after its weights); `device const float*` in the kernel.
     Weights(&'a MetalWeights, usize),
     /// setBytes, at most 4096 bytes (ECA taps, small tables).
     Bytes(&'a [u8]),
@@ -233,9 +251,12 @@ struct HostBound {
 
 impl MetalStream<'_> {
     /// Encodes `kernel` (specialised with `consts`) over `grid`, with `params` at [[buffer(0)]]
-    /// and `binds` from [[buffer(1)]]. Checks the params, the bindings and the grid first; an
-    /// empty grid encodes nothing (the library is still compiled, so a broken one is an `Err`
-    /// whatever the sizes). Host binding: waits for the work and copies the outputs back.
+    /// and `binds` from [[buffer(1)]]. Checks the params, the bindings and the grid first, and
+    /// that they give the kernel everything it reads (params, every buffer index, every
+    /// threadgroup index it uses); an empty grid encodes nothing (the library is still compiled
+    /// and the checks still made, so a broken launch is an `Err` whatever the sizes). Host
+    /// binding: waits for the work and copies the outputs back; a GPU failure is this launch's
+    /// `Err`.
     pub fn launch<P: KernelParams>(
         &mut self,
         kernel: &Kernel,
@@ -248,6 +269,9 @@ impl MetalStream<'_> {
         let plans: Vec<SlotPlan> = binds.iter().map(Bind::plan).collect();
         check_slots(op, kernel.function, std::mem::size_of::<P>(), &plans)?;
         let pipeline = self.ctx.pipeline(kernel, consts).map_err(|e| format!("{op}: {e}"))?;
+        if let Some(args) = &pipeline.args {
+            check_args(op, kernel.function, args, std::mem::size_of::<P>(), binds.len(), &grid.threadgroup_bytes)?;
+        }
         check_grid(
             op,
             kernel.function,
@@ -275,8 +299,13 @@ impl MetalStream<'_> {
             &bound.slots,
             &grid,
         );
-        // The host binding: wait, then copy the outputs back into their tensors.
-        self.ctx.wait(serial)?;
+        // The host binding: wait, then copy the outputs back into their tensors. Nothing else is
+        // in flight, so a failure is this launch's alone and, with nothing copied back, nothing
+        // holds what it wrote: it is acknowledged here, and the stream carries on.
+        if let Err(e) = self.ctx.wait(serial) {
+            self.ctx.acknowledge_failure();
+            return Err(e);
+        }
         for (index, storage, floats) in &bound.written {
             let (Bind::Out(t) | Bind::InOut(t)) = binds[*index] else {
                 unreachable!("only Out and InOut are written");
@@ -304,23 +333,19 @@ impl MetalStream<'_> {
         for (index, bind) in binds.iter().enumerate() {
             let slot = match *bind {
                 Bind::In(t) => {
-                    let storage = self.mirror(t)?;
-                    let slot = Slot::Buffer { id: storage.buf().as_id(), offset: 0 };
+                    let (storage, lead) = self.mirror(t)?;
+                    let slot = Slot::Buffer { id: storage.buf().as_id(), offset: (lead * 4) as u64 };
                     bound.read.push(storage);
                     slot
                 }
-                Bind::Out(t) => {
-                    let floats = t.data.try_borrow().map_err(|_| borrowed(op))?.len();
-                    let storage = storage::take_gpu(floats * 4).map_err(|e| format!("{op}: {e}"))?;
-                    let slot = Slot::Buffer { id: storage.buf().as_id(), offset: 0 };
-                    bound.written.push((index, storage, floats));
-                    slot
-                }
-                Bind::InOut(t) => {
+                // Out starts from the tensor's values as InOut does: the resident binding binds the
+                // tensor's own storage, so what a launch does not write keeps what earlier
+                // launches wrote there (or alloc's NaNs). Only the rule checks tell them apart.
+                Bind::Out(t) | Bind::InOut(t) => {
                     let data = t.data.try_borrow().map_err(|_| borrowed(op))?;
                     let completed = self.ctx.retire();
                     let storage = storage::take_host(data.len() * 4, completed).map_err(|e| format!("{op}: {e}"))?;
-                    write_storage(&storage, &data);
+                    write_storage(&storage, 0, &data);
                     let slot = Slot::Buffer { id: storage.buf().as_id(), offset: 0 };
                     bound.written.push((index, storage, data.len()));
                     slot
@@ -338,22 +363,25 @@ impl MetalStream<'_> {
         Ok(bound)
     }
 
-    /// The device copy of input `t`: the mirror's, kept by content id, or a new one.
-    fn mirror(&mut self, t: &GpuTensor) -> MetalResult<Arc<MtlStorage>> {
+    /// The device copy of input `t`, and the float it starts at (1 with MAKEPAD_METAL_MISALIGN,
+    /// else 0): the mirror's, kept by content id, or a new one.
+    fn mirror(&mut self, t: &GpuTensor) -> MetalResult<(Arc<MtlStorage>, usize)> {
         let op = self.op;
         let data = t.data.try_borrow().map_err(|_| borrowed(op))?;
+        let lead = usize::from(misaligned_inputs());
+        let bytes = (data.len() + lead) * 4;
         let id = t.id.get();
         if let Some(storage) = self.ctx.mirror.get(id) {
-            if storage.bytes() >= data.len() * 4 {
-                return Ok(storage.clone());
+            if storage.bytes() >= bytes {
+                return Ok((storage.clone(), lead));
             }
         }
         let completed = self.ctx.retire();
-        let storage = storage::take_host(data.len() * 4, completed).map_err(|e| format!("{op}: {e}"))?;
-        write_storage(&storage, &data);
+        let storage = storage::take_host(bytes, completed).map_err(|e| format!("{op}: {e}"))?;
+        write_storage(&storage, lead, &data);
         let dropped = self.ctx.mirror.insert(id, storage.clone(), storage.bytes());
         drop(dropped);
-        Ok(storage)
+        Ok((storage, lead))
     }
 
     /// `kernel`'s pipeline limits with `consts` (compiling it if it is not yet).
@@ -438,34 +466,40 @@ fn borrowed(op: &str) -> String {
     format!("{op}: a bound tensor is mutably borrowed")
 }
 
-/// Copies `values` into the start of `storage`'s buffer, which the host may write (taken with
-/// `take_host`).
-fn write_storage(storage: &MtlStorage, values: &[f32]) {
-    // SAFETY: the buffer holds at least `values.len()` f32s, no queued work uses it, and Shared
-    // contents are page-aligned.
+/// Copies `values` into `storage`'s buffer from float `at` on; the host may write the buffer
+/// (taken with `take_host`).
+fn write_storage(storage: &MtlStorage, at: usize, values: &[f32]) {
+    debug_assert!(storage.bytes() >= (at + values.len()) * 4);
+    // SAFETY: the buffer holds at least `at + values.len()` f32s (it was taken for them), no
+    // queued work uses it, and Shared contents are page-aligned.
     unsafe {
-        std::ptr::copy_nonoverlapping(values.as_ptr(), storage.buf().contents() as *mut f32, values.len());
+        let dst = (storage.buf().contents() as *mut f32).add(at);
+        std::ptr::copy_nonoverlapping(values.as_ptr(), dst, values.len());
     }
 }
 
 impl GpuTensor {
-    /// A `[rows, cols]` tensor for the running op to write, `Out` or `InOut` (contents undefined;
-    /// zero in the host binding). Callable inside `with_metal_stream`.
+    /// A `[rows, cols]` tensor for the running op to write, `Out` or `InOut`. Callable inside
+    /// `with_metal_stream`. Its contents are undefined: write an element before reading it, and
+    /// fill before accumulating. The host binding fills it with [`UNWRITTEN_BITS`], a NaN, so a
+    /// read too early shows; the resident binding hands out a pooled buffer as it was left.
     pub fn alloc(rows: usize, cols: usize) -> MetalResult<GpuTensor> {
         let floats = rows.checked_mul(cols).ok_or_else(|| format!("GpuTensor::alloc: {rows}x{cols} overflows"))?;
-        let tensor = gpu_tensor::tensor(rows, cols, vec![0.0; floats]);
+        let tensor = gpu_tensor::tensor(rows, cols, vec![f32::from_bits(UNWRITTEN_BITS); floats]);
         note_alloc(tensor.id.get());
         Ok(tensor)
     }
 
-    /// `[len, 1]` words read as u32.
+    /// `[len, 1]` words read as u32, undefined as [`GpuTensor::alloc`]'s.
     pub fn alloc_u32(len: usize) -> MetalResult<GpuTensor> {
         GpuTensor::alloc(len, 1)
     }
 
-    /// Whether the view starts on a 16-byte boundary, so a kernel may read it as `float4`.
+    /// Whether the view starts on a 16-byte boundary, so a kernel may read it as `float4`. Always
+    /// true in the host binding, which binds every tensor at the start of its copy, unless
+    /// MAKEPAD_METAL_MISALIGN=1, which binds inputs 4 bytes in and makes it false for every tensor.
     pub fn is_aligned16(&self) -> bool {
-        true
+        !misaligned_inputs()
     }
 }
 
@@ -514,13 +548,15 @@ pub fn download_u32(t: &GpuTensor) -> MetalResult<Vec<u32>> {
     read_host("download_u32", t, |values| values.iter().map(|v| v.to_bits()).collect())
 }
 
-/// Commits what the calling thread's stream has open and waits for all of it; returns the first
-/// GPU failure since the last wait. Ok at once on a thread with no stream.
+/// Commits what the calling thread's stream has open and waits for all of it; returns a GPU
+/// failure no synchronize has reported yet, and acknowledges it: later waits are Ok again (in the
+/// resident binding, until then every wait at or after the failure returns it, and what was
+/// written from the failure up to here stays untrusted). Ok at once on a thread with no stream.
 pub fn synchronize() -> MetalResult<()> {
     host_call("synchronize")?;
     with_ctx("synchronize", false, |ctx| {
         let _pool = AutoreleasePool::new();
-        ctx.wait_all()
+        ctx.synchronize()
     })
     .map(|_| ())
 }

@@ -47,7 +47,10 @@ pub(crate) fn attach(stream: u64, device: &StrongId) {
     });
 }
 
-/// Storage of at least `bytes` that the GPU will write (`Pool::take_gpu`).
+/// Storage of at least `bytes` that the GPU will write (`Pool::take_gpu`): `GpuTensor::alloc` in
+/// the resident binding (step 12). The host binding seeds every output from its tensor, so it
+/// takes `take_host` buffers only.
+#[allow(dead_code)]
 pub(crate) fn take_gpu(bytes: usize) -> Result<Arc<MtlStorage>, String> {
     with_pool(|pool| {
         let ThreadPool { home, device } = pool;

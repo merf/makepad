@@ -25,7 +25,11 @@ pub(crate) fn tensor(rows: usize, cols: usize, data: Vec<f32>) -> GpuTensor {
     }
 }
 
+/// A host op's read of `t`. Every host op reads through here, so each is `Err` inside
+/// `with_metal_stream`, as it will be once tensors are resident and a host read waits for the
+/// stream (`stream::host_call`).
 fn data(t: &GpuTensor) -> Result<std::cell::Ref<'_, Vec<f32>>, String> {
+    crate::stream::host_call("metal GpuTensor host op")?;
     t.data
         .try_borrow()
         .map_err(|_| "metal GpuTensor already borrowed".to_string())
@@ -119,6 +123,7 @@ pub fn available() -> bool {
 }
 
 pub fn upload(values: &[f32], rows: usize, cols: usize) -> Result<GpuTensor, String> {
+    crate::stream::host_call("gpu_upload")?;
     if values.len() != rows * cols {
         return Err(format!(
             "metal upload len {} != {}x{}",
@@ -133,6 +138,7 @@ pub fn upload(values: &[f32], rows: usize, cols: usize) -> Result<GpuTensor, Str
 /// u32 words as `[len, 1]` (at least one row, as on CUDA), held in `data` as f32 bits so the
 /// stream binds them like any tensor; `to_bits` reads them back unchanged.
 pub fn upload_u32(values: &[u32]) -> Result<GpuTensor, String> {
+    crate::stream::host_call("gpu_upload_u32")?;
     let words = values.iter().map(|&word| f32::from_bits(word)).collect();
     Ok(GpuTensor {
         rows: values.len().max(1),
@@ -147,6 +153,7 @@ pub fn download(t: &GpuTensor) -> Result<Vec<f32>, String> {
 }
 
 pub fn upload_into(t: &GpuTensor, values: &[f32]) -> Result<(), String> {
+    crate::stream::host_call("gpu_upload_into")?;
     let mut slot = t
         .data
         .try_borrow_mut()
@@ -162,6 +169,7 @@ pub fn upload_into(t: &GpuTensor, values: &[f32]) -> Result<(), String> {
 }
 
 pub fn copy_into(src: &GpuTensor, dst: &GpuTensor) -> Result<(), String> {
+    crate::stream::host_call("gpu_copy_into")?;
     let src_data = data(src)?.clone();
     let mut dst_data = dst
         .data

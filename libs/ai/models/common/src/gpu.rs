@@ -3552,9 +3552,11 @@ mod imp {
     }
 
     pub fn gpu_weight_cache_evict_prefix(_prefix: &str) -> Result<usize, String> {
+        // macOS: never starts a Metal stream either. A thread without one holds no stream weights,
+        // so starting one would only evict nothing (or fail to start, and turn an unload into Err).
         #[cfg(target_os = "macos")]
         {
-            return makepad_ai_metal::stream::evict_weights(_prefix, false);
+            return makepad_ai_metal::stream::evict_weights(_prefix, true);
         }
         #[cfg(not(target_os = "macos"))]
         {

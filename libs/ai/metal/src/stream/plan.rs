@@ -1,6 +1,6 @@
-//! The checks a launch makes on its params and bindings before it compiles or encodes anything,
-//! over a plain description of each binding so they run on any OS. A failure is an `Err` with
-//! nothing encoded (cutie-metal.md §8, rules for kernel authors).
+//! The checks a launch makes on its params and bindings before it encodes anything, over a plain
+//! description of each binding and of what the kernel reads, so they run on any OS. A failure is
+//! an `Err` with nothing encoded (cutie-metal.md §8, rules for kernel authors).
 
 use super::MetalResult;
 
@@ -84,6 +84,94 @@ pub(crate) fn check_slots(op: &str, function: &str, params_bytes: usize, slots: 
             }
             _ => {}
         }
+    }
+    Ok(())
+}
+
+/// How a pipeline's reflection lists one of the kernel's arguments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArgKind {
+    /// `[[buffer(index)]]`.
+    Buffer,
+    /// `[[threadgroup(index)]]`.
+    Threadgroup,
+    /// Textures, samplers and the rest: the stream binds none.
+    Other,
+}
+
+/// What a kernel reads, from its pipeline's reflection: bit `i` of `buffers` for each
+/// `[[buffer(i)]]` it uses, the size of the params struct it reads at `[[buffer(0)]]` (0 when
+/// unknown), and bit `i` of `threadgroups` for each `[[threadgroup(i)]]` it uses.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct KernelArgs {
+    pub buffers: u64,
+    pub params_bytes: usize,
+    pub threadgroups: u32,
+}
+
+impl KernelArgs {
+    /// Adds one argument from the reflection: its kind, its index, whether the kernel uses it, and
+    /// for a buffer the size of the type it points at. Arguments the kernel does not use are left
+    /// out (it never reads them). An index past what a launch can bind is kept as the highest bit,
+    /// so the launch check refuses it.
+    pub(crate) fn add(&mut self, kind: ArgKind, index: u64, used: bool, data_bytes: u64) {
+        if !used {
+            return;
+        }
+        match kind {
+            ArgKind::Buffer => {
+                self.buffers |= 1 << index.min(63);
+                if index == 0 {
+                    self.params_bytes = data_bytes as usize;
+                }
+            }
+            ArgKind::Threadgroup => self.threadgroups |= 1 << index.min(31),
+            ArgKind::Other => {}
+        }
+    }
+}
+
+/// Checks a launch of `function` gives it everything `args` says it reads: params at
+/// `[[buffer(0)]]` at least as big as its struct, a binding at every other buffer index it uses
+/// (`binds` bindings cover 1 to `binds`), and threadgroup memory at every threadgroup index it
+/// uses. A compute encoder keeps its bindings, params and threadgroup lengths from one dispatch to
+/// the next, so once dispatches share an encoder (the resident binding) whatever a launch left out
+/// would be read from the dispatch before it; refusing it here makes both bindings fail alike.
+pub(crate) fn check_args(
+    op: &str,
+    function: &str,
+    args: &KernelArgs,
+    params_bytes: usize,
+    binds: usize,
+    threadgroup_bytes: &[u32; 4],
+) -> MetalResult<()> {
+    if args.buffers & 1 != 0 {
+        if params_bytes == 0 {
+            return Err(format!(
+                "{op} ({function}): the kernel reads params at [[buffer(0)]] and the launch passes none"
+            ));
+        }
+        if params_bytes < args.params_bytes {
+            return Err(format!(
+                "{op} ({function}): {params_bytes} bytes of params, the kernel's struct at [[buffer(0)]] \
+                 is {} bytes",
+                args.params_bytes
+            ));
+        }
+    }
+    if let Some(index) = (1..64).find(|&index| args.buffers & (1 << index) != 0 && index > binds) {
+        return Err(format!(
+            "{op} ({function}): the kernel reads [[buffer({index})]] and the launch binds only {binds} \
+             (Bind::Absent fills a slot the kernel does not read)"
+        ));
+    }
+    if let Some(index) = (0..32).find(|&index| {
+        args.threadgroups & (1 << index) != 0 && threadgroup_bytes.get(index).is_none_or(|&bytes| bytes == 0)
+    }) {
+        return Err(format!(
+            "{op} ({function}): the kernel uses [[threadgroup({index})]] and the grid gives it no memory \
+             (Grid::threadgroup)"
+        ));
     }
     Ok(())
 }

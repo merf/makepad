@@ -1,7 +1,9 @@
 //! A forced command-buffer failure on the Mac (RationalVisions docs/cutie-metal.md, step 7): a
 //! kernel writes far past its buffer, the GPU faults, and the stream reports it at its next wait
-//! (in the host binding, the launch's own) with the op's label, once, then carries on. A test
-//! binary of its own, so a GPU fault cannot touch the other tests' processes.
+//! with the op's label, then carries on. In the host binding that wait is the launch's own, which
+//! acknowledges the failure (nothing else was in flight, and nothing it wrote was copied back), so
+//! the synchronize after it is Ok. From step 12 a failure stays pending until a synchronize
+//! reports it. A test binary of its own, so a GPU fault cannot touch the other tests' processes.
 //!
 //! `cargo test -p makepad-ai-metal --test stream_fault -- --nocapture`
 #![cfg(target_os = "macos")]
@@ -30,7 +32,7 @@ fn a_gpu_fault_surfaces_at_the_next_wait_with_its_label() {
     assert!(err.contains("stream-fault: probe_fault"), "the error names the op's command buffer: {err}");
     assert!(err.contains("failed"), "{err}");
 
-    // Reported once: the next wait has nothing to report.
+    // Reported by the launch, which acknowledged it: the synchronize has nothing to report.
     stream::synchronize().expect("the failure was already reported");
 
     // And the stream carries on.

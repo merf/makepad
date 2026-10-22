@@ -1,17 +1,20 @@
 //! The Metal stream's bring-up on the Mac (RationalVisions docs/cutie-metal.md, step 7), in the
 //! host binding: every library and pipeline compiles; fill, copy, add, mul and relu match the host
 //! bit for bit; every kind of binding, function constants, threadgroup memory and the weight cache
-//! work; empty grids encode nothing; and the seam's rules come back as errors, not panics.
+//! work; an output written in parts keeps every part; empty grids encode nothing; and the seam's
+//! rules come back as errors, not panics: a launch that leaves out something its kernel reads
+//! (from the pipeline's reflection), and host ops inside an op.
 //!
-//! `cargo test -p makepad-ai-metal --test stream`. The forced command-buffer failure is
-//! `--test stream_fault` (a process of its own), the probe `--test stream_probe -- --nocapture`.
+//! `cargo test -p makepad-ai-metal --test stream`, and again with MAKEPAD_METAL_MISALIGN=1 (inputs
+//! bound 4 bytes in). The forced command-buffer failure is `--test stream_fault` (a process of its
+//! own), the probe `--test stream_probe -- --nocapture`.
 #![cfg(target_os = "macos")]
 
 use makepad_ai_metal::stream::kernels::*;
 use makepad_ai_metal::stream::{
-    self, tensor_ops, with_metal_stream, Bind, FnConst, Grid, Kernel, KernelLib, KernelParams,
+    self, tensor_ops, with_metal_stream, Bind, FnConst, Grid, Kernel, KernelLib, KernelParams, MetalStream,
 };
-use makepad_ai_metal::GpuTensor;
+use makepad_ai_metal::{gpu_tensor, GpuTensor};
 use std::cell::Cell;
 
 /// A small deterministic generator (xorshift64*).
@@ -253,6 +256,132 @@ fn an_op_can_write_a_tensor_then_read_and_write_it_again() {
     .unwrap();
     let want: Vec<f32> = (0..n).map(|i| start[i] * 2.0 + x[i]).collect();
     assert_bits("probe_inout", &stream::download(&io).unwrap(), &want);
+}
+
+/// Copies all of `src` into `out` from word `at` on, in one launch: an `Out` written in part.
+fn copy_part(s: &mut MetalStream<'_>, src: &GpuTensor, out: &GpuTensor, at: usize) -> Result<(), String> {
+    let len = src.rows() * src.cols();
+    let params = TensorCopy2d {
+        rows: 1,
+        cols: len as u32,
+        src_ld: len as u32,
+        dst_ld: (out.rows() * out.cols()) as u32,
+        src_offset: 0,
+        dst_offset: at as u32,
+    };
+    s.launch(&TENSOR_COPY2D, &[], &params, &[Bind::In(src), Bind::Out(out)], Grid::cover([len, 1, 1], [256, 1, 1])?)
+}
+
+#[test]
+fn an_output_written_in_parts_keeps_every_part() {
+    // Its own thread, so the pool starts empty. The sizes are the ones where an output buffer
+    // taken afresh for each launch loses the first part: 400 and 600 floats into 1000 (1600, 2400
+    // and 4000 bytes; the second part's copy takes the bucket the first launch's output went back
+    // to). A GEMM's c_offset and a concat write their outputs this way.
+    std::thread::spawn(|| {
+        let mut rng = Rng(0x5eed_0007);
+        let (a, b) = (rng.values(400), rng.values(600));
+        let (ta, tb) = (upload(&a), upload(&b));
+        let out = with_metal_stream("bring-up: parts", |s| {
+            let out = GpuTensor::alloc(1000, 1)?;
+            copy_part(s, &ta, &out, 0)?;
+            copy_part(s, &tb, &out, 400)?;
+            Ok(out)
+        })
+        .unwrap()
+        .host();
+        let want: Vec<f32> = a.iter().chain(&b).copied().collect();
+        assert_bits("two parts", &out, &want);
+    })
+    .join()
+    .unwrap();
+}
+
+/// The host binding only: a new tensor is NaN (`UNWRITTEN_BITS`) until written, so an op that
+/// leaves part of its output unwritten shows it. From step 12 a new tensor is a pooled buffer as
+/// it was left, and this test goes (or moves behind a switch that poisons pooled buffers).
+#[test]
+fn what_an_op_leaves_unwritten_is_nan_in_the_host_binding() {
+    let a: Vec<f32> = (0..400).map(|i| i as f32 - 200.0).collect();
+    let ta = upload(&a);
+    let out = with_metal_stream("bring-up: unwritten", |s| {
+        let out = GpuTensor::alloc(1000, 1)?;
+        copy_part(s, &ta, &out, 0)?;
+        Ok(out)
+    })
+    .unwrap();
+    let words = stream::download_u32(&out).unwrap();
+    assert_eq!(words[..400], bits(&a)[..]);
+    if let Some(i) = (400..1000).find(|&i| words[i] != stream::UNWRITTEN_BITS) {
+        panic!("word {i}, never written, is {:#010x}, not alloc's {:#010x}", words[i], stream::UNWRITTEN_BITS);
+    }
+}
+
+#[test]
+fn a_launch_must_give_the_kernel_everything_it_reads() {
+    // Checked against the pipeline's reflection: once dispatches share an encoder (step 12), what a
+    // launch leaves out would be read from the dispatch before it. If this Mac's Metal gives no
+    // reflection, the stream logs "no argument reflection" and these launches are not refused.
+    let x = upload(&[1.0, 2.0, 3.0, 4.0]);
+    let no_output = with_metal_stream("bring-up: no output", |s| {
+        s.launch(&TENSOR_ADD, &[], &TensorCount { n: 4 }, &[Bind::In(&x), Bind::In(&x)], Grid::linear(4, 64)?)
+    })
+    .err()
+    .expect("tensor_add_f32 reads [[buffer(3)]], which the launch does not bind");
+    assert!(no_output.contains("[[buffer(3)]]") && no_output.contains("binds only 2"), "{no_output}");
+    let no_params = with_metal_stream("bring-up: no params", |s| {
+        let out = GpuTensor::alloc(4, 1)?;
+        s.launch(&TENSOR_FILL, &[], &(), &[Bind::Out(&out)], Grid::linear(4, 64)?)
+    })
+    .err()
+    .expect("tensor_fill_u32 reads params");
+    assert!(no_params.contains("[[buffer(0)]]") && no_params.contains("passes none"), "{no_params}");
+    let small_params = with_metal_stream("bring-up: small params", |s| {
+        let out = GpuTensor::alloc(4, 1)?;
+        s.launch(&TENSOR_COPY2D, &[], &TensorFill { n: 4, bits: 0 }, &[Bind::In(&x), Bind::Out(&out)], Grid::linear(4, 64)?)
+    })
+    .err()
+    .expect("TensorCopy2d is 24 bytes, TensorFill 8");
+    assert!(small_params.contains("8 bytes of params") && small_params.contains("is 24 bytes"), "{small_params}");
+    let no_threadgroup = with_metal_stream("bring-up: no threadgroup memory", |s| {
+        let out = GpuTensor::alloc(1, 1)?;
+        s.launch(&PROBE_THREADGROUP_SUM, &[], &TensorCount { n: 4 }, &[Bind::In(&x), Bind::Out(&out)], Grid::linear(4, 4)?)
+    })
+    .err()
+    .expect("probe_threadgroup_sum uses [[threadgroup(0)]]");
+    assert!(no_threadgroup.contains("[[threadgroup(0)]]"), "{no_threadgroup}");
+    // Refused before anything was encoded: nothing pending, and the stream goes on.
+    stream::synchronize().unwrap();
+    assert_eq!(stream::download(&tensor_ops::add(&x, &x).unwrap()).unwrap(), vec![2.0, 4.0, 6.0, 8.0]);
+}
+
+#[test]
+fn host_ops_inside_an_op_are_errors() {
+    // As they will be once a host read waits for the stream (step 12): host data comes into an op
+    // through weights, upload_bytes or Bind::Bytes, and results leave it after the op.
+    let x = upload(&[1.0, -2.0]);
+    let y = upload(&[0.0, 0.0]);
+    let results = with_metal_stream("bring-up: host ops", |_| {
+        Ok(vec![
+            ("gpu_tensor::upload", gpu_tensor::upload(&[1.0], 1, 1).map(|_| ())),
+            ("gpu_tensor::upload_u32", gpu_tensor::upload_u32(&[1]).map(|_| ())),
+            ("gpu_tensor::download", gpu_tensor::download(&x).map(|_| ())),
+            ("gpu_tensor::relu (a host op)", gpu_tensor::relu(&x).map(|_| ())),
+            ("gpu_tensor::upload_into", gpu_tensor::upload_into(&y, &[1.0, 2.0])),
+            ("gpu_tensor::copy_into", gpu_tensor::copy_into(&x, &y)),
+            ("stream::upload", stream::upload(&[1.0], 1, 1).map(|_| ())),
+            ("stream::with_host", stream::with_host(&x, |_| ())),
+        ])
+    })
+    .unwrap();
+    for (name, result) in results {
+        let err = result.err().unwrap_or_else(|| panic!("{name} inside with_metal_stream returned Ok"));
+        assert!(err.contains("host call inside with_metal_stream"), "{name}: {err}");
+    }
+    // Outside an op they work.
+    assert_eq!(gpu_tensor::download(&gpu_tensor::relu(&x).unwrap()).unwrap(), vec![1.0, 0.0]);
+    gpu_tensor::copy_into(&x, &y).unwrap();
+    assert_eq!(stream::download(&y).unwrap(), vec![1.0, -2.0]);
 }
 
 #[test]

@@ -133,8 +133,14 @@ impl<B: ThreadHome> Storage<B> {
     /// once when that stream owns it. Otherwise the storage is adopted (owner: this stream,
     /// serials 0) if its owner is gone or has completed its last use, and refused while that use
     /// is pending: tensors belong to the thread that made them (Cutie's own contract), and a
-    /// thread handing one over synchronises first. Two threads adopting at once: one wins, the
-    /// other then sees it as the owner.
+    /// thread handing one over synchronises first.
+    ///
+    /// This checks a handover; it does not make sharing safe. The owner's serials and watermark
+    /// are read one after the other, so a thread that claims storage while its owner is still
+    /// binding it (two threads using one tensor, or two threads adopting it at once and one
+    /// starting work on it) can see an old `last_use` and adopt it while that work is pending.
+    /// The compare-exchange only stops two adoptions from both succeeding against the same
+    /// owner. The other stream's failures are not seen here either: its synchronize reports them.
     pub fn claim(&self, clock: &StreamClock, op: &str) -> Result<(), String> {
         let mine = clock.id();
         let mut owner = self.stream.load(Ordering::Acquire);

@@ -9,6 +9,7 @@
 use super::grid::{Grid, KernelLimits};
 use super::kernel::{consts_match, FnConst, FnConstKey, Kernel, KernelLib};
 use super::mirror::{Lru, DEFAULT_MIRROR_CAP_MB};
+use super::plan::{ArgKind, KernelArgs};
 use super::source::{kernels_src_dir, library_source};
 use super::storage::{self, MtlStorage};
 use super::weight_map::WeightMap;
@@ -17,7 +18,7 @@ use crate::objc_util::{
     ns_error_string, responds_to, set_label, system_device, AutoreleasePool, MtlBuf, StrongId,
 };
 use crate::residency::{env_usize, CbStatus, CommandBuf, Ring};
-use makepad_objc_sys::runtime::{nil, ObjcId, NO};
+use makepad_objc_sys::runtime::{nil, ObjcId, Object, Sel, NO};
 use makepad_objc_sys::{class, msg_send, sel, sel_impl};
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -37,6 +38,15 @@ const MTL_DATA_TYPE_BOOL: u64 = 53;
 const MTL_COMMAND_BUFFER_STATUS_COMPLETED: u64 = 4;
 const MTL_COMMAND_BUFFER_STATUS_ERROR: u64 = 5;
 
+/// `MTLPipelineOptionArgumentInfo` (`BindingInfo` in newer SDKs, the same bit) and
+/// `MTLPipelineOptionBufferTypeInfo`: the reflection lists the arguments with their buffer types.
+const MTL_PIPELINE_OPTION_ARGUMENT_INFO: u64 = 1 << 0;
+const MTL_PIPELINE_OPTION_BUFFER_TYPE_INFO: u64 = 1 << 1;
+
+/// `MTLBindingType` and `MTLArgumentType` (the same values): Buffer and ThreadgroupMemory.
+const MTL_ARGUMENT_TYPE_BUFFER: u64 = 0;
+const MTL_ARGUMENT_TYPE_THREADGROUP_MEMORY: u64 = 1;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct MtlSize {
@@ -45,11 +55,13 @@ struct MtlSize {
     depth: u64,
 }
 
-/// A compiled pipeline and its limits.
+/// A compiled pipeline, its limits, and what its kernel reads (`None` when Metal gave no
+/// reflection; its launches are then not checked against it).
 struct Pipeline {
     state: StrongId,
     limits: KernelLimits,
     static_threadgroup_bytes: u32,
+    args: Option<KernelArgs>,
 }
 
 /// A pipeline as a launch uses it: the raw handle stays valid while the context holds the
@@ -59,6 +71,18 @@ pub(crate) struct PipelineRef {
     pub state: ObjcId,
     pub limits: KernelLimits,
     pub static_threadgroup_bytes: u32,
+    pub args: Option<KernelArgs>,
+}
+
+impl Pipeline {
+    fn as_ref(&self) -> PipelineRef {
+        PipelineRef {
+            state: self.state.as_id(),
+            limits: self.limits,
+            static_threadgroup_bytes: self.static_threadgroup_bytes,
+            args: self.args,
+        }
+    }
 }
 
 /// The command buffer being encoded into.
@@ -214,19 +238,11 @@ impl StreamCtx {
         if let Some(found) = self.pipelines.get(&key).and_then(|entries| {
             entries.iter().find(|(keys, _)| consts_match(consts, keys)).map(|(_, pipeline)| pipeline)
         }) {
-            return Ok(PipelineRef {
-                state: found.state.as_id(),
-                limits: found.limits,
-                static_threadgroup_bytes: found.static_threadgroup_bytes,
-            });
+            return Ok(found.as_ref());
         }
         let library = self.library(kernel.lib)?;
         let pipeline = compile_pipeline(self.device.as_id(), library, kernel, consts)?;
-        let found = PipelineRef {
-            state: pipeline.state.as_id(),
-            limits: pipeline.limits,
-            static_threadgroup_bytes: pipeline.static_threadgroup_bytes,
-        };
+        let found = pipeline.as_ref();
         let keys: Box<[FnConstKey]> = consts.iter().map(|c| c.key()).collect();
         self.pipelines.entry(key).or_default().push((keys, pipeline));
         Ok(found)
@@ -274,7 +290,8 @@ impl StreamCtx {
     }
 
     /// Waits until the command buffer with `serial` (committing it if it is the open one) and
-    /// every one before it have finished; returns the first failure retired since the last wait.
+    /// every one before it have finished; `Err` with a failure among them that no synchronize has
+    /// acknowledged yet (`Ring::wait`).
     pub(crate) fn wait(&mut self, serial: u64) -> Result<(), String> {
         if self.open.as_ref().is_some_and(|open| open.serial <= serial) {
             self.commit_open();
@@ -288,17 +305,33 @@ impl StreamCtx {
         self.ring.wait_all()
     }
 
+    /// Ends the stickiness of a failure the caller has just been given (`Ring::acknowledge`).
+    /// Everything it may have touched has been committed and waited for.
+    pub(crate) fn acknowledge_failure(&mut self) {
+        // The caller already holds the error; it is returned here once more only to be dropped.
+        let _ = self.ring.acknowledge();
+    }
+
+    /// Commits the open command buffer, waits for everything, and returns a failure not yet
+    /// acknowledged, acknowledging it: what `synchronize` and MAKEPAD_METAL_STREAM_SYNC do.
+    pub(crate) fn synchronize(&mut self) -> Result<(), String> {
+        let waited = self.wait_all();
+        let acknowledged = self.ring.acknowledge();
+        waited.and(acknowledged)
+    }
+
     /// Retires the finished command buffers without blocking; returns the completed watermark.
     pub(crate) fn retire(&mut self) -> u64 {
         self.ring.retire();
         self.ring.completed()
     }
 
-    /// The end of a `with_metal_stream` call: with MAKEPAD_METAL_STREAM_SYNC, commit and wait;
-    /// otherwise commit once the open buffer holds the budget's dispatches.
+    /// The end of a `with_metal_stream` call: with MAKEPAD_METAL_STREAM_SYNC, commit and wait,
+    /// acknowledging a failure (the op that ran it is the one told); otherwise commit once the
+    /// open buffer holds the budget's dispatches.
     pub(crate) fn end_op(&mut self) -> Result<(), String> {
         if self.sync {
-            return self.wait_all();
+            return self.synchronize();
         }
         if self.open.as_ref().is_some_and(|open| open.dispatches >= self.budget) {
             self.commit_open();
@@ -440,8 +473,16 @@ fn compile_pipeline(device: ObjcId, library: ObjcId, kernel: &Kernel, consts: &[
         format!("Metal kernel '{}' in library '{}': {why}", kernel.function, kernel.lib.name)
     })?;
     let mut error: ObjcId = nil;
+    // The reflection is autoreleased: read within this function's pool.
+    let mut reflection: ObjcId = nil;
     let state: ObjcId = unsafe {
-        msg_send![device, newComputePipelineStateWithFunction: function.as_id() error: &mut error]
+        msg_send![
+            device,
+            newComputePipelineStateWithFunction: function.as_id()
+            options: MTL_PIPELINE_OPTION_ARGUMENT_INFO | MTL_PIPELINE_OPTION_BUFFER_TYPE_INFO
+            reflection: &mut reflection
+            error: &mut error
+        ]
     };
     let state = unsafe { StrongId::from_owned(state) }.ok_or_else(|| {
         format!(
@@ -451,6 +492,13 @@ fn compile_pipeline(device: ObjcId, library: ObjcId, kernel: &Kernel, consts: &[
             ns_error_string(error)
         )
     })?;
+    let args = kernel_args(reflection);
+    if args.is_none() {
+        eprintln!(
+            "[metal stream] no argument reflection for '{}': its launches are not checked against what it reads",
+            kernel.function
+        );
+    }
     let max_threads: u64 = unsafe { msg_send![state.as_id(), maxTotalThreadsPerThreadgroup] };
     let simd_width: u64 = unsafe { msg_send![state.as_id(), threadExecutionWidth] };
     let static_threadgroup: u64 = unsafe { msg_send![state.as_id(), staticThreadgroupMemoryLength] };
@@ -458,7 +506,63 @@ fn compile_pipeline(device: ObjcId, library: ObjcId, kernel: &Kernel, consts: &[
         state,
         limits: KernelLimits { max_threads: max_threads as u32, simd_width: simd_width as u32 },
         static_threadgroup_bytes: static_threadgroup as u32,
+        args,
     })
+}
+
+/// What a kernel reads, from its `MTLComputePipelineReflection`: `bindings` (macOS 13 on) or the
+/// older `arguments`, each with its type, index, whether the kernel uses it, and a buffer's data
+/// size. `None` when the reflection has neither.
+fn kernel_args(reflection: ObjcId) -> Option<KernelArgs> {
+    if reflection.is_null() {
+        return None;
+    }
+    let (list, used) = if responds_to(reflection, sel!(bindings)) {
+        let list: ObjcId = unsafe { msg_send![reflection, bindings] };
+        (list, sel!(isUsed))
+    } else if responds_to(reflection, sel!(arguments)) {
+        let list: ObjcId = unsafe { msg_send![reflection, arguments] };
+        (list, sel!(isActive))
+    } else {
+        return None;
+    };
+    if list.is_null() {
+        return None;
+    }
+    // `type` is a Rust keyword, so msg_send! cannot name it.
+    let type_sel = Sel::register("type");
+    let mut args = KernelArgs::default();
+    let count: u64 = unsafe { msg_send![list, count] };
+    for i in 0..count {
+        let arg: ObjcId = unsafe { msg_send![list, objectAtIndex: i] };
+        if arg.is_null() {
+            continue;
+        }
+        // An argument without these is not one this reads: no checks rather than an exception.
+        if !responds_to(arg, type_sel) || !responds_to(arg, sel!(index)) {
+            return None;
+        }
+        let kind: u64 = unsafe { makepad_objc_sys::__send_message_or_panic(arg as *const Object, type_sel, ()) };
+        let kind = match kind {
+            MTL_ARGUMENT_TYPE_BUFFER => ArgKind::Buffer,
+            MTL_ARGUMENT_TYPE_THREADGROUP_MEMORY => ArgKind::Threadgroup,
+            _ => ArgKind::Other,
+        };
+        let index: u64 = unsafe { msg_send![arg, index] };
+        // Taken as used when the object cannot say: a launch is then asked for more, never less.
+        let is_used: u8 = if responds_to(arg, used) {
+            unsafe { makepad_objc_sys::__send_message_or_panic(arg as *const Object, used, ()) }
+        } else {
+            1
+        };
+        let data_bytes: u64 = if kind == ArgKind::Buffer && responds_to(arg, sel!(bufferDataSize)) {
+            unsafe { msg_send![arg, bufferDataSize] }
+        } else {
+            0
+        };
+        args.add(kind, index, is_used != 0, data_bytes);
+    }
+    Some(args)
 }
 
 fn set_function_constant(values: ObjcId, constant: FnConst) {

@@ -29,7 +29,11 @@ fn tensor(rows: usize, cols: usize, data: Vec<f32>) -> GpuTensor {
     }
 }
 
+/// A RIFE op's read of `t`; on macOS `Err` inside `with_metal_stream`, as `gpu_tensor.rs`'s host
+/// ops are.
 fn data(t: &GpuTensor) -> Result<std::cell::Ref<'_, Vec<f32>>, String> {
+    #[cfg(target_os = "macos")]
+    crate::stream::host_call("metal RIFE op")?;
     t.data
         .try_borrow()
         .map_err(|_| "metal GpuTensor already borrowed".to_string())

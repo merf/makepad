@@ -18,6 +18,9 @@
 //!   and is refused while that use is pending ([`Storage::claim`]).
 //! - An in-place write into storage shared with a view is refused
 //!   ([`Storage::check_unshared`]).
+//! - A failed command buffer's error is returned by every wait at or after it until a synchronize
+//!   acknowledges it; what was written from the failure up to then stays untrusted
+//!   ([`Ring::acknowledge`], [`Ring::check_written`]). Waits for earlier work are Ok.
 
 pub mod clock;
 pub mod pool;

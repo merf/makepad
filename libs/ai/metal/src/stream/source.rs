@@ -41,12 +41,23 @@ fn read(path: &Path) -> Result<String, String> {
     })
 }
 
-/// `source` with every line that is exactly `#include "makepad_common.h"` replaced by `header`,
-/// framed by `#line` directives so the compiler's messages name the right file and line.
+/// Whether `line` includes the header: `#include "makepad_common.h"`, alone or followed by a `//`
+/// comment.
+fn includes_header(line: &str) -> bool {
+    let Some(rest) = line.trim().strip_prefix(COMMON_INCLUDE) else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    rest.is_empty() || rest.starts_with("//")
+}
+
+/// `source` with every line that includes the header ([`includes_header`]) replaced by `header`,
+/// framed by `#line` directives so the compiler's messages name the right file and line. Any other
+/// include of it is left as it is, and fails to compile: there is no include path.
 pub(crate) fn splice_header(name: &str, source: &str, header: &str) -> String {
     let mut out = String::with_capacity(source.len() + header.len() + 128);
     for (index, line) in source.lines().enumerate() {
-        if line.trim() == COMMON_INCLUDE {
+        if includes_header(line) {
             out.push_str("#line 1 \"");
             out.push_str(COMMON_HEADER_NAME);
             out.push_str("\"\n");

@@ -111,15 +111,42 @@ pub struct RingStats {
     pub gpu_ms: f64,
 }
 
+/// A failed command buffer not yet acknowledged: its serial, its error with its label, and how
+/// many more failed after it.
+struct Failure {
+    serial: u64,
+    message: String,
+    more: usize,
+}
+
+impl Failure {
+    fn describe(&self) -> String {
+        match self.more {
+            0 => self.message.clone(),
+            1 => format!("{} (and 1 more command buffer after it)", self.message),
+            more => format!("{} (and {more} more command buffers after it)", self.message),
+        }
+    }
+}
+
 /// A stream's committed command buffers not yet retired, oldest first, and its clock.
+///
+/// A failed command buffer's error is sticky: every wait for it or for a later serial returns it
+/// until [`Ring::acknowledge`] (a synchronize). Metal runs later work after a fault, and that work
+/// may have read what the failed buffer wrote, so what was written from the failure up to the
+/// acknowledgement stays untrusted afterwards too ([`Ring::check_written`]). Waits for work
+/// committed before the failure are Ok.
 pub struct Ring<C: CommandBuf> {
     clock: Arc<StreamClock>,
     /// (serial, command buffer, label) in commit order.
     in_flight: VecDeque<(u64, C, String)>,
     last_committed: u64,
     max_in_flight: usize,
-    /// The first failure retired since the last wait.
-    error: Option<String>,
+    /// The first failure retired and not yet acknowledged.
+    failure: Option<Failure>,
+    /// Acknowledged failures: the failed serial, the last serial committed when it was
+    /// acknowledged, and the error. Storage last written in one of these spans is untrusted.
+    failed_spans: Vec<(u64, u64, String)>,
     stats: RingStats,
 }
 
@@ -132,7 +159,8 @@ impl<C: CommandBuf> Ring<C> {
             in_flight: VecDeque::new(),
             last_committed: 0,
             max_in_flight: max_in_flight.max(1),
-            error: None,
+            failure: None,
+            failed_spans: Vec::new(),
             stats: RingStats::default(),
         }
     }
@@ -161,21 +189,25 @@ impl<C: CommandBuf> Ring<C> {
     }
 
     /// Pops the finished command buffers off the front without blocking, stopping at the first
-    /// still pending, and advances the clock to the last one popped. A failure is kept (the
-    /// first only, with its serial and label) and returned by the next [`Ring::wait`]; each
-    /// one's GPU time goes into the stats. The stream calls this before any host-idle acquire.
+    /// still pending, and advances the clock to the last one popped (a failed buffer is finished
+    /// too: the GPU is done with what it bound). A failure is kept, the first with its serial and
+    /// label and the later ones counted, until [`Ring::acknowledge`]; each one's GPU time goes
+    /// into the stats. The stream calls this before any host-idle acquire.
     pub fn retire(&mut self) {
         while let Some((serial, cb, label)) = self.in_flight.front() {
             match cb.status() {
                 CbStatus::Pending => break,
                 CbStatus::Completed => {}
-                CbStatus::Failed(message) => {
-                    if self.error.is_none() {
-                        self.error = Some(format!(
-                            "Metal command buffer {serial} ({label}) failed: {message}"
-                        ));
+                CbStatus::Failed(message) => match &mut self.failure {
+                    Some(failure) => failure.more += 1,
+                    None => {
+                        self.failure = Some(Failure {
+                            serial: *serial,
+                            message: format!("Metal command buffer {serial} ({label}) failed: {message}"),
+                            more: 0,
+                        })
                     }
-                }
+                },
             }
             self.stats.gpu_ms += cb.gpu_ms();
             let serial = *serial;
@@ -185,8 +217,8 @@ impl<C: CommandBuf> Ring<C> {
     }
 
     /// Called before committing a command buffer: retires what has finished, then, while the ring
-    /// holds `max_in_flight`, waits on the oldest. A failure found here waits for the next
-    /// [`Ring::wait`].
+    /// holds `max_in_flight`, waits on the oldest. A failure found here is kept for the waits
+    /// after it.
     pub fn make_room(&mut self) {
         self.retire();
         while self.in_flight.len() >= self.max_in_flight {
@@ -214,11 +246,11 @@ impl<C: CommandBuf> Ring<C> {
         self.stats.commits += 1;
     }
 
-    /// Blocks until command buffer `serial` and every one before it have finished, retires them,
-    /// and returns the first failure retired since the last wait, if any. `serial` must be
-    /// committed: the stream commits its open command buffer before waiting on it. Serial 0 (the
-    /// host) and serials already retired do not block, but still return a failure kept since the
-    /// last wait.
+    /// Blocks until command buffer `serial` and every one before it have finished, and retires
+    /// them. `Err` when one of them failed and the failure is not yet acknowledged (sticky: every
+    /// wait at or after the failed serial returns it). `serial` must be committed: the stream
+    /// commits its open command buffer before waiting on it. Serial 0 (the host) and serials
+    /// already retired do not block.
     pub fn wait(&mut self, serial: u64) -> Result<(), String> {
         if serial > self.last_committed {
             return Err(format!(
@@ -230,8 +262,8 @@ impl<C: CommandBuf> Ring<C> {
         if serial > self.completed() {
             self.block_until(serial);
         }
-        if let Some(error) = self.error.take() {
-            return Err(error);
+        if let Some(failure) = self.failure.as_ref().filter(|failure| failure.serial <= serial) {
+            return Err(failure.describe());
         }
         if serial > self.completed() {
             return Err(format!(
@@ -244,6 +276,43 @@ impl<C: CommandBuf> Ring<C> {
     /// [`Ring::wait`] for the last command buffer committed.
     pub fn wait_all(&mut self) -> Result<(), String> {
         self.wait(self.last_committed)
+    }
+
+    /// Ends a failure's stickiness: `Err` with it once more if one was kept, after which waits
+    /// are Ok again. Storage written from the failed serial up to the last one committed now
+    /// stays untrusted ([`Ring::check_written`]). Called by a synchronize, after it has committed
+    /// and waited for everything; Ok when there is nothing to acknowledge.
+    pub fn acknowledge(&mut self) -> Result<(), String> {
+        let Some(failure) = self.failure.take() else {
+            return Ok(());
+        };
+        let message = failure.describe();
+        self.failed_spans.push((failure.serial, self.last_committed, message.clone()));
+        Err(message)
+    }
+
+    /// Whether the host may trust storage last written by command buffer `serial`: `Err` when
+    /// that buffer failed, or ran after a failure that is not yet acknowledged, or between a
+    /// failure and its acknowledgement. Serial 0 (written by the host) is always Ok. For reads of
+    /// written storage (download, with_host, binding an input) once tensors are resident; it does
+    /// not wait.
+    pub fn check_written(&self, serial: u64) -> Result<(), String> {
+        if serial == 0 {
+            return Ok(());
+        }
+        if let Some(failure) = self.failure.as_ref().filter(|failure| failure.serial <= serial) {
+            return Err(failure.describe());
+        }
+        for (first, last, message) in &self.failed_spans {
+            if (*first..=*last).contains(&serial) {
+                return Err(format!(
+                    "data written by Metal command buffer {serial} is not trusted: command buffers \
+                     {first} to {last} ran at or after a failure, reported by a synchronize since: \
+                     {message}"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Waits on every command buffer up to `serial`, in order, then retires.
