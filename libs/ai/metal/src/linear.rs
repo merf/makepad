@@ -9,7 +9,7 @@
 //! W is bound where it is: in the host binding its device copy is kept by content id, so a weight
 //! is uploaded once; once tensors are resident it is bound from its own storage.
 //!
-//! macOS. Until the wiring declares it in lib.rs it compiles as `stream::gemm::linear`.
+//! macOS.
 
 use crate::gpu_types::GpuTensor;
 use crate::stream::gemm::{gemm_dim, GemmAddRows, GEMM_ADD_ROWS};

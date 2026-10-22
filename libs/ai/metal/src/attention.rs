@@ -15,7 +15,7 @@
 //! queries run in chunks so the scores stay within 64M floats (256 MB), as CUDA's do; with it, in
 //! one pass, as CUDA's do.
 //!
-//! macOS. Until the wiring declares it in lib.rs it compiles as `stream::gemm::attention`.
+//! macOS.
 
 use crate::gpu_types::GpuTensor;
 use crate::stream::gemm::{check_simd_width, gemm_dim, GemmSoftmaxRows, GEMM_SOFTMAX_ROWS, SIMD_WIDTH};

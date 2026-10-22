@@ -111,6 +111,142 @@ pub fn gpu_vit_backbone_resident(
     Err("gpu_vit_backbone_resident: CUDA runs the per-op path".to_string())
 }
 
+/// What MAKEPAD_CUTIE_METAL_REF sends back to its host reference on macOS, where Cutie's ops and
+/// the generic ops it calls run Makepad's Metal kernels, so a reference stays one variable away to
+/// bisect or compare (RationalVisions docs/cutie-metal.md §8): `all`, or op names separated by
+/// commas, each a `gpu_cutie_X` or `gpu_X` function's name with or without its prefix.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug, PartialEq)]
+enum MetalReference {
+    All,
+    Ops(Vec<&'static str>),
+}
+
+/// Every op MAKEPAD_CUTIE_METAL_REF can name: Cutie's own (`gpu_cutie_X`), then the generic ops
+/// that run Makepad's kernels on macOS (`gpu_X`), whose references are the host versions they had
+/// before (for `linear_f32_resident`, ggml's half-staged GEMM).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const METAL_REFERENCE_OPS: &[&str] = &[
+    "add_broadcast",
+    "aggregate",
+    "attn_mask",
+    "conv2d",
+    "conv2d_fused",
+    "crop",
+    "eca",
+    "gru",
+    "layer_norm",
+    "linear",
+    "matmul",
+    "maxpool3x3s2",
+    "normalise_rows",
+    "object_values",
+    "others",
+    "pad",
+    "resize_bilinear",
+    "rgb_planes",
+    "sigmoid",
+    "similarity",
+    "sine_encoding",
+    "softmax_axis0",
+    "topk_softmax",
+    "attention_packed_cross_bias",
+    "attention_packed_cross_f32",
+    "concat_cols",
+    "layer_norm_pytorch",
+    "linear_f32_resident",
+    "pixal_pool",
+    "planar_tokens_transpose",
+    "realesrgan_scale_add",
+    "slice_cols",
+];
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl MetalReference {
+    /// `value` read, and the names in it that are no op's.
+    fn parse(value: &str) -> (MetalReference, Vec<String>) {
+        let mut ops = Vec::new();
+        let mut unknown = Vec::new();
+        let mut all = false;
+        for name in value.split(',').map(str::trim).filter(|name| !name.is_empty()) {
+            if name == "all" {
+                all = true;
+                continue;
+            }
+            let bare = name.strip_prefix("gpu_cutie_").or_else(|| name.strip_prefix("gpu_")).unwrap_or(name);
+            match METAL_REFERENCE_OPS.iter().find(|&&op| op == bare) {
+                Some(&op) => ops.push(op),
+                None => unknown.push(name.to_string()),
+            }
+        }
+        (if all { MetalReference::All } else { MetalReference::Ops(ops) }, unknown)
+    }
+
+    fn forces(&self, op: &str) -> bool {
+        debug_assert!(METAL_REFERENCE_OPS.contains(&op), "{op} is not in METAL_REFERENCE_OPS");
+        match self {
+            MetalReference::All => true,
+            MetalReference::Ops(ops) => ops.contains(&op),
+        }
+    }
+}
+
+/// Whether MAKEPAD_CUTIE_METAL_REF sends `op` (one of [`METAL_REFERENCE_OPS`]) to its host
+/// reference. Read once; the first call prints what it forces, and any name it does not know.
+#[cfg(target_os = "macos")]
+fn cutie_metal_ref(op: &str) -> bool {
+    static REFERENCE: std::sync::OnceLock<MetalReference> = std::sync::OnceLock::new();
+    REFERENCE
+        .get_or_init(|| {
+            let value = std::env::var("MAKEPAD_CUTIE_METAL_REF").unwrap_or_default();
+            let (reference, unknown) = MetalReference::parse(&value);
+            if !unknown.is_empty() {
+                eprintln!(
+                    "[cutie metal] MAKEPAD_CUTIE_METAL_REF: no op named {}; it takes all, or {}",
+                    unknown.join(", "),
+                    METAL_REFERENCE_OPS.join(", ")
+                );
+            }
+            match &reference {
+                MetalReference::All => eprintln!("[cutie metal] MAKEPAD_CUTIE_METAL_REF: every op on its host reference"),
+                MetalReference::Ops(ops) if !ops.is_empty() => {
+                    eprintln!("[cutie metal] MAKEPAD_CUTIE_METAL_REF: {} on their host references", ops.join(", "))
+                }
+                MetalReference::Ops(_) => {}
+            }
+            reference
+        })
+        .forces(op)
+}
+
+#[cfg(test)]
+mod metal_reference_tests {
+    use super::*;
+
+    #[test]
+    fn metal_reference_reads_names_with_or_without_their_prefix() {
+        assert_eq!(MetalReference::parse(""), (MetalReference::Ops(vec![]), vec![]));
+        let (reference, unknown) = MetalReference::parse(" sigmoid, gpu_cutie_topk_softmax,gpu_slice_cols ,,linear");
+        assert_eq!(reference, MetalReference::Ops(vec!["sigmoid", "topk_softmax", "slice_cols", "linear"]));
+        assert!(unknown.is_empty());
+        assert!(reference.forces("linear") && !reference.forces("linear_f32_resident"));
+        assert!(!reference.forces("layer_norm_pytorch"));
+        let (reference, unknown) = MetalReference::parse("all,sigmod,cutie_gru");
+        assert_eq!(reference, MetalReference::All);
+        assert_eq!(unknown, ["sigmod", "cutie_gru"]);
+        assert!(METAL_REFERENCE_OPS.iter().all(|op| reference.forces(op)));
+    }
+
+    #[test]
+    fn metal_reference_ops_are_named_once() {
+        let mut names = METAL_REFERENCE_OPS.to_vec();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), METAL_REFERENCE_OPS.len());
+        assert!(!names.contains(&"all"));
+    }
+}
+
 #[cfg(not(all(any(target_os = "linux", target_os = "windows"), makepad_ai_cuda_kernels)))]
 mod imp {
     use super::GemmPrecision;
@@ -2150,7 +2286,10 @@ mod imp {
     ) -> Result<GpuTensor,String> {
         #[cfg(target_os = "macos")]
         {
-            return makepad_ai_metal::gpu_tensor::pool_area(_x, _width, _height, _out_width, _out_height);
+            if super::cutie_metal_ref("pixal_pool") {
+                return makepad_ai_metal::gpu_tensor::pool_area(_x, _width, _height, _out_width, _out_height);
+            }
+            return makepad_ai_metal::generic_ops::pixal_pool(_x, _width, _height, _out_width, _out_height);
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -2686,9 +2825,14 @@ mod imp {
         _bias: &[f32],
         _eps: f32,
     ) -> Result<GpuTensor, String> {
+        // macOS: the kernel `gpu_cutie_layer_norm` runs (PyTorch's CUDA order), so the two agree to
+        // the bit as on CUDA.
         #[cfg(target_os = "macos")]
         {
-            return makepad_ai_metal::gpu_tensor::layer_norm_pytorch(_x, _scale, _bias, _eps);
+            if super::cutie_metal_ref("layer_norm_pytorch") {
+                return makepad_ai_metal::gpu_tensor::layer_norm_pytorch(_x, _scale, _bias, _eps);
+            }
+            return makepad_ai_metal::cutie_ops::gpu_layer_norm_pytorch(_x, _scale, _bias, _eps);
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -2975,9 +3119,15 @@ mod imp {
         _scale: f32,
         _bias: &GpuTensor,
     ) -> Result<GpuTensor, String> {
+        // macOS: fp32 GEMMs and softmax on the Metal stream, as CUDA's.
         #[cfg(target_os = "macos")]
         {
-            return makepad_ai_metal::gpu_tensor::attention_packed_cross_bias(
+            if super::cutie_metal_ref("attention_packed_cross_bias") {
+                return makepad_ai_metal::gpu_tensor::attention_packed_cross_bias(
+                    _q, _k, _v, _head_count, _scale, _bias,
+                );
+            }
+            return makepad_ai_metal::attention::attention_packed_cross_bias(
                 _q, _k, _v, _head_count, _scale, _bias,
             );
         }
@@ -3473,9 +3623,14 @@ mod imp {
         _weight: &GpuTensor,
         _bias: Option<&GpuTensor>,
     ) -> Result<GpuTensor, String> {
+        // macOS: an fp32 GEMM on the Metal stream and the bias added on the device, as CUDA's
+        // (the reference is ggml's GEMM, which stages its tiles in half).
         #[cfg(target_os = "macos")]
         {
-            return makepad_ai_metal::gpu_tensor::linear_f32_resident(_x, _weight, _bias);
+            if super::cutie_metal_ref("linear_f32_resident") {
+                return makepad_ai_metal::gpu_tensor::linear_f32_resident(_x, _weight, _bias);
+            }
+            return makepad_ai_metal::linear::linear_f32_resident(_x, _weight, _bias);
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -3766,9 +3921,13 @@ mod imp {
         _head_count: usize,
         _scale: f32,
     ) -> Result<GpuTensor, String> {
+        // macOS: fp32 GEMMs and softmax on the Metal stream, as CUDA's.
         #[cfg(target_os = "macos")]
         {
-            return makepad_ai_metal::gpu_tensor::attention_packed_cross_f32(_q, _k, _v, _head_count, _scale);
+            if super::cutie_metal_ref("attention_packed_cross_f32") {
+                return makepad_ai_metal::gpu_tensor::attention_packed_cross_f32(_q, _k, _v, _head_count, _scale);
+            }
+            return makepad_ai_metal::attention::attention_packed_cross_f32(_q, _k, _v, _head_count, _scale);
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -3988,7 +4147,10 @@ mod imp {
     pub fn gpu_slice_cols(_x: &GpuTensor, _start: usize, _len: usize) -> Result<GpuTensor, String> {
         #[cfg(target_os = "macos")]
         {
-            return makepad_ai_metal::gpu_tensor::slice_cols(_x, _start, _len);
+            if super::cutie_metal_ref("slice_cols") {
+                return makepad_ai_metal::gpu_tensor::slice_cols(_x, _start, _len);
+            }
+            return makepad_ai_metal::generic_ops::slice_cols(_x, _start, _len);
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -4001,7 +4163,17 @@ mod imp {
     }
 
     pub fn gpu_concat_cols(_parts: &[&GpuTensor]) -> Result<GpuTensor, String> {
-        Err(GPU_UNAVAILABLE.to_string())
+        #[cfg(target_os = "macos")]
+        {
+            if super::cutie_metal_ref("concat_cols") {
+                return makepad_ai_metal::gpu_tensor::concat_cols(_parts);
+            }
+            return makepad_ai_metal::generic_ops::concat_cols(_parts);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(GPU_UNAVAILABLE.to_string())
+        }
     }
 
     pub fn gpu_slice_rows(_x: &GpuTensor, _start: usize, _len: usize) -> Result<GpuTensor, String> {
@@ -4015,22 +4187,22 @@ mod imp {
         }
     }
 
+    // macOS: one host copy until tensors are resident (CUDA makes adjacent parts a view).
     pub fn gpu_concat_rows(_a: &GpuTensor, _b: &GpuTensor) -> Result<GpuTensor, String> {
-        Err(GPU_UNAVAILABLE.to_string())
+        #[cfg(target_os = "macos")]
+        {
+            return makepad_ai_metal::generic_ops::concat_rows(_a, _b);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(GPU_UNAVAILABLE.to_string())
+        }
     }
 
     pub fn gpu_concat_rows_many(_parts: &[&GpuTensor]) -> Result<GpuTensor, String> {
         #[cfg(target_os = "macos")]
         {
-            let mut parts = _parts.iter();
-            let first = parts
-                .next()
-                .ok_or_else(|| "concat_rows_many: empty".to_string())?;
-            let mut acc = makepad_ai_metal::gpu_tensor::slice_rows(first, 0, first.rows())?;
-            for part in parts {
-                acc = makepad_ai_metal::gpu_tensor::concat_rows(&acc, part)?;
-            }
-            return Ok(acc);
+            return makepad_ai_metal::generic_ops::concat_rows_many(_parts);
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -4361,7 +4533,10 @@ mod imp {
     ) -> Result<GpuTensor, String> {
         #[cfg(target_os = "macos")]
         {
-            return makepad_ai_metal::gpu_tensor::scale_add(_base, _delta, _scale);
+            if super::cutie_metal_ref("realesrgan_scale_add") {
+                return makepad_ai_metal::gpu_tensor::scale_add(_base, _delta, _scale);
+            }
+            return makepad_ai_metal::generic_ops::realesrgan_scale_add(_base, _delta, _scale);
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -4613,7 +4788,10 @@ mod imp {
     pub fn gpu_planar_tokens_transpose(_x: &GpuTensor) -> Result<GpuTensor, String> {
         #[cfg(target_os = "macos")]
         {
-            return makepad_ai_metal::gpu_tensor::transpose(_x);
+            if super::cutie_metal_ref("planar_tokens_transpose") {
+                return makepad_ai_metal::gpu_tensor::transpose(_x);
+            }
+            return makepad_ai_metal::generic_ops::planar_tokens_transpose(_x);
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -4866,7 +5044,8 @@ mod imp {
         makepad_ai_metal::stream::pool_cap_override(_bytes);
     }
 
-    // Cutie's ops without CUDA kernels: the host references (cuda/src/cutie_ops.rs).
+    // Cutie's ops without CUDA kernels: on macOS Metal's kernels, elsewhere (and where
+    // MAKEPAD_CUTIE_METAL_REF names them) their host references.
     include!("gpu_cutie_host.rs");
 }
 

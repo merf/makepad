@@ -381,17 +381,6 @@ pub(crate) fn check_simd_width(s: &mut MetalStream<'_>, op: &str, kernel: &Kerne
     Ok(())
 }
 
-// Until the wiring declares them in lib.rs (`#[cfg(target_os = "macos")] pub mod linear;` and
-// `pub mod attention;`), the GEMM's two users compile from here, as `stream::gemm::linear` and
-// `stream::gemm::attention`; the wiring deletes these lines and changes the one `use` in
-// tests/gemm.rs.
-#[cfg(target_os = "macos")]
-#[path = "../attention.rs"]
-pub mod attention;
-#[cfg(target_os = "macos")]
-#[path = "../linear.rs"]
-pub mod linear;
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -14,7 +14,7 @@
 //!   would run it: four billion floats, never Cutie's.
 //! - ECA with more than [`CUTIE_ECA_MAX_TAPS`] taps is `Err`: CUDA runs the host reference for
 //!   those (never Cutie's 3 or 5), which this crate cannot call, so the caller does
-//!   (models/common's gpu_cutie_metal.rs).
+//!   (models/common's gpu_cutie_host.rs).
 //!
 //! The checks, the kernels' params and their grids are plain functions of the sizes, compiled and
 //! tested on any OS, with the kernels' reduction trees run on the host as the MSL writes them; the

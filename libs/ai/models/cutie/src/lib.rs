@@ -2,9 +2,10 @@
 //! Segmentation", the `merf/Cutie` fork at ec5cdd4), natively: the `cutie-base-mega` checkpoint
 //! read from its `.pth`, the network on Makepad's CUDA tensors in fp32, and Cutie's memory and
 //! per-frame step. Checked part by part against a PyTorch oracle (RationalVisions'
-//! `tools/cutie-oracle`) with `cutie-validate`. On macOS, which has no Cutie kernels yet, each of
-//! Cutie's ops is its host reference on the Metal tensors (`gpu_cutie_host.rs` in
-//! makepad-ai-common): the same checks, correct and slow.
+//! `tools/cutie-oracle`) with `cutie-validate`. On macOS Cutie's ops are Makepad's Metal kernels
+//! (makepad-ai-metal's `cutie_ops`, dispatched by `gpu_cutie_host.rs` in makepad-ai-common), each
+//! one variable away from its host reference (MAKEPAD_CUTIE_METAL_REF=all or op,op): the same
+//! checks.
 //!
 //! ```ignore
 //! let cutie = Cutie::load(Path::new("cutie-base-mega.pth"))?;
@@ -114,7 +115,7 @@ pub struct Cutie {
 impl Cutie {
     /// Reads the checkpoint and builds the network on the device. Fails at once where Cutie's
     /// ops do not run (`gpu_cutie_available`): a Linux or Windows build without their CUDA kernels
-    /// (no nvcc), or no device. On macOS they run as the host references.
+    /// (no nvcc), or no device. On macOS they are Metal's kernels.
     pub fn load(path: &Path) -> Result<Self> {
         if !makepad_ai_common::gpu::gpu_cutie_available() {
             return Err(DiffusionError::model(

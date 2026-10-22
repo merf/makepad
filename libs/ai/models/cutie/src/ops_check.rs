@@ -46,8 +46,10 @@ const EXACT: Tol = Tol { rel: 0.0, cos: 1.0 - 1e-12, bool_mismatch: 0.0 };
 /// Ops that sum, or call exp, tanh or log: fp32 rounding apart.
 const TIGHT: Tol = Tol { rel: 1e-5, cos: 0.9999999, bool_mismatch: 0.0 };
 
-/// What a kernel is held to against PyTorch's pinned values: its bits where the ops are kernels
-/// of their own (CUDA), else the reference's tolerance, since the ops then are the references.
+/// What a kernel is held to against PyTorch's pinned values: its bits where the ops are CUDA's
+/// kernels (`GPU_CUTIE_KERNELS`), else the reference's tolerance: elsewhere the ops are the
+/// references, and Metal's kernels call `precise::` exp, log, sin and cos, which round otherwise
+/// than CUDA's (cutie-metal.md D8).
 fn kernel_tol(reference: Tol) -> Tol {
     if GPU_CUTIE_KERNELS {
         EXACT
@@ -926,7 +928,9 @@ pub(crate) fn check(report: &mut Report) -> Result<()> {
     // What `Cutie::load` asks before anything else: these ops run here, so it must say so.
     let available = gpu_cutie_available();
     report.record(STAGE, "available", "gpu_cutie_available", available, format!("{available} (where nothing runs them, false)"));
-    if !GPU_CUTIE_KERNELS {
+    if cfg!(target_os = "macos") {
+        report.note("ops: Metal's kernels (MAKEPAD_CUTIE_METAL_REF=all or op,op runs those ops as their host references, which then compare with themselves); PyTorch's pins at TIGHT where CUDA's expf, logf, sinf and cosf give its bits");
+    } else if !GPU_CUTIE_KERNELS {
         report.note("ops: this build has no Cutie kernels; each op is its host reference, so kernel against reference compares the reference with itself");
     }
     let mut ck = OpsCheck { report, rng: Rng(0x0dd_c0ffee_5eed), conv_cases: 0 };

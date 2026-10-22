@@ -15,10 +15,8 @@
 #![cfg(target_os = "macos")]
 
 use makepad_ai_metal::stream::gemm::{self, GemmMode, GEMM, GEMM_KERNELS, SIMD_WIDTH};
-// Until the wiring declares them in lib.rs; then `use makepad_ai_metal::{attention, linear};`.
-use makepad_ai_metal::stream::gemm::{attention, linear};
 use makepad_ai_metal::stream::{self, with_metal_stream, Bind, Gemm, GemmOperand};
-use makepad_ai_metal::GpuTensor;
+use makepad_ai_metal::{attention, linear, GpuTensor};
 
 /// fp32's unit roundoff, 2^-24.
 const U: f64 = 1.0 / (1u64 << 24) as f64;
