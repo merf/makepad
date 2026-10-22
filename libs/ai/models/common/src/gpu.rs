@@ -3972,7 +3972,14 @@ mod imp {
     }
 
     pub fn gpu_concat_cols(_parts: &[&GpuTensor]) -> Result<GpuTensor, String> {
-        Err(GPU_UNAVAILABLE.to_string())
+        #[cfg(target_os = "macos")]
+        {
+            return makepad_ai_metal::gpu_tensor::concat_cols(_parts);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(GPU_UNAVAILABLE.to_string())
+        }
     }
 
     pub fn gpu_slice_rows(_x: &GpuTensor, _start: usize, _len: usize) -> Result<GpuTensor, String> {
