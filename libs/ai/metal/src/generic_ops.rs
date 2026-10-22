@@ -566,6 +566,17 @@ mod metal_tests {
         }
     }
 
+    /// As `assert_bits`, but any NaN matches any NaN: the GPU's arithmetic gives the canonical
+    /// NaN (0x7fc00000, as CUDA's does), not the host's propagated payload. For ops that compute
+    /// (the pool, the scale add); ops that only move words keep the payload and use `assert_bits`.
+    fn assert_bits_any_nan(what: &str, got: &[f32], want: &[f32]) {
+        assert_eq!(got.len(), want.len(), "{what}: length");
+        let same = |a: f32, b: f32| a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan());
+        if let Some(i) = (0..got.len()).find(|&i| !same(got[i], want[i])) {
+            panic!("{what}: element {i} is {:#010x}, the host's {:#010x}", got[i].to_bits(), want[i].to_bits());
+        }
+    }
+
     #[test]
     fn every_kernel_compiles() {
         assert!(library_available(&GENERIC_OPS), "generic_ops.metal does not compile");
@@ -618,7 +629,7 @@ mod metal_tests {
             let x = upload(&xs, channels, w * h).unwrap();
             let got = download(&pixal_pool(&x, w, h, ow, oh).unwrap()).unwrap();
             let want = super::tests::pool_host(&xs, channels, w, h, ow, oh);
-            assert_bits(&format!("pool {w}x{h} to {ow}x{oh}"), &got, &want);
+            assert_bits_any_nan(&format!("pool {w}x{h} to {ow}x{oh}"), &got, &want);
         }
 
         for (rows, cols) in [(1, 1), (3, 5), (64, 1000), (257, 3)] {
@@ -636,7 +647,7 @@ mod metal_tests {
         for scale in [-1.0f32, 0.2, 3.0e-3] {
             let got = download(&realesrgan_scale_add(&b, &d, scale).unwrap()).unwrap();
             let want: Vec<f32> = bs.iter().zip(&ds).map(|(&b, &d)| scale.mul_add(d, b)).collect();
-            assert_bits(&format!("scale add {scale}"), &got, &want);
+            assert_bits_any_nan(&format!("scale add {scale}"), &got, &want);
         }
     }
 }

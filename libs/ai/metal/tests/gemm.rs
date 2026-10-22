@@ -741,8 +741,8 @@ fn bits(values: &[f32]) -> Vec<u32> {
 fn attention_chunks_and_a_zero_bias_change_no_bit() {
     // The queries in chunks (CUDA's bound on the scores, made small) give what one pass gives:
     // on the naive kernel the same bits, each output being the same fmas in the same order; on
-    // the tiled one a query lands at another row of its tile, so only within TIGHT unless the
-    // SIMD-group product rounds alike at every position (printed). And a zero bias adds nothing
+    // the tiled one a query lands at another row of its tile, and the SIMD-group product rounds
+    // alike at every position (found on an M5, step 9), so the same bits there too. And a zero bias adds nothing
     // (x + 0 is x), so the biased attention is the plain one, bit for bit, on either kernel.
     let mut rng = Rng(0x6e44_000a);
     let (heads, q_len, kv_len) = (3, 10, 41);
@@ -762,7 +762,7 @@ fn attention_chunks_and_a_zero_bias_change_no_bit() {
                 assert_eq!(bits(&chunked), bits(&whole), "{what}");
             } else {
                 assert_tight(&what, &chunked, &whole_f64);
-                eprintln!("{what}: the same bits as one pass: {}", bits(&chunked) == bits(&whole));
+                assert_eq!(bits(&chunked), bits(&whole), "{what}: the same bits as one pass");
             }
         }
         let biased = download(&attention::attention_packed_cross_bias(&tq, &tk, &tv, heads, 0.2, &zero).unwrap());
