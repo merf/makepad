@@ -1,10 +1,12 @@
 // Cutie (video object segmentation) device ops, in exact fp32: the native port is checked against
-// a PyTorch fp32 oracle with TF32 off (models/cutie). The Rust wrappers are in src/cutie_ops.rs;
+// a PyTorch fp32 oracle with TF32 off (models/cutie). The one exception is the convolution's
+// columns in half, for propagation steps run in fp16 (`gpu_cutie_conv2d_fused_f16`). The Rust wrappers are in src/cutie_ops.rs;
 // each op there has a host reference beside it that these kernels must match.
 //
 // Elementwise arithmetic that PyTorch does as separate tensor ops (each rounded) is written with
 // the _rn intrinsics, so nvcc cannot contract it into an FMA that PyTorch never does.
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <stdint.h>
 #include <float.h>
 #include <math.h>
@@ -93,9 +95,14 @@ extern "C" cudaError_t makepad_cuda_cutie_maxpool3x3s2_f32(
 // window with stride and zero padding, row r = c*k*k + ky*k + kx and column q = oy*ow + ox: the
 // layout PyTorch's [out][in][k][k] weights multiply as a [out, in*k*k] matrix. Per image
 // (col[b][r][q], one GEMM an image) or, `side_by_side`, the images' columns next to each other
-// (col[r][b][q], one GEMM for them all).
+// (col[r][b][q], one GEMM for them all). The columns are f32, or for fp16 steps half (each value
+// rounded to nearest, as autocast's cast before a convolution rounds it).
+static __device__ __forceinline__ void cutie_col_store(float* col, size_t at, float v) { col[at] = v; }
+static __device__ __forceinline__ void cutie_col_store(__half* col, size_t at, float v) { col[at] = __float2half_rn(v); }
+
+template <typename Col>
 static __global__ void cutie_im2col_kernel(
-    const float* __restrict__ x, float* __restrict__ col, uint32_t images, uint32_t channels, uint32_t width,
+    const float* __restrict__ x, Col* __restrict__ col, uint32_t images, uint32_t channels, uint32_t width,
     uint32_t height, uint32_t ow, uint32_t oh, uint32_t k, uint32_t pad, uint32_t stride, size_t rows,
     bool side_by_side) {
     const size_t opix = size_t(ow) * oh;
@@ -114,21 +121,34 @@ static __global__ void cutie_im2col_kernel(
             v = x[((b * channels + c) * height + iy) * size_t(width) + ix];
         }
         const size_t at = side_by_side ? size_t(r) * images + b : row;
-        col[at * opix + q] = v;
+        cutie_col_store(col, at * opix + q, v);
     }
 }
 
-extern "C" cudaError_t makepad_cuda_cutie_im2col_f32(
-    const float* x, float* col, uint32_t images, uint32_t channels, uint32_t width, uint32_t height,
+template <typename Col>
+static cudaError_t cutie_im2col(
+    const float* x, Col* col, uint32_t images, uint32_t channels, uint32_t width, uint32_t height,
     uint32_t ow, uint32_t oh, uint32_t k, uint32_t pad, uint32_t stride, uint32_t side_by_side, cudaStream_t stream) {
     const size_t opix = size_t(ow) * oh;
     const size_t rows = size_t(images) * channels * k * k;
     if (!opix || !rows) return cudaSuccess;
     const dim3 block(256, 1, 1);
     const dim3 grid((unsigned)((opix + 255) / 256), (unsigned)(rows < 65535 ? rows : 65535), 1);
-    cutie_im2col_kernel<<<grid, block, 0, stream>>>(
+    cutie_im2col_kernel<Col><<<grid, block, 0, stream>>>(
         x, col, images, channels, width, height, ow, oh, k, pad, stride, rows, side_by_side != 0);
     return cudaGetLastError();
+}
+
+extern "C" cudaError_t makepad_cuda_cutie_im2col_f32(
+    const float* x, float* col, uint32_t images, uint32_t channels, uint32_t width, uint32_t height,
+    uint32_t ow, uint32_t oh, uint32_t k, uint32_t pad, uint32_t stride, uint32_t side_by_side, cudaStream_t stream) {
+    return cutie_im2col(x, col, images, channels, width, height, ow, oh, k, pad, stride, side_by_side, stream);
+}
+
+extern "C" cudaError_t makepad_cuda_cutie_im2col_f16(
+    const float* x, __half* col, uint32_t images, uint32_t channels, uint32_t width, uint32_t height,
+    uint32_t ow, uint32_t oh, uint32_t k, uint32_t pad, uint32_t stride, uint32_t side_by_side, cudaStream_t stream) {
+    return cutie_im2col(x, col, images, channels, width, height, ow, oh, k, pad, stride, side_by_side, stream);
 }
 
 // What a convolution does after its product, in one pass: the bias added, then the residual

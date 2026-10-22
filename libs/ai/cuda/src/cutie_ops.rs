@@ -22,6 +22,10 @@ unsafe extern "C" {
         x: *const f32, col: *mut f32, images: u32, channels: u32, width: u32, height: u32, ow: u32, oh: u32,
         k: u32, pad: u32, stride: u32, side_by_side: u32, stream: cudaStream_t,
     ) -> cudaError_t;
+    fn makepad_cuda_cutie_im2col_f16(
+        x: *const f32, col: *mut u16, images: u32, channels: u32, width: u32, height: u32, ow: u32, oh: u32,
+        k: u32, pad: u32, stride: u32, side_by_side: u32, stream: cudaStream_t,
+    ) -> cudaError_t;
     fn makepad_cuda_cutie_conv_epilogue_f32(
         out: *mut f32, bias: *const f32, residual: *const f32, relu: u32, channels: u32, plane: usize, rows: usize,
         stream: cudaStream_t,
@@ -99,6 +103,8 @@ const CUTIE_TOPK_MAX: usize = 64;
 const CUTIE_CONV_SCRATCH_BYTES: usize = 256 << 20;
 /// Batches of images this small (output pixels each) run as one GEMM, side by side.
 const CUTIE_CONV_SIDE_BY_SIDE_PIXELS: usize = 4096;
+/// The most output pixels (over the batch) a direct convolution runs in half for an fp16 step.
+const CUTIE_HALF_DIRECT_MAX_PIXELS: usize = 16384;
 
 /// A dimension as the kernels take it.
 fn cutie_u32(op: &str, v: usize) -> Result<u32, String> {
@@ -175,7 +181,34 @@ pub fn gpu_cutie_conv2d_fused(
     weights: &[f32], bias: Option<&[f32]>, out_channels: usize, k: usize, pad: usize, stride: usize,
     residual: Option<&GpuTensor>, relu: bool,
 ) -> Result<GpuTensor, String> {
-    let op = "gpu_cutie_conv2d";
+    cutie_conv2d(x, batch, in_w, in_h, cache_namespace, key, weights, bias, out_channels, k, pad, stride, residual, relu, false)
+}
+
+/// `gpu_cutie_conv2d_fused` for propagation steps run in fp16, as PyTorch's autocast runs a
+/// convolution: the columns and the weights rounded to half, multiplied with fp32 accumulation
+/// (cuBLAS, CUDA_R_16F operands, CUBLAS_COMPUTE_32F, tensor cores), the output, the bias, residual
+/// and ReLU in f32, so tensors between ops stay f32 (autocast would also store the output in half).
+/// The half weights are cached apart from the f32 ones, under `{cache_namespace}::{key}::cutie_conv_f16`.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_cutie_conv2d_fused_f16(
+    x: &GpuTensor, batch: usize, in_w: usize, in_h: usize, cache_namespace: &str, key: &str,
+    weights: &[f32], bias: Option<&[f32]>, out_channels: usize, k: usize, pad: usize, stride: usize,
+    residual: Option<&GpuTensor>, relu: bool,
+) -> Result<GpuTensor, String> {
+    cutie_conv2d(x, batch, in_w, in_h, cache_namespace, key, weights, bias, out_channels, k, pad, stride, residual, relu, true)
+}
+
+/// Whether `gpu_cutie_conv2d_fused_f16` really runs in half: here, yes.
+pub const GPU_CUTIE_HALF: bool = true;
+
+/// The convolution behind both: f32 columns and weights, or with `half` both in half.
+#[allow(clippy::too_many_arguments)]
+fn cutie_conv2d(
+    x: &GpuTensor, batch: usize, in_w: usize, in_h: usize, cache_namespace: &str, key: &str,
+    weights: &[f32], bias: Option<&[f32]>, out_channels: usize, k: usize, pad: usize, stride: usize,
+    residual: Option<&GpuTensor>, relu: bool, half: bool,
+) -> Result<GpuTensor, String> {
+    let op = if half { "gpu_cutie_conv2d_f16" } else { "gpu_cutie_conv2d" };
     cutie_check_f32(op, x)?;
     if batch == 0 || x.rows == 0 || x.rows % batch != 0 || x.cols != in_w * in_h || k == 0 || stride == 0 || in_w + 2 * pad < k || in_h + 2 * pad < k {
         return Err(format!("{op} {key}: x {}x{} for batch {batch} at {in_w}x{in_h}, k {k} pad {pad} stride {stride}", x.rows, x.cols));
@@ -199,52 +232,80 @@ pub fn gpu_cutie_conv2d_fused(
     let (channels_u, w_u, h_u, ow_u, oh_u, k_u, pad_u, stride_u) =
         (d(in_channels)?, d(in_w)?, d(in_h)?, d(ow)?, d(oh)?, d(k)?, d(pad)?, d(stride)?);
     let (batch_u, out_channels_u) = (d(batch)?, d(out_channels)?);
+    // A direct (1x1, stride 1) convolution over a large plane stays fp32 in an fp16 step: its
+    // input would be rounded to half in a pass of its own, which costs more there than the half
+    // product saves (at 960x540 the encoder's 240x136 ones were half again as slow; at 120x68 and
+    // below, faster).
+    let half = half && !(k == 1 && stride == 1 && pad == 0 && batch * opix > CUTIE_HALF_DIRECT_MAX_PIXELS);
+    // Bytes a column value takes, and the type cuBLAS reads the columns and weights as.
+    let (es, ab_type) = if half { (size_of::<u16>(), crate::CUDA_R_16F) } else { (size_of::<f32>(), crate::CUDA_R_32F) };
     with_dense_linear_backend(|backend| {
         backend.prepare_device()?;
-        // Weights then bias, one cached buffer: no host upload after the first call.
-        let qualified_key = format!("{cache_namespace}::{key}::cutie_conv");
-        let floats = weights.len() + bias.map_or(0, |b| b.len());
-        backend.cached_weight_buffer(&qualified_key, floats * size_of::<f32>(), || {
-            let mut raw = Vec::with_capacity(floats * size_of::<f32>());
-            for v in weights.iter().chain(bias.into_iter().flatten()) {
+        // Weights then bias, one cached buffer: no host upload after the first call. In half,
+        // the weights rounded to nearest, then the bias in f32 from a 256-byte boundary.
+        let qualified_key = format!("{cache_namespace}::{key}::{}", if half { "cutie_conv_f16" } else { "cutie_conv" });
+        let bias_at = if half { (weights.len() * es).div_ceil(256) * 256 } else { weights.len() * es };
+        let bytes = bias_at + bias.map_or(0, |b| b.len()) * size_of::<f32>();
+        backend.cached_weight_buffer(&qualified_key, bytes, || {
+            let mut raw = Vec::with_capacity(bytes);
+            for &v in weights {
+                if half {
+                    raw.extend_from_slice(&crate::quant::f32_to_f16_rn(v).to_le_bytes());
+                } else {
+                    raw.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            raw.resize(bias_at, 0);
+            for v in bias.into_iter().flatten() {
                 raw.extend_from_slice(&v.to_le_bytes());
             }
             Ok(raw)
         })?;
-        let w_ptr = backend
+        let w_base = backend
             .weight_buffers
             .get(&qualified_key)
             .ok_or_else(|| format!("missing cached cutie conv weights {qualified_key}"))?
             .ptr
             .as_ptr()
-            .cast::<f32>();
+            .cast::<u8>();
+        let w_ptr = w_base.cast::<c_void>().cast_const();
         let out = GpuTensor::from_pool(batch * out_channels, opix)?;
         let x_ptr = x.device_ptr()?;
         let out_ptr = out.device_ptr()?;
-        let bias_ptr = if bias.is_some() { unsafe { w_ptr.add(weights.len()) } } else { std::ptr::null() };
+        let bias_ptr = if bias.is_some() { unsafe { w_base.add(bias_at).cast::<f32>().cast_const() } } else { std::ptr::null() };
         let residual_ptr = match residual {
             Some(r) => r.device_ptr()?.cast_const(),
             None => std::ptr::null(),
         };
+        // Scratch for `values` column values, from the pool.
+        let scratch = |values: usize| GpuTensor::from_pool((values * es).div_ceil(size_of::<f32>()).max(1), 1);
+        let im2col = |src: *const f32, col: *mut f32, images: u32, side_by_side: u32| {
+            gpu_check(unsafe {
+                if half {
+                    makepad_cuda_cutie_im2col_f16(
+                        src, col.cast::<u16>(), images, channels_u, w_u, h_u, ow_u, oh_u, k_u, pad_u, stride_u, side_by_side,
+                        backend.stream,
+                    )
+                } else {
+                    makepad_cuda_cutie_im2col_f32(
+                        src, col, images, channels_u, w_u, h_u, ow_u, oh_u, k_u, pad_u, stride_u, side_by_side, backend.stream,
+                    )
+                }
+            })
+        };
         let per_image = kdim * opix;
-        let side_by_side =
-            batch > 1 && opix <= CUTIE_CONV_SIDE_BY_SIDE_PIXELS && batch * per_image * size_of::<f32>() <= CUTIE_CONV_SCRATCH_BYTES;
+        let side_by_side = batch > 1 && opix <= CUTIE_CONV_SIDE_BY_SIDE_PIXELS && batch * per_image * es <= CUTIE_CONV_SCRATCH_BYTES;
         if side_by_side {
             // Small images: one GEMM over every image's columns side by side keeps cuBLAS's
             // tiles full, then each image's channels are put back in place with the epilogue.
             let wide = dim(batch * opix)?;
-            let col = GpuTensor::from_pool(kdim, batch * opix)?;
+            let col = scratch(kdim * batch * opix)?;
             let stacked = GpuTensor::from_pool(out_channels, batch * opix)?;
-            gpu_check(unsafe {
-                makepad_cuda_cutie_im2col_f32(
-                    x_ptr, col.device_ptr()?, batch_u, channels_u, w_u, h_u, ow_u, oh_u, k_u, pad_u, stride_u, 1,
-                    backend.stream,
-                )
-            })?;
+            im2col(x_ptr, col.device_ptr()?, batch_u, 1)?;
             unsafe {
                 crate::cublas_gemm_ex(
                     backend.blas, crate::CUBLAS_OP_N, crate::CUBLAS_OP_N, wide, n, kd, &1.0f32,
-                    col.device_ptr()?.cast::<c_void>(), crate::CUDA_R_32F, wide, w_ptr.cast::<c_void>(), crate::CUDA_R_32F, kd,
+                    col.device_ptr()?.cast::<c_void>(), ab_type, wide, w_ptr, ab_type, kd,
                     &0.0f32, stacked.device_ptr()?.cast::<c_void>(), crate::CUDA_R_32F, wide, crate::CUBLAS_COMPUTE_32F,
                     crate::CUBLAS_GEMM_DEFAULT,
                 )
@@ -259,30 +320,36 @@ pub fn gpu_cutie_conv2d_fused(
             return Ok(out);
         }
         let direct = k == 1 && stride == 1 && pad == 0;
+        // A direct (1x1, stride 1) convolution's input is its columns: in half, rounded once into
+        // scratch for every image.
+        let x_half = if direct && half {
+            let values = x.rows * x.cols;
+            let t = scratch(values)?;
+            gpu_check(unsafe { makepad_cuda_f32_to_f16(x_ptr, t.device_ptr()?.cast::<u16>(), d(values)?, backend.stream) })?;
+            Some(t)
+        } else {
+            None
+        };
         // Images per GEMM: all of them, unless their columns outgrow the scratch.
-        let group = if direct { batch } else { (CUTIE_CONV_SCRATCH_BYTES / size_of::<f32>() / per_image.max(1)).clamp(1, batch) };
-        let col = if direct { None } else { Some(GpuTensor::from_pool(group * kdim, opix)?) };
+        let group = if direct { batch } else { (CUTIE_CONV_SCRATCH_BYTES / es / per_image.max(1)).clamp(1, batch) };
+        let col = if direct { None } else { Some(scratch(group * per_image)?) };
         let mut first = 0;
         while first < batch {
             let count = group.min(batch - first);
-            let src = unsafe { x_ptr.add(first * in_channels * in_w * in_h) };
-            let a = match &col {
-                Some(col) => {
-                    gpu_check(unsafe {
-                        makepad_cuda_cutie_im2col_f32(
-                            src, col.device_ptr()?, count as u32, channels_u, w_u, h_u, ow_u, oh_u, k_u, pad_u, stride_u, 0,
-                            backend.stream,
-                        )
-                    })?;
-                    col.device_ptr()?
+            let at = first * in_channels * in_w * in_h;
+            let a: *const c_void = match (&col, &x_half) {
+                (Some(col), _) => {
+                    im2col(unsafe { x_ptr.add(at) }, col.device_ptr()?, count as u32, 0)?;
+                    col.device_ptr()?.cast::<c_void>().cast_const()
                 }
-                None => src,
+                (None, Some(h)) => unsafe { h.device_ptr()?.cast::<u16>().add(at).cast::<c_void>().cast_const() },
+                (None, None) => unsafe { x_ptr.add(at).cast::<c_void>().cast_const() },
             };
             unsafe {
                 crate::cublas_gemm_strided_batched_ex(
                     backend.blas, crate::CUBLAS_OP_N, crate::CUBLAS_OP_N, m, n, kd, &1.0f32,
-                    a.cast::<c_void>(), crate::CUDA_R_32F, m, per_image as i64,
-                    w_ptr.cast::<c_void>(), crate::CUDA_R_32F, kd, 0,
+                    a, ab_type, m, per_image as i64,
+                    w_ptr, ab_type, kd, 0,
                     &0.0f32, out_ptr.add(first * out_channels * opix).cast::<c_void>(), crate::CUDA_R_32F, m,
                     (out_channels * opix) as i64, count as i32, crate::CUBLAS_COMPUTE_32F, crate::CUBLAS_GEMM_DEFAULT,
                 )

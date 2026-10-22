@@ -45,7 +45,7 @@ use makepad_ai_common::gpu::{
     gpu_pixal_pool, gpu_planar_tokens_transpose, gpu_realesrgan_scale_add, gpu_rife_fill, gpu_slice_cols, gpu_slice_rows,
     gpu_cutie_add_broadcast, gpu_cutie_add_broadcast_reference, gpu_cutie_aggregate, gpu_cutie_aggregate_reference,
     gpu_add, gpu_birefnet_relu, gpu_cutie_attn_mask, gpu_cutie_attn_mask_reference, gpu_cutie_conv2d, gpu_cutie_conv2d_fused,
-    gpu_cutie_conv2d_fused_reference, gpu_cutie_conv2d_reference, gpu_cutie_crop,
+    gpu_cutie_conv2d_fused_f16, gpu_cutie_conv2d_fused_reference, gpu_cutie_conv2d_reference, gpu_cutie_crop, GPU_CUTIE_HALF,
     gpu_cutie_crop_reference, gpu_cutie_eca, gpu_cutie_eca_reference, gpu_cutie_gru, gpu_cutie_gru_reference,
     gpu_cutie_layer_norm, gpu_cutie_layer_norm_reference, gpu_cutie_matmul, gpu_cutie_matmul_reference,
     gpu_cutie_maxpool3x3s2, gpu_cutie_maxpool3x3s2_reference, gpu_cutie_normalise_rows, gpu_cutie_normalise_rows_reference,
@@ -486,7 +486,14 @@ impl OpsCheck<'_> {
         let expected =
             gpu_cutie_conv2d_fused_reference(&x, batch, w, h, CUTIE_NAMESPACE, &key, &weights, b.as_deref(), out_c, k, pad, stride, r.as_ref(), relu)
                 .map_err(|e| dev(&case, e))?;
-        self.compare("conv fused", &case, &fused, &expected, TIGHT)
+        self.compare("conv fused", &case, &fused, &expected, TIGHT)?;
+        if GPU_CUTIE_HALF {
+            // The fp16 steps' convolution, against the same reference (in fp32).
+            let half = gpu_cutie_conv2d_fused_f16(&x, batch, w, h, CUTIE_NAMESPACE, &key, &weights, b.as_deref(), out_c, k, pad, stride, r.as_ref(), relu)
+                .map_err(|e| dev(&case, e))?;
+            self.compare("conv fused", &format!("{case} f16"), &half, &expected, Tol::HALF)?;
+        }
+        Ok(())
     }
 
     // --- Pooling and elementwise ---

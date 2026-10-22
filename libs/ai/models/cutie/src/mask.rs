@@ -139,7 +139,9 @@ impl MaskEncoder {
                 1,
                 1,
                 true,
-            )?,
+            )?
+            // Autocast off around it in Cutie (`modules.py`'s SensoryDeepUpdater).
+            .always_fp32(),
         })
     }
 

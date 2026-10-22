@@ -89,6 +89,32 @@ pub struct CutieConfig {
     pub num_prototypes: usize,
     pub max_long_tokens: usize,
     pub buffer_tokens: usize,
+    /// What steps without a mask (propagation) run their convolutions in; steps given a mask
+    /// (commits, restoring memory frames) are always fp32, as the Python worker's autocast.
+    pub precision: CutiePrecision,
+}
+
+/// What a propagation step's convolutions run in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CutiePrecision {
+    /// Exact fp32 throughout: the oracle checks' precision.
+    Fp32,
+    /// As PyTorch's autocast: the convolutions' inputs and weights in half, multiplied with fp32
+    /// accumulation (outputs, the memory read, softmaxes, layer norms and linears fp32), except
+    /// the convolutions Cutie keeps in fp32 under autocast (the decoder's `pred`, the sensory
+    /// updates' `transform`). Where there is no half convolution (Metal, the references) steps
+    /// run fp32: `Cutie::effective_precision` says which.
+    Fp16,
+}
+
+impl CutiePrecision {
+    /// As replies and `RV_CUTIE_FP16` name it.
+    pub fn name(self) -> &'static str {
+        match self {
+            CutiePrecision::Fp32 => "fp32",
+            CutiePrecision::Fp16 => "fp16",
+        }
+    }
 }
 
 impl Default for CutieConfig {
@@ -106,6 +132,7 @@ impl Default for CutieConfig {
             num_prototypes: 128,
             max_long_tokens: 10000,
             buffer_tokens: 2000,
+            precision: CutiePrecision::Fp32,
         }
     }
 }
@@ -131,6 +158,12 @@ impl Cutie {
         }
         let mut weights = Weights::load(path)?;
         Ok(Self { net: CutieNet::load(&mut weights)?, config: CutieConfig::default() })
+    }
+
+    /// The precision steps really run in: `config.precision`, but fp32 where this build has no
+    /// half convolution (`GPU_CUTIE_HALF`: CUDA's only).
+    pub fn effective_precision(&self) -> CutiePrecision {
+        if makepad_ai_common::gpu::GPU_CUTIE_HALF { self.config.precision } else { CutiePrecision::Fp32 }
     }
 
     /// A processor for `objects` objects (the worker's slots), with its own memory.

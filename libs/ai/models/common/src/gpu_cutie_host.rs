@@ -97,6 +97,20 @@ pub fn gpu_cutie_conv2d_fused(
     gpu_cutie_conv2d_fused_reference(x, batch, in_w, in_h, cache_namespace, key, weights, bias, out_channels, k, pad, stride, residual, relu)
 }
 
+/// CUDA's half convolution for fp16 steps. Here there is none (no Metal kernel in half yet), so
+/// it is the fp32 one: `GPU_CUTIE_HALF` says so, and Cutie reports fp32.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_cutie_conv2d_fused_f16(
+    x: &GpuTensor, batch: usize, in_w: usize, in_h: usize, cache_namespace: &str, key: &str,
+    weights: &[f32], bias: Option<&[f32]>, out_channels: usize, k: usize, pad: usize, stride: usize,
+    residual: Option<&GpuTensor>, relu: bool,
+) -> Result<GpuTensor, String> {
+    gpu_cutie_conv2d_fused(x, batch, in_w, in_h, cache_namespace, key, weights, bias, out_channels, k, pad, stride, residual, relu)
+}
+
+/// Whether `gpu_cutie_conv2d_fused_f16` really runs in half (CUDA's): not on these builds.
+pub const GPU_CUTIE_HALF: bool = false;
+
 pub fn gpu_cutie_maxpool3x3s2(x: &GpuTensor, w: usize, h: usize) -> Result<GpuTensor, String> {
     #[cfg(target_os = "macos")]
     if !super::cutie_metal_ref("maxpool3x3s2")? {

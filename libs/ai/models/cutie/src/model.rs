@@ -20,15 +20,38 @@
 use crate::torch_pth::PthStateDict;
 use crate::{DiffusionError, Result};
 use makepad_ai_common::gpu::{
-    cutie_conv_out, gpu_add, gpu_birefnet_relu, gpu_concat_rows_many, gpu_cutie_add_broadcast, gpu_cutie_conv2d_fused, gpu_cutie_eca,
+    cutie_conv_out, gpu_add, gpu_birefnet_relu, gpu_concat_rows_many, gpu_cutie_add_broadcast, gpu_cutie_conv2d_fused,
+    gpu_cutie_conv2d_fused_f16, gpu_cutie_eca,
     gpu_cutie_layer_norm, gpu_cutie_sine_encoding, gpu_cutie_linear, gpu_download, gpu_planar_tokens_transpose,
     gpu_slice_rows, gpu_upload, GpuTensor,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::Path;
 
 /// The device weight cache's namespace for Cutie (`unload_cutie` evicts it).
 pub(crate) const CUTIE_NAMESPACE: &str = "cutie";
+
+thread_local! {
+    /// Whether this thread's convolutions run in half now (a step in fp16, `HalfConvs`).
+    static HALF_CONVS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// While alive, the calling thread's convolutions run in half when `on` (a propagation step in
+/// fp16), but those marked `fp32`; dropped, it puts back what was before. Cutie runs on one
+/// thread, so a switch for the step there reaches every convolution without passing a flag down.
+pub(crate) struct HalfConvs(bool);
+
+impl HalfConvs {
+    pub(crate) fn begin(on: bool) -> Self {
+        Self(HALF_CONVS.with(|h| h.replace(on)))
+    }
+}
+
+impl Drop for HalfConvs {
+    fn drop(&mut self) {
+        HALF_CONVS.with(|h| h.set(self.0));
+    }
+}
 
 /// BatchNorm's epsilon in Cutie's ResNets (torchvision's default).
 pub(crate) const BN_EPS: f64 = 1e-5;
@@ -83,7 +106,7 @@ impl Weights {
     pub(crate) fn conv(&mut self, name: &str, in_c: usize, out_c: usize, k: usize, pad: usize, stride: usize, bias: bool) -> Result<Conv2d> {
         let weights = self.f32(&format!("{name}.weight"), &[out_c, in_c, k, k])?;
         let bias = if bias { Some(self.f32(&format!("{name}.bias"), &[out_c])?) } else { None };
-        Ok(Conv2d { key: format!("{}{name}", self.key_prefix), weights, bias, in_c, out_c, k, pad, stride })
+        Ok(Conv2d { key: format!("{}{name}", self.key_prefix), weights, bias, in_c, out_c, k, pad, stride, fp32: false })
     }
 
     /// A bias-free Conv2d followed by an eval-mode BatchNorm2d, the BatchNorm folded into the
@@ -237,9 +260,17 @@ pub(crate) struct Conv2d {
     pub(crate) k: usize,
     pub(crate) pad: usize,
     pub(crate) stride: usize,
+    /// Always fp32, even in an fp16 step: the convolutions Cutie runs with autocast off.
+    pub(crate) fp32: bool,
 }
 
 impl Conv2d {
+    /// This convolution in fp32 even in fp16 steps.
+    pub(crate) fn always_fp32(mut self) -> Self {
+        self.fp32 = true;
+        self
+    }
+
     pub(crate) fn forward(&self, x: &Feat) -> Result<Feat> {
         self.forward_fused(x, None, false)
     }
@@ -256,7 +287,8 @@ impl Conv2d {
         if x.c != self.in_c {
             return Err(DiffusionError::model(format!("cutie conv {}: {} channels in, wants {}", self.key, x.c, self.in_c)));
         }
-        let t = gpu_cutie_conv2d_fused(
+        let conv = if !self.fp32 && HALF_CONVS.with(Cell::get) { gpu_cutie_conv2d_fused_f16 } else { gpu_cutie_conv2d_fused };
+        let t = conv(
             &x.t, x.n, x.w, x.h, CUTIE_NAMESPACE, &self.key, &self.weights, self.bias.as_deref(), self.out_c, self.k, self.pad, self.stride,
             residual.map(|r| &r.t), relu,
         )

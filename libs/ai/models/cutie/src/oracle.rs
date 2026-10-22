@@ -407,6 +407,11 @@ impl Tol {
     /// tenth of their range (YouTubeComp-15 at 960x540: 7%, cosine 0.9999997). The whole tensor
     /// must still agree (cosine), and the masks are judged by IoU.
     pub(crate) const RUN: Tol = Tol { rel: 0.15, cos: 0.9999, bool_mismatch: 0.01 };
+    /// One convolution in half against fp32: inputs and weights rounded to half's 10-bit
+    /// mantissas, as TF32 rounds them (rel 2e-4 to 1e-3, 1 - cosine about 2e-8 a layer, above),
+    /// with room; a convolution that lost its fp32 accumulation, or read the wrong half, misses
+    /// by far more.
+    pub(crate) const HALF: Tol = Tol { rel: 4e-3, cos: 1.0 - 1e-6, bool_mismatch: 0.0 };
     /// Reported, never failing.
     pub(crate) const INFO: Tol = Tol { rel: f32::INFINITY, cos: f64::NEG_INFINITY, bool_mismatch: 1.0 };
 }

@@ -66,7 +66,8 @@ impl SensoryUpdater {
             g16_conv: w.conv(&format!("{name}.g16_conv"), g_dims[0], mid, 1, 0, 1, true)?,
             g8_conv: w.conv(&format!("{name}.g8_conv"), g_dims[1], mid, 1, 0, 1, true)?,
             g4_conv: w.conv(&format!("{name}.g4_conv"), g_dims[2], mid, 1, 0, 1, true)?,
-            transform: w.conv(&format!("{name}.transform"), mid + sensory, sensory * 3, 3, 1, 1, true)?,
+            // Autocast off around it in Cutie (`modules.py`'s SensoryUpdater).
+            transform: w.conv(&format!("{name}.transform"), mid + sensory, sensory * 3, 3, 1, 1, true)?.always_fp32(),
         })
     }
 
@@ -113,7 +114,8 @@ impl MaskDecoder {
             feat_proc4: w.conv("mask_decoder.decoder_feat_proc.transforms.1", f4_dim, up[1], 1, 0, 1, true)?,
             up_16_8: MaskUpsampleBlock::load(w, "mask_decoder.up_16_8", up[0], up[1])?,
             up_8_4: MaskUpsampleBlock::load(w, "mask_decoder.up_8_4", up[1], up[2])?,
-            pred: w.conv("mask_decoder.pred", up[2], 1, 3, 1, 1, true)?,
+            // Autocast off around it in Cutie (`big_modules.py`'s MaskDecoder).
+            pred: w.conv("mask_decoder.pred", up[2], 1, 3, 1, 1, true)?.always_fp32(),
             sensory_update: SensoryUpdater::load(w, "mask_decoder.sensory_update", [up[0], up[1], up[2] + 1], sensory, sensory)?,
         })
     }

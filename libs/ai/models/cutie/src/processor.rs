@@ -249,6 +249,8 @@ impl<'a> CutieProcessor<'a> {
         &mut self, image: &[u8], width: usize, height: usize, mask: Option<&[f32]>, force_permanent: bool, end: bool, tap: &mut Tap,
     ) -> Result<Vec<f32>> {
         let n = self.objects;
+        // fp16 steps are the propagated ones (no mask), as the Python worker's autocast.
+        let _half = crate::model::HalfConvs::begin(self.config.precision == crate::CutiePrecision::Fp16 && mask.is_none());
         let frame = Frame::new(width, height, self.config.max_internal_size);
         if mask.is_some_and(|m| m.len() != n * width * height) {
             return Err(DiffusionError::model(format!("cutie step: the mask is not {n} objects at {width}x{height}")));

@@ -32,6 +32,9 @@
 //!   and the ReLU as passes of their own, and the bare GEMM of the same shape (what is left is
 //!   im2col and the epilogue).
 //!
+//! With MAKEPAD_CUTIE_BENCH_FP16=1 the steps without a mask run in fp16 (`CutiePrecision::Fp16`,
+//! CUDA only), so their digests differ from fp32's.
+//!
 //! Prints `BENCH` lines and one `CUTIE_BENCH {json}` line. The GPU may be shared: compare runs
 //! made close together, several times. The Python worker's side is RationalVisions'
 //! `tools/cutie-oracle/cutie_oracle.py bench`, on the same oracle.
@@ -40,7 +43,7 @@ use crate::memory::{KeyValueStore, Permanence};
 use crate::model::{add, dev, relu, Conv2d, CutieNet, Feat, Tap, Weights};
 use crate::oracle::{Oracle, Report};
 use crate::processor::{CutieProcessor, Frame, WorkerMasks};
-use crate::{DiffusionError, Result};
+use crate::{CutieConfig, CutiePrecision, DiffusionError, Result};
 use makepad_ai_common::gpu::{
     cutie_conv_out, gpu_cutie_matmul, gpu_cutie_maxpool3x3s2, gpu_cutie_similarity, gpu_cutie_topk_softmax, gpu_download, gpu_perf_stats,
     gpu_rife_fill, gpu_stream_counts, gpu_synchronize, gpu_upload,
@@ -201,12 +204,13 @@ pub(crate) fn run(oracle: &Oracle, weights_path: &Path, report: &mut Report) -> 
     let (pw, ph) = frame.padded();
     let name = oracle.dir.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     println!(
-        "BENCH {name}: {w}x{h} ({}x{} inside, padded {pw}x{ph}, {} tokens a frame), {n} objects, {} frames, {} steps; {passes} passes (the first cold), then {PART_PASSES} in parts",
+        "BENCH {name}: {w}x{h} ({}x{} inside, padded {pw}x{ph}, {} tokens a frame), {n} objects, {} frames, {} steps, propagation in {}; {passes} passes (the first cold), then {PART_PASSES} in parts",
         frame.w,
         frame.h,
         (pw / 16) * (ph / 16),
         oracle.frames,
-        oracle.schedule().len()
+        oracle.schedule().len(),
+        bench_precision().name()
     );
 
     let mut watch = MemoryWatch::new();
@@ -455,6 +459,8 @@ fn profile_conv(
 /// decoder for `objects` objects on its features (the memory readout and sensory memory
 /// constant), then of the mask encoder (its inputs constant), each timed alone (`profile_conv`).
 fn conv_profile(net: &CutieNet, image: &Feat, objects: usize) -> Result<Vec<ConvTime>> {
+    // As the bench's propagation runs them (the bare GEMM stays fp32).
+    let _half = crate::model::HalfConvs::begin(bench_precision() == CutiePrecision::Fp16);
     let mut times = Vec::new();
     let pe = &net.pixel_encoder;
     let x = pe.normalise(image)?;
@@ -535,12 +541,19 @@ fn conv_profile(net: &CutieNet, image: &Feat, objects: usize) -> Result<Vec<Conv
     Ok(times)
 }
 
+/// What the bench's propagation steps run in: fp16 with MAKEPAD_CUTIE_BENCH_FP16=1 (fp32 where
+/// this build has no half convolution), else fp32.
+fn bench_precision() -> CutiePrecision {
+    let asked = std::env::var("MAKEPAD_CUTIE_BENCH_FP16").is_ok_and(|v| v == "1");
+    if asked && makepad_ai_common::gpu::GPU_CUTIE_HALF { CutiePrecision::Fp16 } else { CutiePrecision::Fp32 }
+}
+
 /// The oracle's run once, as stage `run` drives it (without taps or comparisons), with a fresh
 /// processor: each step timed, synchronised before and after; in parts when `in_parts`.
 fn replay(oracle: &Oracle, net: &CutieNet, frames: &[u8], masks: &WorkerMasks, in_parts: bool, watch: &mut MemoryWatch) -> Result<Vec<Step>> {
     let (w, h, n) = (oracle.width, oracle.height, oracle.objects);
     let (plane, size) = (w * h, w * h * 3);
-    let mut processor = CutieProcessor::new(net, oracle.config.clone(), n);
+    let mut processor = CutieProcessor::new(net, CutieConfig { precision: bench_precision(), ..oracle.config.clone() }, n);
     // Each frame's latest label map, frame 0's the seed's to begin with (the worker's masks).
     let mut frame_labels: Vec<Option<Vec<u8>>> = vec![None; oracle.frames];
     frame_labels[0] = Some(masks.seed.clone());
@@ -593,6 +606,7 @@ fn step_in_parts(
 ) -> Result<Vec<f32>> {
     let n = p.objects;
     let net = p.net;
+    let _half = crate::model::HalfConvs::begin(p.config.precision == crate::CutiePrecision::Fp16 && mask.is_none());
     let mut no_taps = Tap::none();
     let tap = &mut no_taps;
     let frame = Frame::new(width, height, p.config.max_internal_size);
