@@ -39,6 +39,8 @@ pub(crate) struct Oracle {
     pub(crate) objects: usize,
     /// The settings Cutie ran with (`config.*` in `raw/meta.txt`; the defaults where absent).
     pub(crate) config: CutieConfig,
+    /// How the oracle's `torch.topk` broke exact ties, from the device it ran on (`TieOrder`).
+    pub(crate) tie_order: TieOrder,
     /// Every processor step of the run (`raw/schedule.tsv`).
     schedule: Vec<ScheduleRow>,
     manifests: HashMap<String, Vec<(String, String, Vec<usize>)>>,
@@ -135,6 +137,13 @@ impl Oracle {
         };
         let objects = get("objects")?;
         let config = Self::read_config(&meta, objects).map_err(|e| io(&meta_path, e))?;
+        // Oracles from before meta.txt carried the settings record the device in oracle.json
+        // only (read only then: it is large).
+        let json = match Self::device_in(&meta, None) {
+            Some(_) => None,
+            None => fs::read_to_string(dir.join("oracle.json")).ok(),
+        };
+        let tie_order = TieOrder::of_device(Self::device_in(&meta, json.as_deref()).as_deref());
         let schedule = Self::read_schedule(dir)?;
         let mut manifests = HashMap::new();
         for step in schedule.iter().filter_map(|r| r.tap.as_deref()) {
@@ -160,9 +169,25 @@ impl Oracle {
             height: get("height")?,
             objects,
             config,
+            tie_order,
             schedule,
             manifests,
         })
+    }
+
+    /// The device the oracle ran on: `meta.txt`'s `config.device`, else the top-level `"device"`
+    /// of `oracle.json` (`json`, written with one space of indent; the settings' own `"device"`,
+    /// deeper, may say `auto`), which every oracle has, older ones without `config.*` lines too.
+    /// None when neither names one.
+    fn device_in(meta: &str, json: Option<&str>) -> Option<String> {
+        let named = |v: &str| -> Option<String> {
+            let v = v.trim().trim_end_matches(',').trim().trim_matches('"');
+            (!v.is_empty() && v != "auto").then(|| v.to_string())
+        };
+        meta.lines()
+            .find_map(|l| l.strip_prefix("config.device="))
+            .and_then(named)
+            .or_else(|| json?.lines().find_map(|l| l.strip_prefix(" \"device\":")).and_then(named))
     }
 
     /// The settings in `meta.txt`'s `config.<key>=<value>` lines over the defaults (an oracle
@@ -382,6 +407,11 @@ impl Tol {
     /// tenth of their range (YouTubeComp-15 at 960x540: 7%, cosine 0.9999997). The whole tensor
     /// must still agree (cosine), and the masks are judged by IoU.
     pub(crate) const RUN: Tol = Tol { rel: 0.15, cos: 0.9999, bool_mismatch: 0.01 };
+    /// One convolution in half against fp32: inputs and weights rounded to half's 10-bit
+    /// mantissas, as TF32 rounds them (rel 2e-4 to 1e-3, 1 - cosine about 2e-8 a layer, above),
+    /// with room; a convolution that lost its fp32 accumulation, or read the wrong half, misses
+    /// by far more.
+    pub(crate) const HALF: Tol = Tol { rel: 4e-3, cos: 1.0 - 1e-6, bool_mismatch: 0.0 };
     /// Reported, never failing.
     pub(crate) const INFO: Tol = Tol { rel: f32::INFINITY, cos: f64::NEG_INFINITY, bool_mismatch: 1.0 };
 }
@@ -551,6 +581,214 @@ impl Report {
     }
 }
 
+/// How an oracle's `torch.topk` broke exact ties, which PyTorch leaves open: from the device it
+/// ran on (`Oracle::device_in`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TieOrder {
+    /// CUDA's: the lower index first, as the port's top-ks (`gpu_cutie_topk_softmax`). On such an
+    /// oracle the port is held to it: a tie it broke otherwise fails (`TieJudgement::pass`).
+    LowerIndex,
+    /// CPU torch's (or the device is not recorded): an order of its own, so the picks at an exact
+    /// tie are judged as a set.
+    Open,
+}
+
+impl TieOrder {
+    fn of_device(device: Option<&str>) -> Self {
+        match device {
+            Some(d) if d.starts_with("cuda") => TieOrder::LowerIndex,
+            _ => TieOrder::Open,
+        }
+    }
+}
+
+/// Exact ties at the cut of a top-k taken down each column of a score matrix: the memory read's
+/// similarity [N, h*w], each pixel keeping its k best memory tokens. `torch.topk` leaves open
+/// which of equal values it keeps: CUDA's keeps the lower index, as the port does
+/// (`gpu_cutie_topk_softmax`), and CPU torch's an order of its own (about half of the tied
+/// columns the higher index, on the PC's x86 and the Mac's M5 alike). Working memory holds the
+/// first frame twice (the commit's permanent copy, then the propagation's first temporary
+/// frame), so pairs of identical tokens tie, and the cut falls inside a pair wherever an odd
+/// number of tokens score above it: at `prop_f40` 50 of Solege-03's 336 columns, 32 of
+/// YouTubeComp-15's, 40 of lawn_cut's 432; in the edits, 100 at `back_f9` and 98 at `prop2_f11`.
+/// So where the oracle's own k-th and (k+1)-th scores are exactly equal, a top-k's output is
+/// judged with its picks among the tied tokens taken as a set (`align`); every other column, and
+/// every token outside the tie, exactly as before. On an oracle made on CUDA (`TieOrder::
+/// LowerIndex`) the picks are still aligned, but a column moved fails the judgement's row, so the
+/// port's lower-index rule stays checked against CUDA's torch.
+pub(crate) struct TopKTies {
+    rows: usize,
+    cols: usize,
+    /// Each tied column with its tied tokens (the rows scoring exactly the k-th best), ascending.
+    columns: Vec<(usize, Vec<usize>)>,
+}
+
+impl TopKTies {
+    /// The columns of `scores` (an oracle tap whose last two dimensions are the rows and the
+    /// columns, any before them 1) whose k-th and (k+1)-th largest are exactly equal.
+    pub(crate) fn find(scores: &OracleTap, k: usize) -> Result<Self> {
+        let dims = scores.shape.len();
+        let (rows, cols) = if dims >= 2 { (scores.shape[dims - 2], scores.shape[dims - 1]) } else { (0, 0) };
+        if dims < 2 || rows * cols != scores.values.len() {
+            return Err(DiffusionError::model(format!("cutie oracle: top-k scores {:?} are not one matrix", scores.shape)));
+        }
+        let mut columns = Vec::new();
+        // Without a (k+1)-th score every token is kept: no cut, no tie.
+        if k == 0 || k >= rows {
+            return Ok(Self { rows, cols, columns });
+        }
+        let at = |r: usize, c: usize| scores.values[r * cols + c];
+        let mut column = vec![0.0f32; rows];
+        for c in 0..cols {
+            for (r, v) in column.iter_mut().enumerate() {
+                *v = at(r, c);
+            }
+            // Largest first: the k largest end up before index k, the (k+1)-th at it.
+            column.select_nth_unstable_by(k, |a, b| b.total_cmp(a));
+            let next = column[k];
+            let kth = column[..k].iter().copied().min_by(|a, b| a.total_cmp(b)).unwrap_or(f32::NAN);
+            if kth == next {
+                columns.push((c, (0..rows).filter(|&r| at(r, c) == kth).collect()));
+            }
+        }
+        Ok(Self { rows, cols, columns })
+    }
+
+    /// Judges `actual`, a top-k's output down the columns of the scores ([rows, cols] in the same
+    /// order, zero where a token was not kept: the read's affinity), against the oracle's
+    /// `expected`. In each tied column where it kept other tied tokens than the oracle did, as
+    /// many of them, their weights are moved onto the oracle's, in order (they are equal: equal
+    /// scores through one softmax). Every token outside the tie, every column without one, and a
+    /// tied column that kept another number of the tied tokens than the oracle are left as they
+    /// are, to be compared as before.
+    pub(crate) fn align(&self, actual: &mut [f32], expected: &[f32]) -> TieJudgement {
+        let mut judgement = TieJudgement { columns: self.cols, tied: self.columns.len(), ..TieJudgement::default() };
+        let n = self.rows * self.cols;
+        if actual.len() != n || expected.len() != n {
+            // The comparison fails on the size; nothing to judge.
+            judgement.unmatched = self.columns.len();
+            return judgement;
+        }
+        let cols = self.cols;
+        for (c, tied) in &self.columns {
+            let kept = |t: &[f32]| -> Vec<usize> { tied.iter().copied().filter(|&r| t[r * cols + c] != 0.0).collect() };
+            let (ours, theirs) = (kept(actual), kept(expected));
+            if ours == theirs {
+                continue;
+            }
+            if ours.len() != theirs.len() {
+                judgement.unmatched += 1;
+                continue;
+            }
+            let weights: Vec<f32> = ours.iter().map(|&r| actual[r * cols + c]).collect();
+            for &r in &ours {
+                actual[r * cols + c] = 0.0;
+            }
+            for ((&from, &to), &w) in ours.iter().zip(&theirs).zip(&weights) {
+                actual[to * cols + c] = w;
+                judgement.moves.push((from, to, w));
+            }
+            judgement.moved += 1;
+        }
+        judgement
+    }
+}
+
+/// What `TopKTies::align` found and did.
+#[derive(Default)]
+pub(crate) struct TieJudgement {
+    /// The top-k's columns, and those tied at its cut in the oracle's scores.
+    pub(crate) columns: usize,
+    pub(crate) tied: usize,
+    /// Tied columns that kept other tied tokens than the oracle, as many, judged as sets: their
+    /// weights were moved onto the oracle's tokens.
+    pub(crate) moved: usize,
+    /// Tied columns that kept another number of the tied tokens than the oracle (or a top-k of
+    /// another size), left to the comparison.
+    pub(crate) unmatched: usize,
+    /// Each weight moved: from row, to row, the weight.
+    moves: Vec<(usize, usize, f32)>,
+}
+
+impl TieJudgement {
+    /// `sums`, the top-k output's sums along each row (the read's usage, [rows]), with the
+    /// weights `align` moved moved too (each row's change summed in f64, then added once).
+    pub(crate) fn align_sums(&self, sums: &mut [f32]) {
+        let mut change: HashMap<usize, f64> = HashMap::new();
+        for &(from, to, w) in &self.moves {
+            *change.entry(from).or_insert(0.0) -= w as f64;
+            *change.entry(to).or_insert(0.0) += w as f64;
+        }
+        for (row, d) in change {
+            if let Some(s) = sums.get_mut(row).filter(|_| d != 0.0) {
+                *s = (*s as f64 + d) as f32;
+            }
+        }
+    }
+
+    /// Whether the judgement's row passes, the oracle having broken ties in `order`. Where it kept
+    /// the lower index (CUDA's torch.topk, as the port's top-k does), the port must have kept the
+    /// oracle's own tied tokens: a column `moved` fails, and so does one `unmatched` where
+    /// `unmatched_fails` (stage `memory`, which reads with the oracle's own keys; stage `run`
+    /// reads its own, whose near ties may move the cut, as its affinity row allows). Anywhere else
+    /// the picks at a tie are judged as sets and the row passes, saying what was moved.
+    pub(crate) fn pass(&self, order: TieOrder, unmatched_fails: bool) -> bool {
+        match order {
+            TieOrder::LowerIndex => self.moved == 0 && (!unmatched_fails || self.unmatched == 0),
+            TieOrder::Open => true,
+        }
+    }
+
+    /// What was judged, for a report row.
+    pub(crate) fn note(&self, k: usize, order: TieOrder) -> String {
+        let rule = match order {
+            TieOrder::LowerIndex => "a CUDA oracle: the lower index must be kept",
+            TieOrder::Open => "not a CUDA oracle: tied picks judged as sets",
+        };
+        format!(
+            "{} of {} columns tied at the top {k}'s cut in the oracle's scores; {} kept other tied tokens than the oracle ({} weights moved onto the oracle's), {} another number of them ({rule})",
+            self.tied,
+            self.columns,
+            self.moved,
+            self.moves.len(),
+            self.unmatched
+        )
+    }
+}
+
+/// A `Comparer`'s judging of the memory read's exact top-k ties (`TopKTies`), for stage `run`:
+/// `memory.read.affinity` is aligned to the oracle's picks among the tied tokens before it is
+/// compared, then `memory.read.usage` by the same moves. (Stage `memory` aligns the read itself,
+/// and carries the oracle's picks on into the usage counted and the readout.)
+pub(crate) struct ReadTies {
+    pub(crate) top_k: usize,
+    /// The step's judgement, once its affinity is taken.
+    pub(crate) judgement: Option<TieJudgement>,
+}
+
+impl ReadTies {
+    pub(crate) fn new(top_k: usize) -> Self {
+        Self { top_k, judgement: None }
+    }
+
+    /// Aligns `actual`, the tap `name` of `step`, when it is the read's affinity or usage.
+    fn align(&mut self, oracle: &Oracle, step: &str, name: &str, actual: &mut [f32], expected: &[f32]) -> Result<()> {
+        match name {
+            "memory.read.affinity" if oracle.has(step, "memory.read.similarity") => {
+                let ties = TopKTies::find(&oracle.tap(step, "memory.read.similarity")?, self.top_k)?;
+                self.judgement = Some(ties.align(actual, expected));
+            }
+            "memory.read.usage" => {
+                if let Some(judgement) = &self.judgement {
+                    judgement.align_sums(actual);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
 /// Compares every tap put with the oracle's of the same name in `step` (names the oracle lacks
 /// are noted, not failed). `tol` chooses the tolerance by name.
 pub(crate) struct Comparer<'a> {
@@ -560,11 +798,13 @@ pub(crate) struct Comparer<'a> {
     pub(crate) step: String,
     pub(crate) tol: &'a dyn Fn(&str) -> Tol,
     pub(crate) seen: HashMap<String, usize>,
+    /// When set, the read's affinity and usage are judged at exact top-k ties (`ReadTies`).
+    pub(crate) read_ties: Option<ReadTies>,
 }
 
 impl<'a> Comparer<'a> {
     pub(crate) fn new(oracle: &'a Oracle, report: &'a mut Report, stage: &str, step: &str, tol: &'a dyn Fn(&str) -> Tol) -> Self {
-        Self { oracle, report, stage: stage.into(), step: step.into(), tol, seen: HashMap::new() }
+        Self { oracle, report, stage: stage.into(), step: step.into(), tol, seen: HashMap::new(), read_ties: None }
     }
 
     /// Takes a tap: the oracle's `#n` suffix is added for a name put again.
@@ -577,7 +817,10 @@ impl<'a> Comparer<'a> {
             return Ok(());
         }
         let expected = self.oracle.tap(&self.step, &name)?;
-        let actual = gpu_download(t).map_err(|e| DiffusionError::model(format!("cutie tap {name}: {e}")))?;
+        let mut actual = gpu_download(t).map_err(|e| DiffusionError::model(format!("cutie tap {name}: {e}")))?;
+        if let Some(ties) = &mut self.read_ties {
+            ties.align(self.oracle, &self.step, &name, &mut actual, &expected.values)?;
+        }
         let tol = (self.tol)(&name);
         self.report.compare(&self.stage, &self.step, &name, &actual, &expected, tol);
         Ok(())
@@ -631,5 +874,117 @@ impl<'a> Comparer<'a> {
             .filter(|name| self.oracle.shape(&self.step, name).map_or(true, |s| s.iter().product::<usize>() > 0))
             .map(String::from)
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Scores [1, rows, cols] from columns.
+    fn scores(columns: &[&[f32]]) -> OracleTap {
+        let (rows, cols) = (columns[0].len(), columns.len());
+        let values = (0..rows * cols).map(|i| columns[i % cols][i / cols]).collect();
+        OracleTap { shape: vec![1, rows, cols], dtype: "float32".into(), values }
+    }
+
+    /// A top-k output [rows, cols] keeping `kept[c]`'s rows of column c, each at weight `w`.
+    fn kept(rows: usize, kept: &[&[usize]], w: f32) -> Vec<f32> {
+        let cols = kept.len();
+        let mut out = vec![0.0; rows * cols];
+        for (c, rows) in kept.iter().enumerate() {
+            for &r in *rows {
+                out[r * cols + c] = w;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn only_a_tie_at_the_cut_is_a_tie() {
+        let s = scores(&[
+            &[5.0, 4.0, 4.0, 1.0, 0.0],  // 2nd and 3rd equal: tied, rows 1 and 2
+            &[5.0, 4.0, 3.0, 3.0, 0.0],  // equal below the cut
+            &[4.0, 4.0, 1.0, 0.0, 0.0],  // equal inside the top 2
+            &[2.0, 0.0, 2.0, -1.0, 2.0], // three equal across the cut: rows 0, 2, 4
+        ]);
+        let ties = TopKTies::find(&s, 2).unwrap();
+        assert_eq!(ties.columns, vec![(0, vec![1, 2]), (3, vec![0, 2, 4])]);
+        assert!(TopKTies::find(&s, 5).unwrap().columns.is_empty(), "every token kept: no cut");
+        assert!(TopKTies::find(&s, 0).unwrap().columns.is_empty());
+        let not_a_matrix = OracleTap { shape: vec![4, 5], dtype: "float32".into(), values: vec![0.0; 19] };
+        assert!(TopKTies::find(&not_a_matrix, 2).is_err());
+    }
+
+    #[test]
+    fn other_tied_picks_are_moved_and_nothing_else() {
+        let s = scores(&[&[5.0, 4.0, 4.0, 1.0, 0.0], &[5.0, 4.0, 3.0, 3.0, 0.0], &[2.0, 0.0, 2.0, -1.0, 2.0]]);
+        let ties = TopKTies::find(&s, 2).unwrap();
+        // The oracle kept the higher of each tie; the port the lower, and in the untied column
+        // another token than the oracle.
+        let expected = kept(5, &[&[0, 2], &[0, 1], &[2, 4]], 0.5);
+        let mut actual = kept(5, &[&[0, 1], &[0, 2], &[0, 2]], 0.5);
+        let mut usage: Vec<f32> = (0..5).map(|r| (0..3).map(|c| actual[r * 3 + c]).sum()).collect();
+        let judgement = ties.align(&mut actual, &expected);
+        assert_eq!((judgement.tied, judgement.moved, judgement.unmatched), (2, 2, 0));
+        let column = |t: &[f32], c: usize| (0..5).map(|r| t[r * 3 + c]).collect::<Vec<_>>();
+        assert_eq!(column(&actual, 0), column(&expected, 0));
+        assert_eq!(column(&actual, 2), column(&expected, 2));
+        assert_eq!(column(&actual, 1), vec![0.5, 0.0, 0.5, 0.0, 0.0], "an untied column is left to the comparison");
+        judgement.align_sums(&mut usage);
+        let sums: Vec<f32> = (0..5).map(|r| (0..3).map(|c| actual[r * 3 + c]).sum()).collect();
+        assert_eq!(usage, sums, "the usage follows the moves");
+    }
+
+    #[test]
+    fn a_tie_kept_in_another_number_is_left_alone() {
+        let s = scores(&[&[5.0, 4.0, 4.0, 1.0, 0.0]]);
+        let ties = TopKTies::find(&s, 2).unwrap();
+        let expected = kept(5, &[&[0, 2]], 0.5);
+        for picks in [&[1usize, 2][..], &[0, 3][..]] {
+            let mut actual = kept(5, &[picks], 0.5);
+            let before = actual.clone();
+            let judgement = ties.align(&mut actual, &expected);
+            assert_eq!((judgement.moved, judgement.unmatched), (0, 1), "{picks:?}");
+            assert_eq!(actual, before);
+        }
+        let mut same = expected.clone();
+        let judgement = ties.align(&mut same, &expected);
+        assert_eq!((judgement.tied, judgement.moved, judgement.unmatched), (1, 0, 0));
+        let mut short = vec![0.0; 4];
+        assert_eq!(ties.align(&mut short, &expected).unmatched, 1, "another size is not judged");
+    }
+
+    #[test]
+    fn a_cuda_oracle_holds_the_port_to_the_lower_index() {
+        let s = scores(&[&[5.0, 4.0, 4.0, 1.0, 0.0]]);
+        let ties = TopKTies::find(&s, 2).unwrap();
+        let lower = kept(5, &[&[0, 1]], 0.5);
+        let (cuda, cpu) = (TieOrder::LowerIndex, TieOrder::Open);
+        // The port kept the higher of the twins, CUDA's oracle the lower: moved, which fails there.
+        let moved = ties.align(&mut kept(5, &[&[0, 2]], 0.5), &lower);
+        assert_eq!(moved.moved, 1);
+        assert!(!moved.pass(cuda, true) && !moved.pass(cuda, false));
+        assert!(moved.pass(cpu, true));
+        // Both twins kept: another number, failing on the oracle's own keys only.
+        let unmatched = ties.align(&mut kept(5, &[&[1, 2]], 0.5), &lower);
+        assert_eq!((unmatched.moved, unmatched.unmatched), (0, 1));
+        assert!(!unmatched.pass(cuda, true) && unmatched.pass(cuda, false) && unmatched.pass(cpu, true));
+        let same = ties.align(&mut lower.clone(), &lower);
+        assert!(same.pass(cuda, true));
+    }
+
+    #[test]
+    fn the_device_gives_the_tie_order() {
+        let order = |meta: &str, json: Option<&str>| TieOrder::of_device(Oracle::device_in(meta, json).as_deref());
+        let json = |device: &str| format!("{{\n \"what\": \"oracle\",\n \"device\": \"{device}\",\n \"settings\": {{\n  \"device\": \"auto\"\n }}\n}}\n");
+        assert_eq!(order("frames=42\nconfig.device=cuda\n", None), TieOrder::LowerIndex);
+        assert_eq!(order("frames=42\nconfig.device=cpu\n", Some(&json("cuda"))), TieOrder::Open, "meta.txt first");
+        // Older oracles: no config lines, the device in oracle.json, not its settings' "auto".
+        assert_eq!(order("frames=42\n", Some(&json("cuda"))), TieOrder::LowerIndex);
+        assert_eq!(order("frames=42\n", Some(&json("cpu"))), TieOrder::Open);
+        assert_eq!(order("config.device=auto\n", Some(&json("cuda"))), TieOrder::LowerIndex);
+        assert_eq!(order("frames=42\n", Some("{\n \"settings\": {\n  \"device\": \"cuda\"\n }\n}\n")), TieOrder::Open);
+        assert_eq!(order("frames=42\n", None), TieOrder::Open, "not recorded");
     }
 }

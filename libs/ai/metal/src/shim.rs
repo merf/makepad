@@ -4884,17 +4884,17 @@ mod imp {
             }
         }
 
-        /// The f32 contents of a host-backed tensor as little-endian bytes.
+        /// The f32 contents of a resident tensor as little-endian bytes, read on the host once its
+        /// writer has finished (`stream::with_host`, which borrows the stream's context, not this
+        /// one: no re-entry).
         fn tensor_f32_bytes(t: &crate::gpu_types::GpuTensor) -> Result<Vec<u8>, String> {
-            let data = t
-                .data
-                .try_borrow()
-                .map_err(|_| "metal GpuTensor already borrowed".to_string())?;
-            let mut bytes = Vec::with_capacity(data.len() * 4);
-            for value in data.iter() {
-                bytes.extend_from_slice(&value.to_le_bytes());
-            }
-            Ok(bytes)
+            crate::stream::with_host(t, |data| {
+                let mut bytes = Vec::with_capacity(data.len() * 4);
+                for value in data.iter() {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+                bytes
+            })
         }
 
         /// A pooled f32 `[rows, cols]` buffer registered in `keep` (given back
@@ -4922,8 +4922,8 @@ mod imp {
             lin: &super::DecLinearRef<'_>,
             keep: &mut Vec<StrongId>,
         ) -> Result<ObjcId, String> {
-            let n = lin.weight.rows;
-            let k = lin.weight.cols;
+            let n = lin.weight.rows();
+            let k = lin.weight.cols();
             let weight = lin.weight;
             let w_id = self.get_or_create_named_weight_buffer(
                 "two_way",
@@ -4933,10 +4933,10 @@ mod imp {
             let dst_id = self.two_way_scratch(m, n, keep)?;
             self.matmul_nt_into_buffer(GGML_TYPE_F32, w_id, src_id, dst_id, m, k, n)?;
             if let Some(bias) = lin.bias {
-                if bias.rows * bias.cols != n {
+                if bias.rows() * bias.cols() != n {
                     return Err(format!(
                         "two-way linear bias {}x{} does not match n {}",
-                        bias.rows, bias.cols, n
+                        bias.rows(), bias.cols(), n
                     ));
                 }
                 let b_id = self.get_or_create_named_weight_buffer(
@@ -5031,7 +5031,7 @@ mod imp {
             }
             let sa = &layer.self_attn;
             let ca = &layer.cross_attn;
-            let inner = sa.q.weight.rows;
+            let inner = sa.q.weight.rows();
             if inner == 0 || inner % layer.n_head != 0 {
                 return Err(format!(
                     "two-way layer: attention width {} not divisible by {} heads",
@@ -5043,7 +5043,7 @@ mod imp {
                 return Err(format!("two-way layer: head dim {} unsupported", head_dim));
             }
             let shape_ok = |lin: &super::DecLinearRef<'_>, n: usize, k: usize| {
-                lin.weight.rows == n && lin.weight.cols == k
+                lin.weight.rows() == n && lin.weight.cols() == k
             };
             if !shape_ok(&sa.q, inner, dim)
                 || !shape_ok(&sa.k, inner, dim)
@@ -5053,12 +5053,12 @@ mod imp {
                 || !shape_ok(&ca.k, inner, ctx_dim)
                 || !shape_ok(&ca.v, inner, ctx_dim)
                 || !shape_ok(&ca.out, dim, inner)
-                || layer.ffn_first.weight.cols != dim
-                || !shape_ok(&layer.ffn_second, dim, layer.ffn_first.weight.rows)
+                || layer.ffn_first.weight.cols() != dim
+                || !shape_ok(&layer.ffn_second, dim, layer.ffn_first.weight.rows())
             {
                 return Err("two-way layer: weight shapes do not match the layer".to_string());
             }
-            let ffn_width = layer.ffn_first.weight.rows;
+            let ffn_width = layer.ffn_first.weight.rows();
             let scale = 1.0 / (head_dim as f32).sqrt();
             let eps = layer.eps;
             let tag = TWO_WAY_TAG_BASE;

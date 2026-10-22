@@ -2,9 +2,10 @@
 //! Segmentation", the `merf/Cutie` fork at ec5cdd4), natively: the `cutie-base-mega` checkpoint
 //! read from its `.pth`, the network on Makepad's CUDA tensors in fp32, and Cutie's memory and
 //! per-frame step. Checked part by part against a PyTorch oracle (RationalVisions'
-//! `tools/cutie-oracle`) with `cutie-validate`. On macOS, which has no Cutie kernels yet, each of
-//! Cutie's ops is its host reference on the Metal tensors (`gpu_cutie_host.rs` in
-//! makepad-ai-common): the same checks, correct and slow.
+//! `tools/cutie-oracle`) with `cutie-validate`. On macOS Cutie's ops are Makepad's Metal kernels
+//! (makepad-ai-metal's `cutie_ops`, dispatched by `gpu_cutie_host.rs` in makepad-ai-common), each
+//! one variable away from its host reference (MAKEPAD_CUTIE_METAL_REF=all or op,op): the same
+//! checks.
 //!
 //! ```ignore
 //! let cutie = Cutie::load(Path::new("cutie-base-mega.pth"))?;
@@ -26,7 +27,11 @@
 //! that made them. Load, step and unload (`unload_cutie`, then `gpu_pool_clear` if wanted) on one
 //! thread kept for Cutie. A `Cutie` moved to another thread still works there, but uploads every
 //! convolution's weights again on that thread, and `unload_cutie` frees only the calling thread's
-//! copy. A `CutieProcessor` borrows its `Cutie` and stays on its thread (it is not `Send`).
+//! copy. On macOS the new thread also compiles the Metal kernel libraries again at first use
+//! (`Cutie::load`'s check compiled them on the loading thread only), and a tensor that queued work
+//! on the old thread's stream still uses is refused there: call `gpu_synchronize` on the old
+//! thread before the move. A `CutieProcessor` borrows its `Cutie` and stays on its thread (it is
+//! not `Send`).
 //!
 //! **Errors**: a step that fails part way (the device out of memory, a frame of another size than
 //! the memory's) may leave the processor's counters advanced and its usage counted, as
@@ -84,6 +89,32 @@ pub struct CutieConfig {
     pub num_prototypes: usize,
     pub max_long_tokens: usize,
     pub buffer_tokens: usize,
+    /// What steps without a mask (propagation) run their convolutions in; steps given a mask
+    /// (commits, restoring memory frames) are always fp32, as the Python worker's autocast.
+    pub precision: CutiePrecision,
+}
+
+/// What a propagation step's convolutions run in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CutiePrecision {
+    /// Exact fp32 throughout: the oracle checks' precision.
+    Fp32,
+    /// As PyTorch's autocast: the convolutions' inputs and weights in half, multiplied with fp32
+    /// accumulation (outputs, the memory read, softmaxes, layer norms and linears fp32), except
+    /// the convolutions Cutie keeps in fp32 under autocast (the decoder's `pred`, the sensory
+    /// updates' `transform`). Where there is no half convolution (Metal, the references) steps
+    /// run fp32: `Cutie::effective_precision` says which.
+    Fp16,
+}
+
+impl CutiePrecision {
+    /// As replies and `RV_CUTIE_FP16` name it.
+    pub fn name(self) -> &'static str {
+        match self {
+            CutiePrecision::Fp32 => "fp32",
+            CutiePrecision::Fp16 => "fp16",
+        }
+    }
 }
 
 impl Default for CutieConfig {
@@ -101,6 +132,7 @@ impl Default for CutieConfig {
             num_prototypes: 128,
             max_long_tokens: 10000,
             buffer_tokens: 2000,
+            precision: CutiePrecision::Fp32,
         }
     }
 }
@@ -114,15 +146,24 @@ pub struct Cutie {
 impl Cutie {
     /// Reads the checkpoint and builds the network on the device. Fails at once where Cutie's
     /// ops do not run (`gpu_cutie_available`): a Linux or Windows build without their CUDA kernels
-    /// (no nvcc), or no device. On macOS they run as the host references.
+    /// (no nvcc), no device, or on macOS a Metal kernel library of theirs that does not compile or
+    /// a GPU without the 32-wide SIMD groups some of their kernels are written for (logged). On
+    /// macOS that check compiles every library on the calling thread, which is then Cutie's (see
+    /// Threads above).
     pub fn load(path: &Path) -> Result<Self> {
         if !makepad_ai_common::gpu::gpu_cutie_available() {
             return Err(DiffusionError::model(
-                "cutie's ops do not run here: CUDA without Cutie's kernels (no nvcc at build time), or no device",
+                "cutie's ops do not run here: CUDA without Cutie's kernels (no nvcc at build time), no device, or Metal kernels that do not build or run on this GPU (logged)",
             ));
         }
         let mut weights = Weights::load(path)?;
         Ok(Self { net: CutieNet::load(&mut weights)?, config: CutieConfig::default() })
+    }
+
+    /// The precision steps really run in: `config.precision`, but fp32 where this build has no
+    /// half convolution (`GPU_CUTIE_HALF`: CUDA's only).
+    pub fn effective_precision(&self) -> CutiePrecision {
+        if makepad_ai_common::gpu::GPU_CUTIE_HALF { self.config.precision } else { CutiePrecision::Fp32 }
     }
 
     /// A processor for `objects` objects (the worker's slots), with its own memory.

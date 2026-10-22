@@ -12,7 +12,8 @@
 //!   probability at the frame's size on the host out. The first pass is cold (weights uploaded,
 //!   kernels and cuBLAS loaded); the others are summarised by kind of step: the commit, the
 //!   restart (frame 0 again with its mask), frames propagated without memorising, memorised, and
-//!   memorised with a consolidation.
+//!   memorised with a consolidation. On macOS, also how many times a warm step waited on the
+//!   Metal stream and how many command buffers it committed (`gpu_stream_counts`).
 //! - **Memory**: the convolutions' weights (the weight cache's uploads), the activation pool's
 //!   allocations less what it freed (it keeps freed buffers for reuse: what the run holds on the
 //!   device at most, besides the weights), and the whole device's use over the baseline taken
@@ -31,6 +32,9 @@
 //!   and the ReLU as passes of their own, and the bare GEMM of the same shape (what is left is
 //!   im2col and the epilogue).
 //!
+//! With MAKEPAD_CUTIE_BENCH_FP16=1 the steps without a mask run in fp16 (`CutiePrecision::Fp16`,
+//! CUDA only), so their digests differ from fp32's.
+//!
 //! Prints `BENCH` lines and one `CUTIE_BENCH {json}` line. The GPU may be shared: compare runs
 //! made close together, several times. The Python worker's side is RationalVisions'
 //! `tools/cutie-oracle/cutie_oracle.py bench`, on the same oracle.
@@ -39,10 +43,10 @@ use crate::memory::{KeyValueStore, Permanence};
 use crate::model::{add, dev, relu, Conv2d, CutieNet, Feat, Tap, Weights};
 use crate::oracle::{Oracle, Report};
 use crate::processor::{CutieProcessor, Frame, WorkerMasks};
-use crate::{DiffusionError, Result};
+use crate::{CutieConfig, CutiePrecision, DiffusionError, Result};
 use makepad_ai_common::gpu::{
     cutie_conv_out, gpu_cutie_matmul, gpu_cutie_maxpool3x3s2, gpu_cutie_similarity, gpu_cutie_topk_softmax, gpu_download, gpu_perf_stats,
-    gpu_rife_fill, gpu_synchronize, gpu_upload,
+    gpu_rife_fill, gpu_stream_counts, gpu_synchronize, gpu_upload,
 };
 use std::path::Path;
 use std::time::Instant;
@@ -121,6 +125,9 @@ struct Step {
     /// The probabilities' bits hashed, to compare passes.
     digest: u64,
     parts: Vec<Lap>,
+    /// On macOS, the Metal stream's command buffers committed and waits inside the step (the
+    /// synchronisations around it left out; in parts, the laps' own counted too).
+    stream: Option<(u64, u64)>,
 }
 
 /// The device's memory in use, sampled after load and after every step.
@@ -197,12 +204,13 @@ pub(crate) fn run(oracle: &Oracle, weights_path: &Path, report: &mut Report) -> 
     let (pw, ph) = frame.padded();
     let name = oracle.dir.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     println!(
-        "BENCH {name}: {w}x{h} ({}x{} inside, padded {pw}x{ph}, {} tokens a frame), {n} objects, {} frames, {} steps; {passes} passes (the first cold), then {PART_PASSES} in parts",
+        "BENCH {name}: {w}x{h} ({}x{} inside, padded {pw}x{ph}, {} tokens a frame), {n} objects, {} frames, {} steps, propagation in {}; {passes} passes (the first cold), then {PART_PASSES} in parts",
         frame.w,
         frame.h,
         (pw / 16) * (ph / 16),
         oracle.frames,
-        oracle.schedule().len()
+        oracle.schedule().len(),
+        bench_precision().name()
     );
 
     let mut watch = MemoryWatch::new();
@@ -265,6 +273,22 @@ pub(crate) fn run(oracle: &Oracle, weights_path: &Path, report: &mut Report) -> 
             kinds_json.push(format!("\"{}\":{}", kind.name(), s.json()));
         }
     }
+    // macOS: how often a warm step commits and waits on the Metal stream (Cutie's goal is one
+    // wait a step, its probabilities' download; the in-flight cap and host reads add to it).
+    let counted: Vec<(u64, u64)> = warm.iter().flatten().filter_map(|s| s.stream).collect();
+    let stream_json = match (
+        Stats::of(&counted.iter().map(|c| c.1 as f64).collect::<Vec<_>>()),
+        Stats::of(&counted.iter().map(|c| c.0 as f64).collect::<Vec<_>>()),
+    ) {
+        (Some(waits), Some(commits)) => {
+            println!(
+                "BENCH   Metal stream a step: waits median {:.0} (min {:.0}, max {:.0}), command buffers committed median {:.0} (min {:.0}, max {:.0})",
+                waits.median, waits.min, waits.max, commits.median, commits.min, commits.max
+            );
+            format!(",\"stream\":{{\"waits\":{},\"commits\":{}}}", waits.json(), commits.json())
+        }
+        _ => String::new(),
+    };
 
     let device_mb = watch.peak.saturating_sub(watch.baseline) as f64 / MB;
     println!(
@@ -362,7 +386,7 @@ pub(crate) fn run(oracle: &Oracle, weights_path: &Path, report: &mut Report) -> 
     }
 
     println!(
-        "CUTIE_BENCH {{\"oracle\":\"{name}\",\"width\":{w},\"height\":{h},\"objects\":{n},\"frames\":{},\"passes\":{passes},\"load_read_ms\":{read_ms:.1},\"load_build_ms\":{build_ms:.1},\"cold\":{{\"commit\":{:.2},\"restart\":{:.2},\"first_propagated\":{first_propagated:.2},\"run\":{cold_run:.1}}},\"warm_run\":{},\"fps\":{fps:.2},\"steps\":{{{}}},\"memory_mb\":{{\"conv_weights\":{conv_weights_mb:.1},\"pool\":{pool_mb:.1},\"device_peak\":{device_mb:.0}}},\"parts\":{{{}}},\"deterministic\":{},\"digest\":\"{run_digest:016x}\",\"convs\":{{{}}}}}",
+        "CUTIE_BENCH {{\"oracle\":\"{name}\",\"width\":{w},\"height\":{h},\"objects\":{n},\"frames\":{},\"passes\":{passes},\"load_read_ms\":{read_ms:.1},\"load_build_ms\":{build_ms:.1},\"cold\":{{\"commit\":{:.2},\"restart\":{:.2},\"first_propagated\":{first_propagated:.2},\"run\":{cold_run:.1}}},\"warm_run\":{},\"fps\":{fps:.2},\"steps\":{{{}}}{stream_json},\"memory_mb\":{{\"conv_weights\":{conv_weights_mb:.1},\"pool\":{pool_mb:.1},\"device_peak\":{device_mb:.0}}},\"parts\":{{{}}},\"deterministic\":{},\"digest\":\"{run_digest:016x}\",\"convs\":{{{}}}}}",
         oracle.frames,
         first(Kind::Commit),
         first(Kind::Restart),
@@ -435,6 +459,8 @@ fn profile_conv(
 /// decoder for `objects` objects on its features (the memory readout and sensory memory
 /// constant), then of the mask encoder (its inputs constant), each timed alone (`profile_conv`).
 fn conv_profile(net: &CutieNet, image: &Feat, objects: usize) -> Result<Vec<ConvTime>> {
+    // As the bench's propagation runs them (the bare GEMM stays fp32).
+    let _half = crate::model::HalfConvs::begin(bench_precision() == CutiePrecision::Fp16);
     let mut times = Vec::new();
     let pe = &net.pixel_encoder;
     let x = pe.normalise(image)?;
@@ -515,12 +541,19 @@ fn conv_profile(net: &CutieNet, image: &Feat, objects: usize) -> Result<Vec<Conv
     Ok(times)
 }
 
+/// What the bench's propagation steps run in: fp16 with MAKEPAD_CUTIE_BENCH_FP16=1 (fp32 where
+/// this build has no half convolution), else fp32.
+fn bench_precision() -> CutiePrecision {
+    let asked = std::env::var("MAKEPAD_CUTIE_BENCH_FP16").is_ok_and(|v| v == "1");
+    if asked && makepad_ai_common::gpu::GPU_CUTIE_HALF { CutiePrecision::Fp16 } else { CutiePrecision::Fp32 }
+}
+
 /// The oracle's run once, as stage `run` drives it (without taps or comparisons), with a fresh
 /// processor: each step timed, synchronised before and after; in parts when `in_parts`.
 fn replay(oracle: &Oracle, net: &CutieNet, frames: &[u8], masks: &WorkerMasks, in_parts: bool, watch: &mut MemoryWatch) -> Result<Vec<Step>> {
     let (w, h, n) = (oracle.width, oracle.height, oracle.objects);
     let (plane, size) = (w * h, w * h * 3);
-    let mut processor = CutieProcessor::new(net, oracle.config.clone(), n);
+    let mut processor = CutieProcessor::new(net, CutieConfig { precision: bench_precision(), ..oracle.config.clone() }, n);
     // Each frame's latest label map, frame 0's the seed's to begin with (the worker's masks).
     let mut frame_labels: Vec<Option<Vec<u8>>> = vec![None; oracle.frames];
     frame_labels[0] = Some(masks.seed.clone());
@@ -537,12 +570,16 @@ fn replay(oracle: &Oracle, net: &CutieNet, frames: &[u8], masks: &WorkerMasks, i
         let consolidations = processor.memory.consolidations;
         gpu_synchronize().map_err(|e| dev("bench sync", e))?;
         let mut laps = Laps::new(in_parts);
+        let counts = gpu_stream_counts();
         let started = Instant::now();
         let prob = if in_parts {
             step_in_parts(&mut processor, rgb, w, h, mask.as_deref(), row.force_permanent, &mut laps)?
         } else {
             processor.step(rgb, w, h, mask.as_deref(), row.force_permanent, false)?
         };
+        let stream = gpu_stream_counts()
+            .zip(counts)
+            .map(|(after, before)| (after.0.saturating_sub(before.0), after.1.saturating_sub(before.1)));
         gpu_synchronize().map_err(|e| dev("bench sync", e))?;
         let ms = started.elapsed().as_secs_f64() * 1e3;
         watch.sample();
@@ -555,7 +592,7 @@ fn replay(oracle: &Oracle, net: &CutieNet, frames: &[u8], masks: &WorkerMasks, i
             _ => Kind::Propagate,
         };
         frame_labels[row.frame] = Some(CutieProcessor::labels(&prob, n + 1, plane));
-        steps.push(Step { kind, ms, digest: digest(&prob), parts: laps.parts });
+        steps.push(Step { kind, ms, digest: digest(&prob), parts: laps.parts, stream });
     }
     Ok(steps)
 }
@@ -569,6 +606,7 @@ fn step_in_parts(
 ) -> Result<Vec<f32>> {
     let n = p.objects;
     let net = p.net;
+    let _half = crate::model::HalfConvs::begin(p.config.precision == crate::CutiePrecision::Fp16 && mask.is_none());
     let mut no_taps = Tap::none();
     let tap = &mut no_taps;
     let frame = Frame::new(width, height, p.config.max_internal_size);

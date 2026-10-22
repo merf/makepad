@@ -2,7 +2,9 @@
 // host in PyTorch's order and uploads, through the public gpu_* surface only, so it builds against
 // any backend's GpuTensor. Included by cutie_ops.rs inside the CUDA `mod imp` (where `cutie-validate
 // ops` checks each kernel against its reference) and by models/common/src/gpu_cutie_host.rs on
-// builds without Cutie's kernels, where the references are the ops (macOS: on the Metal tensors).
+// builds without Cutie's CUDA kernels: there the references are the ops on Linux and Windows, and
+// on macOS the path MAKEPAD_CUTIE_METAL_REF forces beside Metal's kernels (and the ECA past
+// CUTIE_ECA_MAX_TAPS taps, as on CUDA).
 
 fn cutie_check_f32(op: &str, x: &GpuTensor) -> Result<(), String> {
     if x.is_half() {

@@ -1,39 +1,54 @@
 //! Practical-RIFE v4.26 ops for the macOS Metal path.
 //!
 //! Fills the exact op set `rife_model.rs` needs and CUDA provides on the
-//! fleet (`libs/ai/cuda/kernels/rife.cu`), in the HOST-BACKED style of this
-//! crate's `GpuTensor`: the convolutions — over 90 % of the FLOPs — ride
-//! the ggml Metal GEMM through `shim::try_matmul_nt_f32` via a strided
-//! im2col, and the cheap elementwise/gather ops (warp, PReLU tail, pixel
-//! shuffle, merge) run banded on the CPU, which on unified memory is the
-//! same RAM the GPU reads. Semantics are transcribed 1:1 from the portable
+//! fleet (`libs/ai/cuda/kernels/rife.cu`), on the host: the convolutions —
+//! over 90 % of the FLOPs — as a strided im2col and Accelerate's sgemm
+//! (`matmul_nn_blas`), and the cheap elementwise/gather ops (warp, PReLU
+//! tail, pixel shuffle, merge) banded on the CPU, on the same unified
+//! memory the GPU reads. Semantics are transcribed 1:1 from the portable
 //! reference in `makepad-ai-rife::rife_cpu` — that file stays the parity
 //! oracle, and the op-level tests over there compare THIS module against
 //! it on random tensors.
+//!
+//! On macOS the tensors are GPU-resident (cutie-metal.md §9): each op reads its inputs on the host
+//! where they lie, once their writers have finished (`stream::host_slice`), and puts its result in
+//! a new tensor written by the host (`stream::upload_as`), around the same code as before. The
+//! helpers below are split by OS so the Windows build, over the host struct, still compiles.
 
 use crate::gpu_types::GpuTensor;
-use std::cell::RefCell;
 
 pub fn prof_dump() {}
 
 #[cfg(target_os = "macos")]
 pub(crate) fn prof_add(_slot: usize, _started: std::time::Instant) {}
 
-fn tensor(rows: usize, cols: usize, data: Vec<f32>) -> GpuTensor {
-    GpuTensor {
-        rows,
-        cols,
-        data: RefCell::new(data),
-        #[cfg(target_os = "macos")]
-        u32s: RefCell::new(Vec::new()),
-        #[cfg(target_os = "macos")]
-        id: std::cell::Cell::new(crate::gpu_types::fresh_tensor_id()),
-    }
+/// What a RIFE op names itself in errors.
+#[cfg(target_os = "macos")]
+const RIFE_OP: &str = "metal RIFE op";
+
+/// A RIFE op's result as a new tensor.
+#[cfg(target_os = "macos")]
+fn tensor(rows: usize, cols: usize, data: Vec<f32>) -> Result<GpuTensor, String> {
+    crate::stream::upload_as(RIFE_OP, &data, rows, cols)
 }
 
-fn data(t: &GpuTensor) -> Result<std::cell::Ref<'_, Vec<f32>>, String> {
+#[cfg(not(target_os = "macos"))]
+fn tensor(rows: usize, cols: usize, data: Vec<f32>) -> Result<GpuTensor, String> {
+    Ok(GpuTensor { rows, cols, data: std::cell::RefCell::new(data) })
+}
+
+/// A RIFE op's read of `t`; on macOS where it lies, once its writer has finished, and `Err` inside
+/// `with_metal_stream`, as `gpu_tensor.rs`'s host ops are.
+#[cfg(target_os = "macos")]
+fn data(t: &GpuTensor) -> Result<crate::stream::HostSlice<'_>, String> {
+    crate::stream::host_slice(RIFE_OP, t)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn data(t: &GpuTensor) -> Result<std::cell::Ref<'_, [f32]>, String> {
     t.data
         .try_borrow()
+        .map(|values| std::cell::Ref::map(values, |values| values.as_slice()))
         .map_err(|_| "metal GpuTensor already borrowed".to_string())
 }
 
@@ -242,7 +257,7 @@ pub fn conv2d_planar_strided(
             *v += b;
         }
     }
-    Ok(tensor(out_channels, n, out))
+    tensor(out_channels, n, out)
 }
 
 /// `nn.ConvTranspose2d(in, out, k, stride, pad)` — expressed as a stride-1
@@ -300,7 +315,7 @@ pub fn conv_transpose2d(
     }
     let out_w = (in_width - 1) * stride + kw - 2 * pad;
     let out_h = (in_height - 1) * stride + kh - 2 * pad;
-    let stuffed_tensor = tensor(in_channels, sw * sh, stuffed);
+    let stuffed_tensor = tensor(in_channels, sw * sh, stuffed)?;
     conv2d_planar_strided(
         &stuffed_tensor,
         sw,
@@ -367,7 +382,7 @@ pub fn warp(
             }
         }
     });
-    Ok(tensor(channels, plane, out))
+    tensor(channels, plane, out)
 }
 
 /// RIFE's ResConv tail: `LeakyReLU(conv * beta_c + residual, slope)`.
@@ -401,7 +416,7 @@ pub fn res_conv(
             }
         }
     });
-    Ok(tensor(channels, plane, out))
+    tensor(channels, plane, out)
 }
 
 pub fn lrelu(x: &GpuTensor, slope: f32) -> Result<GpuTensor, String> {
@@ -410,16 +425,16 @@ pub fn lrelu(x: &GpuTensor, slope: f32) -> Result<GpuTensor, String> {
         .iter()
         .map(|v| if *v < 0.0 { *v * slope } else { *v })
         .collect();
-    Ok(tensor(x.rows, x.cols, out))
+    tensor(x.rows, x.cols, out)
 }
 
 pub fn scale(x: &GpuTensor, factor: f32) -> Result<GpuTensor, String> {
     let xd = data(x)?;
-    Ok(tensor(x.rows, x.cols, xd.iter().map(|v| *v * factor).collect()))
+    tensor(x.rows, x.cols, xd.iter().map(|v| *v * factor).collect())
 }
 
 pub fn fill(rows: usize, cols: usize, value: f32) -> Result<GpuTensor, String> {
-    Ok(tensor(rows, cols, vec![value; rows * cols]))
+    tensor(rows, cols, vec![value; rows * cols])
 }
 
 /// `nn.PixelShuffle(scale)` over `[out_c * scale^2, in_plane]`, plus a per-
@@ -460,7 +475,7 @@ pub fn pixel_shuffle_planar(
             }
         }
     });
-    Ok(tensor(out_channels, out_plane, out))
+    tensor(out_channels, out_plane, out)
 }
 
 /// Final merge: sigmoid the mask, blend the two warped RGB planes, crop the
