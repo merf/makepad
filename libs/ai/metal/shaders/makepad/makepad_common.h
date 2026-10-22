@@ -2,9 +2,9 @@
 // libraries from text at run time, so it splices this file in where a source has the line
 // #include "makepad_common.h" (metal/src/stream/source.rs), framed by #line directives.
 //
-// Two machines fill this file in at the same time (RationalVisions docs/cutie-metal.md, section
-// 11), each only between its own markers below, so their commits never touch the same lines: the
-// Mac writes the contraction setting (step 7), the PC the helpers (step 8).
+// Two machines filled this file in at the same time (RationalVisions docs/cutie-metal.md, section
+// 11), each only between its own markers below: the Mac the contraction setting (step 7), the PC
+// the helpers (step 8).
 #ifndef MAKEPAD_COMMON_H
 #define MAKEPAD_COMMON_H
 
@@ -25,7 +25,9 @@ using namespace metal;
 // ==== End of contraction ====
 
 // ==== Helpers (step 8, the PC) ====
-// cutie_reduce4 in PyTorch's order (cuda/kernels/cutie.cu), the top-k radix key and max_nan.
+// Empty: cutie_reduce4 (PyTorch's order, cuda/kernels/cutie.cu), the top-k radix key and max_nan
+// are kept in each family's own namespace (cutie_elementwise.metal, cutie_softmax_norm.metal,
+// cutie_topk_mask.metal) until one copy moves here.
 // ==== End of helpers ====
 
 #endif

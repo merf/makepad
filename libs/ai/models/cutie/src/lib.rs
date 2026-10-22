@@ -27,7 +27,11 @@
 //! that made them. Load, step and unload (`unload_cutie`, then `gpu_pool_clear` if wanted) on one
 //! thread kept for Cutie. A `Cutie` moved to another thread still works there, but uploads every
 //! convolution's weights again on that thread, and `unload_cutie` frees only the calling thread's
-//! copy. A `CutieProcessor` borrows its `Cutie` and stays on its thread (it is not `Send`).
+//! copy. On macOS the new thread also compiles the Metal kernel libraries again at first use
+//! (`Cutie::load`'s check compiled them on the loading thread only), and a tensor that queued work
+//! on the old thread's stream still uses is refused there: call `gpu_synchronize` on the old
+//! thread before the move. A `CutieProcessor` borrows its `Cutie` and stays on its thread (it is
+//! not `Send`).
 //!
 //! **Errors**: a step that fails part way (the device out of memory, a frame of another size than
 //! the memory's) may leave the processor's counters advanced and its usage counted, as
@@ -115,11 +119,14 @@ pub struct Cutie {
 impl Cutie {
     /// Reads the checkpoint and builds the network on the device. Fails at once where Cutie's
     /// ops do not run (`gpu_cutie_available`): a Linux or Windows build without their CUDA kernels
-    /// (no nvcc), or no device. On macOS they are Metal's kernels.
+    /// (no nvcc), no device, or on macOS a Metal kernel library of theirs that does not compile or
+    /// a GPU without the 32-wide SIMD groups some of their kernels are written for (logged). On
+    /// macOS that check compiles every library on the calling thread, which is then Cutie's (see
+    /// Threads above).
     pub fn load(path: &Path) -> Result<Self> {
         if !makepad_ai_common::gpu::gpu_cutie_available() {
             return Err(DiffusionError::model(
-                "cutie's ops do not run here: CUDA without Cutie's kernels (no nvcc at build time), or no device",
+                "cutie's ops do not run here: CUDA without Cutie's kernels (no nvcc at build time), no device, or Metal kernels that do not build or run on this GPU (logged)",
             ));
         }
         let mut weights = Weights::load(path)?;

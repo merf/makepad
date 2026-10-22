@@ -7,7 +7,7 @@
 //! The kernel is `shaders/makepad/layer_norm.metal`, ported from cuda/kernels/diffusion_ops.cu's
 //! Welford tree (PyTorch's CUDA fast path) with CUDA's threadgroup of [32, 4]. It is a library of
 //! its own, apart from Cutie's: a model that is not Cutie gets its layer norm from this one
-//! kernel, so until the Mac has compiled them, a fault in a Cutie library cannot break it.
+//! kernel, so a fault in a Cutie library (an edit, another compiler) cannot break it.
 //!
 //! The kernels index in u32 where CUDA's count in size_t, so a tensor of more than u32::MAX
 //! elements is `Err` here (`cutie_u32`'s message) where CUDA would run it: four billion floats.

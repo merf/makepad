@@ -3745,7 +3745,8 @@ mod imp {
         _bias: Option<&GpuTensor>,
     ) -> Result<GpuTensor, String> {
         // macOS: an fp32 GEMM on the Metal stream and the bias added on the device, as CUDA's
-        // (the reference is ggml's GEMM, which stages its tiles in half).
+        // (the reference, where MAKEPAD_CUTIE_METAL_REF forces it, is Accelerate's fp32 sgemm,
+        // `gpu_tensor::linear_f32_exact`).
         #[cfg(target_os = "macos")]
         {
             if super::cutie_metal_ref("linear_f32_resident")? {

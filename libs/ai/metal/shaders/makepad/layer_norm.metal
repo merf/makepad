@@ -2,8 +2,8 @@
 // diffusion_ops.cu's makepad_cuda_layer_norm_pytorch_f32_kernel in the same order of evaluation,
 // launched by metal/src/layer_norm.rs for gpu_layer_norm_pytorch (every model's, on macOS) and by
 // cutie_ops/softmax_norm.rs for gpu_cutie_layer_norm (its affine cached), so the two agree to the
-// bit as they do on CUDA. A library of its own: until the Mac has compiled Cutie's libraries, a
-// fault in one of them breaks Cutie's ops, never the layer norms of the models that are not Cutie.
+// bit as they do on CUDA. A library of its own: a fault in one of Cutie's libraries breaks Cutie's
+// ops, never the layer norms of the models that are not Cutie.
 //
 // Exactness (D8): fast math is off.
 // - Where nvcc contracted (its PTX at -O3 has fma.rn for each Welford update, the combine's mean

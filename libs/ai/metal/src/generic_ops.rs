@@ -11,8 +11,8 @@
 //! - `concat_rows` and `concat_rows_many`: parts adjacent in one storage, in order, are a view of
 //!   it, as on CUDA; otherwise one copy (`tensor_copy2d_u32`) a part into a new tensor.
 //!
-//! The library is apart from `tensor.metal`, so that until the Mac has compiled it a fault in it
-//! breaks these ops alone, not the stream's fills and copies. models/common's gpu.rs calls them on
+//! The library is apart from `tensor.metal`, so a fault in it breaks these ops alone, not the
+//! stream's fills and copies. models/common's gpu.rs calls them on
 //! macOS, or the host versions in `gpu_tensor.rs` where MAKEPAD_CUTIE_METAL_REF names the op.
 //!
 //! Every check and u32 conversion is made before anything is encoded, so a failure is an `Err`
@@ -32,7 +32,8 @@ use crate::GpuTensor;
 #[cfg(target_os = "macos")]
 use std::sync::Arc;
 
-/// The pool, the transpose and the scale add (`generic_ops.metal`).
+/// The pool, the transpose, the scale add, the broadcast add and the column gather
+/// (`generic_ops.metal`).
 pub static GENERIC_OPS: KernelLib = KernelLib {
     name: "generic_ops",
     source: include_str!("../shaders/makepad/generic_ops.metal"),

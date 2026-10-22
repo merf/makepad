@@ -43,10 +43,7 @@ pub use softmax_norm::CUTIE_ECA_MAX_TAPS;
 pub use topk_mask::{gpu_cutie_attn_mask, gpu_cutie_topk_softmax};
 
 /// Every library of the kernels Cutie's own ops launch (the five families' and the layer norm's),
-/// for the gate that asks whether they all compile (step 14) and the Mac's bring-up test. The GEMM
-/// (`stream::gemm::GEMM`, under matmul, similarity, the convolutions and the linear), the generic
-/// ops' (`generic_ops::GENERIC_OPS`) and the stream's own (`stream::kernels::TENSOR`) are listed
-/// where they are defined.
+/// for the Mac's bring-up test. [`libraries_cutie_launches`] adds the libraries they share.
 pub static CUTIE_LIBRARIES: &[&KernelLib] = &[
     &elementwise::CUTIE_ELEMENTWISE,
     &pool_resize::CUTIE_POOL_RESIZE,
@@ -55,6 +52,43 @@ pub static CUTIE_LIBRARIES: &[&KernelLib] = &[
     &matmul_conv::CUTIE_MATMUL_CONV,
     &topk_mask::CUTIE_TOPK_MASK,
 ];
+
+/// Every library Cutie's ops launch: its own ([`CUTIE_LIBRARIES`]), the generic ops' it calls
+/// (`generic_ops::GENERIC_OPS`), the GEMM's (`stream::gemm::GEMM`: matmul, similarity, the
+/// convolutions, the linear and the cross-attentions) and the stream's fills, copies, adds and
+/// ReLU (`stream::kernels::TENSOR`). What [`cutie_ready`] compiles.
+pub fn libraries_cutie_launches() -> impl Iterator<Item = &'static KernelLib> {
+    CUTIE_LIBRARIES.iter().copied().chain([
+        &crate::generic_ops::GENERIC_OPS,
+        &crate::stream::gemm::GEMM,
+        &crate::stream::kernels::TENSOR,
+    ])
+}
+
+/// The kernels Cutie's ops launch that refuse SIMD groups of any width but 32 (each launch checks
+/// its own; [`cutie_ready`] checks them all first): the layer norm's, top-k's merge and row sum,
+/// the ECA's row mean, the tiled GEMM and attention's row softmax.
+pub static SIMD_32_KERNELS: &[&Kernel] = &[
+    &crate::layer_norm::LAYER_NORM_PYTORCH,
+    &topk_mask::CUTIE_TOPK_MERGE,
+    &topk_mask::CUTIE_ROW_SUM,
+    &softmax_norm::CUTIE_ECA_ROW_MEAN,
+    &crate::stream::gemm::GEMM_TILED,
+    &crate::stream::gemm::GEMM_SOFTMAX_ROWS,
+];
+
+/// The gate (step 14): `Ok` when the calling thread's stream starts, every library Cutie's ops
+/// launch compiles there ([`libraries_cutie_launches`]) and the kernels of [`SIMD_32_KERNELS`]
+/// get the SIMD groups they are written for. Libraries and pipelines are compiled per thread, now
+/// if they have not been, so ask on the thread that runs Cutie. `Err` names the first library or
+/// kernel that fails, with Metal's message.
+#[cfg(target_os = "macos")]
+pub fn cutie_ready() -> Result<(), String> {
+    libraries_cutie_launches().try_for_each(crate::stream::library_ready)?;
+    crate::stream::with_metal_stream("cutie_ready", |s| {
+        SIMD_32_KERNELS.iter().try_for_each(|kernel| crate::stream::gemm::check_simd_width(s, "cutie_ready", kernel))
+    })
+}
 
 /// Every Cutie kernel, family by family, for the Mac's test that builds every pipeline.
 pub fn cutie_kernels() -> impl Iterator<Item = &'static Kernel> {
@@ -93,5 +127,21 @@ mod tests {
         libs.sort_unstable();
         libs.dedup();
         assert_eq!(libs.len(), CUTIE_LIBRARIES.len(), "library names are the stream's cache keys");
+    }
+
+    #[test]
+    fn the_gate_compiles_every_library_once() {
+        let mut libs: Vec<&str> = libraries_cutie_launches().map(|lib| lib.name).collect();
+        assert_eq!(libs.len(), CUTIE_LIBRARIES.len() + 3);
+        libs.sort_unstable();
+        libs.dedup();
+        assert_eq!(libs.len(), CUTIE_LIBRARIES.len() + 3, "a library is listed twice");
+        for kernel in SIMD_32_KERNELS {
+            assert!(
+                libraries_cutie_launches().any(|lib| std::ptr::eq(lib, kernel.lib)),
+                "{} is in a library the gate does not compile",
+                kernel.function
+            );
+        }
     }
 }

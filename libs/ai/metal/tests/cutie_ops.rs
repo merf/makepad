@@ -8,12 +8,17 @@
 //!
 //! `cargo test -p makepad-ai-metal --test cutie_ops -- --nocapture` (it prints every pipeline's
 //! limits). With MAKEPAD_METAL_KERNELS_SRC=<checkout>/libs/ai/metal/shaders/makepad the sources
-//! are read from disk, for an edit loop without a rebuild.
+//! are read from disk, for an edit loop without a rebuild. Also the gate (step 14): `cutie_ready`.
 #![cfg(target_os = "macos")]
 
-use makepad_ai_metal::cutie_ops::{cutie_kernels, CUTIE_LIBRARIES};
+use makepad_ai_metal::cutie_ops::{cutie_kernels, cutie_ready, CUTIE_LIBRARIES};
 use makepad_ai_metal::generic_ops::{GENERIC_KERNELS, GENERIC_OPS};
 use makepad_ai_metal::stream::{self, with_metal_stream, Kernel};
+
+#[test]
+fn cutie_is_ready_on_this_thread() {
+    cutie_ready().unwrap();
+}
 
 #[test]
 fn every_cutie_library_and_pipeline_compiles() {

@@ -20,8 +20,7 @@
 //!
 //! The library also holds the two kernels the GEMM's users add around it: the bias after a linear
 //! (`GEMM_ADD_ROWS`, `linear.rs`) and attention's row softmax (`GEMM_SOFTMAX_ROWS`,
-//! `attention.rs`). §6 lists them in `tensor.metal`; they are here so the family compiles and
-//! fails as one library.
+//! `attention.rs`), so the family compiles and fails as one library (cutie-metal.md §6).
 
 use super::grid::Grid;
 use super::kernel::{Kernel, KernelLib, KernelParams};

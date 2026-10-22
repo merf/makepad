@@ -1,12 +1,11 @@
 //! Practical-RIFE v4.26 ops for the macOS Metal path.
 //!
 //! Fills the exact op set `rife_model.rs` needs and CUDA provides on the
-//! fleet (`libs/ai/cuda/kernels/rife.cu`), in the HOST-BACKED style of this
-//! crate's `GpuTensor`: the convolutions — over 90 % of the FLOPs — ride
-//! the ggml Metal GEMM through `shim::try_matmul_nt_f32` via a strided
-//! im2col, and the cheap elementwise/gather ops (warp, PReLU tail, pixel
-//! shuffle, merge) run banded on the CPU, which on unified memory is the
-//! same RAM the GPU reads. Semantics are transcribed 1:1 from the portable
+//! fleet (`libs/ai/cuda/kernels/rife.cu`), on the host: the convolutions —
+//! over 90 % of the FLOPs — as a strided im2col and Accelerate's sgemm
+//! (`matmul_nn_blas`), and the cheap elementwise/gather ops (warp, PReLU
+//! tail, pixel shuffle, merge) banded on the CPU, on the same unified
+//! memory the GPU reads. Semantics are transcribed 1:1 from the portable
 //! reference in `makepad-ai-rife::rife_cpu` — that file stays the parity
 //! oracle, and the op-level tests over there compare THIS module against
 //! it on random tensors.

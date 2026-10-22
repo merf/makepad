@@ -1,6 +1,7 @@
 // Cutie's device ops (models/cutie), included inside launch.rs's CUDA `mod imp` so they can use
-// its private helpers. Builds without the kernels run the host references instead
-// (models/common/src/gpu_cutie_host.rs, with the same signatures).
+// its private helpers. Builds without these kernels use models/common/src/gpu_cutie_host.rs, at the
+// same signatures: Metal's kernels on macOS (each one variable away from its host reference), the
+// host references elsewhere.
 //
 // Every op is f32 with exact fp32 arithmetic: Cutie is checked against a PyTorch fp32 oracle with
 // TF32 off. Each `gpu_cutie_X` has a host reference `gpu_cutie_X_reference` (download, compute on
@@ -85,8 +86,9 @@ unsafe extern "C" {
     ) -> cudaError_t;
 }
 
-/// Whether `gpu_cutie_X` are kernels of their own (here) or the host references
-/// (models/common/src/gpu_cutie_host.rs): `cutie-validate ops` holds kernels to PyTorch's bits.
+/// Whether `gpu_cutie_X` are CUDA's kernels (here), whose expf, logf, sinf and cosf give PyTorch's
+/// bits, so `cutie-validate ops` holds them to PyTorch's bits (gpu_cutie_host.rs's is false: the
+/// references, or Metal's kernels with `precise::` rounding).
 pub const GPU_CUTIE_KERNELS: bool = true;
 
 /// The most taps `makepad_cuda_cutie_eca_f32` takes by value (Cutie's ECA has 3 or 5).
@@ -135,9 +137,9 @@ fn cutie_sgemm(
     .map_err(|e| e.to_string())
 }
 
-/// Whether Cutie's ops run here: this build has their CUDA kernels (this file; the stubs say
-/// false) and a CUDA device is present. `gpu_device_available` alone is not enough: without the
-/// kernels on macOS it reports Metal's device, on which these ops do not run.
+/// Whether Cutie's ops run here: this build has their CUDA kernels (this file) and a CUDA device is
+/// present. Builds without them use common's `gpu_cutie_host.rs`, whose `gpu_cutie_available` asks
+/// on macOS whether Metal's kernels build and run on this GPU, and says false elsewhere.
 pub fn gpu_cutie_available() -> bool {
     gpu_device_available()
 }
@@ -438,8 +440,9 @@ pub fn gpu_cutie_crop(x: &GpuTensor, w: usize, h: usize, left: usize, top: usize
 // --- Matrix products ---
 
 /// x @ W^T + b, Cutie's Linears (the object transformer's): `gpu_linear_f32_resident`, cuBLAS
-/// SGEMM in fp32 with the weight kept on the device. Its own name so builds without these
-/// kernels can give it an exact fp32 product (Metal's shared linear stages its tiles in half).
+/// SGEMM in fp32 with the weight kept on the device. Its own name gives Cutie's linear its own
+/// ops-check row and MAKEPAD_CUTIE_METAL_REF name (`linear`); on macOS it runs the same fp32 GEMM
+/// as `gpu_linear_f32_resident`.
 pub fn gpu_cutie_linear(x: &GpuTensor, w: &GpuTensor, bias: Option<&GpuTensor>) -> Result<GpuTensor, String> {
     gpu_linear_f32_resident(x, w, bias)
 }

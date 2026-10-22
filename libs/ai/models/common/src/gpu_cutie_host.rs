@@ -7,10 +7,24 @@
 // adds and resizes go through this backend's gpu_* ops. Included inside gpu.rs's `mod imp` for
 // those builds.
 
-/// Whether Cutie's ops run here: on macOS when the Metal device is there; elsewhere without the
-/// kernels, never. (Step 14 also asks each Cutie library to compile.)
+/// Whether Cutie's ops run here: on macOS when the calling thread's Metal stream starts (the device
+/// check: `gpu_device_available` is true on every Mac), every kernel library Cutie's ops launch
+/// compiles there and the kernels written for 32-wide SIMD groups get them
+/// (`makepad_ai_metal::cutie_ops::cutie_ready`, which compiles them now on this thread, so ask on
+/// Cutie's; a failure is logged with Metal's message); elsewhere without the kernels, never.
 pub fn gpu_cutie_available() -> bool {
-    cfg!(target_os = "macos") && gpu_device_available()
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(e) = makepad_ai_metal::cutie_ops::cutie_ready() {
+            eprintln!("[cutie] Cutie's ops do not run on Metal here: {e}");
+            return false;
+        }
+        true
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
 }
 
 /// Whether `gpu_cutie_X` are CUDA's kernels (cuda/src/cutie_ops.rs), whose expf, logf, sinf and

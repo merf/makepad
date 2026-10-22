@@ -792,7 +792,13 @@ pub fn available() -> bool {
 
 /// Whether `lib` compiles on the calling thread's stream (compiling it now if it has not).
 pub fn library_available(lib: &'static KernelLib) -> bool {
-    with_ctx("library_available", true, |ctx| ctx.library(lib).map(|_| ())).is_ok()
+    library_ready(lib).is_ok()
+}
+
+/// [`library_available`] with the reason: `Err` with Metal's compile error, or why the thread has
+/// no stream.
+pub fn library_ready(lib: &'static KernelLib) -> MetalResult<()> {
+    with_started("library_ready", |ctx| ctx.library(lib).map(|_| ()))
 }
 
 /// Drops the calling thread's cached weights whose key starts with `prefix`; returns how many.
