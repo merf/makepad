@@ -408,10 +408,11 @@ impl MetalStream<'_> {
         self.launch(&TENSOR_COPY2D, &[], &params, &[Bind::In(src), Bind::Out(dst)], grid)
     }
 
-    /// C = alpha * op(A) @ op(B) + beta * C (step 8: `gemm.metal`, naive and tiled).
+    /// C = alpha * op(A) @ op(B) + beta * C in fp32: checked and planned by `gemm.rs` (what it
+    /// refuses, the naive or tiled kernel, MAKEPAD_METAL_GEMM), run by `gemm.metal`.
     pub fn gemm(&mut self, g: &Gemm<'_>) -> MetalResult<()> {
-        let _ = g;
-        Err(format!("{}: MetalStream::gemm is not written yet (step 8)", self.op))
+        let op = self.op;
+        super::gemm::run(self, op, g)
     }
 
     /// "{namespace}::{key}::{suffix}"; `fill` runs only on a miss or a size change, writing

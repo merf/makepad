@@ -39,6 +39,8 @@
 // The crate-private helpers in these modules serve the macOS stream; elsewhere only the tests use
 // them.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub mod gemm;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub mod grid;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub mod kernel;
