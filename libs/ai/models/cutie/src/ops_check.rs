@@ -21,14 +21,19 @@
 //!
 //! The generic ops Cutie calls (`gpu_slice_cols`, `gpu_concat_cols`, `gpu_pixal_pool`, ...,
 //! `gpu_layer_norm_pytorch`) are checked against makepad-ai-common's `host_ops`, the same values
-//! on the host: exactly where they move values or add once, within `TIGHT` for the pool, the scale
-//! add and the layer norm. Their rows are named after their `gpu_` functions.
+//! on the host, and their results' shapes against the op's: exactly where they move values, add
+//! once, pool (sums in row order, one division) or scale and add (one fma), within `TIGHT` for the
+//! layer norm (its truth is in f64), and for the scale add where MAKEPAD_CUTIE_METAL_REF puts it on
+//! macOS's host version, which rounds twice. Their rows are named after their `gpu_` functions.
+//! No case asks an op to refuse what CUDA refuses (an index past the columns, a slice past the
+//! end): `gpu_gather_cols` on macOS checks no index yet (cutie-metal.md step 12).
 //!
 //! `MAKEPAD_CUTIE_OPS=row,row` runs only those rows (the labels this report prints, or a family
 //! of them: [`OPS_FAMILIES`], Metal's kernel families); a name it does not know is an error that
-//! lists what it takes. A filtered run draws every case's inputs as an unfiltered one does, so a
-//! case's values do not depend on the filter. Where MAKEPAD_CUTIE_METAL_REF puts an op on its host
-//! reference (macOS), its rows are marked "(reference forced)": the kernel did not run there.
+//! lists what it takes. `layer_norm` and `layer_norm_pytorch` run together ([`OPS_TOGETHER`]). A
+//! filtered run draws every case's inputs as an unfiltered one does, so a case's values do not
+//! depend on the filter. Where MAKEPAD_CUTIE_METAL_REF puts an op on its host reference (macOS),
+//! its rows are marked "(reference forced)": the kernel did not run there.
 
 use crate::model::{dev, CUTIE_NAMESPACE};
 use crate::oracle::{OracleTap, Report, Tol};
@@ -36,7 +41,7 @@ use crate::Result;
 use makepad_ai_common::host_ops::{self, HostMat};
 use makepad_ai_common::gpu::{
     gpu_add_cols_broadcast, gpu_concat_cols, gpu_cutie_metal_ref_forces, gpu_gather_cols, gpu_layer_norm_pytorch,
-    gpu_pixal_pool, gpu_planar_tokens_transpose, gpu_realesrgan_scale_add, gpu_rife_fill, gpu_slice_cols,
+    gpu_pixal_pool, gpu_planar_tokens_transpose, gpu_realesrgan_scale_add, gpu_rife_fill, gpu_slice_cols, gpu_slice_rows,
     gpu_cutie_add_broadcast, gpu_cutie_add_broadcast_reference, gpu_cutie_aggregate, gpu_cutie_aggregate_reference,
     gpu_add, gpu_birefnet_relu, gpu_cutie_attn_mask, gpu_cutie_attn_mask_reference, gpu_cutie_conv2d, gpu_cutie_conv2d_fused,
     gpu_cutie_conv2d_fused_reference, gpu_cutie_conv2d_reference, gpu_cutie_crop,
@@ -55,7 +60,8 @@ use std::time::Instant;
 
 const STAGE: &str = "ops";
 
-/// Ops that only move, pick or compare values: bit for bit.
+/// Ops that only move, pick or compare values: the same values (`Report::compare` subtracts, so
+/// -0 equals +0 and a NaN matches any NaN; a sign of zero or a NaN's payload is not compared).
 const EXACT: Tol = Tol { rel: 0.0, cos: 1.0 - 1e-12, bool_mismatch: 0.0 };
 /// Ops that sum, or call exp, tanh or log: fp32 rounding apart.
 const TIGHT: Tol = Tol { rel: 1e-5, cos: 0.9999999, bool_mismatch: 0.0 };
@@ -88,14 +94,21 @@ const OPS_FAMILIES: &[(&str, &[&str])] = &[
     ),
 ];
 
+/// Rows that run together when the filter names any of them: Cutie's cached layer norm and
+/// `gpu_layer_norm_pytorch` run one kernel (CUDA's `makepad_cuda_layer_norm_pytorch_f32`, Metal's
+/// `layer_norm.metal`), and `layer_norm`'s reference is that kernel too, so only
+/// `layer_norm_pytorch`'s cases (an eps near the variance, constant rows, a large mean) test its
+/// arithmetic in full. As MAKEPAD_CUTIE_METAL_REF forces them together.
+const OPS_TOGETHER: &[&[&str]] = &[&["layer_norm", "layer_norm_pytorch"]];
+
 /// Every row label, family by family.
 fn ops_rows() -> impl Iterator<Item = &'static str> {
     OPS_FAMILIES.iter().flat_map(|(_, rows)| rows.iter().copied())
 }
 
 /// MAKEPAD_CUTIE_OPS read: `None` for every row (empty, or `all` among the names), else the rows
-/// named, each a row label or a family's name, separated by commas; `Err` naming what it does not
-/// know and listing what it takes.
+/// named, each a row label or a family's name, separated by commas, with the rows that run with
+/// them ([`OPS_TOGETHER`]); `Err` naming what it does not know and listing what it takes.
 fn parse_ops_filter(value: &str) -> std::result::Result<Option<Vec<&'static str>>, String> {
     let mut rows: Vec<&'static str> = Vec::new();
     let mut unknown = Vec::new();
@@ -113,8 +126,11 @@ fn parse_ops_filter(value: &str) -> std::result::Result<Option<Vec<&'static str>
             unknown.push(name);
         }
         for row in named {
-            if !rows.contains(&row) {
-                rows.push(row);
+            let together = OPS_TOGETHER.iter().copied().find(|group| group.contains(&row)).unwrap_or(&[]);
+            for row in std::iter::once(row).chain(together.iter().copied()) {
+                if !rows.contains(&row) {
+                    rows.push(row);
+                }
             }
         }
     }
@@ -931,7 +947,9 @@ impl OpsCheck<'_> {
         Ok(())
     }
 
-    /// LayerNorm of rows [rows, cols] with its affine cached against `gpu_layer_norm_pytorch`.
+    /// LayerNorm of rows [rows, cols] with its affine cached against `gpu_layer_norm_pytorch`
+    /// (the same kernel, EXACT: the cached affine), and against `host_ops`' in f64 (`TIGHT`: the
+    /// arithmetic, which the reference shares).
     fn layer_norm(&mut self, rows: usize, cols: usize, timed: bool) -> Result<()> {
         let xv = self.rng.normals(rows * cols, 3.0);
         let gamma = self.rng.normals(cols, 1.0);
@@ -953,6 +971,8 @@ impl OpsCheck<'_> {
         let expected = run(true).map_err(|e| dev(&case, e))?;
         self.compare("layer_norm", &case, &actual, &expected, EXACT)?;
         self.compare("layer_norm", &format!("{case} cached"), &again, &expected, EXACT)?;
+        let host_ln = host_ops::layer_norm_pytorch(host(&xv, rows, cols)?, &gamma, &beta, 1e-5);
+        self.generic("layer_norm", &format!("{case} host_ops"), Ok(actual), host_ln, (rows, cols), TIGHT)?;
         if timed {
             let kernel = time_ms(5, || run(false))?;
             let reference = time_ms(5, || run(true))?;
@@ -1100,14 +1120,21 @@ impl OpsCheck<'_> {
 
     // --- The generic ops Cutie calls, against makepad-ai-common's host_ops ---
 
-    /// A generic op's result against its host version's on the same values.
+    /// A generic op's result against its host version's on the same values, and its shape against
+    /// `shape` ([rows, cols], what the op returns): Cutie reshapes by that, and the values alone
+    /// would pass a transpose that kept [rows, cols]. A wrong shape is a failing row of its own.
     fn generic(
         &mut self, op: &str, case: &str, actual: std::result::Result<GpuTensor, String>, expected: std::result::Result<Vec<f32>, String>,
-        tol: Tol,
+        shape: (usize, usize), tol: Tol,
     ) -> Result<()> {
         let actual = actual.map_err(|e| dev(&format!("{op} {case}"), e))?;
         let expected = expected.map_err(|e| dev(&format!("{op} {case} host"), e))?;
-        self.compare_host(op, case, &actual, expected, tol)
+        self.compare_host(op, case, &actual, expected, tol)?;
+        if (actual.rows(), actual.cols()) != shape {
+            let why = format!("returned [{}, {}], the op's shape is [{}, {}]", actual.rows(), actual.cols(), shape.0, shape.1);
+            self.report.fail(STAGE, op, &format!("{case} shape"), why);
+        }
+        Ok(())
     }
 
     /// Columns `start..start + len` of a random [rows, cols].
@@ -1118,7 +1145,8 @@ impl OpsCheck<'_> {
         }
         let x = up(&xv, rows, cols)?;
         let expected = host_ops::slice_cols(host(&xv, rows, cols)?, start, len);
-        self.generic("slice_cols", &format!("{rows}x{cols} cols {start}+{len}"), gpu_slice_cols(&x, start, len), expected, EXACT)
+        let case = format!("{rows}x{cols} cols {start}+{len}");
+        self.generic("slice_cols", &case, gpu_slice_cols(&x, start, len), expected, (rows, len), EXACT)
     }
 
     /// Random parts [rows, widths[i]] side by side, the list of them `repeats` times over (one
@@ -1132,12 +1160,14 @@ impl OpsCheck<'_> {
         let hosts = values.iter().zip(widths).map(|(v, &w)| host(v, rows, w)).collect::<Result<Vec<_>>>()?;
         let parts: Vec<&GpuTensor> = (0..repeats).flat_map(|_| parts.iter()).collect();
         let hosts: Vec<HostMat> = (0..repeats).flat_map(|_| hosts.iter().copied()).collect();
+        let width = widths.iter().sum::<usize>() * repeats;
         let widths: Vec<String> = widths.iter().map(|w| w.to_string()).collect();
         let case = format!("{what} {rows} rows of {}{}", widths.join("+"), if repeats > 1 { format!(" x{repeats}") } else { String::new() });
-        self.generic("concat_cols", &case, gpu_concat_cols(&parts), host_ops::concat_cols(&hosts), EXACT)
+        self.generic("concat_cols", &case, gpu_concat_cols(&parts), host_ops::concat_cols(&hosts), (rows, width), EXACT)
     }
 
-    /// Area pooling of masks (0..1 with exact 0s and 1s) w x h to ow x oh.
+    /// Area pooling of masks (0..1 with exact 0s and 1s) w x h to ow x oh: sums in row order and
+    /// one division, as CUDA's kernel, Metal's and macOS's host version all do, so EXACT.
     fn pixal_pool(&mut self, planes: usize, w: usize, h: usize, ow: usize, oh: usize) -> Result<()> {
         let xv = self.masks(planes, w * h);
         if !self.wants("pixal_pool") {
@@ -1146,7 +1176,7 @@ impl OpsCheck<'_> {
         let x = up(&xv, planes, w * h)?;
         let expected = host_ops::pixal_pool(host(&xv, planes, w * h)?, w, h, ow, oh);
         let case = format!("{planes} planes {w}x{h} to {ow}x{oh}");
-        self.generic("pixal_pool", &case, gpu_pixal_pool(&x, w, h, ow, oh), expected, TIGHT)
+        self.generic("pixal_pool", &case, gpu_pixal_pool(&x, w, h, ow, oh), expected, (planes, ow * oh), EXACT)
     }
 
     fn planar_tokens_transpose(&mut self, rows: usize, cols: usize) -> Result<()> {
@@ -1156,11 +1186,30 @@ impl OpsCheck<'_> {
         }
         let x = up(&xv, rows, cols)?;
         let expected = Ok(host_ops::planar_tokens_transpose(host(&xv, rows, cols)?));
-        self.generic("planar_tokens_transpose", &format!("{rows}x{cols}"), gpu_planar_tokens_transpose(&x), expected, EXACT)
+        let case = format!("{rows}x{cols}");
+        self.generic("planar_tokens_transpose", &case, gpu_planar_tokens_transpose(&x), expected, (cols, rows), EXACT)
+    }
+
+    /// Rows `start..start + count` of a random [rows, cols] taken by `gpu_slice_rows`, then
+    /// transposed, as Cutie takes each object's value to tokens (mask.rs): the transpose reads
+    /// from the rows' offset (a view on CUDA).
+    fn transpose_of_rows(&mut self, rows: usize, cols: usize, start: usize, count: usize) -> Result<()> {
+        let xv = self.rng.normals(rows * cols, 1.0);
+        if !self.wants("planar_tokens_transpose") {
+            return Ok(());
+        }
+        let x = up(&xv, rows, cols)?;
+        let part = &xv[start * cols..(start + count) * cols];
+        let expected = Ok(host_ops::planar_tokens_transpose(host(part, count, cols)?));
+        let case = format!("rows {start}+{count} of {rows}x{cols} (gpu_slice_rows)");
+        let actual = gpu_slice_rows(&x, start, count).and_then(|view| gpu_planar_tokens_transpose(&view));
+        self.generic("planar_tokens_transpose", &case, actual, expected, (cols, count), EXACT)
     }
 
     /// `base + scale * delta`: Cutie's `1 - mask` (`ones_minus_mask`: base 1, delta masks, scale
-    /// -1), else random base and delta.
+    /// -1), else random base and delta. EXACT: CUDA's kernel and Metal's are one `fma`, as
+    /// `host_ops`; `TIGHT` where MAKEPAD_CUTIE_METAL_REF puts it on macOS's host version, which
+    /// rounds the product and the sum apart.
     fn scale_add(&mut self, rows: usize, cols: usize, scale: f32, ones_minus_mask: bool) -> Result<()> {
         let (bv, dv) = if ones_minus_mask {
             (vec![1.0; rows * cols], self.masks(rows, cols))
@@ -1173,7 +1222,8 @@ impl OpsCheck<'_> {
         let (b, d) = (up(&bv, rows, cols)?, up(&dv, rows, cols)?);
         let expected = host_ops::realesrgan_scale_add(host(&bv, rows, cols)?, host(&dv, rows, cols)?, scale);
         let case = format!("{rows}x{cols} scale {scale}{}", if ones_minus_mask { " 1 - mask" } else { "" });
-        self.generic("realesrgan_scale_add", &case, gpu_realesrgan_scale_add(&b, &d, scale), expected, TIGHT)
+        let tol = if gpu_cutie_metal_ref_forces("realesrgan_scale_add").map_err(|e| dev("ops", e))? { TIGHT } else { EXACT };
+        self.generic("realesrgan_scale_add", &case, gpu_realesrgan_scale_add(&b, &d, scale), expected, (rows, cols), tol)
     }
 
     /// Columns kept with probability `keep`, in order (memory's survivors); at least one.
@@ -1199,7 +1249,7 @@ impl OpsCheck<'_> {
         let x = up(&xv, rows, cols)?;
         let expected = host_ops::gather_cols(host(&xv, rows, cols)?, &indices);
         let case = format!("{what} {rows}x{cols} {} columns", indices.len());
-        self.generic("gather_cols", &case, gpu_gather_cols(&x, &indices), expected, EXACT)
+        self.generic("gather_cols", &case, gpu_gather_cols(&x, &indices), expected, (rows, indices.len()), EXACT)
     }
 
     /// x [rows, cols] plus a bias of `cols` values held as [bias_rows, cols / bias_rows].
@@ -1212,10 +1262,12 @@ impl OpsCheck<'_> {
         let (x, bias) = (up(&xv, rows, cols)?, up(&biasv, bias_rows, cols / bias_rows)?);
         let expected = host_ops::add_cols_broadcast(host(&xv, rows, cols)?, host(&biasv, bias_rows, cols / bias_rows)?);
         let case = format!("{rows}x{cols} + bias {bias_rows}x{}", cols / bias_rows);
-        self.generic("add_cols_broadcast", &case, gpu_add_cols_broadcast(&x, &bias), expected, EXACT)
+        self.generic("add_cols_broadcast", &case, gpu_add_cols_broadcast(&x, &bias), expected, (rows, cols), EXACT)
     }
 
-    /// `specials` puts NaN, both infinities and -0 among the values (fmaxf's NaN gives 0).
+    /// `specials` puts NaN, both infinities and -0 among the values: fmaxf's NaN gives 0 (where
+    /// torch.relu keeps NaN; Cutie's ReLUs see no NaN), and -0 gives a zero of either sign (EXACT
+    /// does not compare signs of zero).
     fn birefnet_relu(&mut self, rows: usize, cols: usize, specials: bool) -> Result<()> {
         let mut xv = self.rng.normals(rows * cols, 1.0);
         if !self.wants("birefnet_relu") {
@@ -1235,7 +1287,7 @@ impl OpsCheck<'_> {
         let x = up(&xv, rows, cols)?;
         let expected = Ok(host_ops::birefnet_relu(&xv));
         let case = format!("{rows}x{cols}{}", if specials { " specials" } else { "" });
-        self.generic("birefnet_relu", &case, gpu_birefnet_relu(&x), expected, EXACT)
+        self.generic("birefnet_relu", &case, gpu_birefnet_relu(&x), expected, (rows, cols), EXACT)
     }
 
     fn rife_fill(&mut self, rows: usize, cols: usize, value: f32) -> Result<()> {
@@ -1243,12 +1295,17 @@ impl OpsCheck<'_> {
             return Ok(());
         }
         let case = format!("{rows}x{cols} of {value}");
-        self.generic("rife_fill", &case, gpu_rife_fill(rows, cols, value), host_ops::rife_fill(rows, cols, value), EXACT)
+        self.generic("rife_fill", &case, gpu_rife_fill(rows, cols, value), host_ops::rife_fill(rows, cols, value), (rows, cols), EXACT)
     }
 
-    /// Rows of spread 3 about their own means (spread `offset`), random affine.
-    fn layer_norm_pytorch(&mut self, rows: usize, cols: usize, offset: f32) -> Result<()> {
-        let mut xv = self.rng.normals(rows * cols, 3.0);
+    /// Rows of normals times `spread` about `mean` plus a mean of their own (normals times
+    /// `offset`), random affine, eps 1e-5. A spread of 3 checks the arithmetic, but there eps moves
+    /// the result by about 5e-7, under `TIGHT`. Spreads of 1e-3 and 3.2e-3 (variances of 1e-6 and
+    /// 1e-5) catch an eps that is lost, misread or added outside the square root. Spread 0 gives
+    /// constant rows, whose result is the bias (NaN with eps 0). A mean of 100 against a spread
+    /// of 1 catches a variance taken as E[x^2] - mean^2 in f32 (PyTorch's is Welford's).
+    fn layer_norm_pytorch(&mut self, rows: usize, cols: usize, spread: f32, mean: f32, offset: f32) -> Result<()> {
+        let mut xv = self.rng.normals(rows * cols, spread);
         let offsets = self.rng.normals(rows, offset);
         let gamma = self.rng.normals(cols, 1.0);
         let beta = self.rng.normals(cols, 0.5);
@@ -1256,12 +1313,13 @@ impl OpsCheck<'_> {
             return Ok(());
         }
         for (row, off) in xv.chunks_mut(cols).zip(&offsets) {
-            row.iter_mut().for_each(|v| *v += off);
+            row.iter_mut().for_each(|v| *v += mean + off);
         }
         let x = up(&xv, rows, cols)?;
         let expected = host_ops::layer_norm_pytorch(host(&xv, rows, cols)?, &gamma, &beta, 1e-5);
-        let case = format!("{rows}x{cols} offsets {offset}");
-        self.generic("layer_norm_pytorch", &case, gpu_layer_norm_pytorch(&x, &gamma, &beta, 1e-5), expected, TIGHT)
+        let case = format!("{rows}x{cols} spread {spread} mean {mean} offsets {offset}");
+        let actual = gpu_layer_norm_pytorch(&x, &gamma, &beta, 1e-5);
+        self.generic("layer_norm_pytorch", &case, actual, expected, (rows, cols), TIGHT)
     }
 }
 
@@ -1602,11 +1660,23 @@ fn run(ck: &mut OpsCheck) -> Result<()> {
     ck.rife_fill(1, 3500, 0.5)?;
     ck.rife_fill(7, 13, -2.5)?;
     // The layer norm under Cutie's (the object transformer's queries), and odd widths.
-    ck.layer_norm_pytorch(16 * 3, 256, 1.0)?;
-    ck.layer_norm_pytorch(16, 256, 0.0)?;
-    ck.layer_norm_pytorch(7, 12, 3.0)?;
-    ck.layer_norm_pytorch(3, 4, 1.0)?;
-    ck.layer_norm_pytorch(2, 1024, 1.0)?;
+    ck.layer_norm_pytorch(16 * 3, 256, 3.0, 0.0, 1.0)?;
+    ck.layer_norm_pytorch(16, 256, 3.0, 0.0, 0.0)?;
+    ck.layer_norm_pytorch(7, 12, 3.0, 0.0, 3.0)?;
+    ck.layer_norm_pytorch(3, 4, 3.0, 0.0, 1.0)?;
+    ck.layer_norm_pytorch(2, 1024, 3.0, 0.0, 1.0)?;
+    // eps: variances of 1e-6 (eps the most of var + eps) and 1e-5 (eps half of it); constant rows.
+    ck.layer_norm_pytorch(4, 256, 1e-3, 0.0, 0.0)?;
+    ck.layer_norm_pytorch(3, 256, 3.2e-3, 0.0, 0.0)?;
+    ck.layer_norm_pytorch(5, 64, 0.0, 0.0, 1.0)?;
+    // A mean far above the spread: E[x^2] - mean^2 in f32 cancels (rel about 1e-3, simulated),
+    // while a correct f32 kernel is about 1e-6 off. Not 1000: there the mean's own f32 rounding
+    // (3e-5) puts a correct kernel past TIGHT (CUDA's: rel 2e-5).
+    ck.layer_norm_pytorch(3, 256, 1.0, 100.0, 0.0)?;
+    // A transpose reading rows from an offset, as Cutie takes each object's value to tokens
+    // (mask.rs): one object's rows of three, and the last row of an odd size.
+    ck.transpose_of_rows(3 * 256, P16, 256, 256)?;
+    ck.transpose_of_rows(7, 5, 6, 1)?;
     Ok(())
 }
 
@@ -1623,7 +1693,19 @@ mod tests {
         assert_eq!(parse_ops_filter("pool_resize,maxpool"), Ok(Some(vec!["maxpool", "resize"])));
         assert_eq!(parse_ops_filter("gemm,all"), Ok(None));
         let generic = parse_ops_filter("generic").unwrap().unwrap();
-        assert!(generic.contains(&"layer_norm_pytorch") && generic.len() == 10, "{generic:?}");
+        assert!(generic.contains(&"layer_norm_pytorch") && generic.len() == 11, "{generic:?}");
+        assert_eq!(generic.last(), Some(&"layer_norm"), "with the layer norm it runs together with");
+    }
+
+    #[test]
+    fn the_layer_norms_run_together() {
+        assert_eq!(parse_ops_filter("layer_norm"), Ok(Some(vec!["layer_norm", "layer_norm_pytorch"])));
+        assert_eq!(parse_ops_filter("layer_norm_pytorch, eca"), Ok(Some(vec!["layer_norm_pytorch", "layer_norm", "eca"])));
+        let family = parse_ops_filter("softmax_norm").unwrap().unwrap();
+        assert_eq!(family, ["softmax0", "aggregate", "eca", "layer_norm", "layer_norm_pytorch", "sine"]);
+        for group in OPS_TOGETHER {
+            assert!(group.iter().all(|row| ops_rows().any(|label| label == *row)), "{group:?}");
+        }
     }
 
     #[test]

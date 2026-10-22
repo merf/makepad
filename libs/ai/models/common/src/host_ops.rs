@@ -10,6 +10,12 @@
 //! divided once; the scale add as CUDA's one `fmaf`. The layer norm takes its moments and its
 //! result in f64 and rounds once, so it is within fp32 rounding of PyTorch's Welford order and
 //! CUDA's `rsqrtf`, not their bits.
+//!
+//! Where CUDA's kernels and PyTorch differ, these follow CUDA. The pool divides its sum once by
+//! the window's area; PyTorch's area interpolate (`adaptive_avg_pool2d`) divides by the window's
+//! height, then by its width. The two agree wherever the area is a power of two, as at Cutie's
+//! strides 4 and 16, but can differ by an ulp at odd windows. ReLU is `fmaxf`, so NaN gives 0;
+//! `torch.relu` keeps NaN.
 
 /// A row-major `[rows, cols]` matrix of f32 values, borrowed.
 #[derive(Clone, Copy, Debug)]
@@ -77,7 +83,7 @@ pub fn concat_cols(parts: &[HostMat]) -> Result<Vec<f32>, String> {
 /// Adaptive average pooling of planar `x` `[channels, height*width]` to `[channels,
 /// out_height*out_width]` (CUDA's `gpu_pixal_pool`, `pixal_pool_kernel`): each output the mean of
 /// its window `[floor(i*in/out), ceil((i+1)*in/out))` in each direction, summed in f32 row by row
-/// and divided once by the window's size.
+/// and divided once by the window's size (PyTorch divides by its height, then its width).
 pub fn pixal_pool(x: HostMat, width: usize, height: usize, out_width: usize, out_height: usize) -> Result<Vec<f32>, String> {
     if width == 0
         || height == 0
@@ -154,7 +160,7 @@ pub fn add_cols_broadcast(x: HostMat, bias: HostMat) -> Result<Vec<f32>, String>
     Ok((0..x.rows).flat_map(|r| x.row(r).iter().zip(bias.values).map(|(&v, &b)| v + b)).collect())
 }
 
-/// `fmaxf(x, 0)` (CUDA's `gpu_birefnet_relu`): NaN and -inf give 0.
+/// `fmaxf(x, 0)` (CUDA's `gpu_birefnet_relu`): NaN and -inf give 0 (`torch.relu` keeps NaN).
 pub fn birefnet_relu(x: &[f32]) -> Vec<f32> {
     x.iter().map(|&v| v.max(0.0)).collect()
 }
