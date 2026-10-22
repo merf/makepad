@@ -487,9 +487,13 @@ fn the_ring_holds_no_more_than_the_in_flight_cap() {
         let cap = std::env::var("MAKEPAD_METAL_MAX_IN_FLIGHT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(3usize).max(1);
         let x = upload(&values(SPIN_THREADS, 16));
         stream::stats(true);
-        let mut outs = Vec::new();
+        // Each spin reads the one before, so the GPU runs them in order: spins that share
+        // nothing but a read overlap on Apple GPUs (the M5 ran three at once), and then one wait
+        // retires several and fewer than four are needed.
+        let mut outs: Vec<GpuTensor> = Vec::new();
         for i in 0..cap + 4 {
-            outs.push(spin(&x, iterations));
+            let out = spin(outs.last().unwrap_or(&x), iterations);
+            outs.push(out);
             stream::flush().unwrap();
             let state = stream::ring_state();
             assert!(state.in_flight <= cap, "commit {i}: {} in flight, the cap is {cap}", state.in_flight);
