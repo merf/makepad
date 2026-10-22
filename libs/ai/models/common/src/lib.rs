@@ -13,6 +13,7 @@ pub mod backend;
 pub mod dtype;
 pub mod error;
 pub mod gpu;
+pub mod host_ops;
 pub mod json;
 pub mod metal_accel;
 pub mod progress;

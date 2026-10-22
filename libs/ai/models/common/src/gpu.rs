@@ -263,6 +263,30 @@ fn cutie_metal_ref(op: &str) -> Result<bool, String> {
     }
 }
 
+/// Whether MAKEPAD_CUTIE_METAL_REF sends what `name` names (an op, with or without its prefix, or
+/// an ops check row label) to its host reference, so the ops check can mark those rows "(reference
+/// forced)". Always false off macOS, and for a name the variable does not take (an op with no Metal
+/// kernel to stand in for); `Err` when the variable itself names something that is no op.
+pub fn gpu_cutie_metal_ref_forces(name: &str) -> Result<bool, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let Ok(MetalReference::Ops(ops)) = MetalReference::parse(name) else {
+            return Ok(false);
+        };
+        for op in ops {
+            if cutie_metal_ref(op)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = name;
+        Ok(false)
+    }
+}
+
 #[cfg(test)]
 mod metal_reference_tests {
     use super::*;
