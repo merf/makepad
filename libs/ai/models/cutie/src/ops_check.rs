@@ -929,7 +929,7 @@ pub(crate) fn check(report: &mut Report) -> Result<()> {
     let available = gpu_cutie_available();
     report.record(STAGE, "available", "gpu_cutie_available", available, format!("{available} (where nothing runs them, false)"));
     if cfg!(target_os = "macos") {
-        report.note("ops: Metal's kernels (MAKEPAD_CUTIE_METAL_REF=all or op,op runs those ops as their host references, which then compare with themselves); PyTorch's pins at TIGHT where CUDA's expf, logf, sinf and cosf give its bits");
+        report.note("ops: Metal's kernels (MAKEPAD_CUTIE_METAL_REF=all, or ops by name or by this report's row label, runs those ops as their host references, which then compare with themselves); PyTorch's pins at TIGHT where CUDA's expf, logf, sinf and cosf give its bits");
     } else if !GPU_CUTIE_KERNELS {
         report.note("ops: this build has no Cutie kernels; each op is its host reference, so kernel against reference compares the reference with itself");
     }

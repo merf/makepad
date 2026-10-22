@@ -6,8 +6,13 @@
 //! mul_mm stages its tiles in half, for every caller: Body's linears become fp32 (deliberately),
 //! and Cutie's `gpu_cutie_linear` needs no host sgemm.
 //!
-//! W is bound where it is: in the host binding its device copy is kept by content id, so a weight
-//! is uploaded once; once tensors are resident it is bound from its own storage.
+//! In the host binding W's device copy is a stream weight keyed by W's content id
+//! (`gpu_linear_f32_resident::t{id}::w`), copied once and kept, as ggml's `resident_f32` cache
+//! kept it before: not through the input mirror, whose least recently used copies go past its cap
+//! (512 MB) and which never keeps a copy bigger than that, so Body's 664 MB pose correctives would
+//! be copied again on every call. `gpu_weight_cache_evict_prefix("gpu_linear_f32_resident")`
+//! drops them. Once tensors are resident (step 12), W is bound from its own storage instead and
+//! this cache goes.
 //!
 //! macOS.
 
@@ -44,7 +49,15 @@ pub fn linear_f32_resident(x: &GpuTensor, weight: &GpuTensor, bias: Option<&GpuT
     let rows = gemm_dim(OP, "m", m)?;
     let cols = gemm_dim(OP, "n", n)?;
     gemm_dim(OP, "k", k)?;
+    let weight_key = format!("{OP}::t{}::w", weight.id.get());
     with_metal_stream(OP, |s| {
+        // The host binding's copy of W, by content id (module docs). The fill reads W's host
+        // values, which only the host binding has; step 12 binds W itself (Bind::In).
+        let w = s.weights(&weight_key, n * k, |dst| {
+            let values = weight.data.try_borrow().map_err(|_| format!("{OP}: the weight tensor is mutably borrowed"))?;
+            dst.copy_from_slice(&values);
+            Ok(())
+        })?;
         let out = GpuTensor::alloc(m, n)?;
         s.gemm(&Gemm {
             m,
@@ -55,7 +68,7 @@ pub fn linear_f32_resident(x: &GpuTensor, weight: &GpuTensor, bias: Option<&GpuT
             beta: 0.0,
             a: GemmOperand { src: Bind::In(x), offset: 0, ld: k, trans: false, batch_stride: 0 },
             // W [n, k] read as its transpose, op(B) [k, n].
-            b: GemmOperand { src: Bind::In(weight), offset: 0, ld: k, trans: true, batch_stride: 0 },
+            b: GemmOperand { src: Bind::Weights(&w, 0), offset: 0, ld: k, trans: true, batch_stride: 0 },
             c: Bind::Out(&out),
             c_offset: 0,
             ldc: n,

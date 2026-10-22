@@ -3,9 +3,9 @@
 //! makepad-ai-llm (the graph is that model).
 //!
 //! Makepad's own kernels run on the Metal stream (`stream`): Cutie's ops
-//! (`cutie_ops`), the generic ops Cutie calls (`generic_ops`), and the fp32
-//! GEMM's users, `linear` and `attention` (RationalVisions
-//! docs/cutie-metal.md).
+//! (`cutie_ops`), the generic ops Cutie calls (`generic_ops`), PyTorch's
+//! layer norm (`layer_norm`), and the fp32 GEMM's users, `linear` and
+//! `attention` (RationalVisions docs/cutie-metal.md).
 
 pub mod affine;
 #[cfg(target_os = "macos")]
@@ -16,6 +16,7 @@ pub mod generic_ops;
 pub mod gpu_types;
 #[cfg(target_os = "macos")]
 pub mod gpu_tensor;
+pub mod layer_norm;
 #[cfg(target_os = "macos")]
 pub mod linear;
 #[cfg(target_os = "macos")]

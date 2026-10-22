@@ -1,8 +1,10 @@
 //! Cutie's kernel libraries on the Mac (RationalVisions docs/cutie-metal.md, steps 9 and 10), in
-//! the host binding: every Cutie library and the generic ops' library compile, and every one of
-//! their kernels makes a pipeline. Each family's own checks against the host are its module's
-//! tests (`cargo test -p makepad-ai-metal --lib cutie_ops::<family>`, `--lib generic_ops`), the
-//! ops against their references `cutie-validate <oracle> ops`.
+//! the host binding: every Cutie library (the layer norm's among them) and the generic ops'
+//! library compile, and every one of their kernels makes a pipeline. The GEMM's are
+//! `tests/gemm.rs`'s. Families (a) and (c), the layer norm and the generic ops also have unit
+//! tests against the host (`cargo test -p makepad-ai-metal --lib cutie_ops::elementwise`,
+//! `cutie_ops::softmax_norm`, `layer_norm`, `generic_ops`); every op is checked against its
+//! reference by `cutie-validate <oracle> ops`, the only check of families (b), (d) and (e).
 //!
 //! `cargo test -p makepad-ai-metal --test cutie_ops -- --nocapture` (it prints every pipeline's
 //! limits). With MAKEPAD_METAL_KERNELS_SRC=<checkout>/libs/ai/metal/shaders/makepad the sources

@@ -7,8 +7,9 @@
 //! - `elementwise`: sigmoid, gru, others, pad, crop, add_broadcast, normalise_rows, rgb_planes,
 //!   object_values;
 //! - `pool_resize`: maxpool3x3s2, resize_bilinear;
-//! - `softmax_norm`: softmax_axis0, aggregate, eca, layer_norm (and `gpu_layer_norm_pytorch` on
-//!   the same kernel), sine_encoding;
+//! - `softmax_norm`: softmax_axis0, aggregate, eca, layer_norm, sine_encoding; the layer norm on
+//!   [`crate::layer_norm`]'s kernel, a library of its own, which `gpu_layer_norm_pytorch` runs for
+//!   every model;
 //! - `matmul_conv`: matmul, similarity, conv2d, conv2d_fused, on `MetalStream::gemm`;
 //! - `topk_mask`: topk_softmax, attn_mask.
 //!
@@ -36,18 +37,21 @@ pub use pool_resize::{gpu_cutie_maxpool3x3s2, gpu_cutie_resize_bilinear};
 #[cfg(target_os = "macos")]
 pub use softmax_norm::{
     gpu_cutie_aggregate, gpu_cutie_eca, gpu_cutie_layer_norm, gpu_cutie_sine_encoding, gpu_cutie_softmax_axis0,
-    gpu_layer_norm_pytorch,
 };
 pub use softmax_norm::CUTIE_ECA_MAX_TAPS;
 #[cfg(target_os = "macos")]
 pub use topk_mask::{gpu_cutie_attn_mask, gpu_cutie_topk_softmax};
 
-/// Every Cutie library, for the gate that asks whether they all compile (step 14) and the Mac's
-/// bring-up test.
+/// Every library of the kernels Cutie's own ops launch (the five families' and the layer norm's),
+/// for the gate that asks whether they all compile (step 14) and the Mac's bring-up test. The GEMM
+/// (`stream::gemm::GEMM`, under matmul, similarity, the convolutions and the linear), the generic
+/// ops' (`generic_ops::GENERIC_OPS`) and the stream's own (`stream::kernels::TENSOR`) are listed
+/// where they are defined.
 pub static CUTIE_LIBRARIES: &[&KernelLib] = &[
     &elementwise::CUTIE_ELEMENTWISE,
     &pool_resize::CUTIE_POOL_RESIZE,
     &softmax_norm::CUTIE_SOFTMAX_NORM,
+    &crate::layer_norm::LAYER_NORM,
     &matmul_conv::CUTIE_MATMUL_CONV,
     &topk_mask::CUTIE_TOPK_MASK,
 ];
@@ -58,6 +62,7 @@ pub fn cutie_kernels() -> impl Iterator<Item = &'static Kernel> {
         elementwise::ELEMENTWISE_KERNELS,
         pool_resize::POOL_RESIZE_KERNELS,
         softmax_norm::SOFTMAX_NORM_KERNELS,
+        crate::layer_norm::LAYER_NORM_KERNELS,
         matmul_conv::MATMUL_CONV_KERNELS,
         topk_mask::TOPK_MASK_KERNELS,
     ]

@@ -548,10 +548,13 @@ fn the_seams_rules_are_errors_not_panics() {
     assert!(err.contains("bound again"), "{err}");
     // And the stream goes on.
     assert_eq!(stream::download(&tensor_ops::add(&x, &x).unwrap()).unwrap(), vec![2.0, 4.0]);
-    assert!(with_metal_stream("bring-up: gemm", |s| s.gemm(&gemm_stub(&x))).is_err(), "gemm arrives in step 8");
+    // A GEMM is checked before its library is asked for (tests/gemm.rs runs the GEMM itself).
+    let err = with_metal_stream("bring-up: gemm", |s| s.gemm(&gemm_into_nothing(&x))).unwrap_err();
+    assert_eq!(err, "bring-up: gemm: gemm writes C through Bind::Out or Bind::InOut");
 }
 
-fn gemm_stub(x: &GpuTensor) -> stream::Gemm<'_> {
+/// A 1x1x1 GEMM with C bound nowhere (`Bind::Absent`), which the GEMM's checks refuse.
+fn gemm_into_nothing(x: &GpuTensor) -> stream::Gemm<'_> {
     let operand = stream::GemmOperand { src: Bind::In(x), offset: 0, ld: 1, trans: false, batch_stride: 0 };
     stream::Gemm {
         m: 1,

@@ -147,6 +147,13 @@ fn cutie_check_f32(op: &str, x: &GpuTensor) -> MetalResult<()> {
     Ok(())
 }
 
+/// A GEMM's error under a convolution's key, as CUDA's "{op} {key}: <cuBLAS's error>": the
+/// stream's own "{op}: " taken off, so the op is named once.
+fn keyed_error(op: &str, key: &str, e: &str) -> String {
+    let detail = e.strip_prefix(op).and_then(|rest| rest.strip_prefix(": ")).unwrap_or(e);
+    format!("{op} {key}: {detail}")
+}
+
 /// CUDA's launch over `rows` rows of `plane` values: threadgroups of 256 along the plane, a
 /// threadgroup a row along y up to 65535, the kernel looping over the rows beyond.
 fn rows_grid(plane: usize, rows: usize) -> MetalResult<Grid> {
@@ -195,10 +202,17 @@ impl GemmDims {
     }
 
     /// CUDA's `cutie_sgemm` refuses a product it would run (not empty, k not 0) past cuBLAS's
-    /// int sizes; the same here, before anything is encoded.
+    /// int sizes; the same here, before anything is encoded. With k = 0 it zeroes C, which the
+    /// stream's fill counts in u32 (CUDA's memset does not): C's elements must fit one.
     fn check(&self) -> MetalResult<()> {
-        if self.m == 0 || self.n == 0 || self.k == 0 {
+        if self.m == 0 || self.n == 0 {
             return Ok(());
+        }
+        if self.k == 0 {
+            let op = "cutie sgemm";
+            let words =
+                self.m.checked_mul(self.n).ok_or_else(|| format!("{op}: {}x{} does not fit the kernel's 32-bit sizes", self.m, self.n))?;
+            return cutie_u32(op, words).map(|_| ());
         }
         for v in [self.n, self.m, self.k, self.b.ld, self.a.ld] {
             i32::try_from(v).map_err(|_| format!("cutie sgemm: {v} exceeds the GEMM's sizes (cuBLAS's on CUDA)"))?;
@@ -484,7 +498,7 @@ pub fn gpu_cutie_conv2d_fused(
     let epilogue = plan.epilogue(bias.is_some(), residual.is_some(), relu);
     let epilogue_grid = rows_grid(plan.opix, plan.out_rows())?;
     let residual_bind = residual.map_or(Bind::Absent, Bind::In);
-    let gemm_err = |e: String| format!("{op} {key}: {e}");
+    let gemm_err = |e: String| keyed_error(op, key, &e);
     with_metal_stream(op, |s| {
         // Weights then bias, one cached buffer: no host upload after the first call.
         let w = s.weights(&qualified_key, floats, |dst| {
@@ -1004,6 +1018,28 @@ mod tests {
             }
             assert_close(&format!("similarity ms {shrinkage} qe {selection}"), &actual, &expected, 1e-4);
         }
+    }
+
+    #[test]
+    fn a_gemm_is_checked_before_anything_is_encoded() {
+        let big = 1usize << 31;
+        let e = GemmDims::product(big, 1, 1, big, true, 1, false).check().unwrap_err();
+        assert_eq!(e, format!("cutie sgemm: {big} exceeds the GEMM's sizes (cuBLAS's on CUDA)"));
+        assert!(GemmDims::product(big, 1, 0, big, true, 1, false).check().is_ok(), "k = 0 zeroes C, of 2^31 words");
+        // k = 0 zeroes C with the stream's fill, which counts in u32 (CUDA's memset does not).
+        let e = GemmDims::product(1 << 16, 1 << 16, 0, 1, false, 1 << 16, false).check().unwrap_err();
+        assert_eq!(e, "cutie sgemm: 4294967296 does not fit the kernel's 32-bit sizes");
+        assert!(GemmDims::product(0, 1 << 40, 0, 1, false, 1, false).check().is_ok(), "an empty product does nothing");
+    }
+
+    #[test]
+    fn a_conv_gemms_error_names_the_op_once_with_the_key() {
+        let e = "gpu_cutie_conv2d: gemm reads float 9 of B (3x3, ld 3, offset 0, 1 batches 0 apart), its binding holds 9";
+        assert_eq!(
+            keyed_error("gpu_cutie_conv2d", "enc.layer1.0.conv1", e),
+            "gpu_cutie_conv2d enc.layer1.0.conv1: gemm reads float 9 of B (3x3, ld 3, offset 0, 1 batches 0 apart), its binding holds 9"
+        );
+        assert_eq!(keyed_error("gpu_cutie_conv2d", "k", "no Metal stream"), "gpu_cutie_conv2d k: no Metal stream");
     }
 
     #[test]

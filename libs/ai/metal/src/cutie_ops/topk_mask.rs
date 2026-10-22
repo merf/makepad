@@ -5,11 +5,14 @@
 //! cuda/kernels/cutie.cu; each op's host reference is in cuda/src/cutie_reference.rs.
 //!
 //! Each op makes the checks CUDA's wrapper makes, in its order and with its messages, before
-//! anything is encoded. The kernels index in 64 bits wherever CUDA's do (size_t), so no size CUDA
-//! takes is refused here for being large. The merge and the row sums go round a SIMD-group in
-//! CUDA's butterfly order, written for its 32 lanes (Apple's SIMD-groups are 32 wide): a pipeline
-//! of another width is an `Err`, never another order. The checks, the kernels' params and their
-//! grids are plain functions of the sizes, compiled and tested on any OS; the ops are macOS only.
+//! anything is encoded. The kernels index in 64 bits wherever CUDA's do (size_t); the one size
+//! limit CUDA lacks is the stream's zero fill (CUDA's is a memset), which counts its words in u32:
+//! a similarity of more than u32::MAX elements, or a mask of 2^31 objects or more, is `Err` here
+//! (`cutie_u32`'s message), never Cutie's sizes. The merge and the row sums go round a SIMD-group
+//! in CUDA's butterfly order, written for its 32 lanes (Apple's SIMD-groups are 32 wide): a
+//! pipeline of another width is an `Err`, never another order. The checks, the kernels' params and
+//! their grids are plain functions of the sizes, compiled and tested on any OS; the ops are macOS
+//! only.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
 use crate::stream::{Grid, Kernel, KernelLib, KernelLimits, KernelParams, MetalResult};
@@ -184,7 +187,11 @@ fn topk_plan(m: usize, p: usize, k: usize) -> MetalResult<TopkPlan> {
     if k > CUTIE_TOPK_MAX {
         return Err(format!("{op}: top {k} of {m} rows; the kernel takes at most {CUTIE_TOPK_MAX} (Cutie's top_k is 30)"));
     }
-    let (m, p) = (cutie_u32(op, m)?, cutie_u32(op, p)?);
+    let (m_u, p_u) = (cutie_u32(op, m)?, cutie_u32(op, p)?);
+    // The affinity is zeroed by the stream's fill, which counts its words in u32.
+    let words = m.checked_mul(p).ok_or_else(|| format!("{op}: {m}x{p} does not fit the kernel's 32-bit sizes"))?;
+    cutie_u32(op, words)?;
+    let (m, p) = (m_u, p_u);
     let slices = topk_slices(m);
     let partial = TopkPartial { m, p, k: k as u32, chunk: m.div_ceil(slices), slices };
     Ok(TopkPlan {
@@ -246,6 +253,9 @@ fn attn_plan(n: usize, p: usize, heads: usize, queries: usize) -> MetalResult<At
         .checked_mul(heads)
         .and_then(|rows| rows.checked_mul(queries))
         .ok_or_else(|| format!("{op}: {n} objects x {heads} heads x {queries} queries overflows"))?;
+    // Each object's two flags are zeroed by the stream's fill, which counts its words in u32.
+    let flags = n.checked_mul(2).ok_or_else(|| format!("{op}: {n} objects overflows"))?;
+    cutie_u32(op, flags)?;
     Ok(AttnPlan {
         n,
         p,
@@ -455,6 +465,10 @@ mod tests {
         assert!(!topk_plan(40, 0, 30).unwrap().picks());
         let e = topk_plan(1 << 32, 1, 30).unwrap_err();
         assert_eq!(e, "gpu_cutie_topk_softmax: 4294967296 does not fit the kernel's 32-bit sizes");
+        // The affinity's zero fill counts in u32: m * p must fit, before anything is encoded.
+        let e = topk_plan(1 << 16, 1 << 16, 30).unwrap_err();
+        assert_eq!(e, "gpu_cutie_topk_softmax: 4294967296 does not fit the kernel's 32-bit sizes");
+        assert_eq!(topk_plan(65535, 65537, 30).unwrap().partial.p, 65537, "u32::MAX elements");
     }
 
     #[test]
@@ -517,5 +531,9 @@ mod tests {
         assert_eq!(e, "gpu_cutie_attn_mask: 4294967296 does not fit the kernel's 32-bit sizes");
         let e = attn_plan(u32::MAX as usize, 1, u32::MAX as usize, u32::MAX as usize).unwrap_err();
         assert!(e.ends_with("queries overflows"), "{e}");
+        // The flags' zero fill counts in u32: two words an object.
+        let e = attn_plan(1 << 31, 1, 1, 1).unwrap_err();
+        assert_eq!(e, "gpu_cutie_attn_mask: 4294967296 does not fit the kernel's 32-bit sizes");
+        assert_eq!(attn_plan((1 << 31) - 1, 1, 1, 1).unwrap().n, (1 << 31) - 1);
     }
 }

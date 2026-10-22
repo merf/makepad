@@ -1,10 +1,12 @@
 //! Cutie's softmax down columns, aggregate, ECA, layer norm and sine encoding as Metal kernels
 //! (RationalVisions docs/cutie-metal.md, family (c)), at the signatures of the macOS
 //! `gpu_cutie_*` functions (models/common's gpu_cutie_host.rs, the same as CUDA's in
-//! cuda/src/cutie_ops.rs), and `gpu_layer_norm_pytorch` on the same layer norm kernel, so the ops
-//! check's EXACT comparison of the two holds by construction as it does on CUDA. The kernels are
-//! `shaders/makepad/cutie_softmax_norm.metal`, ported from cuda/kernels/cutie.cu and, for the
-//! layer norm, diffusion_ops.cu; each op's host reference is in cuda/src/cutie_reference.rs.
+//! cuda/src/cutie_ops.rs). The kernels are `shaders/makepad/cutie_softmax_norm.metal`, ported
+//! from cuda/kernels/cutie.cu, but for the layer norm's: `gpu_cutie_layer_norm` launches
+//! [`crate::layer_norm`]'s kernel (`layer_norm.metal`, a library of its own, which
+//! `gpu_layer_norm_pytorch` runs for every model) with its affine cached, so the ops check's EXACT
+//! comparison of the two holds by construction as it does on CUDA. Each op's host reference is in
+//! cuda/src/cutie_reference.rs.
 //!
 //! Each op makes the checks CUDA's wrapper makes, in its order and with its messages, before
 //! anything is encoded, and launches CUDA's kernels with CUDA's threadgroups where the order of a
@@ -21,13 +23,16 @@
 //! ops are macOS only.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
+use crate::layer_norm::{layer_norm_params, LayerNormPytorch};
 use crate::stream::{Grid, Kernel, KernelLib, KernelParams, MetalResult};
 #[cfg(target_os = "macos")]
-use crate::stream::{upload, with_metal_stream, Bind, MetalStream};
+use crate::layer_norm::{launch_layer_norm, layer_norm_grid};
+#[cfg(target_os = "macos")]
+use crate::stream::{with_metal_stream, Bind, MetalStream};
 #[cfg(target_os = "macos")]
 use crate::GpuTensor;
 
-/// Cutie's softmax, aggregate, ECA, layer norm and sine kernels (`cutie_softmax_norm.metal`).
+/// Cutie's softmax, aggregate, ECA and sine kernels (`cutie_softmax_norm.metal`).
 pub static CUTIE_SOFTMAX_NORM: KernelLib = KernelLib {
     name: "cutie_softmax_norm",
     source: include_str!("../../shaders/makepad/cutie_softmax_norm.metal"),
@@ -46,8 +51,6 @@ pub static CUTIE_ECA_ROW_MEAN: Kernel = Kernel { lib: &CUTIE_SOFTMAX_NORM, funct
 pub static CUTIE_ECA_SCALE: Kernel = Kernel { lib: &CUTIE_SOFTMAX_NORM, function: "cutie_eca_scale_f32" };
 /// x * scale + residual (`CutieEcaApply`).
 pub static CUTIE_ECA_APPLY: Kernel = Kernel { lib: &CUTIE_SOFTMAX_NORM, function: "cutie_eca_apply_f32" };
-/// PyTorch's LayerNorm, a threadgroup a row (`CutieLayerNorm`).
-pub static CUTIE_LAYER_NORM: Kernel = Kernel { lib: &CUTIE_SOFTMAX_NORM, function: "cutie_layer_norm_f32" };
 /// Cutie's sine positional encoding (`CutieSineEncoding`).
 pub static CUTIE_SINE_ENCODING: Kernel = Kernel { lib: &CUTIE_SOFTMAX_NORM, function: "cutie_sine_encoding_f32" };
 
@@ -59,7 +62,6 @@ pub static SOFTMAX_NORM_KERNELS: &[&Kernel] = &[
     &CUTIE_ECA_ROW_MEAN,
     &CUTIE_ECA_SCALE,
     &CUTIE_ECA_APPLY,
-    &CUTIE_LAYER_NORM,
     &CUTIE_SINE_ENCODING,
 ];
 
@@ -75,9 +77,7 @@ const SOFTMAX_COLUMN_THREADS: u32 = 128;
 /// CUTIE_SOFTMAX_TILE_COLS and _ROWS).
 const SOFTMAX_TILE_COLS: u32 = 8;
 const SOFTMAX_TILE_ROWS: u32 = 128;
-/// The layer norm's threadgroup: PyTorch's dim3(warp_size, 4).
-const LAYER_NORM_THREADS: [u32; 3] = [32, 4, 1];
-/// The SIMD width CUDA's butterflies and shuffle-down trees are written for.
+/// The SIMD width CUDA's butterflies are written for.
 const WARP: u32 = 32;
 
 /// `cutie_softmax_axis0_f32`'s and `cutie_softmax_axis0_tile_f32`'s params: x [rows, cols].
@@ -131,16 +131,6 @@ pub struct CutieEcaApply {
 }
 // SAFETY: #[repr(C)], 8 bytes, no pointers; `CutieEcaApply` in MSL.
 unsafe impl KernelParams for CutieEcaApply {}
-
-/// `cutie_layer_norm_f32`'s params: rows of `cols` (a multiple of 4), and eps.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct CutieLayerNorm {
-    pub cols: u32,
-    pub eps: f32,
-}
-// SAFETY: #[repr(C)], 8 bytes, no pointers; `CutieLayerNorm` in MSL.
-unsafe impl KernelParams for CutieLayerNorm {}
 
 /// `cutie_sine_encoding_f32`'s params: `freqs` frequencies at `w x h`, the position scale and
 /// eps, and `n` = w * h * 4 * freqs entries.
@@ -243,7 +233,7 @@ impl EcaPlan {
 /// `x` and `residual` as (rows, cols), `n` images of `c` channels, the taps `conv_w`.
 fn eca_params(x: (usize, usize), residual: (usize, usize), n: usize, c: usize, conv_w: &[f32]) -> MetalResult<EcaPlan> {
     let op = "gpu_cutie_eca";
-    if n.checked_mul(c) != Some(x.0) || residual.0 != x.0 || residual.1 != x.1 || conv_w.len() % 2 == 0 {
+    if n.checked_mul(c) != Some(x.0) || residual.0 != x.0 || residual.1 != x.1 || conv_w.len().is_multiple_of(2) {
         return Err("gpu_cutie_eca shape mismatch".into());
     }
     if conv_w.len() > CUTIE_ECA_MAX_TAPS {
@@ -269,7 +259,7 @@ fn eca_params(x: (usize, usize), residual: (usize, usize), n: usize, c: usize, c
 // --- Layer norm ---
 
 /// `gpu_cutie_layer_norm`'s check for `x` [rows, cols] under weight key `key`, with CUDA's
-/// message.
+/// message; the params of `crate::layer_norm`'s kernel.
 fn cutie_layer_norm_params(
     key: &str,
     gamma: usize,
@@ -277,33 +267,12 @@ fn cutie_layer_norm_params(
     rows: usize,
     cols: usize,
     eps: f32,
-) -> MetalResult<CutieLayerNorm> {
+) -> MetalResult<LayerNormPytorch> {
     let op = "gpu_cutie_layer_norm";
-    if gamma != cols || beta != cols || cols % 4 != 0 {
+    if gamma != cols || beta != cols || !cols.is_multiple_of(4) {
         return Err(format!("{op} {key}: {gamma} and {beta} affine values for {cols} columns"));
     }
     layer_norm_params(op, rows, cols, eps)
-}
-
-/// `gpu_layer_norm_pytorch`'s check, with CUDA's message.
-fn layer_norm_pytorch_params(scale: usize, bias: usize, rows: usize, cols: usize, eps: f32) -> MetalResult<CutieLayerNorm> {
-    if scale != cols || bias != cols || cols % 4 != 0 {
-        return Err("gpu_layer_norm_pytorch width mismatch".to_string());
-    }
-    layer_norm_params("gpu_layer_norm_pytorch", rows, cols, eps)
-}
-
-fn layer_norm_params(op: &str, rows: usize, cols: usize, eps: f32) -> MetalResult<CutieLayerNorm> {
-    cutie_u32(op, rows)?;
-    let cols_u = cutie_u32(op, cols)?;
-    cutie_count(op, &[rows, cols])?;
-    Ok(CutieLayerNorm { cols: cols_u, eps })
-}
-
-/// A threadgroup of [32, 4] a row, as PyTorch's launch; nothing when there are no elements.
-fn layer_norm_grid(rows: usize, cols: usize) -> MetalResult<Grid> {
-    let groups = if cols == 0 { 0 } else { rows };
-    Grid::groups([groups, 1, 1], LAYER_NORM_THREADS)
 }
 
 // --- Sine encoding ---
@@ -406,26 +375,10 @@ pub fn gpu_cutie_eca(x: &GpuTensor, residual: &GpuTensor, n: usize, c: usize, co
     })
 }
 
-/// One launch of the layer norm kernel over `x` into `out`, gamma and beta bound as given.
-#[cfg(target_os = "macos")]
-#[allow(clippy::too_many_arguments)]
-fn launch_layer_norm(
-    s: &mut MetalStream<'_>,
-    op: &str,
-    x: &GpuTensor,
-    gamma: Bind<'_>,
-    beta: Bind<'_>,
-    out: &GpuTensor,
-    params: &CutieLayerNorm,
-    grid: Grid,
-) -> MetalResult<()> {
-    require_warp_width(s, op, &CUTIE_LAYER_NORM)?;
-    s.launch(&CUTIE_LAYER_NORM, &[], params, &[Bind::In(x), gamma, beta, Bind::Out(out)], grid)
-}
-
 /// nn.LayerNorm over each row of `x` [rows, cols] (cols % 4 == 0), the kernel of
-/// `gpu_layer_norm_pytorch` (PyTorch's CUDA order), with `gamma` and `beta` kept on the device
-/// under `{cache_namespace}::{key}::cutie_ln` (gamma, then beta) instead of uploaded on every call.
+/// `gpu_layer_norm_pytorch` (`crate::layer_norm`, PyTorch's CUDA order), with `gamma` and `beta`
+/// kept on the device under `{cache_namespace}::{key}::cutie_ln` (gamma, then beta) instead of
+/// uploaded on every call.
 #[cfg(target_os = "macos")]
 pub fn gpu_cutie_layer_norm(
     x: &GpuTensor,
@@ -450,24 +403,6 @@ pub fn gpu_cutie_layer_norm(
         })?;
         let out = GpuTensor::alloc(x.rows(), cols)?;
         launch_layer_norm(s, op, x, Bind::Weights(&affine, 0), Bind::Weights(&affine, cols), &out, &params, grid)?;
-        Ok(out)
-    })
-}
-
-/// nn.LayerNorm over each row of `x` [rows, cols] (cols % 4 == 0) as PyTorch's CUDA fast path
-/// computes it: float4 steps of online Welford moments, its fixed tree over four 32-lane groups,
-/// and gamma * (rstd * (x - mean)) + beta; CUDA's `gpu_layer_norm_pytorch`, on the kernel
-/// `gpu_cutie_layer_norm` runs, the affine uploaded on every call.
-#[cfg(target_os = "macos")]
-pub fn gpu_layer_norm_pytorch(x: &GpuTensor, scale: &[f32], bias: &[f32], eps: f32) -> Result<GpuTensor, String> {
-    let op = "gpu_layer_norm_pytorch";
-    let params = layer_norm_pytorch_params(scale.len(), bias.len(), x.rows(), x.cols(), eps)?;
-    let grid = layer_norm_grid(x.rows(), x.cols()).map_err(|e| format!("{op}: {e}"))?;
-    let gamma = upload(scale, 1, x.cols())?;
-    let beta = upload(bias, 1, x.cols())?;
-    with_metal_stream(op, |s| {
-        let out = GpuTensor::alloc(x.rows(), x.cols())?;
-        launch_layer_norm(s, op, x, Bind::In(&gamma), Bind::In(&beta), &out, &params, grid)?;
         Ok(out)
     })
 }
@@ -520,6 +455,10 @@ mod tests {
         list.iter().map(|&(ty, name)| (ty.to_string(), name.to_string())).collect()
     }
 
+    /// A params struct's MSL name, the kernels that read it, its MSL fields, its Rust size and
+    /// its MSL size.
+    type Twin<'a> = (&'a str, &'a [&'a Kernel], Vec<(String, String)>, usize, usize);
+
     #[test]
     fn every_kernel_is_in_the_library_and_the_library_includes_the_header() {
         let source = CUTIE_SOFTMAX_NORM.source;
@@ -543,7 +482,7 @@ mod tests {
 
     #[test]
     fn params_are_their_msl_twins_field_for_field() {
-        let twins: [(&str, &[&Kernel], Vec<(String, String)>, usize, usize); 7] = [
+        let twins: [Twin<'_>; 6] = [
             (
                 "CutieSoftmaxAxis0",
                 &[&CUTIE_SOFTMAX_AXIS0, &CUTIE_SOFTMAX_AXIS0_TILE],
@@ -561,7 +500,6 @@ mod tests {
                 4 * CUTIE_ECA_MAX_TAPS + 12,
             ),
             ("CutieEcaApply", &[&CUTIE_ECA_APPLY], fields(&[("uint", "plane"), ("uint", "n")]), size_of::<CutieEcaApply>(), 8),
-            ("CutieLayerNorm", &[&CUTIE_LAYER_NORM], fields(&[("uint", "cols"), ("float", "eps")]), size_of::<CutieLayerNorm>(), 8),
             (
                 "CutieSineEncoding",
                 &[&CUTIE_SINE_ENCODING],
@@ -592,8 +530,6 @@ mod tests {
         // The Rust fields in the same order (Debug prints them in declaration order).
         let debug = format!("{:?}", CutieSineEncoding { freqs: 1, w: 2, h: 3, scale: 4.0, eps: 5.0, n: 6 });
         assert_eq!(debug, "CutieSineEncoding { freqs: 1, w: 2, h: 3, scale: 4.0, eps: 5.0, n: 6 }");
-        let debug = format!("{:?}", CutieLayerNorm { cols: 1, eps: 2.0 });
-        assert_eq!(debug, "CutieLayerNorm { cols: 1, eps: 2.0 }");
         assert_eq!(std::mem::offset_of!(CutieEcaScale, k), 4 * CUTIE_ECA_MAX_TAPS);
         assert_eq!(std::mem::offset_of!(CutieEcaScale, rows), 4 * CUTIE_ECA_MAX_TAPS + 8);
     }
@@ -628,10 +564,6 @@ mod tests {
             cutie_layer_norm_params("q norm", 6, 6, 3, 6, 1e-5).unwrap_err(),
             "gpu_cutie_layer_norm q norm: 6 and 6 affine values for 6 columns"
         );
-        let width = "gpu_layer_norm_pytorch width mismatch";
-        assert_eq!(layer_norm_pytorch_params(255, 256, 3, 256, 1e-5).unwrap_err(), width);
-        assert_eq!(layer_norm_pytorch_params(256, 255, 3, 256, 1e-5).unwrap_err(), width);
-        assert_eq!(layer_norm_pytorch_params(6, 6, 3, 6, 1e-5).unwrap_err(), width);
 
         let sine = "gpu_cutie_sine_encoding";
         assert_eq!(sine_encoding_params(0, 24, 14, 32.0, 1e-6).unwrap_err(), format!("{sine}: 0 frequencies at 24x14"));
@@ -686,10 +618,9 @@ mod tests {
         assert_eq!((apply.groups, apply.threads), ([(768 * P16).div_ceil(256) as u32, 1, 1], [256, 1, 1]));
 
         let ln = cutie_layer_norm_params("ln", 256, 256, P4, 256, 1e-5).unwrap();
-        assert_eq!(ln, CutieLayerNorm { cols: 256, eps: 1e-5 });
-        assert_eq!(layer_norm_pytorch_params(256, 256, P4, 256, 1e-5).unwrap(), ln, "one kernel, one params");
-        let grid = layer_norm_grid(P4, 256).unwrap();
-        assert_eq!((grid.groups, grid.threads), ([P4 as u32, 1, 1], [32, 4, 1]), "PyTorch's dim3(32, 4) a row");
+        assert_eq!(ln, LayerNormPytorch { cols: 256, eps: 1e-5 });
+        let pytorch = crate::layer_norm::layer_norm_pytorch_params(256, 256, P4, 256, 1e-5).unwrap();
+        assert_eq!(pytorch, ln, "one kernel, one params");
 
         let sine = sine_encoding_params(64, 24, 14, 32.0, 1e-6).unwrap();
         assert_eq!(sine, CutieSineEncoding { freqs: 64, w: 24, h: 14, scale: 32.0, eps: 1e-6, n: (P16 * 256) as u32 });
@@ -709,9 +640,7 @@ mod tests {
             let plan = eca_params(x, x, n, c, &[1.0, 2.0, 3.0]).unwrap();
             assert!(plan.grids().unwrap().iter().all(Grid::is_empty), "{x:?}: CUDA returns before any launch");
         }
-        assert!(layer_norm_grid(0, 256).unwrap().is_empty());
-        assert!(layer_norm_grid(3, 0).unwrap().is_empty());
-        assert_eq!(layer_norm_pytorch_params(0, 0, 3, 0, 1e-5).unwrap().cols, 0, "no columns is 4-aligned");
+        assert_eq!(cutie_layer_norm_params("ln", 0, 0, 3, 0, 1e-5).unwrap().cols, 0, "no columns is 4-aligned");
     }
 
     #[test]
@@ -772,7 +701,9 @@ mod tests {
     }
 
     /// `cutie_softmax_axis0_tile_f32` as the MSL writes it: per tile of 8 columns, each of the
-    /// [8, 128] threads' strided max and sum, then the tree over thread rows through `shared`.
+    /// [8, 128] threads' strided max and sum, then the tree over thread rows through `shared`. The
+    /// loops run over the kernel's thread indices, as the MSL's threads do.
+    #[allow(clippy::needless_range_loop)]
     fn softmax_tile_as_msl(x: &[f32], m: usize, p: usize) -> Vec<f32> {
         let (cols, rows) = (SOFTMAX_TILE_COLS as usize, SOFTMAX_TILE_ROWS as usize);
         let mut out = vec![f32::NAN; m * p];
@@ -889,110 +820,6 @@ mod tests {
             assert_close(&format!("row mean p{plane}"), &[row_mean_as_msl(&row)], &[mean], 1e-6, 1.0);
         }
     }
-
-    /// One thread's moments, as `softmax_norm::Welford`.
-    #[derive(Clone, Copy, Debug)]
-    struct Welford {
-        mean: f32,
-        sigma2: f32,
-        count: f32,
-    }
-
-    const NO_MOMENTS: Welford = Welford { mean: 0.0, sigma2: 0.0, count: 0.0 };
-
-    /// `welford_online`: `mul_add` where the MSL calls fma().
-    fn welford_online(value: f32, current: Welford) -> Welford {
-        let delta = value - current.mean;
-        let new_count = current.count + 1.0;
-        let new_mean = delta.mul_add(1.0 / new_count, current.mean);
-        Welford { mean: new_mean, sigma2: delta.mul_add(value - new_mean, current.sigma2), count: new_count }
-    }
-
-    /// `welford_combine`, `b` the thread's own.
-    fn welford_combine(b: Welford, a: Welford) -> Welford {
-        let delta = b.mean - a.mean;
-        let count = a.count + b.count;
-        if count <= 0.0 {
-            return NO_MOMENTS;
-        }
-        let coefficient = 1.0 / count;
-        let (n_a, n_b) = (a.count * coefficient, b.count * coefficient);
-        Welford {
-            mean: n_a.mul_add(a.mean, n_b * b.mean),
-            sigma2: (delta * delta * a.count).mul_add(n_b, a.sigma2 + b.sigma2),
-            count,
-        }
-    }
-
-    /// `cutie_layer_norm_f32` for one row as the MSL writes it, thread by thread over [32, 4]:
-    /// each thread's moments over its four-value steps, simd_shuffle_down's tree in each group
-    /// (lanes past the group keep their own), the compact tree through `stats`, then the affine.
-    /// rsqrt is 1 / sqrt here, so the mean and variance are the kernel's and the output within an
-    /// ulp or two of it.
-    fn layer_norm_as_msl(row: &[f32], gamma: &[f32], beta: &[f32], eps: f32) -> (f32, f32, Vec<f32>) {
-        let [width, groups, _] = LAYER_NORM_THREADS.map(|t| t as usize);
-        let threads = width * groups;
-        let vectors = row.len() / 4;
-        let mut wd = vec![NO_MOMENTS; threads];
-        for (t, moments) in wd.iter_mut().enumerate() {
-            for index in (t..vectors).step_by(threads) {
-                for k in 0..4 {
-                    *moments = welford_online(row[4 * index + k], *moments);
-                }
-            }
-        }
-        let mut offset = 16;
-        while offset > 0 {
-            let before = wd.clone();
-            for warp in 0..groups {
-                for lane in 0..width {
-                    let other = if lane + offset < width { before[warp * width + lane + offset] } else { before[warp * width + lane] };
-                    wd[warp * width + lane] = welford_combine(before[warp * width + lane], other);
-                }
-            }
-            offset >>= 1;
-        }
-        let mut stats = [0.0f32; 6];
-        let mut offset = groups / 2;
-        while offset > 0 {
-            for warp in offset..2 * offset {
-                let write_y = warp - offset;
-                stats[2 * write_y] = wd[warp * width].mean;
-                stats[2 * write_y + 1] = wd[warp * width].sigma2;
-                stats[groups + write_y] = wd[warp * width].count;
-            }
-            for warp in 0..offset {
-                let other = Welford { mean: stats[2 * warp], sigma2: stats[2 * warp + 1], count: stats[groups + warp] };
-                wd[warp * width] = welford_combine(wd[warp * width], other);
-            }
-            offset >>= 1;
-        }
-        let (mean, var) = (wd[0].mean, wd[0].sigma2 / row.len() as f32);
-        let rstd = 1.0 / (var + eps).sqrt();
-        let out = row.iter().zip(gamma.iter().zip(beta)).map(|(&v, (&g, &b))| g.mul_add(rstd * (v - mean), b)).collect();
-        (mean, var, out)
-    }
-
-    #[test]
-    fn the_layer_norms_welford_tree_is_a_layer_norm() {
-        let mut rng = Rng(0x5eed_c003);
-        // The object transformer's 256 channels, fewer vectors than threads, more vectors than
-        // threads (each thread two steps), and one vector.
-        for (cols, offset) in [(256, 2.0f32), (64, -5.0), (1024, 0.5), (516, 30.0), (4, 1.0)] {
-            let row: Vec<f32> = rng.uniforms(cols, -3.0, 3.0).iter().map(|v| v + offset).collect();
-            let gamma = rng.uniforms(cols, -1.0, 1.0);
-            let beta = rng.uniforms(cols, -0.5, 0.5);
-            let eps = 1e-5f32;
-            let (mean, var, out) = layer_norm_as_msl(&row, &gamma, &beta, eps);
-            let mean64 = row.iter().map(|&v| v as f64).sum::<f64>() / cols as f64;
-            let var64 = row.iter().map(|&v| (v as f64 - mean64).powi(2)).sum::<f64>() / cols as f64;
-            assert_close(&format!("mean c{cols}"), &[mean], &[mean64], 1e-6, 1.0);
-            assert_close(&format!("variance c{cols}"), &[var], &[var64], 1e-5, 1e-6);
-            let rstd = 1.0 / (var64 + eps as f64).sqrt();
-            let want: Vec<f64> = (0..cols).map(|i| gamma[i] as f64 * (rstd * (row[i] as f64 - mean64)) + beta[i] as f64).collect();
-            assert_close(&format!("layer norm c{cols}"), &out, &want, 1e-5, 1.0);
-        }
-    }
 }
 
 /// The ops on the Mac against the host, in the host binding: each against f64 (or the host's
@@ -1062,7 +889,6 @@ mod metal_tests {
                 s.limits(kernel, &[])?;
             }
             require_warp_width(s, "cutie softmax norm", &CUTIE_ECA_ROW_MEAN)?;
-            require_warp_width(s, "cutie softmax norm", &CUTIE_LAYER_NORM)?;
             let tile = s.limits(&CUTIE_SOFTMAX_AXIS0_TILE, &[])?;
             assert!(tile.max_threads >= SOFTMAX_TILE_COLS * SOFTMAX_TILE_ROWS, "the tile's 1024 threads: {tile:?}");
             Ok(())
@@ -1177,7 +1003,7 @@ mod metal_tests {
             let xt = up(&x, rows, cols);
             let cached = down(&gpu_cutie_layer_norm(&xt, "metal_tests", &key, &gamma, &beta, 1e-5).unwrap());
             let again = down(&gpu_cutie_layer_norm(&xt, "metal_tests", &key, &gamma, &beta, 1e-5).unwrap());
-            let plain = down(&gpu_layer_norm_pytorch(&xt, &gamma, &beta, 1e-5).unwrap());
+            let plain = down(&crate::layer_norm::gpu_layer_norm_pytorch(&xt, &gamma, &beta, 1e-5).unwrap());
             let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
             assert_eq!(bits(&cached), bits(&plain), "{rows}x{cols}: cached against uploaded affine");
             assert_eq!(bits(&again), bits(&plain), "{rows}x{cols}: from the cache");
@@ -1199,7 +1025,6 @@ mod metal_tests {
             err(gpu_cutie_layer_norm(&x, "metal_tests", "odd", &[1.0; 6], &[0.0; 6], 1e-5)),
             "gpu_cutie_layer_norm odd: 6 and 6 affine values for 6 columns"
         );
-        assert_eq!(err(gpu_layer_norm_pytorch(&x, &[1.0; 6], &[0.0; 6], 1e-5)), "gpu_layer_norm_pytorch width mismatch");
     }
 
     #[test]
