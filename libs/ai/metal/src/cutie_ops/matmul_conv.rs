@@ -36,6 +36,8 @@ static IM2COL: Kernel = Kernel { lib: &CUTIE_MATMUL_CONV, function: "cutie_im2co
 static UNSTACK_EPILOGUE: Kernel = Kernel { lib: &CUTIE_MATMUL_CONV, function: "cutie_unstack_epilogue_f32" };
 /// The bias, residual and ReLU in place ([`CutieConvEpilogue`]).
 static CONV_EPILOGUE: Kernel = Kernel { lib: &CUTIE_MATMUL_CONV, function: "cutie_conv_epilogue_f32" };
+/// im2col, the GEMM and the epilogue in one pass ([`CutieConvGemm`]).
+static CONV_GEMM: Kernel = Kernel { lib: &CUTIE_MATMUL_CONV, function: "cutie_conv_gemm_f32" };
 /// The similarity's operands before its GEMMs ([`CutieSimilarityPrep`]).
 static SIMILARITY_PREP: Kernel = Kernel { lib: &CUTIE_MATMUL_CONV, function: "cutie_similarity_prep_f32" };
 /// The similarity from its GEMMs, in place ([`CutieSimilarityEpilogue`]).
@@ -43,7 +45,7 @@ static SIMILARITY_EPILOGUE: Kernel = Kernel { lib: &CUTIE_MATMUL_CONV, function:
 
 /// Every kernel in [`CUTIE_MATMUL_CONV`], for a bring-up test that compiles them all.
 pub static MATMUL_CONV_KERNELS: &[&Kernel] =
-    &[&IM2COL, &UNSTACK_EPILOGUE, &CONV_EPILOGUE, &SIMILARITY_PREP, &SIMILARITY_EPILOGUE];
+    &[&IM2COL, &UNSTACK_EPILOGUE, &CONV_EPILOGUE, &CONV_GEMM, &SIMILARITY_PREP, &SIMILARITY_EPILOGUE];
 
 /// `CutieIm2col` in MSL: the columns of `images` images from `first_image` on.
 #[repr(C)]
@@ -80,6 +82,50 @@ struct CutieConvEpilogue {
 }
 // SAFETY: #[repr(C)], 28 bytes, no pointers; `CutieConvEpilogue` in MSL.
 unsafe impl KernelParams for CutieConvEpilogue {}
+
+/// `CutieConvGemm` in MSL: a convolution of `images` images as one GEMM with im2col and the
+/// epilogue inside it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CutieConvGemm {
+    images: u32,
+    channels: u32,
+    width: u32,
+    height: u32,
+    ow: u32,
+    oh: u32,
+    k: u32,
+    pad: u32,
+    stride: u32,
+    out_channels: u32,
+    /// channels * k * k.
+    kdim: u32,
+    /// ow * oh.
+    plane: u32,
+    has_bias: u32,
+    has_residual: u32,
+    relu: u32,
+    /// A step of k ([`CONV_GEMM_TILE_K`] rows) as whole channels, window rows and columns.
+    step_c: u32,
+    step_y: u32,
+    step_x: u32,
+}
+// SAFETY: #[repr(C)], 72 bytes, no pointers; `CutieConvGemm` in MSL.
+unsafe impl KernelParams for CutieConvGemm {}
+
+/// The fused kernel's tile and threads (`CONV_TILE`, `CONV_THREADS`): the tiled GEMM's.
+const CONV_GEMM_TILE: usize = 32;
+const CONV_GEMM_THREADS: u32 = 128;
+/// Its depth in k a step (`CONV_TILE_K`).
+const CONV_GEMM_TILE_K: usize = 16;
+
+/// Whether convolutions run in one pass ([`CONV_GEMM`]); MAKEPAD_CUTIE_CONV_FUSED=0 keeps the three
+/// (im2col, MetalStream::gemm, the epilogue), to compare or bisect. Read once.
+#[cfg(target_os = "macos")]
+fn conv_gemm_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MAKEPAD_CUTIE_CONV_FUSED").map_or(true, |v| v.trim() != "0"))
+}
 
 /// `CutieSimilarityPrep` in MSL.
 #[repr(C)]
@@ -369,6 +415,45 @@ impl ConvPlan {
         self.batch * self.out_channels
     }
 
+    /// Whether every GEMM this plan's path runs would be on the tiled kernel (gemm.rs's choice in
+    /// the calling thread's mode), so that the one-pass kernel, which multiplies as that kernel
+    /// does, gives the same bits.
+    #[cfg(target_os = "macos")]
+    fn fused_matches_tiled(&self) -> MetalResult<bool> {
+        use crate::stream::gemm::{mode, GemmVariant};
+        let mode = mode()?;
+        let tiled = |n: usize, batch: usize| GemmVariant::choose(mode, self.out_channels, n, self.kdim, batch) == GemmVariant::Tiled;
+        Ok(match self.path {
+            ConvPath::SideBySide => tiled(self.batch * self.opix, 1),
+            // Groups of images, the last perhaps smaller: one image is the least work any has.
+            ConvPath::Grouped { .. } => tiled(self.opix, 1),
+        })
+    }
+
+    /// The one-pass kernel's params for the whole batch.
+    fn conv_gemm(&self, has_bias: bool, has_residual: bool, relu: bool) -> CutieConvGemm {
+        CutieConvGemm {
+            images: self.batch as u32,
+            channels: self.in_channels as u32,
+            width: self.in_w as u32,
+            height: self.in_h as u32,
+            ow: self.ow as u32,
+            oh: self.oh as u32,
+            k: self.k as u32,
+            pad: self.pad as u32,
+            stride: self.stride as u32,
+            out_channels: self.out_channels as u32,
+            kdim: self.kdim as u32,
+            plane: self.opix as u32,
+            has_bias: has_bias as u32,
+            has_residual: has_residual as u32,
+            relu: relu as u32,
+            step_c: (CONV_GEMM_TILE_K / (self.k * self.k)) as u32,
+            step_y: (CONV_GEMM_TILE_K % (self.k * self.k) / self.k) as u32,
+            step_x: (CONV_GEMM_TILE_K % self.k) as u32,
+        }
+    }
+
     /// The columns of `count` images from `first` on: per image ([count*kdim, opix]) or side by
     /// side ([kdim, count*opix]).
     fn im2col(&self, first: usize, count: usize, side_by_side: bool) -> CutieIm2col {
@@ -513,6 +598,19 @@ pub fn gpu_cutie_conv2d_fused(
         let out = GpuTensor::alloc(plan.out_rows(), plan.opix)?;
         if plan.out_rows() == 0 {
             // No output channels: nothing to compute (cuBLAS returns at once on CUDA).
+            return Ok(out);
+        }
+        if conv_gemm_enabled() && plan.fused_matches_tiled()? {
+            // One pass: the same bits as the three below on the tiled GEMM (cutie_conv_gemm_f32).
+            let params = plan.conv_gemm(bias.is_some(), residual.is_some(), relu);
+            let n = plan.batch * plan.opix;
+            let grid = Grid::groups(
+                [n.div_ceil(CONV_GEMM_TILE), plan.out_channels.div_ceil(CONV_GEMM_TILE), 1],
+                [CONV_GEMM_THREADS, 1, 1],
+            )?;
+            crate::stream::gemm::check_simd_width(s, op, &CONV_GEMM)?;
+            let binds = [Bind::In(x), Bind::Weights(&w, 0), Bind::Out(&out), bias_bind, residual_bind];
+            s.launch(&CONV_GEMM, &[], &params, &binds, grid)?;
             return Ok(out);
         }
         match plan.path {

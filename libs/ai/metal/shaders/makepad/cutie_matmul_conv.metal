@@ -116,6 +116,22 @@ static inline float cutie_conv_epilogue(float v,
     return p.relu != 0 ? fmax(v, 0.0f) : v;
 }
 
+// cutie_conv_epilogue with its params in thread memory (cutie_conv_gemm_f32 builds them).
+static inline float cutie_conv_epilogue_p(float v,
+                                          thread const CutieConvEpilogue& p,
+                                          device const float* bias,
+                                          uint c,
+                                          device const float* residual,
+                                          ulong at) {
+    if (p.has_bias != 0) {
+        v = v + bias[c];
+    }
+    if (p.has_residual != 0) {
+        v = v + residual[at];
+    }
+    return p.relu != 0 ? fmax(v, 0.0f) : v;
+}
+
 // The side-by-side GEMM's result [channels][images][plane] to the images' planar layout
 // [images][channels][plane], with the epilogue (cutie.cu's cutie_unstack_epilogue_kernel).
 kernel void cutie_unstack_epilogue_f32(constant CutieConvEpilogue& p [[buffer(0)]],
@@ -152,6 +168,176 @@ kernel void cutie_conv_epilogue_f32(constant CutieConvEpilogue& p [[buffer(0)]],
     for (uint row = pos.y; row < p.rows; row += groups.y) {
         const ulong at = ulong(row) * p.plane + q;
         out[at] = cutie_conv_epilogue(out[at], p, bias, row % p.channels, residual, at);
+    }
+}
+
+// --- Convolution in one pass: im2col, the GEMM and the epilogue together ---
+
+// A convolution of `images` images as one GEMM, n = images * plane columns: the [out, kdim]
+// weights times the columns im2col would write, read here straight from the input as each step of
+// k is staged, and the epilogue applied as each output is written to its image's plane. The tile,
+// threads and walk down k are gemm.metal's gemm_tiled_f32's (32x32, four SIMD groups, 16 deep,
+// then 8 at a time, zero past its edge), so each output is the same multiply-accumulates in the
+// same order as im2col then MetalStream::gemm on the tiled kernel: the same bits, with the columns
+// never written or read and the epilogue's pass gone (gemm_result is acc itself for alpha 1, beta
+// 0). matmul_conv.rs uses it only where that GEMM would run on the tiled kernel.
+struct CutieConvGemm {
+    uint images;
+    uint channels;      // input channels
+    uint width;
+    uint height;
+    uint ow;
+    uint oh;
+    uint k;
+    uint pad;
+    uint stride;
+    uint out_channels;
+    uint kdim;          // channels * k * k
+    uint plane;         // ow * oh
+    uint has_bias;
+    uint has_residual;
+    uint relu;
+    // A step of k (CONV_TILE_K rows) as whole channels, rows and columns of the window:
+    // CONV_TILE_K = step_c * k * k + step_y * k + step_x.
+    uint step_c;
+    uint step_y;
+    uint step_x;
+};
+
+#define CONV_TILE 32u
+#define CONV_TILE_K 16u
+#define CONV_THREADS 128u
+#define CONV_A_LD (CONV_TILE_K + 4u)
+#define CONV_B_LD (CONV_TILE + 4u)
+#define CONV_A_ROWS_PER_PASS (CONV_THREADS / CONV_TILE_K)
+#define CONV_A_PASSES (CONV_TILE / CONV_A_ROWS_PER_PASS)
+#define CONV_B_ROWS_PER_PASS (CONV_THREADS / CONV_TILE)
+#define CONV_B_PASSES (CONV_TILE_K / CONV_B_ROWS_PER_PASS)
+#define CONV_STAGE (CONV_TILE * CONV_A_LD + CONV_TILE_K * CONV_B_LD)
+
+// (x, y) = (column tile, row tile); 128 threads, four SIMD groups of 32.
+kernel void cutie_conv_gemm_f32(constant CutieConvGemm& p [[buffer(0)]],
+                                device const float* x [[buffer(1)]],
+                                device const float* w [[buffer(2)]],
+                                device float* out [[buffer(3)]],
+                                device const float* bias [[buffer(4)]],
+                                device const float* residual [[buffer(5)]],
+                                uint3 tile [[threadgroup_position_in_grid]],
+                                uint tid [[thread_index_in_threadgroup]],
+                                uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float tiles[CONV_STAGE];
+    threadgroup float* a_tile = tiles;
+    threadgroup float* b_tile = tiles + CONV_TILE * CONV_A_LD;
+
+    const uint m = p.out_channels;
+    const uint n = p.images * p.plane;
+    const uint row0 = tile.y * CONV_TILE;
+    const uint col0 = tile.x * CONV_TILE;
+
+    // This thread's staging: weights column a_kk of rows a_r + 8 * pass, and column b_j's pixel
+    // (image b_img at oy, ox) for rows b_kk + 4 * pass of k.
+    const uint a_kk = tid % CONV_TILE_K;
+    const uint a_r = tid / CONV_TILE_K;
+    const uint b_j = tid % CONV_TILE;
+    const uint b_kk = tid / CONV_TILE;
+    const uint j = col0 + b_j;
+    const bool b_in = j < n;
+    const uint b_img = b_in ? j / p.plane : 0u;
+    const uint q = b_in ? j % p.plane : 0u;
+    const int oy = int(q / p.ow), ox = int(q % p.ow);
+    device const float* x_img = x + ulong(b_img) * p.channels * p.height * p.width;
+
+    // Each of this thread's rows of k as its channel and window position, worked out once and
+    // moved on by a step at a time: no division in the loop.
+    uint row_c[CONV_B_PASSES], row_y[CONV_B_PASSES], row_x[CONV_B_PASSES];
+#pragma clang loop unroll(full)
+    for (uint pass = 0; pass < CONV_B_PASSES; ++pass) {
+        const uint kk = b_kk + pass * CONV_B_ROWS_PER_PASS;
+        row_c[pass] = kk / (p.k * p.k);
+        row_y[pass] = (kk % (p.k * p.k)) / p.k;
+        row_x[pass] = kk % p.k;
+    }
+
+    const uint sub_row = (sg / 2u) * 16u;
+    const uint sub_col = (sg % 2u) * 16u;
+    simdgroup_float8x8 acc[4];
+    for (uint s = 0; s < 4; ++s) {
+        acc[s] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    }
+
+    for (uint k0 = 0; k0 < p.kdim; k0 += CONV_TILE_K) {
+        const uint kk_a = k0 + a_kk;
+#pragma clang loop unroll(full)
+        for (uint pass = 0; pass < CONV_A_PASSES; ++pass) {
+            const uint r = a_r + pass * CONV_A_ROWS_PER_PASS;
+            const uint i = row0 + r;
+            a_tile[r * CONV_A_LD + a_kk] = (i < m && kk_a < p.kdim) ? w[ulong(i) * p.kdim + kk_a] : 0.0f;
+        }
+#pragma clang loop unroll(full)
+        for (uint pass = 0; pass < CONV_B_PASSES; ++pass) {
+            const uint kr = b_kk + pass * CONV_B_ROWS_PER_PASS;
+            const uint kk = k0 + kr;
+            float v = 0.0f;
+            if (b_in && kk < p.kdim) {
+                const int iy = oy * int(p.stride) - int(p.pad) + int(row_y[pass]);
+                const int ix = ox * int(p.stride) - int(p.pad) + int(row_x[pass]);
+                if (iy >= 0 && iy < int(p.height) && ix >= 0 && ix < int(p.width)) {
+                    v = x_img[(ulong(row_c[pass]) * p.height + uint(iy)) * p.width + uint(ix)];
+                }
+            }
+            b_tile[kr * CONV_B_LD + b_j] = v;
+            // The next step's row: CONV_TILE_K further down k.
+            row_x[pass] += p.step_x;
+            row_y[pass] += p.step_y;
+            row_c[pass] += p.step_c;
+            if (row_x[pass] >= p.k) {
+                row_x[pass] -= p.k;
+                row_y[pass] += 1u;
+            }
+            if (row_y[pass] >= p.k) {
+                row_y[pass] -= p.k;
+                row_c[pass] += 1u;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = 0; s < CONV_TILE_K; s += 8) {
+            simdgroup_float8x8 am[2];
+            simdgroup_float8x8 bm[2];
+            simdgroup_load(am[0], a_tile + (sub_row + 0) * CONV_A_LD + s, CONV_A_LD);
+            simdgroup_load(am[1], a_tile + (sub_row + 8) * CONV_A_LD + s, CONV_A_LD);
+            simdgroup_load(bm[0], b_tile + s * CONV_B_LD + sub_col + 0, CONV_B_LD);
+            simdgroup_load(bm[1], b_tile + s * CONV_B_LD + sub_col + 8, CONV_B_LD);
+            simdgroup_multiply_accumulate(acc[0], am[0], bm[0], acc[0]);
+            simdgroup_multiply_accumulate(acc[1], am[0], bm[1], acc[1]);
+            simdgroup_multiply_accumulate(acc[2], am[1], bm[0], acc[2]);
+            simdgroup_multiply_accumulate(acc[3], am[1], bm[1], acc[3]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    simdgroup_store(acc[0], tiles + (sub_row + 0) * CONV_TILE + sub_col + 0, CONV_TILE);
+    simdgroup_store(acc[1], tiles + (sub_row + 0) * CONV_TILE + sub_col + 8, CONV_TILE);
+    simdgroup_store(acc[2], tiles + (sub_row + 8) * CONV_TILE + sub_col + 0, CONV_TILE);
+    simdgroup_store(acc[3], tiles + (sub_row + 8) * CONV_TILE + sub_col + 8, CONV_TILE);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    CutieConvEpilogue e;
+    e.images = p.images;
+    e.channels = m;
+    e.plane = p.plane;
+    e.rows = p.images * m;
+    e.has_bias = p.has_bias;
+    e.has_residual = p.has_residual;
+    e.relu = p.relu;
+    for (uint t = tid; t < CONV_TILE * CONV_TILE; t += CONV_THREADS) {
+        const uint i = row0 + t / CONV_TILE;
+        const uint jj = col0 + t % CONV_TILE;
+        if (i < m && jj < n) {
+            const uint img = jj / p.plane, qq = jj % p.plane;
+            const ulong at = (ulong(img) * m + i) * p.plane + qq;
+            const float v = tiles[t];
+            out[at] = (p.has_bias | p.has_residual | p.relu) != 0 ? cutie_conv_epilogue_p(v, e, bias, i, residual, at) : v;
+        }
     }
 }
 
