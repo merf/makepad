@@ -29,7 +29,7 @@
 
 use crate::memory::{MemoryManager, Permanence, VALUE_DIM};
 use crate::model::{dev, CutieNet, Feat, ImageFeatures, Keys, Tap, Weights};
-use crate::oracle::{Clear, Comparer, Oracle, OracleTap, Report, ScheduleRow, Tol};
+use crate::oracle::{Clear, Comparer, Oracle, OracleTap, ReadTies, Report, ScheduleRow, Tol};
 use crate::{CutieConfig, DiffusionError, Result};
 use makepad_ai_common::gpu::{
     gpu_cutie_aggregate, gpu_cutie_crop, gpu_cutie_pad, gpu_cutie_resize_bilinear, gpu_cutie_rgb_planes, gpu_cutie_softmax_axis0,
@@ -658,7 +658,15 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
                 let long_term = oracle.has(tapped, "state.before.long_mem.b0.key");
                 let tol = |name: &str| run_tol(name, long_term);
                 let mut cmp = Comparer::new(oracle, report, "run", tapped, &tol);
+                // The read's exact top-k ties judged as sets (`ReadTies`), but where its rows
+                // start with long-term memory, whose order is the native run's own.
+                if !long_term {
+                    cmp.read_ties = Some(ReadTies::new(oracle.config.top_k));
+                }
                 let prob = cmp.with(|tap| processor.step_tapped(&frame, w, h, mask.as_deref(), row.force_permanent, false, tap))?;
+                if let Some(judgement) = cmp.read_ties.take().and_then(|ties| ties.judgement) {
+                    cmp.report.record("run", tapped, "memory.read.affinity ties", true, judgement.note(oracle.config.top_k));
+                }
                 // Taps no part puts (e.g. a convolution whose BatchNorm is folded) are noted.
                 let missing = cmp.uncompared(&[""]);
                 if !missing.is_empty() {
@@ -727,7 +735,12 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, weights: &mut Weights)
 ///   their order;
 /// - always, the read's `affinity` and `usage`: each pixel's top-k picks, which a near tie swaps
 ///   (one swapped pick is an entry's whole weight, YouTubeComp-15 at 960x540 rel 7%, cosine
-///   0.99996); the readout judges them too.
+///   0.99996); the readout judges them too. Where the oracle's similarity has an exact tie at the
+///   cut (the first frame held twice) they are first aligned to the oracle's picks among the tied
+///   tokens (`ReadTies`, with a row `memory.read.affinity ties` saying how many), so what is left
+///   is the near ties; not with long-term memory, whose rows are in the native run's order. The
+///   readout is not aligned: the tied tokens are the same frame's, with the same values, and
+///   `Tol::RUN` takes a swapped pick anyway.
 fn run_tol(name: &str, long_term: bool) -> Tol {
     const PROTOTYPE_ORDER: [&str; 5] = [
         "memory.consolidate.query_key",
