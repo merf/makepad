@@ -41,17 +41,20 @@
 //!
 //! Ties: `torch.topk` does not say which of equal values it keeps. Every top-k here (the read's
 //! per-pixel top-k in `gpu_cutie_topk_softmax`, the prototypes, long-term memory's survivors)
-//! keeps the lower index first. That is what the oracle's runs did wherever equal similarities
-//! met at the read's k-th place: working memory holds the first frame twice (the commit's
-//! permanent memory, then the propagation's first temporary frame), so pairs of identical keys
-//! tie. The oracles have no tie among the prototypes or survivors, so the rule is unverified there.
+//! keeps the lower index first. That is what the oracles made on CUDA did wherever equal
+//! similarities met at the read's k-th place: working memory holds the first frame twice (the
+//! commit's permanent memory, then the propagation's first temporary frame), so pairs of
+//! identical keys tie. Oracles made on the CPU keep either token of a pair (about half the
+//! higher), which is as right: the memory check judges the read's picks at an exact tie as a set
+//! (`oracle::TopKTies`). The oracles have no tie among the prototypes or survivors (the first
+//! frame's permanent copy has no counts, so it never ties there), so the rule is unverified there.
 //! Long-term memory's survivors are checked by Solege-03-long (`long_term.max_num_tokens=700`,
 //! `buffer_tokens=100`), whose step `prop_f165` keeps the 472 most used of 640 before the
 //! consolidation adds 128: no tie, the closest neighbours in that order 9.7e-8 apart, and the
 //! teacher-forced survivors are the oracle's in its order.
 
 use crate::model::{dev, CutieNet, Feat, Keys, Tap, Weights};
-use crate::oracle::{Comparer, Oracle, Report, Tol};
+use crate::oracle::{Comparer, Oracle, OracleTap, Report, TieJudgement, Tol, TopKTies};
 use crate::processor::{StepPlan, StepSchedule};
 use crate::{CutieConfig, DiffusionError, Result};
 use makepad_ai_common::gpu::{
@@ -228,8 +231,9 @@ impl KeyValueStore {
     }
 
     /// The indices of the `k` largest of `values`, largest first; equal values by lower index
-    /// (`torch.topk(.., sorted=True)`). The tie rule copies what the oracle showed for the read's
-    /// top-k; it is unverified here, the oracle having no tie or near tie at the prototypes' cut.
+    /// (`torch.topk(.., sorted=True)`). The tie rule copies what CUDA's oracles showed for the
+    /// read's top-k; it is unverified here, no oracle having an exact tie in its usage there (the
+    /// memory check records it: `OracleMemory::record_usage_ties`).
     /// k 0 gives none, as torch.topk does; more than there are is an error, as there.
     pub(crate) fn most_used(values: &[f32], k: usize) -> Result<Vec<u32>> {
         if k > values.len() {
@@ -431,7 +435,25 @@ impl MemoryManager {
     /// The read's first half: the query's similarity to every memory token ([long-term,
     /// working]), the top-k softmax, and the usage counted. Out: the affinity [N, h*w].
     pub(crate) fn read_affinity(&mut self, keys: &Keys, tap: &mut Tap) -> Result<GpuTensor> {
-        let long_size = if self.use_long_term { self.long.size() } else { 0 };
+        let (affinity, usage) = self.read_top_k(keys, tap)?;
+        self.count_usage(&affinity, &usage, tap)?;
+        Ok(affinity)
+    }
+
+    /// Long-term memory's tokens in a read (none without long-term memory).
+    fn long_size(&self) -> usize {
+        if self.use_long_term {
+            self.long.size()
+        } else {
+            0
+        }
+    }
+
+    /// The query's similarity to every memory token ([long-term, working]) and the top-k
+    /// softmax: the affinity [N, h*w] and each token's usage [1, N]. Taps the read up to the
+    /// similarity.
+    pub(crate) fn read_top_k(&self, keys: &Keys, tap: &mut Tap) -> Result<(GpuTensor, GpuTensor)> {
+        let long_size = self.long_size();
         let (long_key, long_shrinkage) = if long_size > 0 { (self.long.key.as_ref(), self.long.shrinkage.as_ref()) } else { (None, None) };
         let memory_key = KeyValueStore::cat(&[long_key, self.work.key.as_ref()])?;
         let memory_shrinkage = KeyValueStore::cat(&[long_shrinkage, self.work.shrinkage.as_ref()])?;
@@ -450,16 +472,22 @@ impl MemoryManager {
         let similarity = gpu_cutie_similarity(&memory_key, Some(&memory_shrinkage), &keys.key.t, Some(&keys.selection.t))
             .map_err(|e| dev("memory similarity", e))?;
         tap.put("memory.read.similarity", &similarity)?;
-        let (affinity, usage) = gpu_cutie_topk_softmax(&similarity, self.top_k).map_err(|e| dev("memory top-k", e))?;
-        tap.put("memory.read.affinity", &affinity)?;
+        gpu_cutie_topk_softmax(&similarity, self.top_k).map_err(|e| dev("memory top-k", e))
+    }
+
+    /// Taps the read's affinity and usage (`read_top_k`'s) and counts the usage: working
+    /// memory's share, and long-term memory's when it is counted.
+    pub(crate) fn count_usage(&mut self, affinity: &GpuTensor, usage: &GpuTensor, tap: &mut Tap) -> Result<()> {
+        tap.put("memory.read.affinity", affinity)?;
         if self.use_long_term {
-            tap.put("memory.read.usage", &usage)?;
-            self.work.update_usage(&usage, long_size)?;
+            let long_size = self.long_size();
+            tap.put("memory.read.usage", usage)?;
+            self.work.update_usage(usage, long_size)?;
             if long_size > 0 && self.count_long_term_usage {
-                self.long.update_usage(&usage, 0)?;
+                self.long.update_usage(usage, 0)?;
             }
         }
-        Ok(affinity)
+        Ok(())
     }
 
     /// The read's second half: every object's values ([long-term, working]) read through the
@@ -701,6 +729,112 @@ impl OracleMemory {
             selection: oracle.feat(step, "key.selection")?,
         })
     }
+
+    /// The read's top-k (`read_top_k`'s affinity and usage) with its exact ties broken as the
+    /// oracle broke them (`TopKTies`): where the port kept other tied tokens than the oracle, the
+    /// affinity with their weights moved onto the oracle's tokens and the usage likewise,
+    /// uploaded, so that the usage counted, the readout and the consolidation after them go on
+    /// from the oracle's picks. The port's own tensors where it kept the same tokens.
+    fn break_ties_as_oracle(
+        ties: &TopKTies, expected: &OracleTap, affinity: GpuTensor, usage: GpuTensor,
+    ) -> Result<(GpuTensor, GpuTensor, TieJudgement)> {
+        let mut aligned = gpu_download(&affinity).map_err(|e| dev("memory ties", e))?;
+        let judgement = ties.align(&mut aligned, &expected.values);
+        if judgement.moved == 0 {
+            return Ok((affinity, usage, judgement));
+        }
+        let mut sums = gpu_download(&usage).map_err(|e| dev("memory ties", e))?;
+        judgement.align_sums(&mut sums);
+        let affinity = gpu_upload(&aligned, affinity.rows(), affinity.cols()).map_err(|e| dev("memory ties", e))?;
+        let usage = gpu_upload(&sums, usage.rows(), usage.cols()).map_err(|e| dev("memory ties", e))?;
+        Ok((affinity, usage, judgement))
+    }
+
+    /// A store's temporary tokens' normalised usage as the oracle's PyTorch had it at the step's
+    /// add (`get_usage` after the read's `update_bucket_usage`: use + usage and life + 1, then
+    /// use / life, each in f32 as there): from `<prefix>.use_count` and `.life_count` before the
+    /// step and, when the step read and counted this store, its share of `memory.read.usage`
+    /// from column `start`. None when the oracle has no counts for the store.
+    fn usage(oracle: &Oracle, step: &str, prefix: &str, start: Option<usize>) -> Result<Option<Vec<f32>>> {
+        let (use_name, life_name) = (format!("{prefix}.use_count"), format!("{prefix}.life_count"));
+        if !oracle.has(step, &use_name) || !oracle.has(step, &life_name) {
+            return Ok(None);
+        }
+        let mut use_count = oracle.tap(step, &use_name)?.values;
+        let mut life_count = oracle.tap(step, &life_name)?.values;
+        if use_count.len() != life_count.len() {
+            let counts = format!("{} use and {} life counts", use_count.len(), life_count.len());
+            return Err(DiffusionError::model(format!("cutie oracle {step}: {prefix} has {counts}")));
+        }
+        if let Some(start) = start.filter(|_| oracle.has(step, "memory.read.usage") && !use_count.is_empty()) {
+            let usage = oracle.tap(step, "memory.read.usage")?.values;
+            let share = usage
+                .get(start..start + use_count.len())
+                .ok_or_else(|| DiffusionError::model(format!("cutie oracle {step}: the read's usage has no columns {start}.. for {prefix}")))?;
+            for ((u, l), s) in use_count.iter_mut().zip(life_count.iter_mut()).zip(share) {
+                *u += s;
+                *l += 1.0;
+            }
+        }
+        Ok(Some(use_count.iter().zip(&life_count).map(|(u, l)| u / l).collect()))
+    }
+
+    /// The exact ties a top `k` of `usage` (`torch.topk(.., sorted=True)`, whose order among
+    /// equal values is open as at the read) meets: equal neighbours in its order down to the
+    /// (k+1)-th, which inside the top k would order the picks and at the cut choose them; and the
+    /// smallest gap between those neighbours.
+    fn usage_ties(usage: &[f32], k: usize) -> (usize, f32) {
+        let mut sorted = usage.to_vec();
+        sorted.sort_by(|a, b| b.total_cmp(a));
+        let end = (k + 1).min(sorted.len());
+        let ties = sorted[..end].windows(2).filter(|w| w[0] == w[1]).count();
+        let gap = sorted[..end].windows(2).map(|w| w[0] - w[1]).fold(f32::INFINITY, f32::min);
+        (ties, gap)
+    }
+
+    /// Rows recording the exact ties in the step's top-k by usage, in the oracle's own usage
+    /// (`usage`): long-term memory's survivors when it dropped its least used tokens, the
+    /// consolidation's prototypes when working memory consolidated. Neither has had one: the
+    /// first frame held twice never ties here (its permanent copy has no counts), and in every
+    /// oracle the closest neighbours are 9.7e-8 apart or more. Each row passes, its note saying
+    /// what it found; with a tie the comparisons after it stay strict (the port keeps the lower
+    /// index), so a failure there that this row explains is torch's order, not the port.
+    fn record_usage_ties(oracle: &Oracle, report: &mut Report, step: &str, memory: &MemoryManager) -> Result<()> {
+        let config = &oracle.config;
+        let cols = |name: &str| -> usize {
+            if oracle.has(step, name) {
+                oracle.shape(step, name).ok().and_then(|s| s.last().copied()).unwrap_or(0)
+            } else {
+                0
+            }
+        };
+        let long_size = if config.use_long_term { cols("state.before.long_mem.b0.key") } else { 0 };
+        let mut record = |name: &str, what: &str, usage: &[f32], k: usize| {
+            let (ties, gap) = Self::usage_ties(usage, k);
+            let of = usage.len();
+            let note = format!(
+                "{ties} exact ties among the top {k} of {of} {what} by usage and at the cut (the oracle's own usage); closest neighbours {gap:.3e} apart"
+            );
+            report.record("memory", step, name, true, note);
+        };
+        if memory.obsolete_removals > 0 {
+            let start = config.count_long_term_usage.then_some(0);
+            if let Some(usage) = Self::usage(oracle, step, "state.before.long_mem.b0", start)? {
+                let keep = config.max_long_tokens.saturating_sub(config.num_prototypes + config.buffer_tokens);
+                record("long_mem.survivors usage ties", "long-term tokens", &usage, keep);
+            }
+        }
+        if memory.consolidations > 0 && oracle.has(step, "memory.consolidate.memory_key") {
+            let perm_end = cols("state.before.work_mem.b0.key").saturating_sub(cols("state.before.work_mem.b0.use_count"));
+            if let Some(mut usage) = Self::usage(oracle, step, "state.before.work_mem.b0", Some(long_size + perm_end))? {
+                // The candidates: the temporary tokens but the last frames kept; when none are
+                // kept, the step's own frame too, whose tokens start unused (0 / 1e-7).
+                usage.resize(cols("memory.consolidate.memory_key"), 0.0);
+                record("memory.consolidate.usage ties", "candidates", &usage, config.num_prototypes);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// What no oracle reaches, on small stores (step `edge`): long-term memory told to keep no tokens
@@ -756,11 +890,20 @@ fn check_edges(report: &mut Report) -> Result<()> {
 /// sensory memory a memorising step replaces with `encode_mask.out.sensory`, keys and values on
 /// steps that add nothing); `step.out.prob` on segmenting steps. The rest is computed here.
 ///
-/// Every tap at `Tol::STAGE`, the affinity too. Its exact ties (the first frame held twice) fall
-/// to the lower index in the oracle as in `gpu_cutie_topk_softmax`. The closest pair at the k-th
-/// place that is not an exact tie is 33 ulps apart (3.9e-6, Solege-03 prop_f40); the native
-/// similarity (up to 1.9e-5 off at that step) changes no column's top k on either clip. The
-/// margin is thin: a similarity kernel must keep near-tied entries within those 33 ulps.
+/// Every tap at `Tol::STAGE`, the affinity too. Where the oracle's own similarity has an exact
+/// tie at the top k's cut (the first frame held twice: `TopKTies`), the port's picks among the
+/// tied tokens are judged as a set: where it kept others than the oracle (CPU torch breaks those
+/// ties in an order of its own; CUDA's oracles keep the lower index, as the port does), its
+/// weights are moved onto the oracle's tokens before the affinity and usage are compared, and the
+/// usage counted and the readout go on from them, so the consolidation after them is checked
+/// against the oracle's own picks. A row a read, `memory.read.affinity ties`, says how many
+/// columns were tied and how many were moved. Every other column, and every token outside a tie,
+/// is compared as it is. The closest pair at the k-th place that is not an exact tie is 33 ulps
+/// apart (3.9e-6, Solege-03 prop_f40); the native similarity (up to 1.9e-5 off at that step)
+/// changes no column's top k on either clip. The margin is thin: a similarity kernel must keep
+/// near-tied entries within those 33 ulps. The top-k by usage (the consolidation's prototypes,
+/// long-term memory's survivors) is recorded likewise (`OracleMemory::record_usage_ties`) and
+/// judged strictly.
 pub(crate) fn check(oracle: &Oracle, report: &mut Report, _weights: &mut Weights) -> Result<()> {
     check_edges(report)?;
     let config = &oracle.config;
@@ -787,15 +930,23 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, _weights: &mut Weights
             cmp.report.fail("memory", step, "memory.read.similarity", "not in the oracle, which segments here");
         }
         if oracle.has(step, "memory.read.similarity") {
-            cmp.with(|tap| {
+            let ties = TopKTies::find(&oracle.tap(step, "memory.read.similarity")?, config.top_k)?;
+            let expected_affinity = if oracle.has(step, "memory.read.affinity") { Some(oracle.tap(step, "memory.read.affinity")?) } else { None };
+            let judgement = cmp.with(|tap| {
                 tap.put("pixel_fusion.in.sensory", &memory.sensory()?.t)?;
                 if let Some(obj_memory) = memory.obj_memory() {
                     tap.put("object_transformer.in.obj_memory", obj_memory)?;
                 }
-                let affinity = memory.read_affinity(&keys, tap)?;
+                let (affinity, usage) = memory.read_top_k(&keys, tap)?;
+                let (affinity, usage, judgement) = match &expected_affinity {
+                    Some(expected) => OracleMemory::break_ties_as_oracle(&ties, expected, affinity, usage)?,
+                    None => (affinity, usage, TieJudgement::default()),
+                };
+                memory.count_usage(&affinity, &usage, tap)?;
                 memory.read_values(&affinity, &keys, tap)?;
-                Ok(())
+                Ok(judgement)
             })?;
+            cmp.report.record("memory", step, "memory.read.affinity ties", true, judgement.note(config.top_k));
             if plan.update_sensory {
                 memory.update_sensory(oracle.feat_as(step, "segment.out.sensory", objects, SENSORY_DIM)?)?;
             }
@@ -814,6 +965,7 @@ pub(crate) fn check(oracle: &Oracle, report: &mut Report, _weights: &mut Weights
             let as_permanent = if row.force_permanent { Permanence::All } else { Permanence::First };
             cmp.with(|tap| memory.add_memory(&keys, &value, &obj_value, as_permanent, tap))?;
             memory.update_sensory(oracle.feat_as(step, "encode_mask.out.sensory", objects, SENSORY_DIM)?)?;
+            OracleMemory::record_usage_ties(oracle, cmp.report, step, &memory)?;
         }
         cmp.with(|tap| memory.dump("state.after", tap))?;
         // Every memory tap the oracle has must have been compared (the last mask is the
