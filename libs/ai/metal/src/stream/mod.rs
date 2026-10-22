@@ -22,8 +22,9 @@
 //!    no host op on a `GpuTensor` and no download: host data comes in through `weights`,
 //!    `upload_bytes` or `Bind::Bytes`.
 //! 2. Write only tensors this op allocated ([`GpuTensor::alloc`] inside the op), each bound
-//!    `Out` or `InOut`. A launch may write part of an output; later launches in the op see what
-//!    it wrote.
+//!    `Out` or `InOut`, and bind nothing else in that launch that overlaps it (not the tensor
+//!    again, not a view of it): a launch is refused otherwise. A launch may write part of an
+//!    output; later launches in the op see what it wrote.
 //! 3. A new tensor's contents are undefined (a pooled buffer as it was left; NaN with
 //!    MAKEPAD_METAL_POISON=1): write every element before it is read, and fill before
 //!    accumulating.

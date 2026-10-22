@@ -290,6 +290,22 @@ pub fn gpu_cutie_metal_ref_forces(name: &str) -> Result<bool, String> {
     }
 }
 
+/// The calling thread's Metal stream on macOS: (command buffers committed, times the host blocked
+/// on one) since the stream's counters were last reset, which this does not do. Read around a
+/// piece of work, the difference says how often it waited (Cutie's goal is one wait a step, its
+/// probabilities' download). `None` elsewhere: CUDA's stream keeps no such counters.
+pub fn gpu_stream_counts() -> Option<(u64, u64)> {
+    #[cfg(target_os = "macos")]
+    {
+        let stats = makepad_ai_metal::stream::stats(false);
+        Some((stats.commits, stats.waits))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 #[cfg(test)]
 mod metal_reference_tests {
     use super::*;

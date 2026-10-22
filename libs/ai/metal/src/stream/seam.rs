@@ -132,7 +132,7 @@ pub(crate) fn host_call(op: &str) -> MetalResult<()> {
     Ok(())
 }
 
-/// The address `HOST_READS` knows storage by.
+/// The address `HOST_READS` and the launch's alias check know storage by.
 fn storage_key(storage: &Arc<MtlStorage>) -> usize {
     Arc::as_ptr(storage) as usize
 }
@@ -242,19 +242,18 @@ impl Bind<'_> {
         let tensor = |kind: SlotKind, t: &GpuTensor, writes: bool| SlotPlan {
             kind,
             tensor: t as *const GpuTensor as usize,
+            storage: storage_key(&t.storage),
+            words: (t.offset, t.offset.saturating_add(t.rows.saturating_mul(t.cols))),
             allocated_here: writes && allocated_here(t.id.get()),
         };
+        let other = |kind: SlotKind| SlotPlan { kind, tensor: 0, storage: 0, words: (0, 0), allocated_here: false };
         match *self {
             Bind::In(t) => tensor(SlotKind::In, t, false),
             Bind::Out(t) => tensor(SlotKind::Out, t, true),
             Bind::InOut(t) => tensor(SlotKind::InOut, t, true),
-            Bind::Weights(w, offset) => SlotPlan {
-                kind: SlotKind::Weights { offset, floats: w.floats },
-                tensor: 0,
-                allocated_here: false,
-            },
-            Bind::Bytes(bytes) => SlotPlan { kind: SlotKind::Bytes(bytes.len()), tensor: 0, allocated_here: false },
-            Bind::Absent => SlotPlan { kind: SlotKind::Absent, tensor: 0, allocated_here: false },
+            Bind::Weights(w, offset) => other(SlotKind::Weights { offset, floats: w.floats }),
+            Bind::Bytes(bytes) => other(SlotKind::Bytes(bytes.len())),
+            Bind::Absent => other(SlotKind::Absent),
         }
     }
 }

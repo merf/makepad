@@ -7,6 +7,9 @@
 //! - `upload_into` a buffer queued work still reads goes through a staging copy queued after it;
 //! - a tensor pending on its owner's stream is refused on another thread until the owner
 //!   synchronizes, then adopted; a tensor dropped on another thread is released, not pooled;
+//! - a buffer released while queued work still reads it (dropped on another thread, trimmed from
+//!   the pool, or over the pool's cap) lives until that work is done: command buffers retain what
+//!   they bind;
 //! - unaligned row views are read and written where they lie, and adjacent ones concatenate to a
 //!   view;
 //! - a download waits for its own writer only;
@@ -15,9 +18,12 @@
 //! The pending cases need work that is still running when the host looks: `probe_spin`, a kernel
 //! calibrated on each thread to take about 200 ms. With MAKEPAD_METAL_STREAM_SYNC=1 every op is
 //! waited for at its end, so nothing is ever pending: those tests check what they can and say so.
+//! The tests take turns on the GPU (`gpu_turn`), so one test's spin never holds up another's
+//! command buffers or its calibration.
 //!
 //! `cargo test -p makepad-ai-metal --release --test residency -- --nocapture`, again with
-//! MAKEPAD_METAL_MISALIGN=1 and with MAKEPAD_METAL_STREAM_SYNC=1.
+//! MAKEPAD_METAL_MISALIGN=1 and with MAKEPAD_METAL_STREAM_SYNC=1, and once with Metal's validation
+//! (MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1), which also catches a buffer used after it is freed.
 #![cfg(target_os = "macos")]
 
 use makepad_ai_metal::cutie_ops::gpu_cutie_sigmoid;
@@ -26,6 +32,7 @@ use makepad_ai_metal::stream::kernels::{ProbeSpin, PROBE_SPIN};
 use makepad_ai_metal::stream::{self, tensor_ops, with_metal_stream, Bind, Grid};
 use makepad_ai_metal::{generic_ops, linear, GpuTensor};
 use std::sync::mpsc::channel;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 /// The spin's threads: one float each.
@@ -34,9 +41,21 @@ const SPIN_THREADS: usize = 1 << 16;
 /// How long a calibrated spin should keep its command buffer running.
 const SPIN_MS: f64 = 200.0;
 
+/// Held for the whole of each test. cargo runs tests side by side, each on its own queue, and
+/// Apple GPUs switch between command buffers, not inside one: another test's 200 ms spin would hold
+/// up a small command buffer whose download is timed, and a calibration made while another spin
+/// runs comes out short.
+static GPU: Mutex<()> = Mutex::new(());
+
+/// The GPU to this test alone until the guard drops (a test that panicked holding it passes it on).
+fn gpu_turn() -> MutexGuard<'static, ()> {
+    GPU.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Runs `f` on a thread of its own (its own stream, ring and pool), allocations not poisoned
-/// whatever MAKEPAD_METAL_POISON says, and passes on its panic.
+/// whatever MAKEPAD_METAL_POISON says, with the GPU to itself, and passes on its panic.
 fn on_own_thread(f: impl FnOnce() + Send + 'static) {
+    let _turn = gpu_turn();
     std::thread::spawn(move || {
         stream::set_poison_allocs(Some(false));
         f()
@@ -87,9 +106,13 @@ fn spin(x: &GpuTensor, iterations: u32) -> GpuTensor {
 }
 
 /// Iterations of a spin over `SPIN_THREADS` that take at least `ms` on this GPU, doubling until
-/// they do (on the calling thread's stream).
+/// they do (on the calling thread's stream). One short spin runs untimed first: the first launch
+/// on a thread compiles the probe library and its pipeline, which would otherwise count as
+/// spinning. (64 iterations: the spin gives `x` back once its `v` has reached 2, which takes at
+/// most 33 steps from any start below 1024, with or without contraction.)
 fn spin_iterations(ms: f64) -> u32 {
     let x = upload(&values(SPIN_THREADS, 99));
+    assert_bits("the warm-up spin", &download(&spin(&x, 64)), &values(SPIN_THREADS, 99));
     let mut iterations = 1u32 << 12;
     loop {
         let started = Instant::now();
@@ -166,14 +189,18 @@ fn an_upload_while_an_older_read_is_pending_takes_another_buffer() {
         if pending {
             assert_ne!(stream::residency(&b).buffer, a_at.buffer, "the host wrote a buffer a pending read uses");
         } else {
+            // The spin was waited for at its op: a's buffer is idle, and the upload takes it.
             assert!(sync_mode(), "the spin finished before the upload: calibrate longer");
-            eprintln!("[residency] SYNC: nothing pending, the upload's buffer is not checked");
+            assert_eq!(stream::residency(&b).buffer, a_at.buffer, "an idle buffer of the bucket is taken again");
+            eprintln!("[residency] SYNC: nothing pending, the upload took the dropped buffer at once");
         }
         assert_bits("what the spin read", &download(&out), &a_values);
         assert_bits("the upload", &download(&b), &b_values);
-        // Once that read has finished, the host may have the buffer again.
-        let c = upload(&values(SPIN_THREADS, 3));
-        assert_eq!(stream::residency(&c).buffer, a_at.buffer, "an idle buffer of the bucket is taken again");
+        if pending {
+            // Once that read has finished, the host may have the buffer again.
+            let c = upload(&values(SPIN_THREADS, 3));
+            assert_eq!(stream::residency(&c).buffer, a_at.buffer, "an idle buffer of the bucket is taken again");
+        }
     });
 }
 
@@ -230,6 +257,7 @@ fn upload_into_a_buffer_queued_work_reads_is_staged_behind_that_work() {
 
 #[test]
 fn a_pending_tensor_is_refused_on_another_thread_until_its_owner_synchronizes() {
+    let _turn = gpu_turn();
     // The tensor, and whether the owner's spin over it was still running when it was handed over.
     let (to_other, from_owner) = channel::<(GpuTensor, bool)>();
     let (refused, wait_refused) = channel::<()>();
@@ -301,6 +329,57 @@ fn a_tensor_dropped_on_another_thread_is_released_not_pooled() {
 }
 
 #[test]
+fn a_buffer_released_while_queued_work_reads_it_lives_until_that_work_is_done() {
+    // Each of three spins reads a buffer that is released for real while the spin is pending:
+    // dropped on another thread, dropped here and then trimmed from the pool, dropped here with the
+    // pool's cap at 0. Nothing in the stream keeps those buffers; the command buffers that bind
+    // them do (retained references). New buffers of the same size, filled with other values, are
+    // then taken from the device, so a freed buffer's memory would likely be written again before
+    // the spins read it.
+    on_own_thread(|| {
+        let iterations = spin_iterations(SPIN_MS);
+        let (a_values, b_values, c_values) = (values(SPIN_THREADS, 20), values(SPIN_THREADS, 21), values(SPIN_THREADS, 22));
+        let mut pending = Vec::new();
+
+        let a = upload(&a_values);
+        let out_a = spin(&a, iterations);
+        stream::flush().unwrap();
+        pending.push(use_pending(&a));
+        std::thread::spawn(move || drop(a)).join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+
+        let b = upload(&b_values);
+        let b_bytes = stream::residency(&b).bytes;
+        let out_b = spin(&b, iterations);
+        stream::flush().unwrap();
+        pending.push(use_pending(&b));
+        drop(b);
+        assert!(stream::pool_trim() >= b_bytes, "the trim releases the dropped buffer");
+        assert_eq!(stream::ring_state().idle_bytes, 0);
+
+        stream::pool_cap_override(Some(0));
+        let c = upload(&c_values);
+        let out_c = spin(&c, iterations);
+        stream::flush().unwrap();
+        pending.push(use_pending(&c));
+        drop(c);
+        assert_eq!(stream::ring_state().idle_bytes, 0, "over the cap: released, not pooled");
+        stream::pool_cap_override(None);
+
+        let decoys: Vec<GpuTensor> = (0..8).map(|i| upload(&vec![-1.0 - i as f32; SPIN_THREADS])).collect();
+        assert_bits("the spin over the buffer dropped on another thread", &download(&out_a), &a_values);
+        assert_bits("the spin over the trimmed buffer", &download(&out_b), &b_values);
+        assert_bits("the spin over the buffer over the cap", &download(&out_c), &c_values);
+        for (i, decoy) in decoys.iter().enumerate() {
+            assert_bits("a new buffer", &download(decoy), &vec![-1.0 - i as f32; SPIN_THREADS]);
+        }
+        if pending.contains(&false) {
+            assert!(sync_mode(), "a spin finished before its buffer was released ({pending:?}): calibrate longer");
+            eprintln!("[residency] SYNC: nothing pending at the releases, retention is not checked");
+        }
+    });
+}
+
+#[test]
 fn unaligned_views_are_read_and_written_where_they_lie() {
     on_own_thread(|| {
         let (rows, cols) = (37, 13);
@@ -331,12 +410,20 @@ fn unaligned_views_are_read_and_written_where_they_lie() {
             generic_ops::add_cols_broadcast(&v, &bias).unwrap(),
             generic_ops::add_cols_broadcast(&copy, &bias_copy).unwrap(),
         );
-        let gamma = values(cols, 11);
-        let beta = values(cols, 12);
+        // The layer norm takes widths that are multiples of 4, and a row view of such a width lies
+        // on a 16-byte boundary: its view starts one word into a column instead.
+        let (ln_rows, ln_cols) = (5, 16);
+        let ln_values = values(1 + ln_rows * ln_cols, 11);
+        let ln_column = stream::upload(&ln_values, ln_values.len(), 1).unwrap();
+        let ln_view = stream::reshape(stream::slice_rows(&ln_column, 1, ln_rows * ln_cols).unwrap(), ln_rows, ln_cols).unwrap();
+        assert!(!ln_view.is_aligned16(), "one word into the column: not on a 16-byte boundary");
+        let ln_copy = stream::upload(&ln_values[1..], ln_rows, ln_cols).unwrap();
+        let gamma = values(ln_cols, 12);
+        let beta = values(ln_cols, 13);
         same(
             "layer_norm_pytorch",
-            gpu_layer_norm_pytorch(&v, &gamma, &beta, 1e-5).unwrap(),
-            gpu_layer_norm_pytorch(&copy, &gamma, &beta, 1e-5).unwrap(),
+            gpu_layer_norm_pytorch(&ln_view, &gamma, &beta, 1e-5).unwrap(),
+            gpu_layer_norm_pytorch(&ln_copy, &gamma, &beta, 1e-5).unwrap(),
         );
         same("sigmoid", gpu_cutie_sigmoid(&v).unwrap(), gpu_cutie_sigmoid(&copy).unwrap());
         // A linear with x, W and the bias all views at odd offsets.

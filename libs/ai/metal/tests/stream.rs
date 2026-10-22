@@ -307,20 +307,30 @@ fn an_output_written_in_parts_keeps_every_part() {
 fn what_an_op_leaves_unwritten_is_nan_with_poisoned_allocations() {
     std::thread::spawn(|| {
         stream::set_poison_allocs(Some(true));
-        let a: Vec<f32> = (0..400).map(|i| i as f32 - 200.0).collect();
-        let ta = upload(&a);
-        // Twice: the second output reuses the first's buffer, which holds what the first left.
-        for round in 0..2 {
+        let full: Vec<f32> = (0..1000).map(|i| i as f32 * 0.5 + 1.0).collect();
+        let part: Vec<f32> = (0..400).map(|i| i as f32 - 200.0).collect();
+        let (tfull, tpart) = (upload(&full), upload(&part));
+        // Round 0 writes every word of its output; round 1 writes the first 400 words of an output
+        // in the same buffer (pooled in between), so its last 600 are NaN only if alloc poisoned
+        // the reused buffer again.
+        let mut first_buffer = None;
+        for (round, (src, values)) in [(&tfull, &full), (&tpart, &part)].into_iter().enumerate() {
             let out = with_metal_stream("bring-up: unwritten", |s| {
                 let out = GpuTensor::alloc(1000, 1)?;
-                copy_part(s, &ta, &out, 0)?;
+                copy_part(s, src, &out, 0)?;
                 Ok(out)
             })
             .unwrap();
             let words = stream::download_u32(&out).unwrap();
-            assert_eq!(words[..400], bits(&a)[..]);
-            if let Some(i) = (400..1000).find(|&i| words[i] != stream::UNWRITTEN_BITS) {
+            let written = values.len();
+            assert_eq!(words[..written], bits(values)[..], "round {round}: the copied words");
+            if let Some(i) = (written..1000).find(|&i| words[i] != stream::UNWRITTEN_BITS) {
                 panic!("round {round}: word {i}, never written, is {:#010x}, not alloc's {:#010x}", words[i], stream::UNWRITTEN_BITS);
+            }
+            let buffer = stream::residency(&out).buffer;
+            match first_buffer {
+                None => first_buffer = Some(buffer),
+                Some(first) => assert_eq!(buffer, first, "round 1's output reuses round 0's buffer"),
             }
         }
     })
@@ -558,6 +568,14 @@ fn the_seams_rules_are_errors_not_panics() {
     })
     .err().expect("an error");
     assert!(err.contains("bound again"), "{err}");
+    // A view of the output is the same memory: refused as well.
+    let err = with_metal_stream("bring-up: view alias", |s| {
+        let out = GpuTensor::alloc(2, 1)?;
+        let part = stream::slice_rows(&out, 1, 1)?;
+        s.launch(&TENSOR_COPY2D, &[], &TensorCopy2d { rows: 1, cols: 1, src_ld: 1, dst_ld: 1, src_offset: 0, dst_offset: 0 }, &[Bind::In(&part), Bind::Out(&out)], Grid::linear(1, 64)?)
+    })
+    .err().expect("an error");
+    assert!(err.contains("a view overlapping it"), "{err}");
     // And the stream goes on.
     assert_eq!(stream::download(&tensor_ops::add(&x, &x).unwrap()).unwrap(), vec![2.0, 4.0]);
     // A GEMM is checked before its library is asked for (tests/gemm.rs runs the GEMM itself).

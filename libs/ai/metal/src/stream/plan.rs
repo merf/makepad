@@ -24,13 +24,28 @@ pub(crate) enum SlotKind {
     Absent,
 }
 
-/// A binding: its kind, the address of the tensor it binds (0 for none), and whether this op
-/// allocated that tensor.
+/// A binding: its kind, the address of the tensor it binds (0 for none), the address of that
+/// tensor's storage (0 for none) and the words it covers there, `[start, end)`, and whether this op
+/// allocated the tensor.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SlotPlan {
     pub kind: SlotKind,
     pub tensor: usize,
+    pub storage: usize,
+    pub words: (usize, usize),
     pub allocated_here: bool,
+}
+
+impl SlotPlan {
+    /// Whether `self` and `other` bind memory in common: the same tensor, or tensors on one
+    /// storage whose words overlap (a view of the other, or of what the other is a view of).
+    fn overlaps(&self, other: &SlotPlan) -> bool {
+        if self.tensor != 0 && self.tensor == other.tensor {
+            return true;
+        }
+        let ((a0, a1), (b0, b1)) = (self.words, other.words);
+        self.storage != 0 && self.storage == other.storage && a0 < a1 && b0 < b1 && a0 < b1 && b0 < a1
+    }
 }
 
 impl SlotKind {
@@ -43,7 +58,8 @@ impl SlotKind {
 /// - params and every `Bytes` at most [`MAX_SET_BYTES`], at most [`MAX_BINDS`] bindings;
 /// - `Weights` read from an offset inside them;
 /// - every `Out` and `InOut` a tensor this op allocated (rule 2), and written through one slot
-///   only: no other slot binds it, as input or output.
+///   only: no other slot binds it, as input or output, nor a view overlapping it (a dispatch's
+///   reads and writes of the same memory are not ordered).
 pub(crate) fn check_slots(op: &str, function: &str, params_bytes: usize, slots: &[SlotPlan]) -> MetalResult<()> {
     if params_bytes > MAX_SET_BYTES {
         return Err(format!("{op} ({function}): {params_bytes} bytes of params, setBytes takes at most {MAX_SET_BYTES}"));
@@ -71,14 +87,11 @@ pub(crate) fn check_slots(op: &str, function: &str, params_bytes: usize, slots: 
                          (GpuTensor::alloc inside the op)"
                     ));
                 }
-                let shared = slots
-                    .iter()
-                    .enumerate()
-                    .any(|(other, s)| other != index && s.tensor == slot.tensor && s.tensor != 0);
+                let shared = slots.iter().enumerate().any(|(other, s)| other != index && s.overlaps(slot));
                 if shared {
                     return Err(format!(
-                        "{op} ({function}): the tensor written at [[buffer({at})]] is bound again; \
-                         read and write it through one InOut"
+                        "{op} ({function}): the tensor written at [[buffer({at})]] is bound again, \
+                         or a view overlapping it is; read and write it through one InOut"
                     ));
                 }
             }

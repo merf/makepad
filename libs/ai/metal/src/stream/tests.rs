@@ -169,9 +169,16 @@ fn the_source_folder_overrides_both_source_and_header() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// A slot plan for tests: the tensor's "address" is a small number.
+/// A slot plan for tests: the tensor's "address" is a small number, its storage of its own (the
+/// same number) and 16 words of it; none for 0.
 fn slot(kind: SlotKind, tensor: usize, allocated_here: bool) -> SlotPlan {
-    SlotPlan { kind, tensor, allocated_here }
+    let words = if tensor == 0 { (0, 0) } else { (0, 16) };
+    SlotPlan { kind, tensor, storage: tensor, words, allocated_here }
+}
+
+/// A view: a tensor of its own (`tensor`) on `storage`'s words `start..end`.
+fn view_slot(kind: SlotKind, tensor: usize, storage: usize, start: usize, end: usize) -> SlotPlan {
+    SlotPlan { kind, tensor, storage, words: (start, end), allocated_here: false }
 }
 
 #[test]
@@ -207,6 +214,23 @@ fn launch_writes_only_tensors_the_op_allocated_through_one_slot() {
     assert!(aliased.contains("bound again"), "{aliased}");
     assert!(check_slots("op", "k", 0, &[out, out]).is_err(), "written twice");
     assert!(check_slots("op", "k", 0, &[slot(SlotKind::InOut, 2, true), x]).is_ok());
+}
+
+#[test]
+fn launch_refuses_a_view_overlapping_what_it_writes() {
+    // `out` is tensor 2 on storage 2, words 0..16.
+    let out = slot(SlotKind::Out, 2, true);
+    let inside = check_slots("op", "k", 0, &[view_slot(SlotKind::In, 7, 2, 4, 8), out]).unwrap_err();
+    assert!(inside.contains("bound again, or a view overlapping it is") && inside.contains("[[buffer(2)]]"), "{inside}");
+    assert!(check_slots("op", "k", 0, &[out, view_slot(SlotKind::In, 7, 2, 15, 20)]).is_err(), "overlapping its last word");
+    let inout = slot(SlotKind::InOut, 2, true);
+    assert!(check_slots("op", "k", 0, &[inout, view_slot(SlotKind::In, 7, 2, 0, 16)]).is_err(), "the whole of an InOut");
+    // Past it in the storage, empty, or on other storage: no memory in common.
+    assert!(check_slots("op", "k", 0, &[view_slot(SlotKind::In, 7, 2, 16, 24), out]).is_ok());
+    assert!(check_slots("op", "k", 0, &[view_slot(SlotKind::In, 7, 2, 8, 8), out]).is_ok());
+    assert!(check_slots("op", "k", 0, &[view_slot(SlotKind::In, 7, 3, 0, 16), out]).is_ok());
+    // Two views of one input may overlap: neither is written.
+    assert!(check_slots("op", "k", 0, &[view_slot(SlotKind::In, 7, 3, 0, 8), view_slot(SlotKind::In, 8, 3, 4, 12), out]).is_ok());
 }
 
 /// What `tensor_add_f32` reads, as its reflection lists it: params of 4 bytes, three buffers.
