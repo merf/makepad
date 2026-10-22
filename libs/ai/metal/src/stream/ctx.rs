@@ -84,10 +84,12 @@ impl Pipeline {
     }
 }
 
-/// The command buffer being encoded into.
+/// The command buffer being encoded into. Its compute encoder is ended for work encoded on the
+/// command buffer itself (an MPS kernel) and opened again by the next dispatch: one buffer, in
+/// order, with Metal's hazard tracking between its encoders.
 struct OpenCb {
     cb: StrongId,
-    encoder: StrongId,
+    encoder: Option<StrongId>,
     serial: u64,
     dispatches: usize,
     first_op: &'static str,
@@ -170,6 +172,8 @@ pub(crate) struct StreamCtx {
     /// MAKEPAD_METAL_MATH_MODE, as `MTLMathMode`: `None` leaves the compiler's default (fast math
     /// off is always set).
     math_mode: Option<u64>,
+    /// The MPS GEMM's kernels (MAKEPAD_METAL_GEMM=mps).
+    pub(crate) mps: super::mps::MpsCache,
 }
 
 impl StreamCtx {
@@ -198,6 +202,7 @@ impl StreamCtx {
             budget: env_usize("MAKEPAD_METAL_STREAM_OPS", DEFAULT_STREAM_OPS).max(1),
             sync: env_usize("MAKEPAD_METAL_STREAM_SYNC", 0) != 0,
             math_mode: math_mode_from_env(),
+            mps: super::mps::MpsCache::default(),
         })
     }
 
@@ -251,19 +256,41 @@ impl StreamCtx {
     /// The open command buffer's serial encoder, opening both if none is: one more dispatch of
     /// `op`. Returns the encoder and the serial its work runs under.
     pub(crate) fn begin_dispatch(&mut self, op: &'static str) -> Result<(ObjcId, u64), String> {
+        let open = self.open_cb(op)?;
+        if open.encoder.is_none() {
+            let encoder: ObjcId = unsafe { msg_send![open.cb.as_id(), computeCommandEncoder] };
+            open.encoder = Some(unsafe { StrongId::retain(encoder) }.ok_or("computeCommandEncoder returned nil")?);
+        }
+        let encoder = open.encoder.as_ref().expect("opened above").as_id();
+        Ok((encoder, open.serial))
+    }
+
+    /// The open command buffer itself, opening one if none is, its compute encoder ended: one more
+    /// dispatch of `op` encoded on the buffer (an MPS kernel). Returns it and its serial.
+    pub(crate) fn begin_buffer_work(&mut self, op: &'static str) -> Result<(ObjcId, u64), String> {
+        let open = self.open_cb(op)?;
+        if let Some(encoder) = open.encoder.take() {
+            unsafe {
+                let _: () = msg_send![encoder.as_id(), endEncoding];
+            }
+        }
+        Ok((open.cb.as_id(), open.serial))
+    }
+
+    /// The open command buffer (opening one, without an encoder, if none is), one more dispatch
+    /// of `op` counted.
+    fn open_cb(&mut self, op: &'static str) -> Result<&mut OpenCb, String> {
         if self.open.is_none() {
             let cb: ObjcId = unsafe { msg_send![self.queue.as_id(), commandBuffer] };
             let cb = unsafe { StrongId::retain(cb) }.ok_or("commandBuffer returned nil")?;
-            let encoder: ObjcId = unsafe { msg_send![cb.as_id(), computeCommandEncoder] };
-            let encoder = unsafe { StrongId::retain(encoder) }.ok_or("computeCommandEncoder returned nil")?;
             let serial = self.next_serial;
             self.next_serial += 1;
-            self.open = Some(OpenCb { cb, encoder, serial, dispatches: 0, first_op: op, last_op: op });
+            self.open = Some(OpenCb { cb, encoder: None, serial, dispatches: 0, first_op: op, last_op: op });
         }
         let open = self.open.as_mut().expect("opened above");
         open.dispatches += 1;
         open.last_op = op;
-        Ok((open.encoder.as_id(), open.serial))
+        Ok(open)
     }
 
     /// Ends the open command buffer's encoder and commits it, after making room in the ring (it
@@ -274,8 +301,10 @@ impl StreamCtx {
             return;
         };
         let label = open.label();
-        unsafe {
-            let _: () = msg_send![open.encoder.as_id(), endEncoding];
+        if let Some(encoder) = &open.encoder {
+            unsafe {
+                let _: () = msg_send![encoder.as_id(), endEncoding];
+            }
         }
         set_label(open.cb.as_id(), &label);
         self.ring.make_room();

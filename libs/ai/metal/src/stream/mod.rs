@@ -58,6 +58,8 @@ mod weight_map;
 #[cfg(target_os = "macos")]
 mod ctx;
 #[cfg(target_os = "macos")]
+mod mps;
+#[cfg(target_os = "macos")]
 mod seam;
 #[cfg(target_os = "macos")]
 pub(crate) mod storage;

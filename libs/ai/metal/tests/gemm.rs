@@ -64,7 +64,8 @@ impl Drop for ModeGuard {
     }
 }
 
-const MODES: [GemmMode; 2] = [GemmMode::Naive, GemmMode::Tiled];
+/// The kernels, and MPS (MAKEPAD_METAL_GEMM=mps), which is held to the same f64 bounds.
+const MODES: [GemmMode; 3] = [GemmMode::Naive, GemmMode::Tiled, GemmMode::Mps];
 
 fn upload(values: &[f32]) -> GpuTensor {
     stream::upload(values, values.len(), 1).unwrap()
@@ -347,7 +348,7 @@ fn packed_heads_are_read_and_written_in_place() {
 #[test]
 fn alpha_beta_and_k_zero() {
     let mut rng = Rng(0x6e44_0004);
-    for mode in [GemmMode::Naive, GemmMode::Tiled, GemmMode::Auto] {
+    for mode in [GemmMode::Naive, GemmMode::Tiled, GemmMode::Auto, GemmMode::Mps] {
         let _mode = ModeGuard::new(mode);
         for (m, n, k) in [(7, 5, 3), (40, 33, 65)] {
             // alpha and beta, C an InOut whose padding must come back unchanged.
@@ -577,7 +578,7 @@ fn linear_f64(x: &[f32], w: &[f32], b: Option<&[f32]>, rows: usize, in_f: usize,
 #[test]
 fn linear_matches_f64_as_the_ops_check_judges_it() {
     let mut rng = Rng(0x6e44_0007);
-    for mode in [GemmMode::Naive, GemmMode::Tiled, GemmMode::Auto] {
+    for mode in [GemmMode::Naive, GemmMode::Tiled, GemmMode::Auto, GemmMode::Mps] {
         let _mode = ModeGuard::new(mode);
         // Cutie's object transformer (256 wide, 2048 in its FFN), Body-like odd sizes, and edges.
         for (rows, in_f, out_f, bias) in
@@ -689,7 +690,7 @@ fn attention_matches_f64_as_the_ops_check_judges_it() {
     const HEAD_DIM: usize = 32;
     let mut rng = Rng(0x6e44_0009);
     let scale = 1.0 / (HEAD_DIM as f32).sqrt();
-    for mode in [GemmMode::Naive, GemmMode::Tiled, GemmMode::Auto] {
+    for mode in [GemmMode::Naive, GemmMode::Tiled, GemmMode::Auto, GemmMode::Mps] {
         let _mode = ModeGuard::new(mode);
         // Cutie's object transformer (8 heads, 16 queries, 336 pixels and back), one key, one
         // query, and past 1024 keys (the softmax's 1024 threads).
@@ -760,6 +761,9 @@ fn attention_chunks_and_a_zero_bias_change_no_bit() {
             let what = format!("{mode:?}: chunks of {} queries", (cap / (heads * kv_len)).max(1));
             if mode == GemmMode::Naive {
                 assert_eq!(bits(&chunked), bits(&whole), "{what}");
+            } else if mode == GemmMode::Mps {
+                // MPS promises no order of its sums across shapes: within the bound alone.
+                assert_tight(&what, &chunked, &whole_f64);
             } else {
                 assert_tight(&what, &chunked, &whole_f64);
                 assert_eq!(bits(&chunked), bits(&whole), "{what}: the same bits as one pass");
