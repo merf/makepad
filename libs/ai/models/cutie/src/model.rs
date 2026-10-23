@@ -45,6 +45,27 @@ impl HalfConvs {
     pub(crate) fn begin(on: bool) -> Self {
         Self(HALF_CONVS.with(|h| h.replace(on)))
     }
+
+    /// Whether this thread's convolutions run in half now.
+    pub(crate) fn on() -> bool {
+        HALF_CONVS.with(Cell::get)
+    }
+}
+
+impl Conv2d {
+    /// This convolution as a graph program's (`gpu_cutie_graph_f16`).
+    pub(crate) fn graph_conv(&self) -> makepad_ai_common::gpu::CutieGraphConv<'_> {
+        makepad_ai_common::gpu::CutieGraphConv {
+            key: &self.key,
+            weights: &self.weights,
+            bias: self.bias.as_deref(),
+            in_channels: self.in_c,
+            out_channels: self.out_c,
+            k: self.k,
+            pad: self.pad,
+            stride: self.stride,
+        }
+    }
 }
 
 impl Drop for HalfConvs {

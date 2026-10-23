@@ -327,6 +327,124 @@ impl MpsCache {
         Ok((&self.graphs[&key], in_buf, out_buf))
     }
 
+    /// A program of convolutions (`cutie_ops::graph`) as one graph in half, made at first use
+    /// under `key` and the input's shape, and the buffers it reads (the input in half) and writes
+    /// (each output in fp32), NCHW from their start. Values are half between the ops; each
+    /// output is cast to fp32.
+    pub(crate) fn program_graph(
+        &mut self, device: ObjcId, key: &str, ops: &[crate::cutie_ops::CutieGraphOp<'_>], shapes: &[crate::cutie_ops::graph::GraphShape],
+        outputs: &[usize],
+    ) -> MetalResult<(ObjcId, Vec<ObjcId>)> {
+        use crate::cutie_ops::CutieGraphOp;
+        let size = |s: &crate::cutie_ops::graph::GraphShape| s.channels * s.width * s.height;
+        let in_buf = self.graph_buffer(device, 2, size(&shapes[0]) * 2)?;
+        let mut out_bufs = Vec::with_capacity(outputs.len());
+        for (i, &o) in outputs.iter().enumerate() {
+            out_bufs.push(self.graph_buffer(device, 10 + i as u8, size(&shapes[o]) * 4)?);
+        }
+        let gkey = (format!("program::{key}"), 1, shapes[0].width, shapes[0].height);
+        if !self.graphs.contains_key(&gkey) {
+            let built = unsafe {
+                let nil: ObjcId = std::ptr::null_mut();
+                let graph: ObjcId = msg_send![class!(MPSGraph), new];
+                let graph = StrongId::from_owned(graph).ok_or("MPSGraph new returned nil")?;
+                let g = graph.as_id();
+                let nchw = |s: &crate::cutie_ops::graph::GraphShape| graph_shape(&[1, s.channels, s.height, s.width]);
+                let x: ObjcId = msg_send![g, placeholderWithShape: nchw(&shapes[0]) dataType: MPS_DATA_TYPE_FLOAT16 name: nil];
+                let mut values: Vec<ObjcId> = vec![x];
+                for op in ops {
+                    let v: ObjcId = match *op {
+                        CutieGraphOp::Conv { src, conv, residual, relu } => {
+                            let (o, i, k, pad) = (conv.out_channels, conv.in_channels, conv.k, conv.pad as u64);
+                            let wdata: ObjcId = msg_send![class!(NSData), dataWithBytes: conv.weights.as_ptr() as *const std::ffi::c_void length: (conv.weights.len() * 4) as u64];
+                            let w32: ObjcId = msg_send![g, constantWithData: wdata shape: graph_shape(&[o, i, k, k]) dataType: MPS_DATA_TYPE_FLOAT32];
+                            let w16: ObjcId = msg_send![g, castTensor: w32 toType: MPS_DATA_TYPE_FLOAT16 name: nil];
+                            let desc: ObjcId = msg_send![
+                                class!(MPSGraphConvolution2DOpDescriptor),
+                                descriptorWithStrideInX: conv.stride as u64
+                                strideInY: conv.stride as u64
+                                dilationRateInX: 1u64
+                                dilationRateInY: 1u64
+                                groups: 1u64
+                                paddingLeft: pad
+                                paddingRight: pad
+                                paddingTop: pad
+                                paddingBottom: pad
+                                paddingStyle: GRAPH_PADDING_EXPLICIT
+                                dataLayout: GRAPH_LAYOUT_NCHW
+                                weightsLayout: GRAPH_LAYOUT_OIHW
+                            ];
+                            if desc.is_null() {
+                                return Err(format!("MPSGraph program {key}: a convolution descriptor returned nil"));
+                            }
+                            let mut y: ObjcId = msg_send![g, convolution2DWithSourceTensor: values[src] weightsTensor: w16 descriptor: desc name: nil];
+                            if let Some(bias) = conv.bias {
+                                let bdata: ObjcId = msg_send![class!(NSData), dataWithBytes: bias.as_ptr() as *const std::ffi::c_void length: (bias.len() * 4) as u64];
+                                let b32: ObjcId = msg_send![g, constantWithData: bdata shape: graph_shape(&[1, o, 1, 1]) dataType: MPS_DATA_TYPE_FLOAT32];
+                                let b16: ObjcId = msg_send![g, castTensor: b32 toType: MPS_DATA_TYPE_FLOAT16 name: nil];
+                                y = msg_send![g, additionWithPrimaryTensor: y secondaryTensor: b16 name: nil];
+                            }
+                            if let Some(r) = residual {
+                                y = msg_send![g, additionWithPrimaryTensor: y secondaryTensor: values[r] name: nil];
+                            }
+                            if relu {
+                                y = msg_send![g, reLUWithTensor: y name: nil];
+                            }
+                            y
+                        }
+                        CutieGraphOp::MaxPool3x3s2 { src } => {
+                            let desc: ObjcId = msg_send![
+                                class!(MPSGraphPooling2DOpDescriptor),
+                                descriptorWithKernelWidth: 3u64
+                                kernelHeight: 3u64
+                                strideInX: 2u64
+                                strideInY: 2u64
+                                dilationRateInX: 1u64
+                                dilationRateInY: 1u64
+                                paddingLeft: 1u64
+                                paddingRight: 1u64
+                                paddingTop: 1u64
+                                paddingBottom: 1u64
+                                paddingStyle: GRAPH_PADDING_EXPLICIT
+                                dataLayout: GRAPH_LAYOUT_NCHW
+                            ];
+                            if desc.is_null() {
+                                return Err(format!("MPSGraph program {key}: the pooling descriptor returned nil"));
+                            }
+                            msg_send![g, maxPooling2DWithSourceTensor: values[src] descriptor: desc name: nil]
+                        }
+                    };
+                    values.push(v);
+                }
+                let xd: ObjcId = msg_send![class!(MPSGraphTensorData), alloc];
+                let xd: ObjcId = msg_send![xd, initWithMTLBuffer: in_buf shape: nchw(&shapes[0]) dataType: MPS_DATA_TYPE_FLOAT16];
+                let xd = StrongId::from_owned(xd).ok_or("MPSGraphTensorData init returned nil")?;
+                let mut keys: Vec<ObjcId> = Vec::new();
+                let mut datas: Vec<StrongId> = Vec::new();
+                for (&o, &buf) in outputs.iter().zip(&out_bufs) {
+                    let y: ObjcId = msg_send![g, castTensor: values[o] toType: MPS_DATA_TYPE_FLOAT32 name: nil];
+                    let yd: ObjcId = msg_send![class!(MPSGraphTensorData), alloc];
+                    let yd: ObjcId = msg_send![yd, initWithMTLBuffer: buf shape: nchw(&shapes[o]) dataType: MPS_DATA_TYPE_FLOAT32];
+                    datas.push(StrongId::from_owned(yd).ok_or("MPSGraphTensorData init returned nil")?);
+                    keys.push(y);
+                }
+                let objects: Vec<ObjcId> = datas.iter().map(StrongId::as_id).collect();
+                let feeds: ObjcId = msg_send![class!(NSDictionary), dictionaryWithObject: xd.as_id() forKey: x];
+                let results: ObjcId = msg_send![class!(NSDictionary), dictionaryWithObjects: objects.as_ptr() forKeys: keys.as_ptr() count: keys.len() as u64];
+                let feeds = StrongId::retain(feeds).ok_or("NSDictionary returned nil")?;
+                let results = StrongId::retain(results).ok_or("NSDictionary returned nil")?;
+                GraphConv { graph, feeds, results, input: x, output: keys.first().copied().unwrap_or(x) }
+            };
+            self.graphs.insert(gkey, built);
+        }
+        Ok((in_buf, out_bufs))
+    }
+
+    /// The program graph made for `key` and an input of `input`'s shape, if `program_graph` made it.
+    pub(crate) fn program(&self, key: &str, input: crate::cutie_ops::graph::GraphShape) -> Option<&GraphConv> {
+        self.graphs.get(&(format!("program::{key}"), 1, input.width, input.height))
+    }
+
     /// The graph made for `key` (layer, images, width, height), if `graph_convolution` made it.
     pub(crate) fn graph(&self, key: &GraphKey) -> Option<&GraphConv> {
         self.graphs.get(key)
@@ -341,13 +459,21 @@ impl MpsCache {
                 return Err("MPSCommandBuffer returned nil".into());
             }
             let nil: ObjcId = std::ptr::null_mut();
+            // An execution descriptor that never commits the command buffer to start the GPU
+            // early (`enableCommitAndContinue`, as PyTorch's MPS stream can turn it off): MPSGraph
+            // otherwise does for a large graph, and the stream's command buffer is the stream's.
+            let descriptor: ObjcId = msg_send![class!(MPSGraphExecutionDescriptor), new];
+            let descriptor = StrongId::from_owned(descriptor).ok_or("MPSGraphExecutionDescriptor new returned nil")?;
+            if crate::objc_util::responds_to(descriptor.as_id(), sel!(setEnableCommitAndContinue:)) {
+                let _: () = msg_send![descriptor.as_id(), setEnableCommitAndContinue: NO];
+            }
             let _: () = msg_send![
                 graph.graph.as_id(),
                 encodeToCommandBuffer: mcb
                 feeds: graph.feeds.as_id()
                 targetOperations: nil
                 resultsDictionary: graph.results.as_id()
-                executionDescriptor: nil
+                executionDescriptor: descriptor.as_id()
             ];
             let now: ObjcId = msg_send![mcb, commandBuffer];
             if now != cb {

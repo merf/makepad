@@ -115,6 +115,26 @@ pub fn gpu_cutie_conv2d_fused_f16(
     gpu_cutie_conv2d_fused(x, batch, in_w, in_h, cache_namespace, key, weights, bias, out_channels, k, pad, stride, residual, relu)
 }
 
+/// Whether `gpu_cutie_graph_f16` runs here: on macOS (MPSGraph), not on the other builds without
+/// CUDA's kernels.
+pub const GPU_CUTIE_GRAPH: bool = cfg!(target_os = "macos");
+
+/// A chain of convolutions as one graph in half (metal's `gpu_cutie_graph_f16`) on macOS; an
+/// error elsewhere (`GPU_CUTIE_GRAPH`).
+pub fn gpu_cutie_graph_f16(
+    x: &GpuTensor, width: usize, height: usize, key: &str, ops: &[super::CutieGraphOp<'_>], outputs: &[usize],
+) -> Result<Vec<GpuTensor>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        return makepad_ai_metal::cutie_ops::gpu_cutie_graph_f16(x, width, height, key, ops, outputs);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (x, width, height, key, ops, outputs);
+        Err("gpu_cutie_graph_f16: macOS only".into())
+    }
+}
+
 /// Whether `gpu_cutie_conv2d_fused_f16` really runs in half: on macOS (MPSCNNConvolution), not on
 /// the other builds without CUDA's kernels.
 pub const GPU_CUTIE_HALF: bool = cfg!(target_os = "macos");

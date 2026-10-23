@@ -287,6 +287,20 @@ pub struct Gemm<'a> {
     pub c_batch_stride: usize,
 }
 
+/// A chain of convolutions as one MPSGraph in half (`cutie_ops::graph`): the program, its
+/// values' shapes (value 0 `x`'s), the values to return and the tensors they go into, and the
+/// copies in and out (`cutie_planar_to_half_f32`, `cutie_graph_to_planar_f32`).
+pub struct MpsGraphRun<'a> {
+    pub key: &'a str,
+    pub x: &'a GpuTensor,
+    pub ops: &'a [crate::cutie_ops::CutieGraphOp<'a>],
+    pub shapes: &'a [crate::cutie_ops::graph::GraphShape],
+    pub outputs: &'a [usize],
+    pub outs: &'a [&'a GpuTensor],
+    pub to_half: &'a Kernel,
+    pub from_graph: &'a Kernel,
+}
+
 /// A convolution for `MetalStream::conv_mpscnn`: the layer (its weights key, PyTorch's
 /// [out][in][k][k] weights and bias on the host, read once to make the MPS kernel), the batch's
 /// planar input and output, a residual, the ReLU, and the two layout kernels (`cutie_mps.metal`).
@@ -598,6 +612,62 @@ impl MetalStream<'_> {
             &[Slot::Buffer { id: out_buf, offset: 0 }, tensor(c.out), residual_slot],
             &Grid::linear(n_out, 256)?,
         );
+        Ok(())
+    }
+
+    /// A program of convolutions on MPSGraph (`MpsGraphRun`): `x` rounded to half into the
+    /// graph's input buffer, the graph (cached by its key and `x`'s shape) into an fp32 buffer an
+    /// output, then each into its tensor; its tensors claimed and stamped as a launch's are.
+    pub fn graph_mpsgraph(&mut self, g: &MpsGraphRun<'_>) -> MetalResult<()> {
+        let op = self.op;
+        let mut binds = vec![Bind::In(g.x)];
+        binds.extend(g.outs.iter().map(|t| Bind::Out(t)));
+        let plans: Vec<SlotPlan> = binds.iter().map(Bind::plan).collect();
+        check_slots(op, "MPSGraph program", 0, &plans)?;
+        self.claim(g.x, true)?;
+        for t in g.outs {
+            self.claim(t, false)?;
+        }
+        let to_half = self.ctx.pipeline(g.to_half, &[]).map_err(|e| format!("{op}: {e}"))?.state;
+        let from_graph = self.ctx.pipeline(g.from_graph, &[]).map_err(|e| format!("{op}: {e}"))?.state;
+        let device = self.ctx.device();
+        let copy = |n: usize| -> Vec<u8> { [n as u32, 0u32, 0u32].iter().flat_map(|v| v.to_le_bytes()).collect() };
+        let tensor = |t: &GpuTensor| Slot::Buffer { id: t.storage.buf().as_id(), offset: (t.offset * 4) as u64 };
+        let n_in = g.x.rows() * g.x.cols();
+
+        let (encoder, serial) = self.ctx.begin_dispatch(op).map_err(|e| format!("{op}: {e}"))?;
+        g.x.storage.mark_use(serial);
+        for t in g.outs {
+            t.storage.mark_write(serial);
+        }
+        let (in_buf, out_bufs) = self.ctx.mps.program_graph(device, g.key, g.ops, g.shapes, g.outputs).map_err(|e| format!("{op}: {e}"))?;
+        let params = copy(n_in);
+        super::ctx::encode_dispatch(
+            encoder,
+            to_half,
+            params.as_ptr() as *const std::ffi::c_void,
+            params.len(),
+            &[tensor(g.x), Slot::Buffer { id: in_buf, offset: 0 }],
+            &Grid::linear(n_in, 256)?,
+        );
+        let (cb, _) = self.ctx.begin_buffer_work(op).map_err(|e| format!("{op}: {e}"))?;
+        {
+            let graph = self.ctx.mps.program(g.key, g.shapes[0]).ok_or_else(|| format!("{op}: MPSGraph program {} not made", g.key))?;
+            super::mps::MpsCache::encode_graph(graph, cb).map_err(|e| format!("{op}: {e}"))?;
+        }
+        let (encoder, _) = self.ctx.begin_dispatch(op).map_err(|e| format!("{op}: {e}"))?;
+        for (t, &buf) in g.outs.iter().zip(&out_bufs) {
+            let n = t.rows() * t.cols();
+            let params = copy(n);
+            super::ctx::encode_dispatch(
+                encoder,
+                from_graph,
+                params.as_ptr() as *const std::ffi::c_void,
+                params.len(),
+                &[Slot::Buffer { id: buf, offset: 0 }, tensor(t), Slot::Buffer { id: self.ctx.dummy(), offset: 0 }],
+                &Grid::linear(n, 256)?,
+            );
+        }
         Ok(())
     }
 

@@ -140,10 +140,52 @@ impl PixelEncoder {
         Feat::new(t, 1, 3, image.w, image.h)
     }
 
+    /// In an fp16 step where the backend runs graphs (`GPU_CUTIE_GRAPH`, macOS): the ResNet from
+    /// conv1 to layer3 as one graph in half (`gpu_cutie_graph_f16`), its activations half between
+    /// the convolutions, f4, f8 and f16 out in fp32. MAKEPAD_CUTIE_GRAPH_ENCODER=0 keeps a
+    /// convolution at a time. `None` when not used.
+    fn encode_graph(&self, image: &Feat) -> Result<Option<(Feat, Feat, Feat)>> {
+        use makepad_ai_common::gpu::{gpu_cutie_graph_f16, CutieGraphOp, GPU_CUTIE_GRAPH};
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled = *ON.get_or_init(|| std::env::var("MAKEPAD_CUTIE_GRAPH_ENCODER").map_or(true, |v| v.trim() != "0"));
+        if !GPU_CUTIE_GRAPH || !enabled || !crate::model::HalfConvs::on() {
+            return Ok(None);
+        }
+        fn push<'a>(ops: &mut Vec<CutieGraphOp<'a>>, op: CutieGraphOp<'a>) -> usize {
+            ops.push(op);
+            ops.len()
+        }
+        let mut ops: Vec<CutieGraphOp<'_>> = Vec::new();
+        let mut x = push(&mut ops, CutieGraphOp::Conv { src: 0, conv: self.conv1.graph_conv(), residual: None, relu: true });
+        x = push(&mut ops, CutieGraphOp::MaxPool3x3s2 { src: x });
+        let mut stages = [0usize; 3];
+        for (s, layer) in [&self.res2, &self.layer2, &self.layer3].into_iter().enumerate() {
+            for block in &layer.blocks {
+                let a = push(&mut ops, CutieGraphOp::Conv { src: x, conv: block.conv1.graph_conv(), residual: None, relu: true });
+                let b = push(&mut ops, CutieGraphOp::Conv { src: a, conv: block.conv2.graph_conv(), residual: None, relu: true });
+                let residual = match &block.downsample {
+                    Some(d) => push(&mut ops, CutieGraphOp::Conv { src: x, conv: d.graph_conv(), residual: None, relu: false }),
+                    None => x,
+                };
+                x = push(&mut ops, CutieGraphOp::Conv { src: b, conv: block.conv3.graph_conv(), residual: Some(residual), relu: true });
+            }
+            stages[s] = x;
+        }
+        let key = format!("{}::pixel_encoder", self.conv1.key);
+        let outs = gpu_cutie_graph_f16(&image.t, image.w, image.h, &key, &ops, &stages).map_err(|e| dev("pixel encoder graph", e))?;
+        let [f4, f8, f16]: [GpuTensor; 3] = outs.try_into().map_err(|_| dev("pixel encoder graph", "three outputs".into()))?;
+        let feat = |t: GpuTensor, c: usize, div: usize| Feat::new(t, 1, c, image.w / div, image.h / div);
+        Ok(Some((feat(f4, 256, 4)?, feat(f8, 512, 8)?, feat(f16, 1024, 16)?)))
+    }
+
     /// `CUTIE.encode_image` (see `CutieNet::encode_image`).
     pub(crate) fn encode(&self, image: &Feat, tap: &mut Tap) -> Result<ImageFeatures> {
         let image = self.normalise(image)?;
         tap.put("encode_image.normalised", &image.t)?;
+        if let Some((f4, f8, f16)) = self.encode_graph(&image)? {
+            let pix_feat = self.pix_feat_proj.forward(&f16)?;
+            return Ok(ImageFeatures { image, f16, f8, f4, pix_feat });
+        }
         let x = self.conv1.forward(&image)?;
         tap.put("net.pixel_encoder.bn1", &x.t)?;
         let x = relu(&x)?;
