@@ -287,6 +287,31 @@ pub struct Gemm<'a> {
     pub c_batch_stride: usize,
 }
 
+/// A convolution for `MetalStream::conv_mpscnn`: the layer (its weights key, PyTorch's
+/// [out][in][k][k] weights and bias on the host, read once to make the MPS kernel), the batch's
+/// planar input and output, a residual, the ReLU, and the two layout kernels (`cutie_mps.metal`).
+/// Padding is k/2 on every side, k odd.
+pub struct MpsConv<'a> {
+    pub key: &'a str,
+    pub weights: &'a [f32],
+    pub bias: Option<&'a [f32]>,
+    pub x: &'a GpuTensor,
+    pub out: &'a GpuTensor,
+    pub residual: Option<&'a GpuTensor>,
+    pub relu: bool,
+    pub batch: usize,
+    pub in_channels: usize,
+    pub in_w: usize,
+    pub in_h: usize,
+    pub out_channels: usize,
+    pub ow: usize,
+    pub oh: usize,
+    pub k: usize,
+    pub stride: usize,
+    pub to_image: &'a Kernel,
+    pub from_image: &'a Kernel,
+}
+
 /// The slot that binds `t` where it lies.
 fn tensor_slot(t: &GpuTensor) -> Slot {
     Slot::Buffer { id: t.storage.buf().as_id(), offset: (t.offset * 4) as u64 }
@@ -424,6 +449,81 @@ impl MetalStream<'_> {
     pub fn gemm(&mut self, g: &Gemm<'_>) -> MetalResult<()> {
         let op = self.op;
         super::gemm::run(self, op, g)
+    }
+
+    /// A convolution on MPS (`MpsConv`): `x`'s planes into an rgba32Float texture array
+    /// (`to_image`), `MPSCNNConvolution` with the bias into a second, then back into `out` with the
+    /// residual added and the ReLU taken (`from_image`), three dispatches on the open command
+    /// buffer. Its tensors are claimed and stamped as a launch's are; `out` must be allocated by
+    /// this op. The caller checks the shapes (`ConvPlan`) and that the padding is k/2.
+    pub fn conv_mpscnn(&mut self, c: &MpsConv<'_>) -> MetalResult<()> {
+        let op = self.op;
+        let residual = c.residual.map_or(Bind::Absent, Bind::In);
+        let binds = [Bind::In(c.x), Bind::Out(c.out), residual];
+        let plans: Vec<SlotPlan> = binds.iter().map(Bind::plan).collect();
+        check_slots(op, "MPSCNNConvolution", 0, &plans)?;
+        self.claim(c.x, true)?;
+        self.claim(c.out, false)?;
+        if let Some(r) = c.residual {
+            self.claim(r, true)?;
+        }
+        let to_image = self.ctx.pipeline(c.to_image, &[]).map_err(|e| format!("{op}: {e}"))?.state;
+        let from_image = self.ctx.pipeline(c.from_image, &[]).map_err(|e| format!("{op}: {e}"))?.state;
+        let device = self.ctx.device();
+        let (in_slices, out_slices) = (c.in_channels.div_ceil(4), c.out_channels.div_ceil(4));
+        let source = self.ctx.mps.texture(device, 0, c.in_w, c.in_h, c.batch * in_slices).map_err(|e| format!("{op}: {e}"))?;
+        let destination = self.ctx.mps.texture(device, 1, c.ow, c.oh, c.batch * out_slices).map_err(|e| format!("{op}: {e}"))?;
+        let layer = super::mps::MpsConvLayer {
+            key: c.key,
+            weights: c.weights,
+            bias: c.bias,
+            in_channels: c.in_channels,
+            out_channels: c.out_channels,
+            k: c.k,
+            stride: c.stride,
+        };
+        let conv = self.ctx.mps.convolution(device, &layer).map_err(|e| format!("{op}: {e}"))?;
+        let shape = |channels: usize, w: usize, h: usize, slices: usize, residual: bool, relu: bool| {
+            [c.batch as u32, channels as u32, w as u32, h as u32, slices as u32, residual as u32, relu as u32]
+        };
+        let bytes = |p: &[u32; 7]| p.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+        let groups = |w: usize, h: usize, layers: usize| [w.div_ceil(16) as u64, h.div_ceil(16) as u64, layers as u64];
+        let tensor = |t: &GpuTensor| (t.storage.buf().as_id(), (t.offset * 4) as u64);
+
+        let (encoder, serial) = self.ctx.begin_dispatch(op).map_err(|e| format!("{op}: {e}"))?;
+        c.x.storage.mark_use(serial);
+        if let Some(r) = c.residual {
+            r.storage.mark_use(serial);
+        }
+        c.out.storage.mark_write(serial);
+        let (x_buf, x_offset) = tensor(c.x);
+        super::ctx::encode_texture_dispatch(
+            encoder,
+            to_image,
+            &bytes(&shape(c.in_channels, c.in_w, c.in_h, in_slices, false, false)),
+            &[(1, x_buf, x_offset)],
+            source,
+            groups(c.in_w, c.in_h, c.batch * in_slices),
+            [16, 16, 1],
+        );
+        let (cb, _) = self.ctx.begin_buffer_work(op).map_err(|e| format!("{op}: {e}"))?;
+        self.ctx
+            .mps
+            .encode_convolution(conv, cb, (source, c.in_channels), (destination, c.out_channels))
+            .map_err(|e| format!("{op}: {e}"))?;
+        let (encoder, _) = self.ctx.begin_dispatch(op).map_err(|e| format!("{op}: {e}"))?;
+        let (out_buf, out_offset) = tensor(c.out);
+        let (residual_buf, residual_offset) = c.residual.map_or((self.ctx.dummy(), 0), tensor);
+        super::ctx::encode_texture_dispatch(
+            encoder,
+            from_image,
+            &bytes(&shape(c.out_channels, c.ow, c.oh, out_slices, c.residual.is_some(), c.relu)),
+            &[(1, out_buf, out_offset), (2, residual_buf, residual_offset)],
+            destination,
+            groups(c.ow, c.oh, c.batch * out_slices),
+            [16, 16, 1],
+        );
+        Ok(())
     }
 
     /// A GEMM `gemm::run` has checked and planned, on MPS (MAKEPAD_METAL_GEMM=mps): its tensors
