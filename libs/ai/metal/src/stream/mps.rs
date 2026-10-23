@@ -18,6 +18,8 @@ use makepad_objc_sys::runtime::{ObjcId, BOOL, NO, YES};
 use makepad_objc_sys::{class, msg_send, sel, sel_impl};
 use std::collections::HashMap;
 
+#[link(name = "MetalPerformanceShadersGraph", kind = "framework")]
+extern "C" {}
 #[link(name = "MetalPerformanceShaders", kind = "framework")]
 extern "C" {}
 
@@ -57,6 +59,48 @@ pub(crate) struct MpsCache {
     textures: HashMap<(u8, usize, usize, usize, u64), StrongId>,
     /// `MPSMatrixDescriptor`s by rows, columns and row bytes.
     descriptors: HashMap<(usize, usize, usize), StrongId>,
+    /// An fp16 step's convolutions on MPSGraph, one graph a layer and input shape.
+    graphs: HashMap<GraphKey, GraphConv>,
+    /// Their input (half) and output (fp32) buffers, one per role and size, shared as the
+    /// textures are.
+    graph_buffers: HashMap<(u8, usize), StrongId>,
+}
+
+/// A graph's layer (weights key), images, and input width and height.
+type GraphKey = (String, usize, usize, usize);
+
+/// One layer's convolution as an MPSGraph: an fp16 input placeholder, the fp32 weights as a
+/// constant cast to half in the graph, the convolution (fp16), its result cast to fp32 and the
+/// bias added in fp32. The input and output `MPSGraphTensorData` wrap the shared buffers.
+pub(crate) struct GraphConv {
+    graph: StrongId,
+    feeds: StrongId,
+    results: StrongId,
+    pub(crate) input: ObjcId,
+    pub(crate) output: ObjcId,
+}
+
+/// `MPSDataTypeFloat16`.
+const MPS_DATA_TYPE_FLOAT16: u32 = 0x1000_0000 | 16;
+/// `MPSGraphPaddingStyleExplicit`, `MPSGraphTensorNamedDataLayoutNCHW` and `OIHW`.
+const GRAPH_PADDING_EXPLICIT: u64 = 0;
+const GRAPH_LAYOUT_NCHW: u64 = 0;
+const GRAPH_LAYOUT_OIHW: u64 = 2;
+
+/// An `NSArray` of `NSNumber`s: a graph tensor's shape (autoreleased).
+fn graph_shape(dims: &[usize]) -> ObjcId {
+    unsafe {
+        let numbers: Vec<ObjcId> = dims.iter().map(|&d| msg_send![class!(NSNumber), numberWithLongLong: d as i64]).collect();
+        msg_send![class!(NSArray), arrayWithObjects: numbers.as_ptr() count: numbers.len() as u64]
+    }
+}
+
+/// A graph's input or output size: images, channels, width and height.
+pub(crate) struct GraphSide {
+    pub images: usize,
+    pub channels: usize,
+    pub width: usize,
+    pub height: usize,
 }
 
 /// `MTLTextureType2DArray`, `MTLPixelFormatR32Float`, `RG32Float` and `RGBA32Float`, read and
@@ -197,6 +241,120 @@ impl MpsCache {
             self.convs.insert(layer.key.to_string(), conv);
         }
         Ok(self.convs[layer.key].as_id())
+    }
+
+    /// The shared buffer for `role` (0 the input in half, 1 the output in fp32) of `bytes`.
+    fn graph_buffer(&mut self, device: ObjcId, role: u8, bytes: usize) -> MetalResult<ObjcId> {
+        if !self.graph_buffers.contains_key(&(role, bytes)) {
+            let buffer = unsafe {
+                // MTLResourceStorageModePrivate.
+                let b: ObjcId = msg_send![device, newBufferWithLength: bytes.max(4) as u64 options: (MTL_STORAGE_MODE_PRIVATE << 4)];
+                StrongId::from_owned(b)
+            }
+            .ok_or_else(|| format!("could not allocate a {bytes}-byte buffer for MPSGraph"))?;
+            self.graph_buffers.insert((role, bytes), buffer);
+        }
+        Ok(self.graph_buffers[&(role, bytes)].as_id())
+    }
+
+    /// The layer's convolution on MPSGraph for an input of `input` and an output of `output`,
+    /// made at first use (its graph compiles at its first encode), and the buffers it reads and
+    /// writes: its input in half and its output in fp32, NCHW from their start.
+    pub(crate) fn graph_convolution(
+        &mut self, device: ObjcId, layer: &MpsConvLayer<'_>, input: &GraphSide, output: &GraphSide,
+    ) -> MetalResult<(&GraphConv, ObjcId, ObjcId)> {
+        let (o, i, k) = (layer.out_channels, layer.in_channels, layer.k);
+        if layer.weights.len() != o * i * k * k || layer.bias.is_some_and(|b| b.len() != o) || input.channels != i || output.channels != o {
+            return Err(format!("MPSGraph convolution {}: {} weights for {o}x{i}x{k}x{k}", layer.key, layer.weights.len()));
+        }
+        let in_bytes = input.images * i * input.width * input.height * 2;
+        let out_bytes = output.images * o * output.width * output.height * 4;
+        let in_buf = self.graph_buffer(device, 0, in_bytes)?;
+        let out_buf = self.graph_buffer(device, 1, out_bytes)?;
+        let key = (layer.key.to_string(), input.images, input.width, input.height);
+        if !self.graphs.contains_key(&key) {
+            let pad = (k / 2) as u64;
+            let conv = unsafe {
+                let nil: ObjcId = std::ptr::null_mut();
+                let graph: ObjcId = msg_send![class!(MPSGraph), new];
+                let graph = StrongId::from_owned(graph).ok_or("MPSGraph new returned nil")?;
+                let g = graph.as_id();
+                let in_shape = graph_shape(&[input.images, i, input.height, input.width]);
+                let out_shape = graph_shape(&[output.images, o, output.height, output.width]);
+                let x: ObjcId = msg_send![g, placeholderWithShape: in_shape dataType: MPS_DATA_TYPE_FLOAT16 name: nil];
+                let wdata: ObjcId = msg_send![class!(NSData), dataWithBytes: layer.weights.as_ptr() as *const std::ffi::c_void length: (layer.weights.len() * 4) as u64];
+                let w32: ObjcId = msg_send![g, constantWithData: wdata shape: graph_shape(&[o, i, k, k]) dataType: MPS_DATA_TYPE_FLOAT32];
+                let w16: ObjcId = msg_send![g, castTensor: w32 toType: MPS_DATA_TYPE_FLOAT16 name: nil];
+                let desc: ObjcId = msg_send![
+                    class!(MPSGraphConvolution2DOpDescriptor),
+                    descriptorWithStrideInX: layer.stride as u64
+                    strideInY: layer.stride as u64
+                    dilationRateInX: 1u64
+                    dilationRateInY: 1u64
+                    groups: 1u64
+                    paddingLeft: pad
+                    paddingRight: pad
+                    paddingTop: pad
+                    paddingBottom: pad
+                    paddingStyle: GRAPH_PADDING_EXPLICIT
+                    dataLayout: GRAPH_LAYOUT_NCHW
+                    weightsLayout: GRAPH_LAYOUT_OIHW
+                ];
+                if desc.is_null() {
+                    return Err("MPSGraphConvolution2DOpDescriptor returned nil".into());
+                }
+                let y16: ObjcId = msg_send![g, convolution2DWithSourceTensor: x weightsTensor: w16 descriptor: desc name: nil];
+                let mut y: ObjcId = msg_send![g, castTensor: y16 toType: MPS_DATA_TYPE_FLOAT32 name: nil];
+                if let Some(bias) = layer.bias {
+                    let bdata: ObjcId = msg_send![class!(NSData), dataWithBytes: bias.as_ptr() as *const std::ffi::c_void length: (bias.len() * 4) as u64];
+                    let b: ObjcId = msg_send![g, constantWithData: bdata shape: graph_shape(&[1, o, 1, 1]) dataType: MPS_DATA_TYPE_FLOAT32];
+                    y = msg_send![g, additionWithPrimaryTensor: y secondaryTensor: b name: nil];
+                }
+                let xd: ObjcId = msg_send![class!(MPSGraphTensorData), alloc];
+                let xd: ObjcId = msg_send![xd, initWithMTLBuffer: in_buf shape: in_shape dataType: MPS_DATA_TYPE_FLOAT16];
+                let xd = StrongId::from_owned(xd).ok_or("MPSGraphTensorData init returned nil")?;
+                let yd: ObjcId = msg_send![class!(MPSGraphTensorData), alloc];
+                let yd: ObjcId = msg_send![yd, initWithMTLBuffer: out_buf shape: out_shape dataType: MPS_DATA_TYPE_FLOAT32];
+                let yd = StrongId::from_owned(yd).ok_or("MPSGraphTensorData init returned nil")?;
+                let feeds: ObjcId = msg_send![class!(NSDictionary), dictionaryWithObject: xd.as_id() forKey: x];
+                let results: ObjcId = msg_send![class!(NSDictionary), dictionaryWithObject: yd.as_id() forKey: y];
+                let feeds = StrongId::retain(feeds).ok_or("NSDictionary returned nil")?;
+                let results = StrongId::retain(results).ok_or("NSDictionary returned nil")?;
+                GraphConv { graph, feeds, results, input: x, output: y }
+            };
+            self.graphs.insert(key.clone(), conv);
+        }
+        Ok((&self.graphs[&key], in_buf, out_buf))
+    }
+
+    /// The graph made for `key` (layer, images, width, height), if `graph_convolution` made it.
+    pub(crate) fn graph(&self, key: &GraphKey) -> Option<&GraphConv> {
+        self.graphs.get(key)
+    }
+
+    /// `graph` encoded on `cb` (no compute encoder open on it), through an `MPSCommandBuffer` round
+    /// it; `Err` if MPSGraph moved on to a command buffer of its own (it committed `cb`).
+    pub(crate) fn encode_graph(graph: &GraphConv, cb: ObjcId) -> MetalResult<()> {
+        unsafe {
+            let mcb: ObjcId = msg_send![class!(MPSCommandBuffer), commandBufferWithCommandBuffer: cb];
+            if mcb.is_null() {
+                return Err("MPSCommandBuffer returned nil".into());
+            }
+            let nil: ObjcId = std::ptr::null_mut();
+            let _: () = msg_send![
+                graph.graph.as_id(),
+                encodeToCommandBuffer: mcb
+                feeds: graph.feeds.as_id()
+                targetOperations: nil
+                resultsDictionary: graph.results.as_id()
+                executionDescriptor: nil
+            ];
+            let now: ObjcId = msg_send![mcb, commandBuffer];
+            if now != cb {
+                return Err("MPSGraph committed the stream's command buffer and went on to another".into());
+            }
+        }
+        Ok(())
     }
 
     /// `conv` from the image in `source` (`in_channels` feature channels) to `destination`

@@ -52,7 +52,19 @@ pub static PLANAR_TO_IMAGE: Kernel = Kernel { lib: &CUTIE_MPS, function: "cutie_
 /// Back, with the residual and the ReLU.
 pub static IMAGE_TO_PLANAR: Kernel = Kernel { lib: &CUTIE_MPS, function: "cutie_image_to_planar_f32" };
 /// Both, for the Mac's test that compiles them.
-pub static MPS_CONV_KERNELS: &[&Kernel] = &[&PLANAR_TO_IMAGE, &IMAGE_TO_PLANAR];
+/// An fp16 step's convolution on MPSGraph: the planar input in half into the graph's buffer.
+pub static PLANAR_TO_HALF: Kernel = Kernel { lib: &CUTIE_MPS, function: "cutie_planar_to_half_f32" };
+/// The graph's fp32 result into the planar output, with the residual and the ReLU.
+pub static GRAPH_TO_PLANAR: Kernel = Kernel { lib: &CUTIE_MPS, function: "cutie_graph_to_planar_f32" };
+pub static MPS_CONV_KERNELS: &[&Kernel] = &[&PLANAR_TO_IMAGE, &IMAGE_TO_PLANAR, &PLANAR_TO_HALF, &GRAPH_TO_PLANAR];
+
+/// Whether an fp16 step's convolutions run on MPSGraph (the default) or on MPSCNNConvolution
+/// (MAKEPAD_CUTIE_F16_CONV=mpscnn, to compare). Read once.
+#[cfg(target_os = "macos")]
+fn f16_conv_on_graph() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MAKEPAD_CUTIE_F16_CONV").map_or(true, |v| v.trim() != "mpscnn"))
+}
 
 /// Whether convolutions run on `MPSCNNConvolution` (MAKEPAD_CUTIE_CONV=mpscnn; read once): where
 /// the padding is k/2 and k is odd, which is every one of Cutie's. Off by default until it is
@@ -666,6 +678,30 @@ fn conv2d_fused(
         let out = GpuTensor::alloc(plan.out_rows(), plan.opix)?;
         if plan.out_rows() == 0 {
             // No output channels: nothing to compute (cuBLAS returns at once on CUDA).
+            return Ok(out);
+        }
+        if half && f16_conv_on_graph() && plan.k % 2 == 1 && plan.pad == plan.k / 2 {
+            s.conv_mpsgraph(&MpsConv {
+                key: &qualified_key,
+                weights,
+                bias,
+                x,
+                out: &out,
+                residual,
+                relu,
+                batch: plan.batch,
+                in_channels: plan.in_channels,
+                in_w: plan.in_w,
+                in_h: plan.in_h,
+                out_channels: plan.out_channels,
+                ow: plan.ow,
+                oh: plan.oh,
+                k: plan.k,
+                stride: plan.stride,
+                to_image: &PLANAR_TO_HALF,
+                from_image: &GRAPH_TO_PLANAR,
+                half_images: false,
+            })?;
             return Ok(out);
         }
         if (half || conv_mpscnn_enabled()) && plan.k % 2 == 1 && plan.pad == plan.k / 2 {

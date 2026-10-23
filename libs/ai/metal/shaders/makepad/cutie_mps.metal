@@ -69,3 +69,43 @@ kernel void cutie_image_to_planar_f32(constant CutieImageShape& p [[buffer(0)]],
         }
     }
 }
+
+// --- The convolution on MPSGraph (an fp16 step's, metal/src/stream/mps.rs) ---
+//
+// MPSGraph reads and writes buffers from their start, in NCHW, which is the planar layout. In:
+// the planar input rounded to half into the graph's input buffer (round to nearest even). Out:
+// the graph's fp32 result (its bias added in the graph) into the planar output, with the
+// residual added and then the ReLU taken, as cutie_image_to_planar_f32.
+
+struct CutieGraphCopy {
+    uint n;             // the elements
+    uint has_residual;
+    uint relu;
+};
+
+kernel void cutie_planar_to_half_f32(constant CutieGraphCopy& p [[buffer(0)]],
+                                     device const float* x [[buffer(1)]],
+                                     device half* y [[buffer(2)]],
+                                     uint i [[thread_position_in_grid]]) {
+    if (i < p.n) {
+        y[i] = half(x[i]);
+    }
+}
+
+kernel void cutie_graph_to_planar_f32(constant CutieGraphCopy& p [[buffer(0)]],
+                                      device const float* y [[buffer(1)]],
+                                      device float* out [[buffer(2)]],
+                                      device const float* residual [[buffer(3)]],
+                                      uint i [[thread_position_in_grid]]) {
+    if (i >= p.n) {
+        return;
+    }
+    float r = y[i];
+    if (p.has_residual != 0) {
+        r = r + residual[i];
+    }
+    if (p.relu != 0) {
+        r = fmax(r, 0.0f);
+    }
+    out[i] = r;
+}

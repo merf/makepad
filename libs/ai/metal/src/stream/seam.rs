@@ -528,6 +528,79 @@ impl MetalStream<'_> {
         Ok(())
     }
 
+    /// A convolution on MPSGraph (an fp16 step's; `MpsConv`, `to_image` and `from_image` being the
+    /// graph's copies `cutie_planar_to_half_f32` and `cutie_graph_to_planar_f32`): `x` rounded to
+    /// half into the graph's input buffer, the graph (the convolution in half, its bias added in
+    /// fp32) into its output buffer, then into `out` with the residual added and the ReLU taken;
+    /// three steps on the open command buffer, its tensors claimed and stamped as a launch's are.
+    pub fn conv_mpsgraph(&mut self, c: &MpsConv<'_>) -> MetalResult<()> {
+        let op = self.op;
+        let residual = c.residual.map_or(Bind::Absent, Bind::In);
+        let binds = [Bind::In(c.x), Bind::Out(c.out), residual];
+        let plans: Vec<SlotPlan> = binds.iter().map(Bind::plan).collect();
+        check_slots(op, "MPSGraph convolution", 0, &plans)?;
+        self.claim(c.x, true)?;
+        self.claim(c.out, false)?;
+        if let Some(r) = c.residual {
+            self.claim(r, true)?;
+        }
+        let to_half = self.ctx.pipeline(c.to_image, &[]).map_err(|e| format!("{op}: {e}"))?.state;
+        let from_graph = self.ctx.pipeline(c.from_image, &[]).map_err(|e| format!("{op}: {e}"))?.state;
+        let device = self.ctx.device();
+        let layer = super::mps::MpsConvLayer {
+            key: c.key,
+            weights: c.weights,
+            bias: c.bias,
+            in_channels: c.in_channels,
+            out_channels: c.out_channels,
+            k: c.k,
+            stride: c.stride,
+        };
+        let input = super::mps::GraphSide { images: c.batch, channels: c.in_channels, width: c.in_w, height: c.in_h };
+        let output = super::mps::GraphSide { images: c.batch, channels: c.out_channels, width: c.ow, height: c.oh };
+        let n_in = c.batch * c.in_channels * c.in_w * c.in_h;
+        let n_out = c.batch * c.out_channels * c.ow * c.oh;
+        let copy = |n: usize, residual: bool, relu: bool| -> Vec<u8> {
+            [n as u32, residual as u32, relu as u32].iter().flat_map(|v| v.to_le_bytes()).collect()
+        };
+        let tensor = |t: &GpuTensor| Slot::Buffer { id: t.storage.buf().as_id(), offset: (t.offset * 4) as u64 };
+
+        let (encoder, serial) = self.ctx.begin_dispatch(op).map_err(|e| format!("{op}: {e}"))?;
+        c.x.storage.mark_use(serial);
+        if let Some(r) = c.residual {
+            r.storage.mark_use(serial);
+        }
+        c.out.storage.mark_write(serial);
+        let (_, in_buf, out_buf) = self.ctx.mps.graph_convolution(device, &layer, &input, &output).map_err(|e| format!("{op}: {e}"))?;
+        let params = copy(n_in, false, false);
+        super::ctx::encode_dispatch(
+            encoder,
+            to_half,
+            params.as_ptr() as *const std::ffi::c_void,
+            params.len(),
+            &[tensor(c.x), Slot::Buffer { id: in_buf, offset: 0 }],
+            &Grid::linear(n_in, 256)?,
+        );
+        let (cb, _) = self.ctx.begin_buffer_work(op).map_err(|e| format!("{op}: {e}"))?;
+        {
+            let key = (c.key.to_string(), c.batch, c.in_w, c.in_h);
+            let graph = self.ctx.mps.graph(&key).ok_or_else(|| format!("{op}: MPSGraph convolution {} not made", c.key))?;
+            super::mps::MpsCache::encode_graph(graph, cb).map_err(|e| format!("{op}: {e}"))?;
+        }
+        let (encoder, _) = self.ctx.begin_dispatch(op).map_err(|e| format!("{op}: {e}"))?;
+        let residual_slot = c.residual.map_or(Slot::Buffer { id: self.ctx.dummy(), offset: 0 }, tensor);
+        let params = copy(n_out, c.residual.is_some(), c.relu);
+        super::ctx::encode_dispatch(
+            encoder,
+            from_graph,
+            params.as_ptr() as *const std::ffi::c_void,
+            params.len(),
+            &[Slot::Buffer { id: out_buf, offset: 0 }, tensor(c.out), residual_slot],
+            &Grid::linear(n_out, 256)?,
+        );
+        Ok(())
+    }
+
     /// A GEMM `gemm::run` has checked and planned, on MPS (MAKEPAD_METAL_GEMM=mps): its tensors
     /// claimed and stamped as a launch's are, then one `MPSMatrixMultiplication` a batch encoded on
     /// the open command buffer between its compute encoders.
