@@ -65,15 +65,22 @@ const MTL_TEXTURE_TYPE_2D_ARRAY: u64 = 3;
 const MTL_PIXEL_FORMAT_R32_FLOAT: u64 = 55;
 const MTL_PIXEL_FORMAT_RG32_FLOAT: u64 = 105;
 const MTL_PIXEL_FORMAT_RGBA32_FLOAT: u64 = 125;
+const MTL_PIXEL_FORMAT_R16_FLOAT: u64 = 25;
+const MTL_PIXEL_FORMAT_RG16_FLOAT: u64 = 65;
+const MTL_PIXEL_FORMAT_RGBA16_FLOAT: u64 = 115;
 
 /// The pixel format an `MPSImage` of `channels` feature channels must have: one or two channels
 /// want a texture of as many (MPSImage asserts "Texture pixel format doesnt match number of
-/// feature channels" on an rgba one), three or more rgba32Float slices of four.
-fn pixel_format(channels: usize) -> u64 {
-    match channels {
-        1 => MTL_PIXEL_FORMAT_R32_FLOAT,
-        2 => MTL_PIXEL_FORMAT_RG32_FLOAT,
-        _ => MTL_PIXEL_FORMAT_RGBA32_FLOAT,
+/// feature channels" on an rgba one), three or more rgba slices of four. In fp32, or in half
+/// (`half`: Cutie's fp16 steps, the convolution's sums still fp32).
+fn pixel_format(channels: usize, half: bool) -> u64 {
+    match (channels, half) {
+        (1, false) => MTL_PIXEL_FORMAT_R32_FLOAT,
+        (2, false) => MTL_PIXEL_FORMAT_RG32_FLOAT,
+        (_, false) => MTL_PIXEL_FORMAT_RGBA32_FLOAT,
+        (1, true) => MTL_PIXEL_FORMAT_R16_FLOAT,
+        (2, true) => MTL_PIXEL_FORMAT_RG16_FLOAT,
+        (_, true) => MTL_PIXEL_FORMAT_RGBA16_FLOAT,
     }
 }
 const MTL_TEXTURE_USAGE_READ_WRITE: u64 = 1 | 2;
@@ -104,11 +111,11 @@ pub(crate) struct MpsConvLayer<'a> {
 
 impl MpsCache {
     /// The texture array for `role` (0 in, 1 out) of `width` x `height` and `layers` layers, for an
-    /// image of `channels` feature channels ([`pixel_format`]).
+    /// image of `channels` feature channels, in half when `half` ([`pixel_format`]).
     pub(crate) fn texture(
-        &mut self, device: ObjcId, role: u8, width: usize, height: usize, layers: usize, channels: usize,
+        &mut self, device: ObjcId, role: u8, width: usize, height: usize, layers: usize, channels: usize, half: bool,
     ) -> MetalResult<ObjcId> {
-        let format = pixel_format(channels);
+        let format = pixel_format(channels, half);
         let key = (role, width, height, layers, format);
         if !self.textures.contains_key(&key) {
             let texture = unsafe {

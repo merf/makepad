@@ -66,6 +66,15 @@ fn conv_mpscnn_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("MAKEPAD_CUTIE_CONV").is_ok_and(|v| v.trim() == "mpscnn"))
 }
 
+/// Whether an fp16 step's MPS convolution keeps its images in half (the input rounded to half
+/// as it is copied in, the output as MPS writes it; the sums in fp32): MAKEPAD_CUTIE_HALF_IMAGES=0
+/// keeps them fp32, to compare. Read once.
+#[cfg(target_os = "macos")]
+fn half_images_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MAKEPAD_CUTIE_HALF_IMAGES").map_or(true, |v| v.trim() != "0"))
+}
+
 thread_local! {
     static CONV_MPSCNN_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
@@ -679,6 +688,7 @@ fn conv2d_fused(
                 stride: plan.stride,
                 to_image: &PLANAR_TO_IMAGE,
                 from_image: &IMAGE_TO_PLANAR,
+                half_images: half && half_images_enabled(),
             })?;
             return Ok(out);
         }
