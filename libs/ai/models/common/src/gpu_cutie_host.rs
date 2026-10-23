@@ -135,6 +135,23 @@ pub fn gpu_cutie_graph_f16(
     }
 }
 
+/// The object transformer as one graph in half (metal's `gpu_cutie_transformer_graph_f16`) on
+/// macOS; an error elsewhere (`GPU_CUTIE_GRAPH`).
+pub fn gpu_cutie_transformer_graph_f16(
+    t: &super::CutieGraphTransformer<'_>, pixel: &GpuTensor, objects: usize, width: usize, height: usize, obj_memory: &GpuTensor,
+    pe: &GpuTensor,
+) -> Result<(GpuTensor, Vec<GpuTensor>), String> {
+    #[cfg(target_os = "macos")]
+    {
+        return makepad_ai_metal::cutie_ops::gpu_cutie_transformer_graph_f16(t, pixel, objects, width, height, obj_memory, pe);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (t, pixel, objects, width, height, obj_memory, pe);
+        Err("gpu_cutie_transformer_graph_f16: macOS only".into())
+    }
+}
+
 /// Whether `gpu_cutie_conv2d_fused_f16` really runs in half: on macOS (MPSCNNConvolution), not on
 /// the other builds without CUDA's kernels.
 pub const GPU_CUTIE_HALF: bool = cfg!(target_os = "macos");

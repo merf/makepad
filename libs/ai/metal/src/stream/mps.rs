@@ -18,6 +18,8 @@ use makepad_objc_sys::runtime::{ObjcId, BOOL, NO, YES};
 use makepad_objc_sys::{class, msg_send, sel, sel_impl};
 use std::collections::HashMap;
 
+mod transformer;
+
 #[link(name = "MetalPerformanceShadersGraph", kind = "framework")]
 extern "C" {}
 #[link(name = "MetalPerformanceShaders", kind = "framework")]

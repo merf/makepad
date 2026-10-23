@@ -301,6 +301,19 @@ pub struct MpsGraphRun<'a> {
     pub from_graph: &'a Kernel,
 }
 
+/// Cutie's object transformer for `MetalStream::transformer_mpsgraph`: its weights, the objects
+/// and the size, the fp32 inputs (pixels, object memory, encoding), the outputs (pixels, then each
+/// aux logits) and the fp32 copy kernel (`cutie_graph_to_planar_f32`) in and out.
+pub struct MpsTransformerRun<'a> {
+    pub t: &'a crate::cutie_ops::transformer_graph::CutieGraphTransformer<'a>,
+    pub objects: usize,
+    pub width: usize,
+    pub height: usize,
+    pub inputs: &'a [&'a GpuTensor; 3],
+    pub outs: &'a [&'a GpuTensor],
+    pub copy: &'a Kernel,
+}
+
 /// A convolution for `MetalStream::conv_mpscnn`: the layer (its weights key, PyTorch's
 /// [out][in][k][k] weights and bias on the host, read once to make the MPS kernel), the batch's
 /// planar input and output, a residual, the ReLU, and the two layout kernels (`cutie_mps.metal`).
@@ -665,6 +678,72 @@ impl MetalStream<'_> {
                 params.as_ptr() as *const std::ffi::c_void,
                 params.len(),
                 &[Slot::Buffer { id: buf, offset: 0 }, tensor(t), Slot::Buffer { id: self.ctx.dummy(), offset: 0 }],
+                &Grid::linear(n, 256)?,
+            );
+        }
+        Ok(())
+    }
+
+    /// The object transformer on MPSGraph (`MpsTransformerRun`): each input copied into the
+    /// graph's buffer, the graph (cached by its key, objects and size), then each output copied
+    /// into its tensor; its tensors claimed and stamped as a launch's are.
+    pub fn transformer_mpsgraph(&mut self, r: &MpsTransformerRun<'_>) -> MetalResult<()> {
+        let op = self.op;
+        let mut binds: Vec<Bind> = r.inputs.iter().map(|t| Bind::In(t)).collect();
+        binds.extend(r.outs.iter().map(|t| Bind::Out(t)));
+        let plans: Vec<SlotPlan> = binds.iter().map(Bind::plan).collect();
+        check_slots(op, "MPSGraph transformer", 0, &plans)?;
+        for t in r.inputs {
+            self.claim(t, true)?;
+        }
+        for t in r.outs {
+            self.claim(t, false)?;
+        }
+        let copy_state = self.ctx.pipeline(r.copy, &[]).map_err(|e| format!("{op}: {e}"))?.state;
+        let device = self.ctx.device();
+        let params = |n: usize| -> Vec<u8> { [n as u32, 0u32, 0u32].iter().flat_map(|v| v.to_le_bytes()).collect() };
+        let tensor = |t: &GpuTensor| Slot::Buffer { id: t.storage.buf().as_id(), offset: (t.offset * 4) as u64 };
+        let (in_bufs, out_bufs) =
+            self.ctx.mps.transformer_graph(device, r.t, r.objects, r.width, r.height).map_err(|e| format!("{op}: {e}"))?;
+        if out_bufs.len() != r.outs.len() {
+            return Err(format!("{op}: {} outputs for the graph's {}", r.outs.len(), out_bufs.len()));
+        }
+        let dummy = Slot::Buffer { id: self.ctx.dummy(), offset: 0 };
+
+        let (encoder, serial) = self.ctx.begin_dispatch(op).map_err(|e| format!("{op}: {e}"))?;
+        for t in r.inputs {
+            t.storage.mark_use(serial);
+        }
+        for t in r.outs {
+            t.storage.mark_write(serial);
+        }
+        for (t, &buf) in r.inputs.iter().zip(&in_bufs) {
+            let n = t.rows() * t.cols();
+            let p = params(n);
+            super::ctx::encode_dispatch(
+                encoder,
+                copy_state,
+                p.as_ptr() as *const std::ffi::c_void,
+                p.len(),
+                &[tensor(t), Slot::Buffer { id: buf, offset: 0 }, dummy],
+                &Grid::linear(n, 256)?,
+            );
+        }
+        let (cb, _) = self.ctx.begin_buffer_work(op).map_err(|e| format!("{op}: {e}"))?;
+        {
+            let graph = self.ctx.mps.transformer(r.t, r.objects, r.width, r.height).ok_or_else(|| format!("{op}: the MPSGraph transformer is not made"))?;
+            super::mps::MpsCache::encode_graph(graph, cb).map_err(|e| format!("{op}: {e}"))?;
+        }
+        let (encoder, _) = self.ctx.begin_dispatch(op).map_err(|e| format!("{op}: {e}"))?;
+        for (t, &buf) in r.outs.iter().zip(&out_bufs) {
+            let n = t.rows() * t.cols();
+            let p = params(n);
+            super::ctx::encode_dispatch(
+                encoder,
+                copy_state,
+                p.as_ptr() as *const std::ffi::c_void,
+                p.len(),
+                &[Slot::Buffer { id: buf, offset: 0 }, tensor(t), dummy],
                 &Grid::linear(n, 256)?,
             );
         }

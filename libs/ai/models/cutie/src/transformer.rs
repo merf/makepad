@@ -111,6 +111,15 @@ struct Attention {
 }
 
 impl Attention {
+    fn graph(&self) -> makepad_ai_common::gpu::CutieGraphAttention<'_> {
+        makepad_ai_common::gpu::CutieGraphAttention {
+            q: self.q.graph_linear(),
+            k: self.k.graph_linear(),
+            v: self.v.graph_linear(),
+            out: self.out.graph_linear(),
+        }
+    }
+
     fn load(w: &mut Weights, name: &str) -> Result<Self> {
         let weight = w.f32(&format!("{name}.in_proj_weight"), &[3 * EMBED, EMBED])?;
         let bias = w.f32(&format!("{name}.in_proj_bias"), &[3 * EMBED])?;
@@ -153,6 +162,22 @@ struct Block {
 }
 
 impl Block {
+    fn graph(&self) -> makepad_ai_common::gpu::CutieGraphBlock<'_> {
+        makepad_ai_common::gpu::CutieGraphBlock {
+            read_from_pixel: self.read_from_pixel.graph(),
+            read_from_pixel_norm: self.read_from_pixel_norm.graph_norm(),
+            self_attn: self.self_attn.graph(),
+            self_attn_norm: self.self_attn_norm.graph_norm(),
+            ffn_norm: self.ffn_norm.graph_norm(),
+            ffn1: self.ffn1.graph_linear(),
+            ffn2: self.ffn2.graph_linear(),
+            read_from_query: self.read_from_query.graph(),
+            pixel_conv1: self.pixel_ffn.conv1.graph_conv(),
+            pixel_conv2: self.pixel_ffn.conv2.graph_conv(),
+            eca: &self.pixel_ffn.eca,
+        }
+    }
+
     fn load(w: &mut Weights, name: &str) -> Result<Self> {
         Ok(Self {
             read_from_pixel: Attention::load(w, &format!("{name}.read_from_pixel.cross_attn"))?,
@@ -222,6 +247,9 @@ pub(crate) struct QueryTransformer {
     /// The learnt `query_init` and `query_emb` [16, 256], shared by the objects.
     query_init: GpuTensor,
     query_emb: GpuTensor,
+    /// The same on the host, for the graph's constants.
+    host_query_init: Vec<f32>,
+    host_query_emb: Vec<f32>,
     summary_to_query_init: Linear,
     summary_to_query_emb: Linear,
     pixel_init_proj: Conv2d,
@@ -237,13 +265,14 @@ pub(crate) struct QueryTransformer {
 impl QueryTransformer {
     pub(crate) fn load(w: &mut Weights) -> Result<Self> {
         let p = "object_transformer";
-        let mut embedding = |name: &str| -> Result<GpuTensor> {
-            let values = w.f32(&format!("{p}.{name}.weight"), &[QUERIES, EMBED])?;
-            gpu_upload(&values, QUERIES, EMBED).map_err(|e| dev("object transformer", e))
-        };
+        let host_query_init = w.f32(&format!("{p}.query_init.weight"), &[QUERIES, EMBED])?;
+        let host_query_emb = w.f32(&format!("{p}.query_emb.weight"), &[QUERIES, EMBED])?;
+        let upload = |values: &[f32]| gpu_upload(values, QUERIES, EMBED).map_err(|e| dev("object transformer", e));
         Ok(Self {
-            query_init: embedding("query_init")?,
-            query_emb: embedding("query_emb")?,
+            query_init: upload(&host_query_init)?,
+            query_emb: upload(&host_query_emb)?,
+            host_query_init,
+            host_query_emb,
             summary_to_query_init: w.linear(&format!("{p}.summary_to_query_init"), EMBED, EMBED, true)?,
             summary_to_query_emb: w.linear(&format!("{p}.summary_to_query_emb"), EMBED, EMBED, true)?,
             pixel_init_proj: w.conv(&format!("{p}.pixel_init_proj"), EMBED, EMBED, 1, 0, 1, true)?,
@@ -266,6 +295,11 @@ impl QueryTransformer {
         }
         if let Some(masks) = forced_masks.filter(|m| m.len() != BLOCKS) {
             return Err(DiffusionError::model(format!("cutie object transformer: {} forced masks for {BLOCKS} blocks", masks.len())));
+        }
+        if forced_masks.is_none() && !tap.active() {
+            if let Some(out) = self.forward_graph(pixel, obj_memory)? {
+                return Ok(out);
+            }
         }
         let p = "net.object_transformer";
 
@@ -309,6 +343,38 @@ impl QueryTransformer {
             tap.put(&format!("object_transformer.out.aux_logits.{i}"), logits)?;
         }
         Ok((pixel, aux))
+    }
+
+    /// In an fp16 step where the backend runs graphs (`GPU_CUTIE_GRAPH`, macOS): the whole
+    /// transformer as one graph in half (`gpu_cutie_transformer_graph_f16`), the pixels and the
+    /// aux logits out in fp32. MAKEPAD_CUTIE_GRAPH_TRANSFORMER=0 keeps it an op at a time. `None`
+    /// when not used.
+    fn forward_graph(&self, pixel: &Feat, obj_memory: &GpuTensor) -> Result<Option<(Feat, Vec<GpuTensor>)>> {
+        use makepad_ai_common::gpu::{gpu_cutie_transformer_graph_f16, CutieGraphTransformer, GPU_CUTIE_GRAPH};
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled = *ON.get_or_init(|| std::env::var("MAKEPAD_CUTIE_GRAPH_TRANSFORMER").map_or(true, |v| v.trim() != "0"));
+        if !GPU_CUTIE_GRAPH || !enabled || !crate::model::HalfConvs::on() {
+            return Ok(None);
+        }
+        let graph = CutieGraphTransformer {
+            key: &self.pixel_init_proj.key,
+            embed: EMBED,
+            heads: HEADS,
+            queries: QUERIES,
+            area_eps: AREA_EPS,
+            query_init: &self.host_query_init,
+            query_emb: &self.host_query_emb,
+            summary_to_query_init: self.summary_to_query_init.graph_linear(),
+            summary_to_query_emb: self.summary_to_query_emb.graph_linear(),
+            pixel_init_proj: self.pixel_init_proj.graph_conv(),
+            pixel_emb_proj: self.pixel_emb_proj.graph_conv(),
+            blocks: self.blocks.iter().map(Block::graph).collect(),
+            mask_pred: self.mask_pred.iter().map(Conv2d::graph_conv).collect(),
+        };
+        let pe = self.spatial_pe.planar(pixel.w, pixel.h)?;
+        let (out, aux) = gpu_cutie_transformer_graph_f16(&graph, &pixel.t, pixel.n, pixel.w, pixel.h, obj_memory, &pe)
+            .map_err(|e| dev("object transformer graph", e))?;
+        Ok(Some((Feat::new(out, pixel.n, EMBED, pixel.w, pixel.h)?, aux)))
     }
 
     /// `mask_pred[i]` on the pixels: [n, h*w], one logit a pixel and object.

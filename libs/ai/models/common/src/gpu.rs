@@ -11,7 +11,9 @@ pub use makepad_ai_loader::accel::GemmPrecision;
 
 /// A chain of Cutie's convolutions as one graph in half (metal's `cutie_ops::graph`), for an fp16
 /// step; `gpu_cutie_graph_f16` runs it where `GPU_CUTIE_GRAPH` says it can (macOS).
-pub use makepad_ai_metal::cutie_ops::{CutieGraphConv, CutieGraphOp};
+pub use makepad_ai_metal::cutie_ops::{
+    CutieGraphAttention, CutieGraphBlock, CutieGraphConv, CutieGraphLinear, CutieGraphNorm, CutieGraphOp, CutieGraphTransformer,
+};
 
 /// Whether `gpu_cutie_graph_f16` runs here: not on CUDA, whose fp16 is a convolution at a time.
 #[cfg(all(any(target_os = "linux", target_os = "windows"), makepad_ai_cuda_kernels))]
@@ -23,6 +25,15 @@ pub fn gpu_cutie_graph_f16(
     _x: &GpuTensor, _width: usize, _height: usize, _key: &str, _ops: &[CutieGraphOp<'_>], _outputs: &[usize],
 ) -> Result<Vec<GpuTensor>, String> {
     Err("gpu_cutie_graph_f16: not on CUDA (GPU_CUTIE_GRAPH is false)".into())
+}
+
+/// Not on CUDA (`GPU_CUTIE_GRAPH` is false): an error.
+#[cfg(all(any(target_os = "linux", target_os = "windows"), makepad_ai_cuda_kernels))]
+pub fn gpu_cutie_transformer_graph_f16(
+    _t: &CutieGraphTransformer<'_>, _pixel: &GpuTensor, _objects: usize, _width: usize, _height: usize, _obj_memory: &GpuTensor,
+    _pe: &GpuTensor,
+) -> Result<(GpuTensor, Vec<GpuTensor>), String> {
+    Err("gpu_cutie_transformer_graph_f16: not on CUDA (GPU_CUTIE_GRAPH is false)".into())
 }
 
 /// One linear of a device-resident ViT layer: a row-major `[n, k]` weight in

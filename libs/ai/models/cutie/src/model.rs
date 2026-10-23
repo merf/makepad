@@ -327,6 +327,9 @@ pub(crate) struct Linear {
     pub(crate) bias: Option<GpuTensor>,
     pub(crate) in_f: usize,
     pub(crate) out_f: usize,
+    /// The weight and bias on the host too, for a graph's constants (`graph_linear`).
+    pub(crate) host_weight: Vec<f32>,
+    pub(crate) host_bias: Option<Vec<f32>>,
 }
 
 impl Linear {
@@ -336,7 +339,14 @@ impl Linear {
             bias: bias.map(|b| gpu_upload(b, 1, out_f)).transpose().map_err(|e| dev("linear bias", e))?,
             in_f,
             out_f,
+            host_weight: weight.to_vec(),
+            host_bias: bias.map(<[f32]>::to_vec),
         })
+    }
+
+    /// This linear as a graph's (`gpu_cutie_transformer_graph_f16`).
+    pub(crate) fn graph_linear(&self) -> makepad_ai_common::gpu::CutieGraphLinear<'_> {
+        makepad_ai_common::gpu::CutieGraphLinear { weight: &self.host_weight, bias: self.host_bias.as_deref(), in_f: self.in_f, out_f: self.out_f }
     }
 
     pub(crate) fn forward(&self, x: &GpuTensor) -> Result<GpuTensor> {
@@ -354,6 +364,11 @@ pub(crate) struct LayerNorm {
 }
 
 impl LayerNorm {
+    /// This norm as a graph's (`gpu_cutie_transformer_graph_f16`).
+    pub(crate) fn graph_norm(&self) -> makepad_ai_common::gpu::CutieGraphNorm<'_> {
+        makepad_ai_common::gpu::CutieGraphNorm { gamma: &self.gamma, beta: &self.beta, eps: self.eps }
+    }
+
     pub(crate) fn forward(&self, x: &GpuTensor) -> Result<GpuTensor> {
         gpu_cutie_layer_norm(x, CUTIE_NAMESPACE, &self.key, &self.gamma, &self.beta, self.eps).map_err(|e| dev(&self.key, e))
     }
