@@ -119,6 +119,11 @@ pub fn gpu_cutie_conv2d_fused_f16(
 /// the other builds without CUDA's kernels.
 pub const GPU_CUTIE_HALF: bool = cfg!(target_os = "macos");
 
+/// Whether an fp16 step runs even the convolutions Cutie keeps in fp32 under autocast (`pred`, the
+/// sensory updates' `transform`) in half: on macOS, where MPSCNN makes them a sixth of a frame
+/// faster at 960x540 with the masks as close (CUDA follows autocast).
+pub const GPU_CUTIE_HALF_EVERY_CONV: bool = cfg!(target_os = "macos");
+
 pub fn gpu_cutie_maxpool3x3s2(x: &GpuTensor, w: usize, h: usize) -> Result<GpuTensor, String> {
     #[cfg(target_os = "macos")]
     if !super::cutie_metal_ref("maxpool3x3s2")? {

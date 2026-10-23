@@ -260,7 +260,8 @@ pub(crate) struct Conv2d {
     pub(crate) k: usize,
     pub(crate) pad: usize,
     pub(crate) stride: usize,
-    /// Always fp32, even in an fp16 step: the convolutions Cutie runs with autocast off.
+    /// Always fp32, even in an fp16 step: the convolutions Cutie runs with autocast off (where the
+    /// backend follows autocast: not `GPU_CUTIE_HALF_EVERY_CONV`).
     pub(crate) fp32: bool,
 }
 
@@ -287,7 +288,8 @@ impl Conv2d {
         if x.c != self.in_c {
             return Err(DiffusionError::model(format!("cutie conv {}: {} channels in, wants {}", self.key, x.c, self.in_c)));
         }
-        let conv = if !self.fp32 && HALF_CONVS.with(Cell::get) { gpu_cutie_conv2d_fused_f16 } else { gpu_cutie_conv2d_fused };
+        let half = (!self.fp32 || makepad_ai_common::gpu::GPU_CUTIE_HALF_EVERY_CONV) && HALF_CONVS.with(Cell::get);
+        let conv = if half { gpu_cutie_conv2d_fused_f16 } else { gpu_cutie_conv2d_fused };
         let t = conv(
             &x.t, x.n, x.w, x.h, CUTIE_NAMESPACE, &self.key, &self.weights, self.bias.as_deref(), self.out_c, self.k, self.pad, self.stride,
             residual.map(|r| &r.t), relu,

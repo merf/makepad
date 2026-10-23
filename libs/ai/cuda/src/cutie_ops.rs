@@ -201,6 +201,10 @@ pub fn gpu_cutie_conv2d_fused_f16(
 /// Whether `gpu_cutie_conv2d_fused_f16` really runs in half: here, yes.
 pub const GPU_CUTIE_HALF: bool = true;
 
+/// Whether an fp16 step runs even the convolutions Cutie keeps in fp32 under autocast (`pred`, the
+/// sensory updates' `transform`) in half: not on CUDA, which follows autocast.
+pub const GPU_CUTIE_HALF_EVERY_CONV: bool = false;
+
 /// The convolution behind both: f32 columns and weights, or with `half` both in half.
 #[allow(clippy::too_many_arguments)]
 fn cutie_conv2d(
