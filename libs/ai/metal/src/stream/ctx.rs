@@ -458,6 +458,32 @@ pub(crate) fn encode_dispatch(
     }
 }
 
+/// Encodes one dispatch of a kernel that reads or writes a texture at `[[texture(0)]]`: the
+/// pipeline, `params` at index 0, `buffers` at their indices, the texture, and `groups` of
+/// `threads`. For the MPS convolution's layout kernels (`MetalStream::conv_mpscnn`), which the
+/// buffer-only `encode_dispatch` cannot bind.
+pub(crate) fn encode_texture_dispatch(
+    encoder: ObjcId,
+    pipeline: ObjcId,
+    params: &[u8],
+    buffers: &[(u64, ObjcId, u64)],
+    texture: ObjcId,
+    groups: [u64; 3],
+    threads: [u64; 3],
+) {
+    unsafe {
+        let _: () = msg_send![encoder, setComputePipelineState: pipeline];
+        let _: () = msg_send![encoder, setBytes: params.as_ptr() as *const c_void length: params.len() as u64 atIndex: 0u64];
+        for &(index, id, offset) in buffers {
+            let _: () = msg_send![encoder, setBuffer: id offset: offset atIndex: index];
+        }
+        let _: () = msg_send![encoder, setTexture: texture atIndex: 0u64];
+        let groups = MtlSize { width: groups[0], height: groups[1], depth: groups[2] };
+        let threads = MtlSize { width: threads[0], height: threads[1], depth: threads[2] };
+        let _: () = msg_send![encoder, dispatchThreadgroups: groups threadsPerThreadgroup: threads];
+    }
+}
+
 /// MAKEPAD_METAL_MATH_MODE=safe|relaxed|fast as `MTLMathMode` (0, 1, 2); anything else leaves
 /// the default. Step 7's probe compares the modes.
 fn math_mode_from_env() -> Option<u64> {

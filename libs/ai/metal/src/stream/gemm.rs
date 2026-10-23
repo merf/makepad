@@ -175,10 +175,14 @@ impl GemmVariant {
     /// for enough work with both sides at least 8, the naive one otherwise (and for k = 0, which
     /// only writes beta·C; mps too, so MPS always multiplies). Auto is as `GemmMode::resolved`.
     pub fn choose(mode: GemmMode, m: usize, n: usize, k: usize, batch: usize) -> GemmVariant {
+        let small_batched = batch > 1 && m.saturating_mul(n).saturating_mul(k) < MPS_BATCHED_MIN_WORK && mps_batched_to_kernels();
         match mode.resolved() {
             GemmMode::Naive => GemmVariant::Naive,
             GemmMode::Tiled => GemmVariant::Tiled,
-            GemmMode::Mps if k > 0 => GemmVariant::Mps,
+            // Batched small products (attention's heads) on the kernels, one dispatch for every
+            // batch, where MPS takes an encode a batch (MAKEPAD_METAL_MPS_BATCHED=kernels).
+            GemmMode::Mps if k > 0 && !small_batched => GemmVariant::Mps,
+            GemmMode::Mps if k > 0 => GemmVariant::choose(GemmMode::Kernels, m, n, k, batch),
             GemmMode::Mps => GemmVariant::Naive,
             GemmMode::Kernels | GemmMode::Auto => {
                 let work = m.saturating_mul(n).saturating_mul(k).saturating_mul(batch);
@@ -190,6 +194,19 @@ impl GemmVariant {
             }
         }
     }
+}
+
+/// Below this much work a batch (m·n·k), a batched product goes to the kernels instead of MPS
+/// when MAKEPAD_METAL_MPS_BATCHED=kernels: attention's heads at Cutie's sizes (a few million),
+/// not a convolution's images (billions).
+const MPS_BATCHED_MIN_WORK: usize = 16 << 20;
+
+/// Whether MAKEPAD_METAL_MPS_BATCHED=kernels (read once; off by default until the Mac measures
+/// it: each batch on MPS is an encode of its own and the compute encoder ended around it, while
+/// the kernels run every batch in one dispatch).
+fn mps_batched_to_kernels() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MAKEPAD_METAL_MPS_BATCHED").is_ok_and(|v| v.trim() == "kernels"))
 }
 
 thread_local! {

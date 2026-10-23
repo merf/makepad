@@ -32,6 +32,7 @@ pub use elementwise::{
 };
 #[cfg(target_os = "macos")]
 pub use matmul_conv::{gpu_cutie_conv2d, gpu_cutie_conv2d_fused, gpu_cutie_matmul, gpu_cutie_similarity};
+pub use matmul_conv::{set_conv_mpscnn_override, CUTIE_MPS, MPS_CONV_KERNELS};
 #[cfg(target_os = "macos")]
 pub use pool_resize::{gpu_cutie_maxpool3x3s2, gpu_cutie_resize_bilinear};
 #[cfg(target_os = "macos")]

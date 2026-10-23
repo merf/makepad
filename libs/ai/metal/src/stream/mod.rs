@@ -77,7 +77,7 @@ pub use plan::{MAX_BINDS, MAX_SET_BYTES};
 pub use seam::{
     available, copy_into, download, download_u32, evict_weights, from_host, library_available,
     library_ready, pool_cap_override, pool_clear, pool_trim, reshape, slice_rows, stats, synchronize, upload, upload_into,
-    upload_u32, with_host, with_metal_stream, Bind, Gemm, GemmOperand, HostSlice, MetalStream, MetalWeights,
+    upload_u32, with_host, with_metal_stream, Bind, Gemm, GemmOperand, HostSlice, MetalStream, MetalWeights, MpsConv,
 };
 #[cfg(target_os = "macos")]
 #[doc(hidden)]

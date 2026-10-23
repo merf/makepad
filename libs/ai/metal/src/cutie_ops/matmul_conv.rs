@@ -21,7 +21,7 @@ use crate::stream::{Grid, Kernel, KernelLib, KernelParams, MetalResult};
 #[cfg(target_os = "macos")]
 use crate::gpu_types::GpuTensor;
 #[cfg(target_os = "macos")]
-use crate::stream::{with_metal_stream, Bind, Gemm, GemmOperand, MetalStream};
+use crate::stream::{with_metal_stream, Bind, Gemm, GemmOperand, MetalStream, MpsConv};
 
 /// The family's kernel library (`cutie_matmul_conv.metal`).
 pub static CUTIE_MATMUL_CONV: KernelLib = KernelLib {
@@ -42,6 +42,39 @@ static CONV_GEMM: Kernel = Kernel { lib: &CUTIE_MATMUL_CONV, function: "cutie_co
 static SIMILARITY_PREP: Kernel = Kernel { lib: &CUTIE_MATMUL_CONV, function: "cutie_similarity_prep_f32" };
 /// The similarity from its GEMMs, in place ([`CutieSimilarityEpilogue`]).
 static SIMILARITY_EPILOGUE: Kernel = Kernel { lib: &CUTIE_MATMUL_CONV, function: "cutie_similarity_epilogue_f32" };
+
+/// The layout kernels around `MPSCNNConvolution` (`cutie_mps.metal`), a library of their own so a
+/// fault there touches only MAKEPAD_CUTIE_CONV=mpscnn. Not among the gate's libraries: compiled
+/// only when that path runs.
+pub static CUTIE_MPS: KernelLib = KernelLib { name: "cutie_mps", source: include_str!("../../shaders/makepad/cutie_mps.metal") };
+/// Planar tensors into an rgba32Float texture array.
+pub static PLANAR_TO_IMAGE: Kernel = Kernel { lib: &CUTIE_MPS, function: "cutie_planar_to_image_f32" };
+/// Back, with the residual and the ReLU.
+pub static IMAGE_TO_PLANAR: Kernel = Kernel { lib: &CUTIE_MPS, function: "cutie_image_to_planar_f32" };
+/// Both, for the Mac's test that compiles them.
+pub static MPS_CONV_KERNELS: &[&Kernel] = &[&PLANAR_TO_IMAGE, &IMAGE_TO_PLANAR];
+
+/// Whether convolutions run on `MPSCNNConvolution` (MAKEPAD_CUTIE_CONV=mpscnn; read once): where
+/// the padding is k/2 and k is odd, which is every one of Cutie's. Off by default until it is
+/// measured on the Mac.
+#[cfg(target_os = "macos")]
+fn conv_mpscnn_enabled() -> bool {
+    if let Some(on) = CONV_MPSCNN_OVERRIDE.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MAKEPAD_CUTIE_CONV").is_ok_and(|v| v.trim() == "mpscnn"))
+}
+
+thread_local! {
+    static CONV_MPSCNN_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs the calling thread's convolutions on `MPSCNNConvolution` or not, whatever
+/// MAKEPAD_CUTIE_CONV says (`None`: the variable again), so a test compares both in one process.
+pub fn set_conv_mpscnn_override(on: Option<bool>) {
+    CONV_MPSCNN_OVERRIDE.with(|cell| cell.set(on));
+}
 
 /// Every kernel in [`CUTIE_MATMUL_CONV`], for a bring-up test that compiles them all.
 pub static MATMUL_CONV_KERNELS: &[&Kernel] =
@@ -598,6 +631,29 @@ pub fn gpu_cutie_conv2d_fused(
         let out = GpuTensor::alloc(plan.out_rows(), plan.opix)?;
         if plan.out_rows() == 0 {
             // No output channels: nothing to compute (cuBLAS returns at once on CUDA).
+            return Ok(out);
+        }
+        if conv_mpscnn_enabled() && plan.k % 2 == 1 && plan.pad == plan.k / 2 {
+            s.conv_mpscnn(&MpsConv {
+                key: &qualified_key,
+                weights,
+                bias,
+                x,
+                out: &out,
+                residual,
+                relu,
+                batch: plan.batch,
+                in_channels: plan.in_channels,
+                in_w: plan.in_w,
+                in_h: plan.in_h,
+                out_channels: plan.out_channels,
+                ow: plan.ow,
+                oh: plan.oh,
+                k: plan.k,
+                stride: plan.stride,
+                to_image: &PLANAR_TO_IMAGE,
+                from_image: &IMAGE_TO_PLANAR,
+            })?;
             return Ok(out);
         }
         if conv_gemm_enabled() && plan.fused_matches_tiled()? {
