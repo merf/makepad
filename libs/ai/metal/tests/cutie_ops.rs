@@ -24,7 +24,7 @@ fn cutie_is_ready_on_this_thread() {
 
 /// MAKEPAD_CUTIE_CONV=mpscnn against the default path, on Cutie's shapes: the stem (7x7, stride
 /// 2), 3x3 at strides 1 and 2, 1x1, channels not a multiple of 4, two images, a residual and a
-/// ReLU. MPS sums in its own order, so within rel 1e-4 of the largest output, not the same bits;
+/// ReLU. MPS keeps the weights in half and sums in its own order, so within rel 5e-4 of the largest output, not the same bits;
 /// a wrong layout, offset or stride misses by far more.
 #[test]
 fn mpscnn_convolutions_match_the_default_path() {
@@ -70,7 +70,10 @@ fn mpscnn_convolutions_match_the_default_path() {
         let scale = expected.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-6);
         let worst = got.iter().zip(&expected).map(|(a, e)| (a - e).abs()).fold(0.0f32, f32::max) / scale;
         println!("mpscnn case {i} ({batch}x{in_c} {w}x{h} -> {out_c} k{k} s{stride}): worst rel {worst:.3e}");
-        assert!(worst < 1e-4, "case {i}: worst rel {worst:.3e} against the default path");
+        // MPSCNNConvolution keeps its weights in half (fp16-representable weights bring these
+        // cases to 1e-5; a data source declaring fp32 does not change it), so Metal's fp16:
+        // within 5e-4, not fp32's 1e-4.
+        assert!(worst < 5e-4, "case {i}: worst rel {worst:.3e} against the default path");
     }
 }
 

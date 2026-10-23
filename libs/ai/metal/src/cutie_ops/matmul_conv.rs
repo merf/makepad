@@ -589,6 +589,32 @@ pub fn gpu_cutie_conv2d_fused(
     bias: Option<&[f32]>, out_channels: usize, k: usize, pad: usize, stride: usize, residual: Option<&GpuTensor>,
     relu: bool,
 ) -> Result<GpuTensor, String> {
+    conv2d_fused(x, batch, in_w, in_h, cache_namespace, key, weights, bias, out_channels, k, pad, stride, residual, relu, false)
+}
+
+/// `gpu_cutie_conv2d_fused` for Cutie's fp16 steps (CUDA's half convolution): on
+/// `MPSCNNConvolution` where the padding is k/2 and k is odd (every one of Cutie's), which keeps
+/// its weights in half and sums in fp32, about rel 2e-4 from the fp32 path (judged by the masks, as
+/// CUDA's fp16 is, not by `Tol::STAGE`); elsewhere the fp32 path.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_cutie_conv2d_fused_f16(
+    x: &GpuTensor, batch: usize, in_w: usize, in_h: usize, cache_namespace: &str, key: &str, weights: &[f32],
+    bias: Option<&[f32]>, out_channels: usize, k: usize, pad: usize, stride: usize, residual: Option<&GpuTensor>,
+    relu: bool,
+) -> Result<GpuTensor, String> {
+    conv2d_fused(x, batch, in_w, in_h, cache_namespace, key, weights, bias, out_channels, k, pad, stride, residual, relu, true)
+}
+
+/// The two above: `half` runs the convolution on `MPSCNNConvolution` (as MAKEPAD_CUTIE_CONV=mpscnn
+/// does for every convolution, to measure).
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn conv2d_fused(
+    x: &GpuTensor, batch: usize, in_w: usize, in_h: usize, cache_namespace: &str, key: &str, weights: &[f32],
+    bias: Option<&[f32]>, out_channels: usize, k: usize, pad: usize, stride: usize, residual: Option<&GpuTensor>,
+    relu: bool, half: bool,
+) -> Result<GpuTensor, String> {
     let op = "gpu_cutie_conv2d";
     cutie_check_f32(op, x)?;
     if let Some(r) = residual {
@@ -633,7 +659,7 @@ pub fn gpu_cutie_conv2d_fused(
             // No output channels: nothing to compute (cuBLAS returns at once on CUDA).
             return Ok(out);
         }
-        if conv_mpscnn_enabled() && plan.k % 2 == 1 && plan.pad == plan.k / 2 {
+        if (half || conv_mpscnn_enabled()) && plan.k % 2 == 1 && plan.pad == plan.k / 2 {
             s.conv_mpscnn(&MpsConv {
                 key: &qualified_key,
                 weights,
