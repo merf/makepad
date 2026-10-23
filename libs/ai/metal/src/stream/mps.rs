@@ -54,14 +54,28 @@ struct KernelKey {
 pub(crate) struct MpsCache {
     kernels: HashMap<KernelKey, StrongId>,
     convs: HashMap<String, StrongId>,
-    textures: HashMap<(u8, usize, usize, usize), StrongId>,
+    textures: HashMap<(u8, usize, usize, usize, u64), StrongId>,
     /// `MPSMatrixDescriptor`s by rows, columns and row bytes.
     descriptors: HashMap<(usize, usize, usize), StrongId>,
 }
 
-/// `MTLTextureType2DArray`, `MTLPixelFormatRGBA32Float`, read and write usage, private storage.
+/// `MTLTextureType2DArray`, `MTLPixelFormatR32Float`, `RG32Float` and `RGBA32Float`, read and
+/// write usage, private storage.
 const MTL_TEXTURE_TYPE_2D_ARRAY: u64 = 3;
+const MTL_PIXEL_FORMAT_R32_FLOAT: u64 = 55;
+const MTL_PIXEL_FORMAT_RG32_FLOAT: u64 = 105;
 const MTL_PIXEL_FORMAT_RGBA32_FLOAT: u64 = 125;
+
+/// The pixel format an `MPSImage` of `channels` feature channels must have: one or two channels
+/// want a texture of as many (MPSImage asserts "Texture pixel format doesnt match number of
+/// feature channels" on an rgba one), three or more rgba32Float slices of four.
+fn pixel_format(channels: usize) -> u64 {
+    match channels {
+        1 => MTL_PIXEL_FORMAT_R32_FLOAT,
+        2 => MTL_PIXEL_FORMAT_RG32_FLOAT,
+        _ => MTL_PIXEL_FORMAT_RGBA32_FLOAT,
+    }
+}
 const MTL_TEXTURE_USAGE_READ_WRITE: u64 = 1 | 2;
 const MTL_STORAGE_MODE_PRIVATE: u64 = 2;
 /// `MPSNNConvolutionAccumulatorPrecisionOptionFloat`: fp32 sums (the default is half).
@@ -89,16 +103,20 @@ pub(crate) struct MpsConvLayer<'a> {
 }
 
 impl MpsCache {
-    /// The texture array for `role` (0 in, 1 out) of `width` x `height` and `layers` layers.
-    pub(crate) fn texture(&mut self, device: ObjcId, role: u8, width: usize, height: usize, layers: usize) -> MetalResult<ObjcId> {
-        let key = (role, width, height, layers);
+    /// The texture array for `role` (0 in, 1 out) of `width` x `height` and `layers` layers, for an
+    /// image of `channels` feature channels ([`pixel_format`]).
+    pub(crate) fn texture(
+        &mut self, device: ObjcId, role: u8, width: usize, height: usize, layers: usize, channels: usize,
+    ) -> MetalResult<ObjcId> {
+        let format = pixel_format(channels);
+        let key = (role, width, height, layers, format);
         if !self.textures.contains_key(&key) {
             let texture = unsafe {
                 let desc: ObjcId = msg_send![class!(MTLTextureDescriptor), new];
                 let desc = StrongId::from_owned(desc).ok_or("MTLTextureDescriptor new returned nil")?;
                 let d = desc.as_id();
                 let _: () = msg_send![d, setTextureType: MTL_TEXTURE_TYPE_2D_ARRAY];
-                let _: () = msg_send![d, setPixelFormat: MTL_PIXEL_FORMAT_RGBA32_FLOAT];
+                let _: () = msg_send![d, setPixelFormat: format];
                 let _: () = msg_send![d, setWidth: width as u64];
                 let _: () = msg_send![d, setHeight: height as u64];
                 let _: () = msg_send![d, setArrayLength: layers as u64];
@@ -107,7 +125,7 @@ impl MpsCache {
                 let texture: ObjcId = msg_send![device, newTextureWithDescriptor: d];
                 StrongId::from_owned(texture)
             }
-            .ok_or_else(|| format!("could not allocate a {width}x{height}x{layers} rgba32Float texture array"))?;
+            .ok_or_else(|| format!("could not allocate a {width}x{height}x{layers} texture array (pixel format {format})"))?;
             self.textures.insert(key, texture);
         }
         Ok(self.textures[&key].as_id())

@@ -471,8 +471,8 @@ impl MetalStream<'_> {
         let from_image = self.ctx.pipeline(c.from_image, &[]).map_err(|e| format!("{op}: {e}"))?.state;
         let device = self.ctx.device();
         let (in_slices, out_slices) = (c.in_channels.div_ceil(4), c.out_channels.div_ceil(4));
-        let source = self.ctx.mps.texture(device, 0, c.in_w, c.in_h, c.batch * in_slices).map_err(|e| format!("{op}: {e}"))?;
-        let destination = self.ctx.mps.texture(device, 1, c.ow, c.oh, c.batch * out_slices).map_err(|e| format!("{op}: {e}"))?;
+        let source = self.ctx.mps.texture(device, 0, c.in_w, c.in_h, c.batch * in_slices, c.in_channels).map_err(|e| format!("{op}: {e}"))?;
+        let destination = self.ctx.mps.texture(device, 1, c.ow, c.oh, c.batch * out_slices, c.out_channels).map_err(|e| format!("{op}: {e}"))?;
         let layer = super::mps::MpsConvLayer {
             key: c.key,
             weights: c.weights,
