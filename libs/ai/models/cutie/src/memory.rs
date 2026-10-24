@@ -425,8 +425,13 @@ impl MemoryManager {
     /// `.query_key` ([1, 64, h*w]), `.query_selection`, `.similarity`, `.affinity`, `.usage`,
     /// `.readout` ([1, n, 256, h*w]), then the network's own taps (pixel fusion, transformer).
     pub(crate) fn read(&mut self, net: &CutieNet, pix_feat: &Feat, keys: &Keys, last_mask: &Feat, tap: &mut Tap) -> Result<Feat> {
-        let affinity = self.read_affinity(keys, tap)?;
-        let visual_readout = self.read_values(&affinity, keys, tap)?;
+        let visual_readout = match self.read_sparse(keys, tap)? {
+            Some(readout) => readout,
+            None => {
+                let affinity = self.read_affinity(keys, tap)?;
+                self.read_values(&affinity, keys, tap)?
+            }
+        };
         let sensory = self.sensory()?;
         let pixel = net.pixel_fusion(pix_feat, &visual_readout, &sensory, last_mask, tap)?;
         let obj_memory = self.obj_memory.as_ref().ok_or_else(|| DiffusionError::model("cutie memory read: no object memory"))?;
@@ -442,6 +447,49 @@ impl MemoryManager {
         Ok(affinity)
     }
 
+    /// In an fp16 step where the backend reads sparsely (`GPU_CUTIE_SPARSE_READOUT`, macOS), and
+    /// no check taps: the top-k softmax and readout from each pixel's picks
+    /// (`gpu_cutie_topk_sparse_readout`) instead of the dense affinity and product, the usage
+    /// counted as `count_usage` does. MAKEPAD_CUTIE_SPARSE_READOUT=0 reads densely. `None` when
+    /// not used.
+    fn read_sparse(&mut self, keys: &Keys, tap: &mut Tap) -> Result<Option<Feat>> {
+        if !Self::reads_sparsely(tap) {
+            return Ok(None);
+        }
+        let similarity = self.similarity(keys, tap)?;
+        self.read_sparse_from(&similarity, keys).map(Some)
+    }
+
+    /// Whether this step reads sparsely (`read_sparse`).
+    pub(crate) fn reads_sparsely(tap: &Tap) -> bool {
+        use makepad_ai_common::gpu::GPU_CUTIE_SPARSE_READOUT;
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled = *ON.get_or_init(|| std::env::var("MAKEPAD_CUTIE_SPARSE_READOUT").map_or(true, |v| v.trim() != "0"));
+        GPU_CUTIE_SPARSE_READOUT && enabled && crate::model::HalfConvs::on() && !tap.active()
+    }
+
+    /// `read_sparse` from the similarity: the readout, the usage counted.
+    pub(crate) fn read_sparse_from(&mut self, similarity: &GpuTensor, keys: &Keys) -> Result<Feat> {
+        use makepad_ai_common::gpu::gpu_cutie_topk_sparse_readout;
+        let long_size = self.long_size();
+        let missing = || DiffusionError::model("cutie memory read: no values");
+        let work_values = self.work.values.as_ref().ok_or_else(missing)?;
+        let mut values = Vec::with_capacity(2);
+        if long_size > 0 {
+            values.push(self.long.values.as_ref().ok_or_else(missing)?);
+        }
+        values.push(work_values);
+        let (readout, usage) = gpu_cutie_topk_sparse_readout(similarity, self.top_k, &values).map_err(|e| dev("memory sparse readout", e))?;
+        let objects = work_values.rows() / VALUE_DIM;
+        if self.use_long_term {
+            self.work.update_usage(&usage, long_size)?;
+            if long_size > 0 && self.count_long_term_usage {
+                self.long.update_usage(&usage, 0)?;
+            }
+        }
+        Feat::new(readout, objects, VALUE_DIM, keys.key.w, keys.key.h)
+    }
+
     /// Long-term memory's tokens in a read (none without long-term memory).
     fn long_size(&self) -> usize {
         if self.use_long_term {
@@ -455,6 +503,13 @@ impl MemoryManager {
     /// softmax: the affinity [N, h*w] and each token's usage [1, N]. Taps the read up to the
     /// similarity.
     pub(crate) fn read_top_k(&self, keys: &Keys, tap: &mut Tap) -> Result<(GpuTensor, GpuTensor)> {
+        let similarity = self.similarity(keys, tap)?;
+        gpu_cutie_topk_softmax(&similarity, self.top_k).map_err(|e| dev("memory top-k", e))
+    }
+
+    /// The query's similarity to every memory token ([long-term, working]) [N, h*w]. Taps the
+    /// read up to it.
+    fn similarity(&self, keys: &Keys, tap: &mut Tap) -> Result<GpuTensor> {
         let long_size = self.long_size();
         let (long_key, long_shrinkage) = if long_size > 0 { (self.long.key.as_ref(), self.long.shrinkage.as_ref()) } else { (None, None) };
         let memory_key = KeyValueStore::cat(&[long_key, self.work.key.as_ref()])?;
@@ -474,7 +529,7 @@ impl MemoryManager {
         let similarity = gpu_cutie_similarity(&memory_key, Some(&memory_shrinkage), &keys.key.t, Some(&keys.selection.t))
             .map_err(|e| dev("memory similarity", e))?;
         tap.put("memory.read.similarity", &similarity)?;
-        gpu_cutie_topk_softmax(&similarity, self.top_k).map_err(|e| dev("memory top-k", e))
+        Ok(similarity)
     }
 
     /// Taps the read's affinity and usage (`read_top_k`'s) and counts the usage: working

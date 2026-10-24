@@ -50,6 +50,8 @@ pub use softmax_norm::{
 pub use softmax_norm::CUTIE_ECA_MAX_TAPS;
 #[cfg(target_os = "macos")]
 pub use topk_mask::{gpu_cutie_attn_mask, gpu_cutie_topk_softmax};
+#[cfg(target_os = "macos")]
+pub use topk_mask::gpu_cutie_topk_sparse_readout;
 
 /// Every library of the kernels Cutie's own ops launch (the five families' and the layer norm's),
 /// for the Mac's bring-up test. [`libraries_cutie_launches`] adds the libraries they share.

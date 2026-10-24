@@ -152,6 +152,24 @@ pub fn gpu_cutie_transformer_graph_f16(
     }
 }
 
+/// Whether `gpu_cutie_topk_sparse_readout` runs here: on macOS, not on the other builds without
+/// CUDA's kernels.
+pub const GPU_CUTIE_SPARSE_READOUT: bool = cfg!(target_os = "macos");
+
+/// The top-k softmax and readout from the picks (metal's `gpu_cutie_topk_sparse_readout`) on
+/// macOS; an error elsewhere (`GPU_CUTIE_SPARSE_READOUT`).
+pub fn gpu_cutie_topk_sparse_readout(sim: &GpuTensor, k: usize, values: &[&GpuTensor]) -> Result<(GpuTensor, GpuTensor), String> {
+    #[cfg(target_os = "macos")]
+    {
+        return makepad_ai_metal::cutie_ops::gpu_cutie_topk_sparse_readout(sim, k, values);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (sim, k, values);
+        Err("gpu_cutie_topk_sparse_readout: macOS only".into())
+    }
+}
+
 /// Whether `gpu_cutie_conv2d_fused_f16` really runs in half: on macOS (MPSCNNConvolution), not on
 /// the other builds without CUDA's kernels.
 pub const GPU_CUTIE_HALF: bool = cfg!(target_os = "macos");

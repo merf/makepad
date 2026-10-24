@@ -36,6 +36,16 @@ pub fn gpu_cutie_transformer_graph_f16(
     Err("gpu_cutie_transformer_graph_f16: not on CUDA (GPU_CUTIE_GRAPH is false)".into())
 }
 
+/// Whether `gpu_cutie_topk_sparse_readout` runs here: not on CUDA (its fp16 reads densely).
+#[cfg(all(any(target_os = "linux", target_os = "windows"), makepad_ai_cuda_kernels))]
+pub const GPU_CUTIE_SPARSE_READOUT: bool = false;
+
+/// Not on CUDA (`GPU_CUTIE_SPARSE_READOUT` is false): an error.
+#[cfg(all(any(target_os = "linux", target_os = "windows"), makepad_ai_cuda_kernels))]
+pub fn gpu_cutie_topk_sparse_readout(_sim: &GpuTensor, _k: usize, _values: &[&GpuTensor]) -> Result<(GpuTensor, GpuTensor), String> {
+    Err("gpu_cutie_topk_sparse_readout: not on CUDA (GPU_CUTIE_SPARSE_READOUT is false)".into())
+}
+
 /// One linear of a device-resident ViT layer: a row-major `[n, k]` weight in
 /// a ggml dtype, its output width and its bias (empty for none).
 #[derive(Clone, Copy)]

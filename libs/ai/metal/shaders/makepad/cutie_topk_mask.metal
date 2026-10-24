@@ -171,14 +171,19 @@ struct CutieTopkMerge {
 // subtracted), summed in PyTorch's order over the picks (best first, four accumulators, pick t
 // into t % 4), normalised, scattered into aff [m, p] (zeroed before). Every lane runs every
 // shuffle: the loop over the picks is the same for the whole SIMD-group, and so is the column.
-kernel void cutie_topk_merge(constant CutieTopkMerge& prm [[buffer(0)]],
-                             device const uint* keys [[buffer(1)]],
-                             device const uint* idx [[buffer(2)]],
-                             device float* aff [[buffer(3)]],
-                             uint group [[threadgroup_position_in_grid]],
-                             uint simdgroup [[simdgroup_index_in_threadgroup]],
-                             uint simdgroups [[simdgroups_per_threadgroup]],
-                             uint lane [[thread_index_in_simdgroup]]) {
+//
+// PICKS (an fp16 step's sparse readout): instead of scattering into aff, pick t's row and weight
+// go to rows[t * p + col] and aff[t * p + col] ([k, p]), every pick written.
+template <bool PICKS>
+kernel void cutie_topk_merge_t(constant CutieTopkMerge& prm [[buffer(0)]],
+                               device const uint* keys [[buffer(1)]],
+                               device const uint* idx [[buffer(2)]],
+                               device float* aff [[buffer(3)]],
+                               device uint* rows [[buffer(4)]],
+                               uint group [[threadgroup_position_in_grid]],
+                               uint simdgroup [[simdgroup_index_in_threadgroup]],
+                               uint simdgroups [[simdgroups_per_threadgroup]],
+                               uint lane [[thread_index_in_simdgroup]]) {
     const uint col = group * simdgroups + simdgroup;
     if (col >= prm.p) {
         return;
@@ -248,12 +253,99 @@ kernel void cutie_topk_merge(constant CutieTopkMerge& prm [[buffer(0)]],
         }
     }
     const float sum = ((a0 + a1) + a2) + a3;
+    if (PICKS) {
+        if (lane < k) {
+            rows[ulong(lane) * p + col] = r0;
+            aff[ulong(lane) * p + col] = e0 / sum;
+        }
+        if (lane + 32 < k) {
+            rows[ulong(lane + 32) * p + col] = r1;
+            aff[ulong(lane + 32) * p + col] = e1 / sum;
+        }
+        return;
+    }
     // A pick is always a real row while k <= m; the bound keeps a stray one off memory.
     if (lane < k && r0 < prm.m) {
         aff[ulong(r0) * p + col] = e0 / sum;
     }
     if (lane + 32 < k && r1 < prm.m) {
         aff[ulong(r1) * p + col] = e1 / sum;
+    }
+}
+
+typedef decltype(cutie_topk_merge_t<false>) cutie_topk_merge_type;
+
+template [[host_name("cutie_topk_merge")]] kernel cutie_topk_merge_type cutie_topk_merge_t<false>;
+template [[host_name("cutie_topk_merge_picks")]] kernel cutie_topk_merge_type cutie_topk_merge_t<true>;
+
+// --- The sparse readout (an fp16 step's) ---
+
+struct CutieSparseReadout {
+    uint v;       // value rows (objects * 256)
+    uint p;       // pixels
+    uint k;       // picks a pixel
+    uint n_long;  // long-term memory's tokens (its values first), then working memory's
+    uint n_work;
+};
+
+// readout[r, col] = sum over the picks t (best first, one accumulator) of weight[t, col] times
+// the picked token's value in row r: long-term memory's values [v, n_long] for a token below
+// n_long, else working memory's [v, n_work]. A thread a pixel and value row, pixels across a
+// threadgroup's rows so a row's reads stay in one value row.
+kernel void cutie_sparse_readout(constant CutieSparseReadout& prm [[buffer(0)]],
+                                 device const uint* rows [[buffer(1)]],
+                                 device const float* weights [[buffer(2)]],
+                                 device const float* long_values [[buffer(3)]],
+                                 device const float* work_values [[buffer(4)]],
+                                 device float* out [[buffer(5)]],
+                                 uint2 gid [[thread_position_in_grid]]) {
+    const uint col = gid.x;
+    const uint r = gid.y;
+    if (col >= prm.p || r >= prm.v) {
+        return;
+    }
+    const ulong p = prm.p;
+    float acc = 0.0f;
+    for (uint t = 0; t < prm.k; ++t) {
+        const uint j = rows[ulong(t) * p + col];
+        const float w = weights[ulong(t) * p + col];
+        const float x = j < prm.n_long ? long_values[ulong(r) * prm.n_long + j] : work_values[ulong(r) * prm.n_work + (j - prm.n_long)];
+        acc = acc + w * x;
+    }
+    out[ulong(r) * p + col] = acc;
+}
+
+struct CutiePickUsage {
+    uint p;
+    uint k;
+    uint m;
+    float scale;  // fixed-point units a unit of weight
+};
+
+// Each token's usage, the picks' weights summed over the pixels, deterministically: each weight
+// rounded to fixed point (`scale` units, chosen so p of them fit a uint) and added with an
+// integer atomic, so the order does not change the sum. counts [m] is zeroed before.
+kernel void cutie_pick_usage(constant CutiePickUsage& prm [[buffer(0)]],
+                             device const uint* rows [[buffer(1)]],
+                             device const float* weights [[buffer(2)]],
+                             device atomic_uint* counts [[buffer(3)]],
+                             uint i [[thread_position_in_grid]]) {
+    if (i >= prm.p * prm.k) {
+        return;
+    }
+    const uint j = rows[i];
+    if (j < prm.m) {
+        atomic_fetch_add_explicit(&counts[j], uint(rint(weights[i] * prm.scale)), memory_order_relaxed);
+    }
+}
+
+// The counts back to fp32 usage [m].
+kernel void cutie_pick_usage_out(constant CutiePickUsage& prm [[buffer(0)]],
+                                 device const uint* counts [[buffer(1)]],
+                                 device float* usage [[buffer(2)]],
+                                 uint j [[thread_position_in_grid]]) {
+    if (j < prm.m) {
+        usage[j] = float(counts[j]) / prm.scale;
     }
 }
 

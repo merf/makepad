@@ -33,6 +33,14 @@ pub static CUTIE_TOPK_PARTIAL_32: Kernel = Kernel { lib: &CUTIE_TOPK_MASK, funct
 pub static CUTIE_TOPK_PARTIAL_64: Kernel = Kernel { lib: &CUTIE_TOPK_MASK, function: "cutie_topk_partial_64" };
 /// Each column's slices merged, the softmax scattered into the zeroed affinity (`CutieTopkMerge`).
 pub static CUTIE_TOPK_MERGE: Kernel = Kernel { lib: &CUTIE_TOPK_MASK, function: "cutie_topk_merge" };
+/// The same merge writing each column's picks, rows and weights [k, p], for the sparse readout
+/// (`CutieTopkMerge`).
+pub static CUTIE_TOPK_MERGE_PICKS: Kernel = Kernel { lib: &CUTIE_TOPK_MASK, function: "cutie_topk_merge_picks" };
+/// The readout from the picks (`CutieSparseReadout`).
+pub static CUTIE_SPARSE_READOUT: Kernel = Kernel { lib: &CUTIE_TOPK_MASK, function: "cutie_sparse_readout" };
+/// The picks' usage in fixed point, and back to fp32 (`CutiePickUsage`).
+pub static CUTIE_PICK_USAGE: Kernel = Kernel { lib: &CUTIE_TOPK_MASK, function: "cutie_pick_usage" };
+pub static CUTIE_PICK_USAGE_OUT: Kernel = Kernel { lib: &CUTIE_TOPK_MASK, function: "cutie_pick_usage_out" };
 /// Each row's sum: the top-k's usage (`CutieRowSum`).
 pub static CUTIE_ROW_SUM: Kernel = Kernel { lib: &CUTIE_TOPK_MASK, function: "cutie_row_sum" };
 /// Each object's foreground flags, and whether it has any foreground and any background
@@ -46,6 +54,10 @@ pub static TOPK_MASK_KERNELS: &[&Kernel] = &[
     &CUTIE_TOPK_PARTIAL_32,
     &CUTIE_TOPK_PARTIAL_64,
     &CUTIE_TOPK_MERGE,
+    &CUTIE_TOPK_MERGE_PICKS,
+    &CUTIE_SPARSE_READOUT,
+    &CUTIE_PICK_USAGE,
+    &CUTIE_PICK_USAGE_OUT,
     &CUTIE_ROW_SUM,
     &CUTIE_ATTN_FOREGROUND,
     &CUTIE_ATTN_MASK,
@@ -97,6 +109,39 @@ struct TopkMerge {
 }
 // SAFETY: #[repr(C)], 16 bytes, no pointers; `CutieTopkMerge` in MSL.
 unsafe impl KernelParams for TopkMerge {}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SparseReadout {
+    v: u32,
+    p: u32,
+    k: u32,
+    n_long: u32,
+    n_work: u32,
+}
+// SAFETY: #[repr(C)], 20 bytes, no pointers; `CutieSparseReadout` in MSL.
+unsafe impl KernelParams for SparseReadout {}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PickUsage {
+    p: u32,
+    k: u32,
+    m: u32,
+    scale: f32,
+}
+// SAFETY: #[repr(C)], 16 bytes, no pointers; `CutiePickUsage` in MSL.
+unsafe impl KernelParams for PickUsage {}
+
+/// The fixed-point units a unit of weight for the usage of `p` pixels: the largest power of two
+/// with p + 1 units' worth fitting a u32 (a token's usage is at most p).
+fn usage_scale(p: usize) -> f32 {
+    let mut scale = 1u64 << 31;
+    while scale > 1 && scale * (p as u64 + 1) > u32::MAX as u64 {
+        scale >>= 1;
+    }
+    scale as f32
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -313,6 +358,59 @@ pub fn gpu_cutie_topk_softmax(sim: &GpuTensor, k: usize) -> Result<(GpuTensor, G
         let grid = simd_grid(op, &CUTIE_ROW_SUM, s.limits(&CUTIE_ROW_SUM, &[])?, m, ROW_SUM_ROWS)?;
         s.launch(&CUTIE_ROW_SUM, &[], &plan.row_sum, &[Bind::In(&aff), Bind::Out(&usage)], grid)?;
         Ok((aff, usage))
+    })
+}
+
+/// An fp16 step's top-k softmax and readout without the dense affinity: the top k of each column
+/// of `sim` [m, p] as `gpu_cutie_topk_softmax` picks and weighs them (the same kernels' picks,
+/// written as each column's rows and weights), then the readout of `values` (memory's values in
+/// parts side by side, [long-term, working], each [v, n_i]) through them, each pixel's k tokens
+/// summed best first in fp32, and each token's usage summed in fixed point (`usage_scale`) so it
+/// is the same whatever order the GPU adds in. Out: the readout [v, p] and the usage [1, m].
+/// Not the dense product's bits (zeros not added, another order), so for fp16 steps only.
+#[cfg(target_os = "macos")]
+pub fn gpu_cutie_topk_sparse_readout(sim: &GpuTensor, k: usize, values: &[&GpuTensor]) -> Result<(GpuTensor, GpuTensor), String> {
+    let op = "gpu_cutie_topk_sparse_readout";
+    cutie_check_f32(op, sim)?;
+    let (m, p) = (sim.rows(), sim.cols());
+    let plan = topk_plan(m, p, k)?;
+    let (long, work) = match values {
+        [work] => (None, *work),
+        [long, work] => (Some(*long), *work),
+        _ => return Err(format!("{op}: {} value parts, wants 1 or 2", values.len())),
+    };
+    let v = work.rows();
+    let n_long = long.map_or(0, |l| l.cols());
+    if long.is_some_and(|l| l.rows() != v) || n_long + work.cols() != m {
+        return Err(format!("{op}: values of {n_long} + {} tokens for a similarity of {m}", work.cols()));
+    }
+    if !plan.picks() {
+        return Err(format!("{op}: no picks for {m} tokens and k {k}"));
+    }
+    let k = plan.k;
+    with_metal_stream(op, |s| {
+        let readout = GpuTensor::alloc(v, p)?;
+        let usage = GpuTensor::alloc(1, m)?;
+        let keys = GpuTensor::alloc_u32(plan.entries())?;
+        let idx = GpuTensor::alloc_u32(plan.entries())?;
+        let partial = plan.partial_kernel();
+        let grid = plan.partial_grid(s.limits(partial, &[])?.max_threads)?;
+        s.launch(partial, &[], &plan.partial, &[Bind::In(sim), Bind::Out(&keys), Bind::Out(&idx)], grid)?;
+        let rows = GpuTensor::alloc_u32(k * p)?;
+        let weights = GpuTensor::alloc(k, p)?;
+        let grid = simd_grid(op, &CUTIE_TOPK_MERGE_PICKS, s.limits(&CUTIE_TOPK_MERGE_PICKS, &[])?, p, TOPK_MERGE_COLUMNS)?;
+        let binds = [Bind::In(&keys), Bind::In(&idx), Bind::Out(&weights), Bind::Out(&rows)];
+        s.launch(&CUTIE_TOPK_MERGE_PICKS, &[], &plan.merge, &binds, grid)?;
+        let params = SparseReadout { v: v as u32, p: p as u32, k: k as u32, n_long: n_long as u32, n_work: work.cols() as u32 };
+        let long_bind = long.map_or(Bind::Absent, Bind::In);
+        let binds = [Bind::In(&rows), Bind::In(&weights), long_bind, Bind::In(work), Bind::Out(&readout)];
+        s.launch(&CUTIE_SPARSE_READOUT, &[], &params, &binds, Grid::cover([p, v, 1], [64, 4, 1])?)?;
+        let counts = GpuTensor::alloc_u32(m)?;
+        s.fill(&counts, 0)?;
+        let params = PickUsage { p: p as u32, k: k as u32, m: m as u32, scale: usage_scale(p) };
+        s.launch(&CUTIE_PICK_USAGE, &[], &params, &[Bind::In(&rows), Bind::In(&weights), Bind::InOut(&counts)], Grid::linear(k * p, 256)?)?;
+        s.launch(&CUTIE_PICK_USAGE_OUT, &[], &params, &[Bind::In(&counts), Bind::Out(&usage)], Grid::linear(m, 256)?)?;
+        Ok((readout, usage))
     })
 }
 

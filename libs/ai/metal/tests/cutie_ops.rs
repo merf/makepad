@@ -102,3 +102,50 @@ fn every_cutie_library_and_pipeline_compiles() {
     .unwrap();
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// The fp16 steps' sparse readout against the dense one (`gpu_cutie_topk_softmax`, then the
+/// values times the affinity): memory in one part and in two ([long-term, working]), within fp32
+/// rounding of each other (the dense product adds zeros and sums in another order); the usage
+/// within the fixed point's rounding, and the same bits on a second run.
+#[test]
+fn sparse_readout_matches_the_dense_one() {
+    use makepad_ai_metal::cutie_ops::{gpu_cutie_matmul, gpu_cutie_topk_softmax, gpu_cutie_topk_sparse_readout};
+    let mut seed = 0x5a1e_u64;
+    let mut values = |n: usize, scale: f32| -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                ((seed >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0) * scale
+            })
+            .collect()
+    };
+    // (tokens of long-term memory, of working memory, pixels, value rows)
+    for &(n_long, n_work, p, v) in &[(0usize, 700usize, 300usize, 256usize), (128, 900, 257, 512), (64, 3000, 1000, 256)] {
+        let m = n_long + n_work;
+        let sim_values = values(m * p, 4.0);
+        let sim = stream::upload(&sim_values, m, p).unwrap();
+        let all_values = values(v * m, 2.0);
+        // Values [v, m] split by columns into the two parts.
+        let part = |from: usize, len: usize| -> Vec<f32> { (0..v).flat_map(|r| all_values[r * m + from..r * m + from + len].to_vec()).collect() };
+        let long = (n_long > 0).then(|| stream::upload(&part(0, n_long), v, n_long).unwrap());
+        let work = stream::upload(&part(n_long, n_work), v, n_work).unwrap();
+        let whole = stream::upload(&all_values, v, m).unwrap();
+        let (aff, dense_usage) = gpu_cutie_topk_softmax(&sim, 30).unwrap();
+        let dense = stream::download(&gpu_cutie_matmul(&whole, false, &aff, false).unwrap()).unwrap();
+        let dense_usage = stream::download(&dense_usage).unwrap();
+        let parts: Vec<&_> = long.iter().chain(std::iter::once(&work)).collect();
+        let run = || {
+            let (readout, usage) = gpu_cutie_topk_sparse_readout(&sim, 30, &parts).unwrap();
+            (stream::download(&readout).unwrap(), stream::download(&usage).unwrap())
+        };
+        let (sparse, usage) = run();
+        let worst = sparse.iter().zip(&dense).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let worst_usage = usage.iter().zip(&dense_usage).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        assert!(worst < 1e-4, "{n_long}+{n_work} tokens: readout off by {worst}");
+        assert!(worst_usage < 1e-3, "{n_long}+{n_work} tokens: usage off by {worst_usage}");
+        let (again, usage_again) = run();
+        assert!(again == sparse && usage_again.iter().zip(&usage).all(|(a, b)| a.to_bits() == b.to_bits()), "not deterministic");
+    }
+}

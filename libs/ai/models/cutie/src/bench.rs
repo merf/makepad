@@ -637,15 +637,23 @@ fn step_in_parts(
             let similarity = gpu_cutie_similarity(&memory_key, Some(&memory_shrinkage), &keys.key.t, Some(&keys.selection.t))
                 .map_err(|e| dev("memory similarity", e))?;
             laps.lap("similarity")?;
-            let (affinity, usage) = gpu_cutie_topk_softmax(&similarity, config.top_k).map_err(|e| dev("memory top-k", e))?;
-            if config.use_long_term {
-                memory.work.update_usage(&usage, long_size)?;
-                if long_size > 0 && config.count_long_term_usage {
-                    memory.long.update_usage(&usage, 0)?;
+            // An fp16 step on macOS reads sparsely (`MemoryManager::read_sparse`): the top-k and
+            // the readout are one lap there, timed as the top-k's.
+            let visual_readout = if crate::memory::MemoryManager::reads_sparsely(tap) {
+                let readout = memory.read_sparse_from(&similarity, &keys)?;
+                laps.lap("top-k softmax")?;
+                readout
+            } else {
+                let (affinity, usage) = gpu_cutie_topk_softmax(&similarity, config.top_k).map_err(|e| dev("memory top-k", e))?;
+                if config.use_long_term {
+                    memory.work.update_usage(&usage, long_size)?;
+                    if long_size > 0 && config.count_long_term_usage {
+                        memory.long.update_usage(&usage, 0)?;
+                    }
                 }
-            }
-            laps.lap("top-k softmax")?;
-            let visual_readout = memory.read_values(&affinity, &keys, tap)?;
+                laps.lap("top-k softmax")?;
+                memory.read_values(&affinity, &keys, tap)?
+            };
             laps.lap("readout")?;
             let sensory = memory.sensory()?;
             let pixel = net.pixel_fusion(&feats.pix_feat, &visual_readout, &sensory, last_mask, tap)?;
