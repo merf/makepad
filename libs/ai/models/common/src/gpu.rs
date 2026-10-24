@@ -14,6 +14,9 @@ pub use makepad_ai_loader::accel::GemmPrecision;
 pub use makepad_ai_metal::cutie_ops::{
     CutieGraphAttention, CutieGraphBlock, CutieGraphConv, CutieGraphLinear, CutieGraphNorm, CutieGraphOp, CutieGraphTransformer,
 };
+/// The memory read's similarity as one graph (metal's `cutie_ops::memory_graph`), for an fp16
+/// step; `gpu_cutie_memory_similarity_f16` runs it where `GPU_CUTIE_GRAPH` says it can (macOS).
+pub use makepad_ai_metal::cutie_ops::CutieMemorySimilarity;
 
 /// Whether `gpu_cutie_graph_f16` runs here: not on CUDA, whose fp16 is a convolution at a time.
 #[cfg(all(any(target_os = "linux", target_os = "windows"), makepad_ai_cuda_kernels))]
@@ -34,6 +37,12 @@ pub fn gpu_cutie_transformer_graph_f16(
     _pe: &GpuTensor,
 ) -> Result<(GpuTensor, Vec<GpuTensor>), String> {
     Err("gpu_cutie_transformer_graph_f16: not on CUDA (GPU_CUTIE_GRAPH is false)".into())
+}
+
+/// Not on CUDA (`GPU_CUTIE_GRAPH` is false): an error.
+#[cfg(all(any(target_os = "linux", target_os = "windows"), makepad_ai_cuda_kernels))]
+pub fn gpu_cutie_memory_similarity_f16(_r: &CutieMemorySimilarity<'_, GpuTensor>) -> Result<GpuTensor, String> {
+    Err("gpu_cutie_memory_similarity_f16: not on CUDA (GPU_CUTIE_GRAPH is false)".into())
 }
 
 /// One linear of a device-resident ViT layer: a row-major `[n, k]` weight in

@@ -314,6 +314,21 @@ pub struct MpsTransformerRun<'a> {
     pub copy: &'a Kernel,
 }
 
+/// The similarity of Cutie's memory read for `MetalStream::memory_similarity_mpsgraph`: memory's
+/// key and shrinkage parts and the query, its sizes, the output, and the kernels that copy
+/// memory's parts into half side by side (`cutie_pad_cols_to_half_f32`), round the query to half
+/// and copy the similarity out.
+pub struct MpsMemoryRun<'a> {
+    pub read: &'a crate::cutie_ops::memory_graph::CutieMemorySimilarity<'a, GpuTensor>,
+    pub ck: usize,
+    pub p: usize,
+    pub tokens: usize,
+    pub similarity: &'a GpuTensor,
+    pub pad: &'a Kernel,
+    pub to_half: &'a Kernel,
+    pub copy: &'a Kernel,
+}
+
 /// A convolution for `MetalStream::conv_mpscnn`: the layer (its weights key, PyTorch's
 /// [out][in][k][k] weights and bias on the host, read once to make the MPS kernel), the batch's
 /// planar input and output, a residual, the ReLU, and the two layout kernels (`cutie_mps.metal`).
@@ -747,6 +762,75 @@ impl MetalStream<'_> {
                 &Grid::linear(n, 256)?,
             );
         }
+        Ok(())
+    }
+
+    /// The memory read's similarity on MPSGraph (`MpsMemoryRun`): memory's parts copied into the
+    /// graph's half buffers side by side, the query rounded to half, the graph (cached by its
+    /// sizes), then the similarity copied out; its tensors claimed and stamped as a launch's are.
+    pub fn memory_similarity_mpsgraph(&mut self, m: &MpsMemoryRun<'_>) -> MetalResult<()> {
+        let op = self.op;
+        let r = m.read;
+        let mut ins: Vec<&GpuTensor> = Vec::new();
+        ins.extend(r.keys.iter().copied());
+        ins.extend(r.shrinkages.iter().copied());
+        ins.push(r.query_key);
+        ins.push(r.query_selection);
+        let mut binds: Vec<Bind> = ins.iter().map(|t| Bind::In(t)).collect();
+        binds.push(Bind::Out(m.similarity));
+        let plans: Vec<SlotPlan> = binds.iter().map(Bind::plan).collect();
+        check_slots(op, "MPSGraph memory similarity", 0, &plans)?;
+        for t in &ins {
+            self.claim(t, true)?;
+        }
+        self.claim(m.similarity, false)?;
+        let pad = self.ctx.pipeline(m.pad, &[]).map_err(|e| format!("{op}: {e}"))?.state;
+        let to_half = self.ctx.pipeline(m.to_half, &[]).map_err(|e| format!("{op}: {e}"))?.state;
+        let copy = self.ctx.pipeline(m.copy, &[]).map_err(|e| format!("{op}: {e}"))?.state;
+        let device = self.ctx.device();
+        let shape = super::mps::MemoryShape { ck: m.ck, p: m.p, tokens: m.tokens };
+        let (in_bufs, out_buf) = self.ctx.mps.memory_similarity_graph(device, &shape).map_err(|e| format!("{op}: {e}"))?;
+        let words = |w: &[usize]| -> Vec<u8> { w.iter().flat_map(|&v| (v as u32).to_le_bytes()).collect() };
+        let tensor = |t: &GpuTensor| Slot::Buffer { id: t.storage.buf().as_id(), offset: (t.offset * 4) as u64 };
+        let buffer = |id: ObjcId| Slot::Buffer { id, offset: 0 };
+        let dummy = Slot::Buffer { id: self.ctx.dummy(), offset: 0 };
+
+        let (encoder, serial) = self.ctx.begin_dispatch(op).map_err(|e| format!("{op}: {e}"))?;
+        for t in &ins {
+            t.storage.mark_use(serial);
+        }
+        m.similarity.storage.mark_write(serial);
+        // Memory's parts side by side, each part's columns after the last.
+        for (parts, buf, rows) in [(r.keys, in_bufs[0], m.ck), (r.shrinkages, in_bufs[1], 1)] {
+            let mut col0 = 0;
+            for t in parts {
+                let cols = t.rows() * t.cols() / rows;
+                let params = words(&[rows, cols, m.tokens, col0, m.tokens]);
+                super::ctx::encode_dispatch(
+                    encoder,
+                    pad,
+                    params.as_ptr() as *const std::ffi::c_void,
+                    params.len(),
+                    &[tensor(t), buffer(buf)],
+                    &Grid::linear(rows * m.tokens, 256)?,
+                );
+                col0 += cols;
+            }
+        }
+        for (t, buf) in [(r.query_key, in_bufs[2]), (r.query_selection, in_bufs[3])] {
+            let n = t.rows() * t.cols();
+            let params = words(&[n, 0, 0]);
+            super::ctx::encode_dispatch(encoder, to_half, params.as_ptr() as *const std::ffi::c_void, params.len(), &[tensor(t), buffer(buf)], &Grid::linear(n, 256)?);
+        }
+        let (cb, _) = self.ctx.begin_buffer_work(op).map_err(|e| format!("{op}: {e}"))?;
+        {
+            let graph = self.ctx.mps.memory_similarity(&shape).ok_or_else(|| format!("{op}: the MPSGraph memory similarity is not made"))?;
+            super::mps::MpsCache::encode_graph(graph, cb).map_err(|e| format!("{op}: {e}"))?;
+        }
+        let (encoder, _) = self.ctx.begin_dispatch(op).map_err(|e| format!("{op}: {e}"))?;
+        let n = m.tokens * m.p;
+        let params = words(&[n, 0, 0]);
+        super::ctx::encode_dispatch(encoder, copy, params.as_ptr() as *const std::ffi::c_void, params.len(), &[buffer(out_buf), tensor(m.similarity), dummy], &Grid::linear(n, 256)?);
         Ok(())
     }
 

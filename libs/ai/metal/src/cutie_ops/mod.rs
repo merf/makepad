@@ -22,6 +22,7 @@ use crate::stream::{Kernel, KernelLib};
 pub mod elementwise;
 pub mod graph;
 pub mod matmul_conv;
+pub mod memory_graph;
 pub mod pool_resize;
 pub mod softmax_norm;
 pub mod topk_mask;
@@ -36,11 +37,14 @@ pub use elementwise::{
 pub use matmul_conv::{gpu_cutie_conv2d, gpu_cutie_conv2d_fused, gpu_cutie_conv2d_fused_f16, gpu_cutie_matmul, gpu_cutie_similarity};
 pub use matmul_conv::{set_conv_mpscnn_override, CUTIE_MPS, MPS_CONV_KERNELS};
 pub use graph::{CutieGraphConv, CutieGraphOp};
+pub use memory_graph::CutieMemorySimilarity;
 pub use transformer_graph::{CutieGraphAttention, CutieGraphBlock, CutieGraphLinear, CutieGraphNorm, CutieGraphTransformer};
 #[cfg(target_os = "macos")]
 pub use graph::gpu_cutie_graph_f16;
 #[cfg(target_os = "macos")]
 pub use transformer_graph::gpu_cutie_transformer_graph_f16;
+#[cfg(target_os = "macos")]
+pub use memory_graph::gpu_cutie_memory_similarity_f16;
 #[cfg(target_os = "macos")]
 pub use pool_resize::{gpu_cutie_maxpool3x3s2, gpu_cutie_resize_bilinear};
 #[cfg(target_os = "macos")]

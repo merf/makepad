@@ -109,3 +109,33 @@ kernel void cutie_graph_to_planar_f32(constant CutieGraphCopy& p [[buffer(0)]],
     }
     out[i] = r;
 }
+
+// --- The memory similarity on MPSGraph (an fp16 step's, metal/src/stream/mps/memory_read.rs) ---
+//
+// In: a part of memory (long-term or working, [rows, src_cols]) rounded to half into columns
+// col0.. of the graph's [rows, dst_cols] buffer; columns from zero_from on are zeroed (none when
+// zero_from is dst_cols).
+
+struct CutiePadCopy {
+    uint rows;
+    uint src_cols;
+    uint dst_cols;
+    uint col0;
+    uint zero_from;
+};
+
+kernel void cutie_pad_cols_to_half_f32(constant CutiePadCopy& p [[buffer(0)]],
+                                       device const float* x [[buffer(1)]],
+                                       device half* y [[buffer(2)]],
+                                       uint i [[thread_position_in_grid]]) {
+    if (i >= p.rows * p.dst_cols) {
+        return;
+    }
+    const uint r = i / p.dst_cols;
+    const uint c = i % p.dst_cols;
+    if (c >= p.col0 && c < p.col0 + p.src_cols) {
+        y[i] = half(x[r * p.src_cols + (c - p.col0)]);
+    } else if (c >= p.zero_from) {
+        y[i] = half(0.0f);
+    }
+}

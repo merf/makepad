@@ -152,6 +152,20 @@ pub fn gpu_cutie_transformer_graph_f16(
     }
 }
 
+/// The memory read's similarity as one graph (metal's `gpu_cutie_memory_similarity_f16`) on
+/// macOS; an error elsewhere (`GPU_CUTIE_GRAPH`).
+pub fn gpu_cutie_memory_similarity_f16(r: &super::CutieMemorySimilarity<'_, GpuTensor>) -> Result<GpuTensor, String> {
+    #[cfg(target_os = "macos")]
+    {
+        return makepad_ai_metal::cutie_ops::gpu_cutie_memory_similarity_f16(r);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = r;
+        Err("gpu_cutie_memory_similarity_f16: macOS only".into())
+    }
+}
+
 /// Whether `gpu_cutie_conv2d_fused_f16` really runs in half: on macOS (MPSCNNConvolution), not on
 /// the other builds without CUDA's kernels.
 pub const GPU_CUTIE_HALF: bool = cfg!(target_os = "macos");

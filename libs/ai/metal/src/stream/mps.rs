@@ -18,6 +18,9 @@ use makepad_objc_sys::runtime::{ObjcId, BOOL, NO, YES};
 use makepad_objc_sys::{class, msg_send, sel, sel_impl};
 use std::collections::HashMap;
 
+mod memory_read;
+pub(crate) use memory_read::MemoryShape;
+mod ops;
 mod transformer;
 
 #[link(name = "MetalPerformanceShadersGraph", kind = "framework")]

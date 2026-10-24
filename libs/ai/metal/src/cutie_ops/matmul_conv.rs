@@ -56,7 +56,9 @@ pub static IMAGE_TO_PLANAR: Kernel = Kernel { lib: &CUTIE_MPS, function: "cutie_
 pub static PLANAR_TO_HALF: Kernel = Kernel { lib: &CUTIE_MPS, function: "cutie_planar_to_half_f32" };
 /// The graph's fp32 result into the planar output, with the residual and the ReLU.
 pub static GRAPH_TO_PLANAR: Kernel = Kernel { lib: &CUTIE_MPS, function: "cutie_graph_to_planar_f32" };
-pub static MPS_CONV_KERNELS: &[&Kernel] = &[&PLANAR_TO_IMAGE, &IMAGE_TO_PLANAR, &PLANAR_TO_HALF, &GRAPH_TO_PLANAR];
+/// A part of memory into the memory similarity's half buffer (`cutie_ops::memory_graph`).
+pub static PAD_COLS_TO_HALF: Kernel = Kernel { lib: &CUTIE_MPS, function: "cutie_pad_cols_to_half_f32" };
+pub static MPS_CONV_KERNELS: &[&Kernel] = &[&PLANAR_TO_IMAGE, &IMAGE_TO_PLANAR, &PLANAR_TO_HALF, &GRAPH_TO_PLANAR, &PAD_COLS_TO_HALF];
 
 /// Whether an fp16 step's convolutions run on MPSGraph (the default) or on MPSCNNConvolution
 /// (MAKEPAD_CUTIE_F16_CONV=mpscnn, to compare). Read once.

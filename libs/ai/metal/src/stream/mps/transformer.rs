@@ -3,7 +3,7 @@
 //! NCHW from their start: the pixels [n, embed, h, w], the object memory [n, queries, embed + 1]
 //! and the sine encoding [1, embed, h, w] in; the pixels and each aux logits [n, 1, h, w] out.
 
-use super::{graph_shape, GraphConv, MpsCache, GRAPH_LAYOUT_NCHW, GRAPH_LAYOUT_OIHW, GRAPH_PADDING_EXPLICIT, MPS_DATA_TYPE_FLOAT16, MPS_DATA_TYPE_FLOAT32};
+use super::{graph_shape, GraphConv, MpsCache, GRAPH_LAYOUT_NCHW, GRAPH_LAYOUT_OIHW, GRAPH_PADDING_EXPLICIT};
 use crate::cutie_ops::graph::CutieGraphConv;
 use crate::cutie_ops::transformer_graph::{CutieGraphAttention, CutieGraphBlock, CutieGraphLinear, CutieGraphNorm, CutieGraphTransformer};
 use crate::objc_util::StrongId;
@@ -11,8 +11,7 @@ use crate::stream::MetalResult;
 use makepad_objc_sys::runtime::ObjcId;
 use makepad_objc_sys::{class, msg_send, sel, sel_impl};
 
-const F16: u32 = MPS_DATA_TYPE_FLOAT16;
-const F32: u32 = MPS_DATA_TYPE_FLOAT32;
+use super::ops::{nil, G, F16, F32};
 /// What a blocked attention entry adds (in fp32): exp of it is 0, as -inf's is, without the NaN
 /// a 0 times -inf would make.
 const BLOCKED: f64 = -1e30;
@@ -23,89 +22,7 @@ const PROB_EPS: f64 = 1e-7;
 const ROLE_IN: u8 = 20;
 const ROLE_OUT: u8 = 30;
 
-/// The graph being built, its tensors autoreleased (the graph keeps them).
-struct G(ObjcId);
-
-fn nil() -> ObjcId {
-    std::ptr::null_mut()
-}
-
 impl G {
-    unsafe fn constant(&self, data: &[f32], dims: &[usize]) -> ObjcId {
-        let bytes: ObjcId = msg_send![class!(NSData), dataWithBytes: data.as_ptr() as *const std::ffi::c_void length: (data.len() * 4) as u64];
-        msg_send![self.0, constantWithData: bytes shape: graph_shape(dims) dataType: F32]
-    }
-    unsafe fn scalar(&self, v: f64, ty: u32) -> ObjcId {
-        msg_send![self.0, constantWithScalar: v dataType: ty]
-    }
-    unsafe fn cast(&self, x: ObjcId, ty: u32) -> ObjcId {
-        msg_send![self.0, castTensor: x toType: ty name: nil()]
-    }
-    unsafe fn half(&self, x: ObjcId) -> ObjcId {
-        self.cast(x, F16)
-    }
-    unsafe fn float(&self, x: ObjcId) -> ObjcId {
-        self.cast(x, F32)
-    }
-    unsafe fn add(&self, a: ObjcId, b: ObjcId) -> ObjcId {
-        msg_send![self.0, additionWithPrimaryTensor: a secondaryTensor: b name: nil()]
-    }
-    unsafe fn sub(&self, a: ObjcId, b: ObjcId) -> ObjcId {
-        msg_send![self.0, subtractionWithPrimaryTensor: a secondaryTensor: b name: nil()]
-    }
-    unsafe fn mul(&self, a: ObjcId, b: ObjcId) -> ObjcId {
-        msg_send![self.0, multiplicationWithPrimaryTensor: a secondaryTensor: b name: nil()]
-    }
-    unsafe fn div(&self, a: ObjcId, b: ObjcId) -> ObjcId {
-        msg_send![self.0, divisionWithPrimaryTensor: a secondaryTensor: b name: nil()]
-    }
-    unsafe fn maximum(&self, a: ObjcId, b: ObjcId) -> ObjcId {
-        msg_send![self.0, maximumWithPrimaryTensor: a secondaryTensor: b name: nil()]
-    }
-    unsafe fn relu(&self, x: ObjcId) -> ObjcId {
-        msg_send![self.0, reLUWithTensor: x name: nil()]
-    }
-    unsafe fn sigmoid(&self, x: ObjcId) -> ObjcId {
-        msg_send![self.0, sigmoidWithTensor: x name: nil()]
-    }
-    unsafe fn reshape(&self, x: ObjcId, dims: &[usize]) -> ObjcId {
-        msg_send![self.0, reshapeTensor: x withShape: graph_shape(dims) name: nil()]
-    }
-    unsafe fn transpose(&self, x: ObjcId, a: usize, b: usize) -> ObjcId {
-        msg_send![self.0, transposeTensor: x dimension: a as u64 withDimension: b as u64 name: nil()]
-    }
-    unsafe fn matmul(&self, a: ObjcId, b: ObjcId) -> ObjcId {
-        msg_send![self.0, matrixMultiplicationWithPrimaryTensor: a secondaryTensor: b name: nil()]
-    }
-    unsafe fn mean(&self, x: ObjcId, axes: &[usize]) -> ObjcId {
-        msg_send![self.0, meanOfTensor: x axes: graph_shape(axes) name: nil()]
-    }
-    unsafe fn softmax(&self, x: ObjcId, axis: usize) -> ObjcId {
-        msg_send![self.0, softMaxWithTensor: x axis: axis as i64 name: nil()]
-    }
-    unsafe fn max_along(&self, x: ObjcId, axis: usize) -> ObjcId {
-        msg_send![self.0, reductionMaximumWithTensor: x axis: axis as i64 name: nil()]
-    }
-    unsafe fn prod_along(&self, x: ObjcId, axis: usize) -> ObjcId {
-        msg_send![self.0, reductionProductWithTensor: x axis: axis as i64 name: nil()]
-    }
-    unsafe fn clamp(&self, x: ObjcId, lo: f64, hi: f64) -> ObjcId {
-        let (lo, hi) = (self.scalar(lo, F32), self.scalar(hi, F32));
-        msg_send![self.0, clampWithTensor: x minValueTensor: lo maxValueTensor: hi name: nil()]
-    }
-    unsafe fn ge(&self, a: ObjcId, b: ObjcId) -> ObjcId {
-        msg_send![self.0, greaterThanOrEqualToWithPrimaryTensor: a secondaryTensor: b name: nil()]
-    }
-    unsafe fn broadcast(&self, x: ObjcId, dims: &[usize]) -> ObjcId {
-        msg_send![self.0, broadcastTensor: x toShape: graph_shape(dims) name: nil()]
-    }
-    unsafe fn concat(&self, a: ObjcId, b: ObjcId, dim: usize) -> ObjcId {
-        msg_send![self.0, concatTensor: a withTensor: b dimension: dim as i64 name: nil()]
-    }
-    unsafe fn slice(&self, x: ObjcId, dim: usize, start: usize, len: usize) -> ObjcId {
-        msg_send![self.0, sliceTensor: x dimension: dim as u64 start: start as i64 length: len as i64 name: nil()]
-    }
-
     /// A same-size convolution on a half NCHW tensor, its bias added and the ReLU taken in half.
     unsafe fn conv(&self, x: ObjcId, c: &CutieGraphConv<'_>, relu: bool) -> MetalResult<ObjcId> {
         let (o, i, k, pad) = (c.out_channels, c.in_channels, c.k, c.pad as u64);

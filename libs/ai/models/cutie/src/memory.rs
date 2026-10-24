@@ -442,6 +442,33 @@ impl MemoryManager {
         Ok(affinity)
     }
 
+    /// In an fp16 step where the backend runs graphs (`GPU_CUTIE_GRAPH`, macOS), and no check
+    /// taps: the similarity as one graph from memory's parts (`gpu_cutie_memory_similarity_f16`,
+    /// its inputs in half, its sums fp32), no copy of memory made. MAKEPAD_CUTIE_GRAPH_MEMORY=0
+    /// keeps `gpu_cutie_similarity`. `None` when not used.
+    fn similarity_graph(&self, keys: &Keys, tap: &Tap) -> Result<Option<GpuTensor>> {
+        use makepad_ai_common::gpu::{gpu_cutie_memory_similarity_f16, CutieMemorySimilarity, GPU_CUTIE_GRAPH};
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled = *ON.get_or_init(|| std::env::var("MAKEPAD_CUTIE_GRAPH_MEMORY").map_or(true, |v| v.trim() != "0"));
+        if !GPU_CUTIE_GRAPH || !enabled || !crate::model::HalfConvs::on() || tap.active() {
+            return Ok(None);
+        }
+        let mut parts: Vec<&KeyValueStore> = Vec::with_capacity(2);
+        if self.long_size() > 0 {
+            parts.push(&self.long);
+        }
+        parts.push(&self.work);
+        let missing = || DiffusionError::model("cutie memory read: nothing memorised");
+        let key_parts = parts.iter().map(|s| s.key.as_ref().ok_or_else(missing)).collect::<Result<Vec<_>>>()?;
+        let shrinkage_parts = parts.iter().map(|s| s.shrinkage.as_ref().ok_or_else(missing)).collect::<Result<Vec<_>>>()?;
+        let tokens: usize = key_parts.iter().map(|k| k.cols()).sum();
+        if self.top_k > tokens {
+            return Err(DiffusionError::model(format!("cutie memory read: top {} of {tokens} memory tokens", self.top_k)));
+        }
+        let read = CutieMemorySimilarity { keys: &key_parts, shrinkages: &shrinkage_parts, query_key: &keys.key.t, query_selection: &keys.selection.t };
+        gpu_cutie_memory_similarity_f16(&read).map(Some).map_err(|e| dev("memory similarity graph", e))
+    }
+
     /// Long-term memory's tokens in a read (none without long-term memory).
     fn long_size(&self) -> usize {
         if self.use_long_term {
@@ -455,6 +482,9 @@ impl MemoryManager {
     /// softmax: the affinity [N, h*w] and each token's usage [1, N]. Taps the read up to the
     /// similarity.
     pub(crate) fn read_top_k(&self, keys: &Keys, tap: &mut Tap) -> Result<(GpuTensor, GpuTensor)> {
+        if let Some(similarity) = self.similarity_graph(keys, tap)? {
+            return gpu_cutie_topk_softmax(&similarity, self.top_k).map_err(|e| dev("memory top-k", e));
+        }
         let long_size = self.long_size();
         let (long_key, long_shrinkage) = if long_size > 0 { (self.long.key.as_ref(), self.long.shrinkage.as_ref()) } else { (None, None) };
         let memory_key = KeyValueStore::cat(&[long_key, self.work.key.as_ref()])?;
