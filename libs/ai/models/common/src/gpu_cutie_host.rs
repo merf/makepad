@@ -135,6 +135,25 @@ pub fn gpu_cutie_graph_f16(
     }
 }
 
+/// The chain as one graph in fp32 (metal's `gpu_cutie_graph_f32`) on macOS when fp32's
+/// convolutions run on MPSGraph (not MAKEPAD_CUTIE_F32_CONV=kernels); `None` otherwise.
+pub fn gpu_cutie_graph_f32(
+    x: &GpuTensor, width: usize, height: usize, key: &str, ops: &[super::CutieGraphOp<'_>], outputs: &[usize],
+) -> Result<Option<Vec<GpuTensor>>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        if !makepad_ai_metal::cutie_ops::f32_conv_on_graph() {
+            return Ok(None);
+        }
+        return makepad_ai_metal::cutie_ops::gpu_cutie_graph_f32(x, width, height, key, ops, outputs).map(Some);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (x, width, height, key, ops, outputs);
+        Ok(None)
+    }
+}
+
 /// The object transformer as one graph in half (metal's `gpu_cutie_transformer_graph_f16`) on
 /// macOS; an error elsewhere (`GPU_CUTIE_GRAPH`).
 pub fn gpu_cutie_transformer_graph_f16(

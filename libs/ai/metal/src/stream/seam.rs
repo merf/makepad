@@ -299,6 +299,9 @@ pub struct MpsGraphRun<'a> {
     pub outs: &'a [&'a GpuTensor],
     pub to_half: &'a Kernel,
     pub from_graph: &'a Kernel,
+    /// The program in half (an fp16 step's; `to_half` rounds the input), else fp32 throughout
+    /// (`to_half` a plain fp32 copy, `cutie_graph_to_planar_f32`).
+    pub half: bool,
 }
 
 /// Cutie's object transformer for `MetalStream::transformer_mpsgraph`: its weights, the objects
@@ -338,6 +341,8 @@ pub struct MpsConv<'a> {
     pub to_image: &'a Kernel,
     pub from_image: &'a Kernel,
     /// The images between the copies in half (Cutie's fp16 steps; the convolution sums in fp32).
+    /// On MPSGraph (`conv_mpsgraph`): the graph's input and convolution in half (an fp16 step's),
+    /// else fp32 throughout (`to_image` then a plain fp32 copy, `cutie_graph_to_planar_f32`).
     pub half_images: bool,
 }
 
@@ -598,14 +603,18 @@ impl MetalStream<'_> {
             r.storage.mark_use(serial);
         }
         c.out.storage.mark_write(serial);
-        let (_, in_buf, out_buf) = self.ctx.mps.graph_convolution(device, &layer, &input, &output).map_err(|e| format!("{op}: {e}"))?;
+        let (_, in_buf, out_buf) = self.ctx.mps.graph_convolution(device, &layer, &input, &output, c.half_images).map_err(|e| format!("{op}: {e}"))?;
         let params = copy(n_in, false, false);
+        // In half: `cutie_planar_to_half_f32` (x, the buffer); in fp32, a plain copy with
+        // `cutie_graph_to_planar_f32` (x, the buffer, no residual).
+        let dummy = Slot::Buffer { id: self.ctx.dummy(), offset: 0 };
+        let in_slots = [tensor(c.x), Slot::Buffer { id: in_buf, offset: 0 }, dummy];
         super::ctx::encode_dispatch(
             encoder,
             to_half,
             params.as_ptr() as *const std::ffi::c_void,
             params.len(),
-            &[tensor(c.x), Slot::Buffer { id: in_buf, offset: 0 }],
+            &in_slots[..if c.half_images { 2 } else { 3 }],
             &Grid::linear(n_in, 256)?,
         );
         let (cb, _) = self.ctx.begin_buffer_work(op).map_err(|e| format!("{op}: {e}"))?;
@@ -653,14 +662,15 @@ impl MetalStream<'_> {
         for t in g.outs {
             t.storage.mark_write(serial);
         }
-        let (in_buf, out_bufs) = self.ctx.mps.program_graph(device, g.key, g.ops, g.shapes, g.outputs).map_err(|e| format!("{op}: {e}"))?;
+        let (in_buf, out_bufs) = self.ctx.mps.program_graph(device, g.key, g.ops, g.shapes, g.outputs, g.half).map_err(|e| format!("{op}: {e}"))?;
         let params = copy(n_in);
+        let in_slots = [tensor(g.x), Slot::Buffer { id: in_buf, offset: 0 }, Slot::Buffer { id: self.ctx.dummy(), offset: 0 }];
         super::ctx::encode_dispatch(
             encoder,
             to_half,
             params.as_ptr() as *const std::ffi::c_void,
             params.len(),
-            &[tensor(g.x), Slot::Buffer { id: in_buf, offset: 0 }],
+            &in_slots[..if g.half { 2 } else { 3 }],
             &Grid::linear(n_in, 256)?,
         );
         let (cb, _) = self.ctx.begin_buffer_work(op).map_err(|e| format!("{op}: {e}"))?;

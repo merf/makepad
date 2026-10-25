@@ -263,13 +263,14 @@ impl MpsCache {
     /// made at first use (its graph compiles at its first encode), and the buffers it reads and
     /// writes: its input in half and its output in fp32, NCHW from their start.
     pub(crate) fn graph_convolution(
-        &mut self, device: ObjcId, layer: &MpsConvLayer<'_>, input: &GraphSide, output: &GraphSide,
+        &mut self, device: ObjcId, layer: &MpsConvLayer<'_>, input: &GraphSide, output: &GraphSide, half: bool,
     ) -> MetalResult<(&GraphConv, ObjcId, ObjcId)> {
         let (o, i, k) = (layer.out_channels, layer.in_channels, layer.k);
         if layer.weights.len() != o * i * k * k || layer.bias.is_some_and(|b| b.len() != o) || input.channels != i || output.channels != o {
             return Err(format!("MPSGraph convolution {}: {} weights for {o}x{i}x{k}x{k}", layer.key, layer.weights.len()));
         }
-        let in_bytes = input.images * i * input.width * input.height * 2;
+        let in_bytes = input.images * i * input.width * input.height * if half { 2 } else { 4 };
+        let in_type = if half { MPS_DATA_TYPE_FLOAT16 } else { MPS_DATA_TYPE_FLOAT32 };
         let out_bytes = output.images * o * output.width * output.height * 4;
         let in_buf = self.graph_buffer(device, 0, in_bytes)?;
         let out_buf = self.graph_buffer(device, 1, out_bytes)?;
@@ -283,10 +284,10 @@ impl MpsCache {
                 let g = graph.as_id();
                 let in_shape = graph_shape(&[input.images, i, input.height, input.width]);
                 let out_shape = graph_shape(&[output.images, o, output.height, output.width]);
-                let x: ObjcId = msg_send![g, placeholderWithShape: in_shape dataType: MPS_DATA_TYPE_FLOAT16 name: nil];
+                let x: ObjcId = msg_send![g, placeholderWithShape: in_shape dataType: in_type name: nil];
                 let wdata: ObjcId = msg_send![class!(NSData), dataWithBytes: layer.weights.as_ptr() as *const std::ffi::c_void length: (layer.weights.len() * 4) as u64];
                 let w32: ObjcId = msg_send![g, constantWithData: wdata shape: graph_shape(&[o, i, k, k]) dataType: MPS_DATA_TYPE_FLOAT32];
-                let w16: ObjcId = msg_send![g, castTensor: w32 toType: MPS_DATA_TYPE_FLOAT16 name: nil];
+                let w16: ObjcId = if half { msg_send![g, castTensor: w32 toType: MPS_DATA_TYPE_FLOAT16 name: nil] } else { w32 };
                 let desc: ObjcId = msg_send![
                     class!(MPSGraphConvolution2DOpDescriptor),
                     descriptorWithStrideInX: layer.stride as u64
@@ -306,14 +307,14 @@ impl MpsCache {
                     return Err("MPSGraphConvolution2DOpDescriptor returned nil".into());
                 }
                 let y16: ObjcId = msg_send![g, convolution2DWithSourceTensor: x weightsTensor: w16 descriptor: desc name: nil];
-                let mut y: ObjcId = msg_send![g, castTensor: y16 toType: MPS_DATA_TYPE_FLOAT32 name: nil];
+                let mut y: ObjcId = if half { msg_send![g, castTensor: y16 toType: MPS_DATA_TYPE_FLOAT32 name: nil] } else { y16 };
                 if let Some(bias) = layer.bias {
                     let bdata: ObjcId = msg_send![class!(NSData), dataWithBytes: bias.as_ptr() as *const std::ffi::c_void length: (bias.len() * 4) as u64];
                     let b: ObjcId = msg_send![g, constantWithData: bdata shape: graph_shape(&[1, o, 1, 1]) dataType: MPS_DATA_TYPE_FLOAT32];
                     y = msg_send![g, additionWithPrimaryTensor: y secondaryTensor: b name: nil];
                 }
                 let xd: ObjcId = msg_send![class!(MPSGraphTensorData), alloc];
-                let xd: ObjcId = msg_send![xd, initWithMTLBuffer: in_buf shape: in_shape dataType: MPS_DATA_TYPE_FLOAT16];
+                let xd: ObjcId = msg_send![xd, initWithMTLBuffer: in_buf shape: in_shape dataType: in_type];
                 let xd = StrongId::from_owned(xd).ok_or("MPSGraphTensorData init returned nil")?;
                 let yd: ObjcId = msg_send![class!(MPSGraphTensorData), alloc];
                 let yd: ObjcId = msg_send![yd, initWithMTLBuffer: out_buf shape: out_shape dataType: MPS_DATA_TYPE_FLOAT32];
@@ -330,16 +331,17 @@ impl MpsCache {
     }
 
     /// A program of convolutions (`cutie_ops::graph`) as one graph in half, made at first use
-    /// under `key` and the input's shape, and the buffers it reads (the input in half) and writes
-    /// (each output in fp32), NCHW from their start. Values are half between the ops; each
-    /// output is cast to fp32.
+    /// under `key` and the input's shape, and the buffers it reads (the input in half, or fp32
+    /// when not `half`) and writes (each output in fp32), NCHW from their start. Values are half
+    /// between the ops (fp32 when not `half`); each output is cast to fp32.
     pub(crate) fn program_graph(
         &mut self, device: ObjcId, key: &str, ops: &[crate::cutie_ops::CutieGraphOp<'_>], shapes: &[crate::cutie_ops::graph::GraphShape],
-        outputs: &[usize],
+        outputs: &[usize], half: bool,
     ) -> MetalResult<(ObjcId, Vec<ObjcId>)> {
         use crate::cutie_ops::CutieGraphOp;
         let size = |s: &crate::cutie_ops::graph::GraphShape| s.channels * s.width * s.height;
-        let in_buf = self.graph_buffer(device, 2, size(&shapes[0]) * 2)?;
+        let value_type = if half { MPS_DATA_TYPE_FLOAT16 } else { MPS_DATA_TYPE_FLOAT32 };
+        let in_buf = self.graph_buffer(device, 2, size(&shapes[0]) * if half { 2 } else { 4 })?;
         let mut out_bufs = Vec::with_capacity(outputs.len());
         for (i, &o) in outputs.iter().enumerate() {
             out_bufs.push(self.graph_buffer(device, 10 + i as u8, size(&shapes[o]) * 4)?);
@@ -352,7 +354,7 @@ impl MpsCache {
                 let graph = StrongId::from_owned(graph).ok_or("MPSGraph new returned nil")?;
                 let g = graph.as_id();
                 let nchw = |s: &crate::cutie_ops::graph::GraphShape| graph_shape(&[1, s.channels, s.height, s.width]);
-                let x: ObjcId = msg_send![g, placeholderWithShape: nchw(&shapes[0]) dataType: MPS_DATA_TYPE_FLOAT16 name: nil];
+                let x: ObjcId = msg_send![g, placeholderWithShape: nchw(&shapes[0]) dataType: value_type name: nil];
                 let mut values: Vec<ObjcId> = vec![x];
                 for op in ops {
                     let v: ObjcId = match *op {
@@ -360,7 +362,7 @@ impl MpsCache {
                             let (o, i, k, pad) = (conv.out_channels, conv.in_channels, conv.k, conv.pad as u64);
                             let wdata: ObjcId = msg_send![class!(NSData), dataWithBytes: conv.weights.as_ptr() as *const std::ffi::c_void length: (conv.weights.len() * 4) as u64];
                             let w32: ObjcId = msg_send![g, constantWithData: wdata shape: graph_shape(&[o, i, k, k]) dataType: MPS_DATA_TYPE_FLOAT32];
-                            let w16: ObjcId = msg_send![g, castTensor: w32 toType: MPS_DATA_TYPE_FLOAT16 name: nil];
+                            let w16: ObjcId = if half { msg_send![g, castTensor: w32 toType: MPS_DATA_TYPE_FLOAT16 name: nil] } else { w32 };
                             let desc: ObjcId = msg_send![
                                 class!(MPSGraphConvolution2DOpDescriptor),
                                 descriptorWithStrideInX: conv.stride as u64
@@ -383,7 +385,7 @@ impl MpsCache {
                             if let Some(bias) = conv.bias {
                                 let bdata: ObjcId = msg_send![class!(NSData), dataWithBytes: bias.as_ptr() as *const std::ffi::c_void length: (bias.len() * 4) as u64];
                                 let b32: ObjcId = msg_send![g, constantWithData: bdata shape: graph_shape(&[1, o, 1, 1]) dataType: MPS_DATA_TYPE_FLOAT32];
-                                let b16: ObjcId = msg_send![g, castTensor: b32 toType: MPS_DATA_TYPE_FLOAT16 name: nil];
+                                let b16: ObjcId = if half { msg_send![g, castTensor: b32 toType: MPS_DATA_TYPE_FLOAT16 name: nil] } else { b32 };
                                 y = msg_send![g, additionWithPrimaryTensor: y secondaryTensor: b16 name: nil];
                             }
                             if let Some(r) = residual {
@@ -419,12 +421,12 @@ impl MpsCache {
                     values.push(v);
                 }
                 let xd: ObjcId = msg_send![class!(MPSGraphTensorData), alloc];
-                let xd: ObjcId = msg_send![xd, initWithMTLBuffer: in_buf shape: nchw(&shapes[0]) dataType: MPS_DATA_TYPE_FLOAT16];
+                let xd: ObjcId = msg_send![xd, initWithMTLBuffer: in_buf shape: nchw(&shapes[0]) dataType: value_type];
                 let xd = StrongId::from_owned(xd).ok_or("MPSGraphTensorData init returned nil")?;
                 let mut keys: Vec<ObjcId> = Vec::new();
                 let mut datas: Vec<StrongId> = Vec::new();
                 for (&o, &buf) in outputs.iter().zip(&out_bufs) {
-                    let y: ObjcId = msg_send![g, castTensor: values[o] toType: MPS_DATA_TYPE_FLOAT32 name: nil];
+                    let y: ObjcId = if half { msg_send![g, castTensor: values[o] toType: MPS_DATA_TYPE_FLOAT32 name: nil] } else { values[o] };
                     let yd: ObjcId = msg_send![class!(MPSGraphTensorData), alloc];
                     let yd: ObjcId = msg_send![yd, initWithMTLBuffer: buf shape: nchw(&shapes[o]) dataType: MPS_DATA_TYPE_FLOAT32];
                     datas.push(StrongId::from_owned(yd).ok_or("MPSGraphTensorData init returned nil")?);

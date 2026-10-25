@@ -58,6 +58,14 @@ pub static PLANAR_TO_HALF: Kernel = Kernel { lib: &CUTIE_MPS, function: "cutie_p
 pub static GRAPH_TO_PLANAR: Kernel = Kernel { lib: &CUTIE_MPS, function: "cutie_graph_to_planar_f32" };
 pub static MPS_CONV_KERNELS: &[&Kernel] = &[&PLANAR_TO_IMAGE, &IMAGE_TO_PLANAR, &PLANAR_TO_HALF, &GRAPH_TO_PLANAR];
 
+/// Whether fp32's convolutions run on MPSGraph (the default) or on the kernels (MPS GEMM or the
+/// tiled kernels with the fused epilogue; MAKEPAD_CUTIE_F32_CONV=kernels). Read once.
+#[cfg(target_os = "macos")]
+pub fn f32_conv_on_graph() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MAKEPAD_CUTIE_F32_CONV").map_or(true, |v| v.trim() != "kernels"))
+}
+
 /// Whether an fp16 step's convolutions run on MPSGraph (the default) or on MPSCNNConvolution
 /// (MAKEPAD_CUTIE_F16_CONV=mpscnn, to compare). Read once.
 #[cfg(target_os = "macos")]
@@ -680,9 +688,11 @@ fn conv2d_fused(
             // No output channels: nothing to compute (cuBLAS returns at once on CUDA).
             return Ok(out);
         }
-        if half && f16_conv_on_graph() && plan.k % 2 == 1 && plan.pad == plan.k / 2 {
+        if (if half { f16_conv_on_graph() } else { f32_conv_on_graph() }) && plan.k % 2 == 1 && plan.pad == plan.k / 2 {
+            // fp32's graphs are cached apart from fp16's.
+            let graph_key = if half { qualified_key.clone() } else { format!("{qualified_key}::f32") };
             s.conv_mpsgraph(&MpsConv {
-                key: &qualified_key,
+                key: &graph_key,
                 weights,
                 bias,
                 x,
@@ -698,9 +708,9 @@ fn conv2d_fused(
                 oh: plan.oh,
                 k: plan.k,
                 stride: plan.stride,
-                to_image: &PLANAR_TO_HALF,
+                to_image: if half { &PLANAR_TO_HALF } else { &GRAPH_TO_PLANAR },
                 from_image: &GRAPH_TO_PLANAR,
-                half_images: false,
+                half_images: half,
             })?;
             return Ok(out);
         }

@@ -91,9 +91,24 @@ pub fn graph_shapes(input: GraphShape, ops: &[CutieGraphOp<'_>]) -> MetalResult<
 pub fn gpu_cutie_graph_f16(
     x: &crate::gpu_types::GpuTensor, width: usize, height: usize, key: &str, ops: &[CutieGraphOp<'_>], outputs: &[usize],
 ) -> MetalResult<Vec<crate::gpu_types::GpuTensor>> {
+    gpu_cutie_graph(x, width, height, key, ops, outputs, true)
+}
+
+/// `gpu_cutie_graph_f16` in fp32 throughout (an fp32 step's), cached apart from it.
+#[cfg(target_os = "macos")]
+pub fn gpu_cutie_graph_f32(
+    x: &crate::gpu_types::GpuTensor, width: usize, height: usize, key: &str, ops: &[CutieGraphOp<'_>], outputs: &[usize],
+) -> MetalResult<Vec<crate::gpu_types::GpuTensor>> {
+    gpu_cutie_graph(x, width, height, &format!("{key}::f32"), ops, outputs, false)
+}
+
+#[cfg(target_os = "macos")]
+fn gpu_cutie_graph(
+    x: &crate::gpu_types::GpuTensor, width: usize, height: usize, key: &str, ops: &[CutieGraphOp<'_>], outputs: &[usize], half: bool,
+) -> MetalResult<Vec<crate::gpu_types::GpuTensor>> {
     use crate::gpu_types::GpuTensor;
     use crate::stream::{with_metal_stream, MpsGraphRun};
-    let op = "gpu_cutie_graph_f16";
+    let op = if half { "gpu_cutie_graph_f16" } else { "gpu_cutie_graph_f32" };
     if x.cols() != width * height {
         return Err(format!("{op} {key}: {}x{} for {width}x{height}", x.rows(), x.cols()));
     }
@@ -114,8 +129,9 @@ pub fn gpu_cutie_graph_f16(
             shapes: &shapes,
             outputs,
             outs: &refs,
-            to_half: &super::matmul_conv::PLANAR_TO_HALF,
+            to_half: if half { &super::matmul_conv::PLANAR_TO_HALF } else { &super::matmul_conv::GRAPH_TO_PLANAR },
             from_graph: &super::matmul_conv::GRAPH_TO_PLANAR,
+            half,
         })?;
         Ok(outs)
     })

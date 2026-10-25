@@ -38,7 +38,9 @@ pub use matmul_conv::{set_conv_mpscnn_override, CUTIE_MPS, MPS_CONV_KERNELS};
 pub use graph::{CutieGraphConv, CutieGraphOp};
 pub use transformer_graph::{CutieGraphAttention, CutieGraphBlock, CutieGraphLinear, CutieGraphNorm, CutieGraphTransformer};
 #[cfg(target_os = "macos")]
-pub use graph::gpu_cutie_graph_f16;
+pub use graph::{gpu_cutie_graph_f16, gpu_cutie_graph_f32};
+#[cfg(target_os = "macos")]
+pub use matmul_conv::f32_conv_on_graph;
 #[cfg(target_os = "macos")]
 pub use transformer_graph::gpu_cutie_transformer_graph_f16;
 #[cfg(target_os = "macos")]

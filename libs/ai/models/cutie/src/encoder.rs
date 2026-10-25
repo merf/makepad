@@ -140,15 +140,16 @@ impl PixelEncoder {
         Feat::new(t, 1, 3, image.w, image.h)
     }
 
-    /// In an fp16 step where the backend runs graphs (`GPU_CUTIE_GRAPH`, macOS): the ResNet from
-    /// conv1 to layer3 as one graph in half (`gpu_cutie_graph_f16`), its activations half between
-    /// the convolutions, f4, f8 and f16 out in fp32. MAKEPAD_CUTIE_GRAPH_ENCODER=0 keeps a
-    /// convolution at a time. `None` when not used.
-    fn encode_graph(&self, image: &Feat) -> Result<Option<(Feat, Feat, Feat)>> {
-        use makepad_ai_common::gpu::{gpu_cutie_graph_f16, CutieGraphOp, GPU_CUTIE_GRAPH};
+    /// Where the backend runs graphs (`GPU_CUTIE_GRAPH`, macOS) and no check taps: the ResNet
+    /// from conv1 to layer3 as one graph, f4, f8 and f16 out in fp32. In an fp16 step in half
+    /// (`gpu_cutie_graph_f16`, its activations half between the convolutions); else in fp32
+    /// (`gpu_cutie_graph_f32`, while fp32's convolutions run on MPSGraph).
+    /// MAKEPAD_CUTIE_GRAPH_ENCODER=0 keeps a convolution at a time. `None` when not used.
+    fn encode_graph(&self, image: &Feat, tap: &Tap) -> Result<Option<(Feat, Feat, Feat)>> {
+        use makepad_ai_common::gpu::{gpu_cutie_graph_f16, gpu_cutie_graph_f32, CutieGraphOp, GPU_CUTIE_GRAPH};
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let enabled = *ON.get_or_init(|| std::env::var("MAKEPAD_CUTIE_GRAPH_ENCODER").map_or(true, |v| v.trim() != "0"));
-        if !GPU_CUTIE_GRAPH || !enabled || !crate::model::HalfConvs::on() {
+        if !GPU_CUTIE_GRAPH || !enabled || tap.active() {
             return Ok(None);
         }
         fn push<'a>(ops: &mut Vec<CutieGraphOp<'a>>, op: CutieGraphOp<'a>) -> usize {
@@ -172,7 +173,15 @@ impl PixelEncoder {
             stages[s] = x;
         }
         let key = format!("{}::pixel_encoder", self.conv1.key);
-        let outs = gpu_cutie_graph_f16(&image.t, image.w, image.h, &key, &ops, &stages).map_err(|e| dev("pixel encoder graph", e))?;
+        let outs = if crate::model::HalfConvs::on() {
+            gpu_cutie_graph_f16(&image.t, image.w, image.h, &key, &ops, &stages)
+        } else {
+            match gpu_cutie_graph_f32(&image.t, image.w, image.h, &key, &ops, &stages).map_err(|e| dev("pixel encoder graph", e))? {
+                Some(outs) => Ok(outs),
+                None => return Ok(None),
+            }
+        }
+        .map_err(|e| dev("pixel encoder graph", e))?;
         let [f4, f8, f16]: [GpuTensor; 3] = outs.try_into().map_err(|_| dev("pixel encoder graph", "three outputs".into()))?;
         let feat = |t: GpuTensor, c: usize, div: usize| Feat::new(t, 1, c, image.w / div, image.h / div);
         Ok(Some((feat(f4, 256, 4)?, feat(f8, 512, 8)?, feat(f16, 1024, 16)?)))
@@ -182,7 +191,7 @@ impl PixelEncoder {
     pub(crate) fn encode(&self, image: &Feat, tap: &mut Tap) -> Result<ImageFeatures> {
         let image = self.normalise(image)?;
         tap.put("encode_image.normalised", &image.t)?;
-        if let Some((f4, f8, f16)) = self.encode_graph(&image)? {
+        if let Some((f4, f8, f16)) = self.encode_graph(&image, tap)? {
             let pix_feat = self.pix_feat_proj.forward(&f16)?;
             return Ok(ImageFeatures { image, f16, f8, f4, pix_feat });
         }

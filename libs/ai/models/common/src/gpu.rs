@@ -27,6 +27,14 @@ pub fn gpu_cutie_graph_f16(
     Err("gpu_cutie_graph_f16: not on CUDA (GPU_CUTIE_GRAPH is false)".into())
 }
 
+/// Not on CUDA: `None` (fp32 a convolution at a time).
+#[cfg(all(any(target_os = "linux", target_os = "windows"), makepad_ai_cuda_kernels))]
+pub fn gpu_cutie_graph_f32(
+    _x: &GpuTensor, _width: usize, _height: usize, _key: &str, _ops: &[CutieGraphOp<'_>], _outputs: &[usize],
+) -> Result<Option<Vec<GpuTensor>>, String> {
+    Ok(None)
+}
+
 /// Not on CUDA (`GPU_CUTIE_GRAPH` is false): an error.
 #[cfg(all(any(target_os = "linux", target_os = "windows"), makepad_ai_cuda_kernels))]
 pub fn gpu_cutie_transformer_graph_f16(
