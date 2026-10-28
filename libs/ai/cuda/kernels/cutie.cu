@@ -209,6 +209,30 @@ extern "C" cudaError_t makepad_cuda_cutie_conv_epilogue_f32(
     return cudaGetLastError();
 }
 
+// The epilogue from a half result (cuDNN's, [rows, plane]) into f32 `out`: the half widened, then
+// as `cutie_conv_epilogue_kernel`.
+static __global__ void cutie_conv_epilogue_from_f16_kernel(
+    const __half* __restrict__ src, float* __restrict__ out, const float* __restrict__ bias,
+    const float* __restrict__ residual, bool relu, uint32_t channels, size_t plane, size_t rows) {
+    const size_t q = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (q >= plane) return;
+    for (size_t row = blockIdx.y; row < rows; row += gridDim.y) {
+        const size_t at = row * plane + q;
+        out[at] = cutie_conv_epilogue(__half2float(src[at]), bias, uint32_t(row % channels), residual, at, relu);
+    }
+}
+
+extern "C" cudaError_t makepad_cuda_cutie_conv_epilogue_from_f16(
+    const uint16_t* src, float* out, const float* bias, const float* residual, uint32_t relu, uint32_t channels,
+    size_t plane, size_t rows, cudaStream_t stream) {
+    if (!plane || !rows) return cudaSuccess;
+    const dim3 block(256, 1, 1);
+    const dim3 grid((unsigned)((plane + 255) / 256), (unsigned)(rows < 65535 ? rows : 65535), 1);
+    cutie_conv_epilogue_from_f16_kernel<<<grid, block, 0, stream>>>(
+        reinterpret_cast<const __half*>(src), out, bias, residual, relu != 0, channels, plane, rows);
+    return cudaGetLastError();
+}
+
 // --- Elementwise ---
 
 static __global__ void cutie_sigmoid_kernel(const float* __restrict__ x, float* __restrict__ out, size_t n) {

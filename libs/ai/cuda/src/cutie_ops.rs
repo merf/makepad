@@ -30,6 +30,10 @@ unsafe extern "C" {
         out: *mut f32, bias: *const f32, residual: *const f32, relu: u32, channels: u32, plane: usize, rows: usize,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    fn makepad_cuda_cutie_conv_epilogue_from_f16(
+        src: *const u16, out: *mut f32, bias: *const f32, residual: *const f32, relu: u32, channels: u32, plane: usize,
+        rows: usize, stream: cudaStream_t,
+    ) -> cudaError_t;
     fn makepad_cuda_cutie_unstack_epilogue_f32(
         src: *const f32, out: *mut f32, bias: *const f32, residual: *const f32, relu: u32, images: u32, channels: u32,
         plane: usize, stream: cudaStream_t,
@@ -189,6 +193,9 @@ pub fn gpu_cutie_conv2d_fused(
 /// (cuBLAS, CUDA_R_16F operands, CUBLAS_COMPUTE_32F, tensor cores), the output, the bias, residual
 /// and ReLU in f32, so tensors between ops stay f32 (autocast would also store the output in half).
 /// The half weights are cached apart from the f32 ones, under `{cache_namespace}::{key}::cutie_conv_f16`.
+/// Past 1x1, where cuDNN loads (`cutie_cudnn_on`), the convolution is cuDNN's instead, as
+/// PyTorch's is: the input rounded to half, half data with fp32 accumulation on tensor cores, its
+/// half result widened in the epilogue (at 960x540 a propagated frame 31 ms against 39).
 #[allow(clippy::too_many_arguments)]
 pub fn gpu_cutie_conv2d_fused_f16(
     x: &GpuTensor, batch: usize, in_w: usize, in_h: usize, cache_namespace: &str, key: &str,
@@ -283,6 +290,27 @@ fn cutie_conv2d(
         };
         // Scratch for `values` column values, from the pool.
         let scratch = |values: usize| GpuTensor::from_pool((values * es).div_ceil(size_of::<f32>()).max(1), 1);
+        if half && k > 1 && cutie_cudnn_on() {
+            // cuDNN in half: the input rounded to half once, the convolution (half data, fp32
+            // accumulation, tensor cores) into a half result, then the epilogue widening it.
+            // Only past 1x1: a 1x1 is a plain product, where cuBLAS on the input (or its
+            // columns) is as fast or faster (at 960x540, cuDNN took 6.4 ms over Cutie's 40 1x1s
+            // against 5.4, and 18.2 over its 38 others against 30.1).
+            let values = x.rows * x.cols;
+            let x_half = scratch(values)?;
+            gpu_check(unsafe { makepad_cuda_f32_to_f16(x_ptr, x_half.device_ptr()?.cast::<u16>(), d(values)?, backend.stream) })?;
+            let y_half = scratch(batch * out_channels * opix)?;
+            let shape = [batch, in_channels, out_channels, in_h, in_w, oh, ow, k, pad, stride];
+            cutie_cudnn_conv(backend.stream, shape, x_half.device_ptr()?.cast::<c_void>(), w_ptr, y_half.device_ptr()?.cast::<c_void>())
+                .map_err(|e| format!("{op} {key}: {e}"))?;
+            gpu_check(unsafe {
+                makepad_cuda_cutie_conv_epilogue_from_f16(
+                    y_half.device_ptr()?.cast::<u16>(), out_ptr, bias_ptr, residual_ptr, relu as u32, out_channels_u, opix,
+                    batch * out_channels, backend.stream,
+                )
+            })?;
+            return Ok(out);
+        }
         let im2col = |src: *const f32, col: *mut f32, images: u32, side_by_side: u32| {
             gpu_check(unsafe {
                 if half {
@@ -369,6 +397,42 @@ fn cutie_conv2d(
             })?;
         }
         Ok(out)
+    })
+}
+
+/// Whether an fp16 step's convolutions run on cuDNN: where its library loads (`cudnn::available`,
+/// `CUDNN_PATH` naming `cudnn64_9.dll` when it is not on the PATH), unless MAKEPAD_CUTIE_CUDNN=0.
+fn cutie_cudnn_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MAKEPAD_CUTIE_CUDNN").map_or(true, |v| v.trim() != "0") && crate::cudnn::available())
+}
+
+/// One half convolution on cuDNN over packed NCHW (Cutie's planar layout): `shape` is batch, in and
+/// out channels, in height and width, out height and width, k, pad, stride. Its descriptors (with a
+/// handle each) are made once a shape and kept for the thread; the workspace comes from the pool.
+fn cutie_cudnn_conv(stream: cudaStream_t, shape: [usize; 10], x: *const c_void, w: *const c_void, y: *mut c_void) -> Result<(), String> {
+    thread_local! {
+        static DESCS: std::cell::RefCell<HashMap<[usize; 10], crate::cudnn::ConvDesc>> = std::cell::RefCell::new(HashMap::new());
+    }
+    let i = |v: usize| i32::try_from(v).map_err(|_| format!("cudnn conv: {v} exceeds cuDNN's sizes"));
+    DESCS.with(|descs| {
+        let mut descs = descs.borrow_mut();
+        if !descs.contains_key(&shape) {
+            let [n, c_in, c_out, h, w, oh, ow, k, pad, stride] = shape;
+            let desc = crate::cudnn::prepare_nchw_contiguous(
+                i(n)?, i(c_in)?, i(c_out)?, i(h)?, i(w)?, i(oh)?, i(ow)?, i(k)?, i(k)?, i(pad)?, i(pad)?, i(stride)?, i(stride)?,
+                crate::cudnn::CUDNN_DATA_HALF, stream,
+            )?;
+            descs.insert(shape, desc);
+        }
+        let desc = &descs[&shape];
+        let bytes = crate::cudnn::workspace_bytes(desc);
+        let workspace = if bytes > 0 { Some(GpuTensor::from_pool(bytes.div_ceil(size_of::<f32>()), 1)?) } else { None };
+        let ws = match &workspace {
+            Some(t) => t.device_ptr()?.cast::<c_void>(),
+            None => std::ptr::null_mut(),
+        };
+        crate::cudnn::convolution_forward_f16(desc, x, w, y, ws, stream)
     })
 }
 
