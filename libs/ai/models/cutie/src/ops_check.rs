@@ -53,7 +53,8 @@ use makepad_ai_common::gpu::{
     gpu_cutie_pad_reference, gpu_cutie_resize_bilinear, gpu_cutie_resize_bilinear_reference, gpu_cutie_rgb_planes,
     gpu_cutie_rgb_planes_reference, gpu_cutie_sigmoid, gpu_cutie_sigmoid_reference, gpu_cutie_similarity,
     gpu_cutie_similarity_reference, gpu_cutie_sine_encoding, gpu_cutie_sine_encoding_reference, gpu_cutie_softmax_axis0,
-    gpu_cutie_softmax_axis0_reference, gpu_cutie_topk_softmax, gpu_cutie_topk_softmax_reference, gpu_download,
+    gpu_cutie_softmax_axis0_reference, gpu_cutie_topk_softmax, gpu_cutie_topk_softmax_reference, gpu_cutie_topk_sparse_readout,
+    gpu_download, GPU_CUTIE_SPARSE_READOUT,
     gpu_attention_packed_cross_bias, gpu_attention_packed_cross_f32, gpu_cutie_available, gpu_cutie_linear, gpu_synchronize, GPU_CUTIE_KERNELS,
     gpu_upload, gpu_weight_cache_evict_prefix, GpuTensor,
 };
@@ -76,7 +77,7 @@ const OPS_FAMILIES: &[(&str, &[&str])] = &[
     ("pool_resize", &["maxpool", "resize"]),
     ("softmax_norm", &["softmax0", "aggregate", "eca", "layer_norm", "sine"]),
     ("matmul_conv", &["conv2d", "conv fused", "matmul", "similar"]),
-    ("topk_mask", &["topk", "attn_mask"]),
+    ("topk_mask", &["topk", "sparse", "attn_mask"]),
     ("gemm", &["linear", "attention"]),
     (
         "generic",
@@ -735,6 +736,34 @@ impl OpsCheck<'_> {
             let reference = time_ms(1, || gpu_cutie_topk_softmax_reference(&sim, k))?;
             self.timing("topk", &case, kernel, reference);
         }
+        Ok(())
+    }
+
+    /// The fp16 steps' sparse readout (where the backend has one) against the dense read it
+    /// replaces: `gpu_cutie_topk_softmax`, then the values [v, m] times the affinity. Memory in one
+    /// part or two ([long-term, working]); the readout within fp32 rounding (the dense product adds
+    /// zeros and sums in another order), the usage within its fixed point, and a second run to the
+    /// bit (the usage's atomics are integers).
+    fn sparse_readout(&mut self, n_long: usize, n_work: usize, p: usize, v: usize) -> Result<()> {
+        if !GPU_CUTIE_SPARSE_READOUT || !self.wants("sparse") {
+            return Ok(());
+        }
+        let m = n_long + n_work;
+        let sim = up(&self.similarities(m * p), m, p)?;
+        let all = self.rng.uniforms(v * m, -2.0, 2.0);
+        let part = |from: usize, len: usize| -> Vec<f32> { (0..v).flat_map(|r| all[r * m + from..r * m + from + len].to_vec()).collect() };
+        let long = if n_long > 0 { Some(up(&part(0, n_long), v, n_long)?) } else { None };
+        let work = up(&part(n_long, n_work), v, n_work)?;
+        let case = format!("{n_long}+{n_work} tokens p{p} v{v}");
+        let (aff, dense_usage) = gpu_cutie_topk_softmax(&sim, 30).map_err(|e| dev(&case, e))?;
+        let dense = gpu_cutie_matmul(&up(&all, v, m)?, false, &aff, false).map_err(|e| dev(&case, e))?;
+        let parts: Vec<&GpuTensor> = long.iter().chain(std::iter::once(&work)).collect();
+        let (readout, usage) = gpu_cutie_topk_sparse_readout(&sim, 30, &parts).map_err(|e| dev(&case, e))?;
+        self.compare("sparse", &format!("{case} readout"), &readout, &dense, TIGHT)?;
+        self.compare("sparse", &format!("{case} usage"), &usage, &dense_usage, Tol { rel: 1e-4, cos: 0.9999999, bool_mismatch: 0.0 })?;
+        let (again, usage_again) = gpu_cutie_topk_sparse_readout(&sim, 30, &parts).map_err(|e| dev(&case, e))?;
+        self.compare("sparse", &format!("{case} readout again"), &again, &readout, EXACT)?;
+        self.compare("sparse", &format!("{case} usage again"), &usage_again, &usage, EXACT)?;
         Ok(())
     }
 
@@ -1492,6 +1521,10 @@ fn run(ck: &mut OpsCheck) -> Result<()> {
     let v = ck.similarities(30000 * P16);
     ck.topk("long", 30000, P16, 64, v, true)?;
     ck.topk_refused(100, 9, 65)?;
+    // The sparse readout: working memory alone, then with long-term memory, then a big frame.
+    ck.sparse_readout(0, 700, 300, 256)?;
+    ck.sparse_readout(128, 900, 257, 512)?;
+    ck.sparse_readout(2040, 8160, 2040, 512)?;
     let v = ck.similarities(3500 * 2500);
     ck.topk("big frame", 3500, 2500, 30, v, true)?;
     let v = ck.similarities(20 * 37);

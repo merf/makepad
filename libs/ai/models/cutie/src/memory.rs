@@ -447,7 +447,7 @@ impl MemoryManager {
         Ok(affinity)
     }
 
-    /// In an fp16 step where the backend reads sparsely (`GPU_CUTIE_SPARSE_READOUT`, macOS), and
+    /// In an fp16 step where the backend reads sparsely (`GPU_CUTIE_SPARSE_READOUT`: Metal and CUDA), and
     /// no check taps: the top-k softmax and readout from each pixel's picks
     /// (`gpu_cutie_topk_sparse_readout`) instead of the dense affinity and product, the usage
     /// counted as `count_usage` does. MAKEPAD_CUTIE_SPARSE_READOUT=0 reads densely. `None` when

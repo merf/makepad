@@ -558,9 +558,12 @@ static __global__ void __launch_bounds__(CUTIE_TOPK_COLS * CUTIE_TOPK_SLICES_PER
 // warp's best head (a shuffle reduction in the key order; rows are unique, so one lane owns it
 // and advances). Then the softmax as Cutie's do_softmax: exp of the picked values (no max
 // subtracted), summed in PyTorch's order over the picks (best first, cutie_reduce4's four
-// accumulators), normalised, scattered into aff [m, p] (zeroed before).
+// accumulators), normalised, scattered into aff [m, p] (zeroed before); or with PICKS, written as
+// each column's picks best first, their weights and rows [k, p].
+template <bool PICKS>
 static __global__ void cutie_topk_merge_kernel(
     const uint32_t* __restrict__ keys, const uint32_t* __restrict__ idx, float* __restrict__ aff,
+    float* __restrict__ pick_weights, uint32_t* __restrict__ pick_rows,
     uint32_t m, uint32_t p, uint32_t k, uint32_t slices) {
     const uint32_t col = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     const uint32_t lane = threadIdx.x % 32;
@@ -619,9 +622,59 @@ static __global__ void cutie_topk_merge_kernel(
         }
     }
     const float sum = __fadd_rn(__fadd_rn(__fadd_rn(a0, a1), a2), a3);
+    if (PICKS) {
+        if (lane < k) {
+            pick_weights[size_t(lane) * p + col] = e0 / sum;
+            pick_rows[size_t(lane) * p + col] = r0;
+        }
+        if (lane + 32 < k) {
+            pick_weights[size_t(lane + 32) * p + col] = e1 / sum;
+            pick_rows[size_t(lane + 32) * p + col] = r1;
+        }
+        return;
+    }
     // A pick is always a real row while k <= m; the bound keeps a stray one off memory.
     if (lane < k && r0 < m) aff[size_t(r0) * p + col] = e0 / sum;
     if (lane + 32 < k && r1 < m) aff[size_t(r1) * p + col] = e1 / sum;
+}
+
+// readout [v, p]: for each pixel and value row, the picks' weights times the picked tokens'
+// values, summed best first in fp32: long-term memory's values [v, n_long] for a token below
+// n_long, else working memory's [v, n_work]. A thread a pixel and value row; pixels along x so a
+// warp's pick reads are coalesced.
+static __global__ void cutie_sparse_readout_kernel(
+    const uint32_t* __restrict__ rows, const float* __restrict__ weights, const float* __restrict__ long_values,
+    const float* __restrict__ work_values, float* __restrict__ out, uint32_t v, uint32_t p, uint32_t k,
+    uint32_t n_long, uint32_t n_work) {
+    const uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= p) return;
+    for (uint32_t r = blockIdx.y * blockDim.y + threadIdx.y; r < v; r += gridDim.y * blockDim.y) {
+        float acc = 0.0f;
+        for (uint32_t t = 0; t < k; ++t) {
+            const uint32_t j = rows[size_t(t) * p + col];
+            const float w = weights[size_t(t) * p + col];
+            const float x = j < n_long ? long_values[size_t(r) * n_long + j] : work_values[size_t(r) * n_work + (j - n_long)];
+            acc = __fmaf_rn(w, x, acc);
+        }
+        out[size_t(r) * p + col] = acc;
+    }
+}
+
+// Each token's usage, the picks' weights summed over the pixels, the same whatever order the
+// atomics land in: each weight rounded to fixed point (`scale` units, so p of them fit a u32) and
+// added as an integer. counts [m] zeroed before.
+static __global__ void cutie_pick_usage_kernel(
+    const uint32_t* __restrict__ rows, const float* __restrict__ weights, uint32_t* __restrict__ counts, size_t n,
+    uint32_t m, float scale) {
+    const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const uint32_t j = rows[i];
+    if (j < m) atomicAdd(&counts[j], uint32_t(rintf(weights[i] * scale)));
+}
+
+static __global__ void cutie_pick_usage_out_kernel(const uint32_t* __restrict__ counts, float* __restrict__ usage, uint32_t m, float scale) {
+    const uint32_t j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j < m) usage[j] = float(counts[j]) / scale;
 }
 
 // The sum of each row of [rows, cols]: one warp a row. Not PyTorch's order for affinity.sum(dim=2)
@@ -666,9 +719,42 @@ extern "C" cudaError_t makepad_cuda_cutie_topk_softmax_f32(
         } else {
             cutie_topk_partial_kernel<64><<<grid, block, 0, stream>>>(sim, keys, idx, m, p, k, chunk, slices);
         }
-        cutie_topk_merge_kernel<<<(p + 3) / 4, 128, 0, stream>>>(keys, idx, aff, m, p, k, slices);
+        cutie_topk_merge_kernel<false><<<(p + 3) / 4, 128, 0, stream>>>(keys, idx, aff, nullptr, nullptr, m, p, k, slices);
     }
     cutie_row_sum_kernel<<<(m + 7) / 8, 256, 0, stream>>>(aff, usage, m, p);
+    return cudaGetLastError();
+}
+
+// The top-k softmax and readout without the dense affinity: the same picks and weights as
+// makepad_cuda_cutie_topk_softmax_f32, written as pick_weights and pick_rows [k, p], the readout
+// [v, p] through them, and the usage [m] summed in fixed point (`scale`). keys and idx hold
+// makepad_cuda_cutie_topk_scratch_entries each; counts [m] is zeroed here.
+extern "C" cudaError_t makepad_cuda_cutie_topk_sparse_readout_f32(
+    const float* sim, uint32_t* keys, uint32_t* idx, float* pick_weights, uint32_t* pick_rows, uint32_t* counts,
+    const float* long_values, const float* work_values, float* readout, float* usage, uint32_t m, uint32_t p, uint32_t k,
+    uint32_t v, uint32_t n_long, uint32_t n_work, float scale, cudaStream_t stream) {
+    if (k == 0 || k > CUTIE_TOPK_MAX || k > m || n_long + n_work != m) return cudaErrorInvalidValue;
+    if (!p) return cudaSuccess;
+    const uint32_t slices = cutie_topk_slices(m);
+    const uint32_t chunk = (m + slices - 1) / slices;
+    const dim3 block(CUTIE_TOPK_COLS, CUTIE_TOPK_SLICES_PER_BLOCK, 1);
+    const dim3 grid((p + CUTIE_TOPK_COLS - 1) / CUTIE_TOPK_COLS,
+                    (slices + CUTIE_TOPK_SLICES_PER_BLOCK - 1) / CUTIE_TOPK_SLICES_PER_BLOCK, 1);
+    if (k <= 32) {
+        cutie_topk_partial_kernel<32><<<grid, block, 0, stream>>>(sim, keys, idx, m, p, k, chunk, slices);
+    } else {
+        cutie_topk_partial_kernel<64><<<grid, block, 0, stream>>>(sim, keys, idx, m, p, k, chunk, slices);
+    }
+    cutie_topk_merge_kernel<true><<<(p + 3) / 4, 128, 0, stream>>>(keys, idx, nullptr, pick_weights, pick_rows, m, p, k, slices);
+    const dim3 rblock(64, 4, 1);
+    const uint32_t ry = (v + 3) / 4;
+    const dim3 rgrid((p + 63) / 64, ry < 65535 ? ry : 65535, 1);
+    cutie_sparse_readout_kernel<<<rgrid, rblock, 0, stream>>>(pick_rows, pick_weights, long_values, work_values, readout, v, p, k, n_long, n_work);
+    cudaError_t err = cudaMemsetAsync(counts, 0, size_t(m) * sizeof(uint32_t), stream);
+    if (err != cudaSuccess) return err;
+    const size_t n = size_t(k) * p;
+    cutie_pick_usage_kernel<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>(pick_rows, pick_weights, counts, n, m, scale);
+    cutie_pick_usage_out_kernel<<<(m + 255) / 256, 256, 0, stream>>>(counts, usage, m, scale);
     return cudaGetLastError();
 }
 

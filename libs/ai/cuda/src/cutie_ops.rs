@@ -65,6 +65,11 @@ unsafe extern "C" {
         m: u32, p: u32, stream: cudaStream_t,
     ) -> cudaError_t;
     fn makepad_cuda_cutie_topk_scratch_entries(m: u32, p: u32, k: u32) -> usize;
+    fn makepad_cuda_cutie_topk_sparse_readout_f32(
+        sim: *const f32, keys: *mut u32, idx: *mut u32, pick_weights: *mut f32, pick_rows: *mut u32, counts: *mut u32,
+        long_values: *const f32, work_values: *const f32, readout: *mut f32, usage: *mut f32, m: u32, p: u32, k: u32, v: u32,
+        n_long: u32, n_work: u32, scale: f32, stream: cudaStream_t,
+    ) -> cudaError_t;
     fn makepad_cuda_cutie_topk_softmax_f32(
         sim: *const f32, aff: *mut f32, usage: *mut f32, keys: *mut u32, idx: *mut u32, m: u32, p: u32, k: u32,
         stream: cudaStream_t,
@@ -720,6 +725,70 @@ pub fn gpu_cutie_topk_softmax(sim: &GpuTensor, k: usize) -> Result<(GpuTensor, G
             )
         })?;
         Ok((aff, usage))
+    })
+}
+
+/// Whether `gpu_cutie_topk_sparse_readout` runs here: yes, as on Metal.
+pub const GPU_CUTIE_SPARSE_READOUT: bool = true;
+
+/// An fp16 step's top-k softmax and readout without the dense affinity: the top k of each column
+/// of `sim` [m, p] as `gpu_cutie_topk_softmax` picks and weighs them (its kernels' picks, written
+/// as each column's rows and weights), then the readout of `values` (memory's values in parts,
+/// [long-term, working], each [v, n_i]) through them, each pixel's k tokens summed best first in
+/// fp32, and each token's usage summed in fixed point so it is the same whatever order the atomics
+/// land in. Out: the readout [v, p] and the usage [1, m]. Not the dense product's bits (zeros not
+/// added, another order), so for fp16 steps only; Metal's `gpu_cutie_topk_sparse_readout` ported.
+pub fn gpu_cutie_topk_sparse_readout(sim: &GpuTensor, k: usize, values: &[&GpuTensor]) -> Result<(GpuTensor, GpuTensor), String> {
+    let op = "gpu_cutie_topk_sparse_readout";
+    cutie_check_f32(op, sim)?;
+    let (m, p) = (sim.rows, sim.cols);
+    let (long, work) = match values {
+        [work] => (None, *work),
+        [long, work] => (Some(*long), *work),
+        _ => return Err(format!("{op}: {} value parts, wants 1 or 2", values.len())),
+    };
+    cutie_check_f32(op, work)?;
+    if let Some(l) = long {
+        cutie_check_f32(op, l)?;
+    }
+    let v = work.rows;
+    let n_long = long.map_or(0, |l| l.cols);
+    if long.is_some_and(|l| l.rows != v) || n_long + work.cols != m {
+        return Err(format!("{op}: values of {n_long} + {} tokens for a similarity of {m}", work.cols));
+    }
+    let k = k.min(m);
+    if k == 0 || k > CUTIE_TOPK_MAX {
+        return Err(format!("{op}: top {k} of {m} rows; the kernel takes 1 to {CUTIE_TOPK_MAX}"));
+    }
+    // Fixed-point units a unit of weight: the largest power of two for which p + 1 fit a u32.
+    let mut scale = 1u64 << 31;
+    while scale > 1 && scale * (p as u64 + 1) > u32::MAX as u64 {
+        scale >>= 1;
+    }
+    let d = |x: usize| cutie_u32(op, x);
+    let (m_u, p_u, k_u) = (d(m)?, d(p)?, k as u32);
+    with_dense_linear_backend(|backend| {
+        backend.prepare_device()?;
+        let readout = GpuTensor::from_pool(v, p)?;
+        let usage = GpuTensor::from_pool(1, m)?;
+        let entries = unsafe { makepad_cuda_cutie_topk_scratch_entries(m_u, p_u, k_u) }.max(1);
+        let keys = GpuTensor::from_pool(entries, 1)?;
+        let idx = GpuTensor::from_pool(entries, 1)?;
+        let weights = GpuTensor::from_pool(k, p)?;
+        let rows = GpuTensor::from_pool(k * p, 1)?;
+        let counts = GpuTensor::from_pool(m, 1)?;
+        let long_ptr = match long {
+            Some(l) => l.device_ptr()?.cast_const(),
+            None => std::ptr::null(),
+        };
+        gpu_check(unsafe {
+            makepad_cuda_cutie_topk_sparse_readout_f32(
+                sim.device_ptr()?, keys.device_ptr()?.cast::<u32>(), idx.device_ptr()?.cast::<u32>(), weights.device_ptr()?,
+                rows.device_ptr()?.cast::<u32>(), counts.device_ptr()?.cast::<u32>(), long_ptr, work.device_ptr()?, readout.device_ptr()?,
+                usage.device_ptr()?, m_u, p_u, k_u, d(v)?, d(n_long)?, d(work.cols)?, scale as f32, backend.stream,
+            )
+        })?;
+        Ok((readout, usage))
     })
 }
 
