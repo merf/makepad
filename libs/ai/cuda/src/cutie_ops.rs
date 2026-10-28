@@ -209,8 +209,9 @@ pub fn gpu_cutie_conv2d_fused_f16(
 pub const GPU_CUTIE_HALF: bool = true;
 
 /// Whether an fp16 step runs even the convolutions Cutie keeps in fp32 under autocast (`pred`, the
-/// sensory updates' `transform`) in half: not on CUDA, which follows autocast.
-pub const GPU_CUTIE_HALF_EVERY_CONV: bool = false;
+/// sensory updates' `transform`) in half: yes, as on Metal (with cuDNN, at 960x540 a propagated
+/// frame 27.0 ms against 30.4; the masks within IoU 0.9985 of fp32, as with those kept fp32).
+pub const GPU_CUTIE_HALF_EVERY_CONV: bool = true;
 
 /// The convolution behind both: f32 columns and weights, or with `half` both in half.
 #[allow(clippy::too_many_arguments)]
