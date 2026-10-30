@@ -11,6 +11,8 @@
 
 use crate::cfg::CfgSet;
 use crate::lexer::{Tok, T};
+use crate::tg;
+use crate::tokbuf::TokBuf;
 use crate::parser::lazy_bodies::{SegRef, TokSeq};
 use crate::pm::{Delimiter, Group, LineColumn, Punct, Spacing, Span, TokenStream, TokenTree};
 #[cfg(test)]
@@ -54,7 +56,7 @@ fn crate_meta(path: &str) -> (String, String, String, String) {
 }
 
 fn crate_meta_uncached(path: &str) -> (String, String, String, String) {
-    crate::gen_local! {
+    crate::memo_local! {
         static CACHE: std::cell::RefCell<crate::fxhash::HashMap<String, (String, String, String, String)>>;
     }
     let mut dir = std::path::Path::new(path).parent().map(|p| p.to_path_buf());
@@ -221,39 +223,29 @@ fn line_col(src: &[u8], ls: &[u32], pos: u32) -> LineColumn {
 
 // ---------------------------------------------------------------- byte payloads
 
-/// Marker prefix of an `include_bytes!` literal whose bytes live in the payload table.
+/// Marker prefix of an `include_bytes!` literal whose bytes live in the payload table. The whole
+/// marker is `\0relax-include:<key>:<path in hex>`: the key (content hash and length) names the
+/// payload, the path names the file it was read from. The marker is part of the expansion text, so
+/// it lives on in front images (a warm start's) while the table is per process: a key the table
+/// does not hold is read again from its file (`payload_of`), checked against the key, and
+/// registered.
 pub const PAYLOAD_MARK: &str = "\\0relax-include:";
 
 static PAYLOADS: relax_session::sync::Mutex<Option<crate::fxhash::HashMap<String, std::sync::Arc<Vec<u8>>>>> = relax_session::sync::Mutex::new(None);
 
-pub(crate) struct ZoneTaken {
-    payloads: Option<crate::fxhash::HashMap<String, std::sync::Arc<Vec<u8>>>>,
-    dirs: Option<crate::fxhash::HashMap<String, (String, String, String, String)>>,
-}
-
-pub(crate) fn zone_take() -> ZoneTaken {
-    let mut payloads = PAYLOADS.lock().unwrap_or_else(|e| e.into_inner());
-    let mut dirs = BY_DIR.lock().unwrap_or_else(|e| e.into_inner());
-    let taken = ZoneTaken { payloads: std::mem::take(&mut *payloads), dirs: std::mem::take(&mut *dirs) };
-    #[cfg(test)]
-    { assert!(payloads.is_none()); assert!(dirs.is_none()); }
-    taken
-}
-
-pub(crate) fn zone_put_back(taken: ZoneTaken) {
-    let mut payloads = PAYLOADS.lock().unwrap_or_else(|e| e.into_inner());
-    std::mem::forget(std::mem::replace(&mut *payloads, taken.payloads));
-    let mut dirs = BY_DIR.lock().unwrap_or_else(|e| e.into_inner());
-    std::mem::forget(std::mem::replace(&mut *dirs, taken.dirs));
-}
-
-/// The payload's key: its hash and length (the same text whichever thread or order includes it;
-/// files parse in parallel), disambiguated in the unlikely case two contents collide.
-fn register_payload(data: Vec<u8>) -> String {
+/// The content part of a payload key: its hash and length (the same text whichever thread or order
+/// includes it; files parse in parallel).
+fn payload_base(data: &[u8]) -> String {
     use std::hash::Hasher;
     let mut h = crate::fxhash::FxHasher::default();
-    h.write(&data);
-    let base = format!("{:016x}{:x}", h.finish(), data.len());
+    h.write(data);
+    format!("{:016x}{:x}", h.finish(), data.len())
+}
+
+/// Registers `data` (read from `path`) and returns the marker's text after PAYLOAD_MARK. The key is
+/// disambiguated in the unlikely case two contents collide.
+fn register_payload(path: &str, data: Vec<u8>) -> String {
+    let base = payload_base(&data);
     let mut g = PAYLOADS.lock().unwrap();
     let p = g.get_or_insert_with(Default::default);
     let mut key = base.clone();
@@ -261,24 +253,55 @@ fn register_payload(data: Vec<u8>) -> String {
     loop {
         match p.get(&key) {
             // the same file included twice is one payload
-            Some(x) if **x == data => return key,
+            Some(x) if **x == data => break,
             Some(_) => {
                 k += 1;
                 key = format!("{}_{}", base, k);
             }
             None => {
                 p.insert(key.clone(), std::sync::Arc::new(data));
-                return key;
+                break;
             }
         }
     }
+    let mut out = key;
+    out.push(':');
+    for b in path.as_bytes() {
+        out.push_str(&format!("{:02x}", b));
+    }
+    out
 }
 
-/// The bytes of a payload marker (`\0relax-include:KEY` after unescaping), if `b` is one.
+/// The bytes of a payload marker (`\0relax-include:KEY:PATH` after unescaping), if `b` is one.
+/// A marker always resolves: a key this generation has not registered (the marker came from a
+/// front image) is read again from its file. A marker that resolves to nothing is an internal
+/// error that names the key, never data (the marker text became a font's bytes once: 2026-10-21).
 pub fn payload_of(b: &[u8]) -> Option<std::sync::Arc<Vec<u8>>> {
     let rest = b.strip_prefix(b"\0relax-include:")?;
-    let key = std::str::from_utf8(rest).ok()?;
-    PAYLOADS.lock().ok()?.as_ref()?.get(key).cloned()
+    let marker = String::from_utf8_lossy(rest);
+    let fail = |why: &str| -> ! { panic!("relax internal error: include_bytes! payload `{marker}`: {why}") };
+    let (key, hex) = marker.split_once(':').unwrap_or_else(|| fail("no source path in the marker"));
+    if let Some(x) = PAYLOADS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(key)) {
+        return Some(x.clone());
+    }
+    let path = (0..hex.len() / 2).map(|i| u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok()).collect::<Option<Vec<u8>>>()
+        .filter(|_| hex.len() % 2 == 0).and_then(|v| String::from_utf8(v).ok())
+        .unwrap_or_else(|| fail("the source path is not hex-encoded UTF-8"));
+    let data = crate::vfs::read(&path).unwrap_or_else(|e| fail(&format!("not registered, and `{path}` could not be read again: {e}")));
+    if key.split('_').next() != Some(payload_base(&data).as_str()) {
+        fail(&format!("not registered, and `{path}` changed since it was included"));
+    }
+    let mut g = PAYLOADS.lock().unwrap_or_else(|e| e.into_inner());
+    let p = g.get_or_insert_with(Default::default);
+    match p.get(key) {
+        Some(x) if **x == data => Some(x.clone()),
+        Some(_) => fail(&format!("not registered, and `{path}` collides with another payload's key")),
+        None => {
+            let x = std::sync::Arc::new(data);
+            p.insert(key.to_string(), x.clone());
+            Some(x)
+        }
+    }
 }
 
 // ---------------------------------------------------------------- the built-in table
@@ -302,6 +325,8 @@ pub enum Builtin {
     Bitflags,
     /// std's `thread_local!` (thread_local_mac.rs)
     ThreadLocal,
+    /// core's `cfg_select!` (rustc_builtin_macros cfg_select.rs)
+    CfgSelect,
 }
 
 const TABLE: &[(&str, Builtin)] = &[
@@ -317,6 +342,7 @@ const TABLE: &[(&str, Builtin)] = &[
     ("include_bytes", Builtin::IncludeBytes),
     ("include", Builtin::Include),
     ("thread_local", Builtin::ThreadLocal),
+    ("cfg_select", Builtin::CfgSelect),
 ];
 
 /// Names of every built-in function-like macro (importing them is a no-op).
@@ -337,18 +363,18 @@ pub fn lookup(name: &str) -> Builtin {
 /// A `macro_rules!` definition Relax replaces with a native expansion: the bitflags crate's
 /// `bitflags!` (MAKEPAD_RUN_NATIVE_BITFLAGS=0 keeps the crate's macro_rules, for A/B measurement).
 pub fn override_rules(options: &crate::options::Options, d: crate::macros::MacroRef) -> crate::macros::MacroRef {
-    if d.name == "bitflags" && d.krate == "bitflags" && options.native_bitflags {
-        crate::gen_local! {
+    if d.name == "bitflags" && crate::crates::base_crate_name(&d.krate) == "bitflags" && options.native_bitflags {
+        crate::memo_local! {
             static BF: std::cell::OnceCell<crate::macros::MacroRef>;
         }
-        return BF.with(|b| b.get_or_init(|| std::sync::Arc::new(crate::macros::MacroDef { name: "bitflags".to_string(), krate: "bitflags".to_string(), exported: true, arms: Vec::new(), builtin: Builtin::Bitflags as u8, def_file: String::new(), def_pos: 0, input: None })).clone());
+        return BF.with(|b| b.get_or_init(|| std::sync::Arc::new(crate::macros::MacroDef { name: "bitflags".to_string(), krate: "bitflags".to_string(), exported: true, arms: Vec::new(), builtin: Builtin::Bitflags as u16, def_file: String::new(), def_pos: 0, def_mod: String::new(), input: None })).clone());
     }
     d
 }
 
 /// `MacroDef.builtin` ids at and above this are function-like proc macros run by the JIT host
 /// (pmhost.rs index).
-pub const HOSTED: u8 = 200;
+pub const HOSTED: u16 = 200;
 
 /// Is `name` a built-in macro or one of the graph's proc macros (importing it is a no-op)?
 pub fn is_macro_name(name: &str) -> bool {
@@ -356,38 +382,30 @@ pub fn is_macro_name(name: &str) -> bool {
 }
 
 /// Built-ins that expand to items (an error there cannot stay with one fn).
-pub fn is_item_level(id: u8) -> bool {
+pub fn is_item_level(id: u16) -> bool {
     if id >= HOSTED {
         return false;
     }
-    matches!(from_u8(id), Builtin::Include | Builtin::Bitflags | Builtin::ThreadLocal)
+    matches!(from_id(id), Builtin::Include | Builtin::Bitflags | Builtin::ThreadLocal | Builtin::CfgSelect)
 }
 
-pub fn from_u8(x: u8) -> Builtin {
-    if x == Builtin::Bitflags as u8 {
+pub fn from_id(x: u16) -> Builtin {
+    if x == Builtin::Bitflags as u16 {
         return Builtin::Bitflags;
     }
     for (_, b) in TABLE {
-        if *b as u8 == x {
+        if *b as u16 == x {
             return *b;
         }
     }
     Builtin::None
 }
 
-crate::gen_local! {
+crate::memo_local! {
     static DEFS: std::cell::RefCell<Vec<Option<crate::macros::MacroRef>>>;
 }
 
-/// The macro definition standing for built-in `name` (no arms; `builtin` set), if any.
-pub fn macro_def(name: &str) -> Option<crate::macros::MacroRef> {
-    let id = match lookup(name) {
-        Builtin::None => match crate::macro_reg::bang_index(name) {
-            Some(i) if i < (256 - HOSTED as usize) => HOSTED + i as u8,
-            _ => return None,
-        },
-        b => b as u8,
-    };
+fn def_for_id(name: &str, id: u16) -> crate::macros::MacroRef {
     DEFS.with(|d| {
         let mut d = d.borrow_mut();
         let i = id as usize;
@@ -395,10 +413,36 @@ pub fn macro_def(name: &str) -> Option<crate::macros::MacroRef> {
             d.resize(i + 1, None);
         }
         if d[i].is_none() {
-            d[i] = Some(std::sync::Arc::new(crate::macros::MacroDef { name: name.to_string(), krate: String::new(), exported: true, arms: Vec::new(), builtin: id, def_file: String::new(), def_pos: 0, input: None }));
+            d[i] = Some(std::sync::Arc::new(crate::macros::MacroDef { name: name.to_string(), krate: String::new(), exported: true, arms: Vec::new(), builtin: id, def_file: String::new(), def_pos: 0, def_mod: String::new(), input: None }));
         }
-        d[i].clone()
+        d[i].clone().unwrap()
     })
+}
+
+/// The macro definition standing for compiler built-in `name` (`TABLE` only, never a hosted proc macro).
+pub fn builtin_macro_def(name: &str) -> Option<crate::macros::MacroRef> {
+    match lookup(name) {
+        Builtin::None => None,
+        b => Some(def_for_id(name, b as u16)),
+    }
+}
+
+/// The macro definition standing for built-in or hosted proc macro `name` as crate `krate` sees it.
+pub fn macro_def_for(krate: &str, name: &str) -> Option<crate::macros::MacroRef> {
+    let id = match lookup(name) {
+        Builtin::None => match crate::macro_reg::bang_index_for(krate, name) {
+            // (u16 ids: a big graph has more than the 56 function-like proc macros a u8 left)
+            Some(i) if i < (u16::MAX - HOSTED) as usize => HOSTED + i as u16,
+            _ => return None,
+        },
+        b => b as u16,
+    };
+    Some(def_for_id(name, id))
+}
+
+/// The macro definition standing for built-in `name` (no arms; `builtin` set), if any.
+pub fn macro_def(name: &str) -> Option<crate::macros::MacroRef> {
+    macro_def_for("", name)
 }
 
 // ---------------------------------------------------------------- tokens -> proc_macro model
@@ -629,7 +673,7 @@ fn stringify_o(buf: Buf, toks: &(impl TokSeq + ?Sized), lo: usize, hi: usize, or
 /// This does not change identifier hygiene or the call-site position of line!().
 fn src_origin(p: &crate::parser::Parser, mut pos: u32) -> u32 {
     let base = p.src.len() as u32;
-    for _ in 0..64 {
+    for _ in 0..4096 {
         if pos < base {
             return pos;
         }
@@ -659,7 +703,7 @@ fn src_origin_end(p: &crate::parser::Parser, z: u32) -> Option<u32> {
 
 fn orig_pos(p: &crate::parser::Parser, mut pos: u32) -> u32 {
     let base = p.src.len() as u32;
-    for _ in 0..64 {
+    for _ in 0..4096 {
         if pos < base {
             break;
         }
@@ -669,10 +713,6 @@ fn orig_pos(p: &crate::parser::Parser, mut pos: u32) -> u32 {
         }
     }
     pos
-}
-
-fn str_lit(s: &str) -> String {
-    format!("{:?}", s)
 }
 
 /// Value of a string literal token's text (`"..."` or `r#"..."#`).
@@ -694,7 +734,7 @@ fn lit_str_value(text: &str) -> Option<String> {
 /// Expands built-in or hosted macro `id` called with the tokens `toks[lo..hi]` (inside the
 /// delimiters); `call_lo..call_hi` is the whole call. Linked proc macros' output tokens are
 /// passed on as tokens (no text round trip).
-pub fn expand(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo: u32, call_hi: u32) -> Result<Expansion, String> {
+pub fn expand(p: &crate::parser::Parser, id: u16, lo: usize, hi: usize, call_lo: u32, call_hi: u32) -> Result<Expansion, String> {
     let _mem = crate::memstat::tag(crate::memstat::Tag::MacroOutput);
     let key = if id >= HOSTED && crate::macro_reg::reusable_bang((id - HOSTED) as usize) {
         crate::parse_work::key_tokens(p, &format!("hosted-bang-{id}"), call_lo, call_hi, lo..hi, item_location(p, call_lo))
@@ -702,19 +742,20 @@ pub fn expand(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo: 
     if let Some(x) = crate::parse_work::get(&key) { return Ok(x); }
     if id >= HOSTED {
         let i = (id - HOSTED) as usize;
-        let ts = expand_pm_ts(p, true, lo, hi, call_lo, call_hi, |input, call| crate::macro_reg::run_bang(p.session, i, input, call))?;
+        let ts = expand_pm_ts(p, true, lo, hi, call_lo, call_hi, |input, call| crate::macro_reg::run_bang_in(p.session, &p.krate, i, input, call))?;
         let mut out = Expansion { text: String::new(), toks: Vec::new(), origins: Vec::new() };
         emit_tokens(&ts.trees, p.edition, &mut out, &mut Vec::new())?;
         crate::parse_work::put(key, &out);
         return Ok(out);
     }
-    if from_u8(id) == Builtin::Include {
+    if from_id(id) == Builtin::Include {
         let (path, data) = include_input(p, lo, hi, call_lo)?;
         let text = String::from_utf8(data).map_err(|_| format!("`{}` is not UTF-8", path))?;
         let sources = p.sources.as_ref().ok_or("include! requires a source registry")?;
         let file = sources.register(&path, std::sync::Arc::from(text.as_bytes()))?;
         let mut toks = Vec::new();
-        crate::lexer::lex(text.as_bytes(), p.edition, &mut toks).map_err(|e| format!("`{path}`: {}", e.msg))?;
+        let lexed = if p.include_as_expr { crate::lexer::lex_keep_shebang(text.as_bytes(), p.edition, &mut toks) } else { crate::lexer::lex(text.as_bytes(), p.edition, &mut toks) };
+        lexed.map_err(|e| format!("`{path}`: {}", e.msg))?;
         toks.retain(|t| t.kind != T::Eof);
         let mut origins = Vec::new();
         let mut origin = |lo, hi| origins.push(TokenOrigin { lo, hi, source: SourceSpan { file, lo, hi } });
@@ -736,7 +777,25 @@ pub fn expand(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo: 
         }
         return Ok(Expansion { text, toks, origins });
     }
-    Expansion::lexed(expand_text(p, id, lo, hi, call_lo, call_hi)?)
+    let g = expand_buf(p, id, lo, hi, call_lo, call_hi)?;
+    if g.origins.is_empty() { return Ok(Expansion::from_buf(g)); }
+    // tokens copied from the input (TokBuf::put_at) keep their source; the others are the call's
+    // (an empty span: no hygiene of their own)
+    let call = p.source_span(call_lo);
+    let call = SourceSpan { hi: call.lo, ..call };
+    let mut origins = Vec::with_capacity(g.toks.len());
+    let mut at = g.origins.iter().peekable();
+    for t in &g.toks {
+        while at.peek().is_some_and(|o| o.0 < t.lo) { at.next(); }
+        let source = match at.peek() {
+            Some(&&(off, o, _)) if off == t.lo => { at.next(); p.source_span(o) }
+            _ => call,
+        };
+        origins.push(TokenOrigin { lo: t.lo, hi: t.hi, source });
+    }
+    let mut x = Expansion::from_buf(g);
+    x.origins = origins;
+    Ok(x)
 }
 
 impl Expansion {
@@ -747,12 +806,12 @@ impl Expansion {
         Ok(out)
     }
 
-    /// Source text of an expansion, lexed.
-    pub fn lexed(text: String) -> Result<Expansion, String> {
-        let mut toks = Vec::new();
-        crate::lexer::lex(text.as_bytes(), 2021, &mut toks).map_err(|e| format!("expands to text that does not lex: {}", e.msg))?;
-        toks.retain(|t| t.kind != T::Eof);
-        Ok(Expansion { text, toks, origins: Vec::new() })
+    /// Tokens built by a built-in (no origins: the expansion maps to its call site).
+    pub fn from_buf(g: TokBuf) -> Self {
+        if crate::parser::verify_tokens() {
+            g.verify("built-in macro");
+        }
+        Self { text: g.s, toks: g.toks, origins: Vec::new() }
     }
 }
 
@@ -771,13 +830,15 @@ fn include_input(p: &crate::parser::Parser, lo: usize, hi: usize, call_lo: u32) 
         format!("{}/{}", crate::program::dir_of(path), rel)
     } else { rel.clone() };
     let path = crate::vfs::normalize_path(&path);
-    let data = crate::vfs::read(&path).map_err(|e| format!("cannot read `{}`: {} -- check the path (relative to this file)", path, e))?;
+    let data = crate::vfs::read(&path).map_err(|e| format!("couldn't read `{}`: {}", path, e))?;
     crate::sip::note_late_input(p.bctx.as_ref().map_or("", |c| c.krate.as_str()), crate::sip::LATE_FILE, &path, Some(&data));
     Ok((path, data))
 }
 
-fn expand_text(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo: u32, call_hi: u32) -> Result<String, String> {
-    let b = from_u8(id);
+fn expand_buf(p: &crate::parser::Parser, id: u16, lo: usize, hi: usize, call_lo: u32, call_hi: u32) -> Result<TokBuf, String> {
+    let b = from_id(id);
+    let one = |kind: T, text: &str| { let mut g = TokBuf::new(p.edition); g.put(kind, text); g };
+    let one_str = |text: &str| { let mut g = TokBuf::new(p.edition); g.str_lit(text); g };
     let buf = Buf { src: p.src, ext: p.ext.view() };
     let toks = &p.toks;
     let ctx = p.bctx.as_deref();
@@ -785,52 +846,72 @@ fn expand_text(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo:
         Builtin::File => {
             let source = p.source_span(call_lo);
             if source.file != 0 {
-                if let Some(sources) = &p.sources { return Ok(str_lit(&file_macro_path(&sources.get(source.file)?.path))); }
+                if let Some(sources) = &p.sources { return Ok(one_str(&file_macro_path(&sources.get(source.file)?.path))); }
             }
             let f = match ctx {
                 Some(c) => c.file_macro.clone(),
                 None => String::new(),
             };
-            return Ok(str_lit(&f));
+            return Ok(one_str(&f));
         }
         Builtin::Line | Builtin::Column => {
             if let Some(span) = p.input_span(call_lo, call_hi) {
                 let value = if b == Builtin::Line { span.start.line } else { span.start.column };
-                return Ok(format!("{}u32", value));
+                return Ok(one(T::Int, &format!("{}u32", value)));
             }
             let pos = orig_pos(p, call_lo);
             let lc = match ctx {
                 Some(c) => line_col(p.src, c.line_starts(p.src), pos),
                 None => line_col(p.src, &line_starts(p.src), pos),
             };
-            return Ok(if b == Builtin::Line { format!("{}u32", lc.line) } else { format!("{}u32", lc.column) });
+            return Ok(one(T::Int, &if b == Builtin::Line { format!("{}u32", lc.line) } else { format!("{}u32", lc.column) }));
         }
         Builtin::ModulePath => {
+            // the package's crate name first, also for a crate renamed to tell two versions of it
+            // apart (crates.rs disambiguate_multi_version_crates; the module keys keep that name)
             let mut m = match ctx {
-                Some(c) => c.module_path.clone(),
-                None => p.krate.clone(),
+                Some(c) => match c.module_path.split_once("::") {
+                    Some((head, rest)) => format!("{}::{}", crate::crates::base_crate_name(head), rest),
+                    None => crate::crates::base_crate_name(&c.module_path).to_string(),
+                },
+                None => crate::crates::base_crate_name(&p.krate).to_string(),
             };
             for s in &p.mod_stack {
                 m.push_str("::");
                 m.push_str(s);
             }
-            return Ok(str_lit(&m));
+            return Ok(one_str(&m));
         }
         Builtin::Stringify => {
-            return Ok(str_lit(&stringify_o(buf, toks, lo, hi, p.tok_origin.view(), p.src.len() as u32)));
+            return Ok(one_str(&stringify_o(buf, toks, lo, hi, p.tok_origin.view(), p.src.len() as u32)));
         }
         Builtin::Env | Builtin::OptionEnv => {
-            let args = lit_args(p, lo, hi)?;
+            // rustc_builtin_macros env.rs: `option_env!` takes one string literal, `env!` one or two
+            let mut args = Vec::new();
+            let runs = split_commas(&p.toks, lo, hi);
+            if b == Builtin::OptionEnv && runs.len() > 1 {
+                return Err("option_env! takes 1 argument".to_string());
+            }
+            if b == Builtin::Env && runs.len() > 2 {
+                return Err("env! takes 1 or 2 arguments".to_string());
+            }
+            for (a, z) in runs {
+                let (v, is_str) = eval_lit(p, a, z)?;
+                if !is_str { return Err("argument must be a string literal".to_string()); }
+                args.push(v);
+            }
             let name = args.first().cloned().ok_or_else(|| "env! takes a variable name -- env!(\"NAME\")".to_string())?;
             let v = env_value(ctx, &name);
             return if b == Builtin::OptionEnv {
-                Ok(match v {
-                    Some(s) => format!("::core::option::Option::Some({})", str_lit(&s)),
-                    None => "::core::option::Option::None::<&'static str>".to_string(),
-                })
+                let mut g = TokBuf::new(p.edition);
+                match v {
+                    Some(s) => tg!(&mut g; :: core :: option :: Option :: Some (#str_lit(&s))),
+                    None => tg!(&mut g; :: core :: option :: Option :: None :: < & 'static str >),
+                }
+                Ok(g)
             } else {
                 match v {
-                    Some(s) => Ok(str_lit(&s)),
+                    Some(s) => Ok(one_str(&s)),
                     None => Err(match args.get(1) {
                         Some(m) => m.clone(),
                         None => format!("environment variable `{}` not defined at compile time -- set it before running makepad run", name),
@@ -840,26 +921,102 @@ fn expand_text(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo:
         }
         Builtin::Concat => {
             let parts = concat_args(p, lo, hi)?;
-            return Ok(str_lit(&parts.concat()));
+            return Ok(one_str(&parts.concat()));
         }
         Builtin::ThreadLocal => {
-            let mut v: Vec<(T, &[u8])> = Vec::new();
+            let mut v: Vec<(T, &[u8], u32)> = Vec::new();
             for i in lo..hi {
                 let t = p.toks.at(i);
-                v.push((t.kind, p.tok_text(t)));
+                v.push((t.kind, p.tok_text(t), t.lo));
             }
-            return crate::thread_local_mac::expand(&v);
+            return crate::thread_local_mac::expand(&v, p.edition);
+        }
+        Builtin::CfgSelect => {
+            // `pred => { tokens }` / `pred => expr,` arms: the first true predicate (`_` is
+            // always true) emits its right-hand side, braces stripped (rustc cfg_select.rs
+            // parse_delimited_token_tree)
+            let ctx = ctx.ok_or_else(|| "cfg_select! needs a crate".to_string())?;
+            let view = crate::parser::lazy_bodies::TokView::new(p.src, &p.toks, &p.ext);
+            let src = view.src();
+            let kind = |i: usize| toks.at(i).kind;
+            let mut i = lo;
+            let mut selected: Option<TokBuf> = None;
+            p.cfg_select_rest.borrow_mut().clear();
+            while i < hi {
+                let pred_lo = i;
+                while i < hi && kind(i) != T::FatArrow {
+                    i += 1;
+                }
+                if i >= hi {
+                    return Err("expected `=>` after a cfg_select! predicate".to_string());
+                }
+                let pred_hi = i;
+                i += 1;
+                let (body_lo, body_hi);
+                if i < hi && kind(i) == T::OpenBrace {
+                    let mut depth = 0;
+                    let open = i;
+                    while i < hi {
+                        match kind(i) {
+                            T::OpenParen | T::OpenBracket | T::OpenBrace => depth += 1,
+                            T::CloseParen | T::CloseBracket | T::CloseBrace => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                    if i >= hi {
+                        return Err("unbalanced braces in a cfg_select! arm".to_string());
+                    }
+                    body_lo = open + 1;
+                    body_hi = i;
+                    i += 1;
+                } else {
+                    body_lo = i;
+                    let mut depth = 0;
+                    while i < hi {
+                        match kind(i) {
+                            T::OpenParen | T::OpenBracket | T::OpenBrace => depth += 1,
+                            T::CloseParen | T::CloseBracket | T::CloseBrace => depth -= 1,
+                            T::Comma if depth == 0 => break,
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                    body_hi = i;
+                }
+                if i < hi && kind(i) == T::Comma {
+                    i += 1;
+                }
+                let wildcard = pred_hi == pred_lo + 1 && buf.get(toks.at(pred_lo).lo, toks.at(pred_lo).hi) == b"_";
+                if selected.is_none() && (wildcard || crate::cfg::eval_tokens(src, pred_lo, pred_hi, &ctx.cfg)) {
+                    let mut g = TokBuf::new(p.edition);
+                    p.copy_toks(&mut g, body_lo, body_hi);
+                    selected = Some(g);
+                } else {
+                    // rustc cfg_select.rs `CfgSelectResult`: the branches not chosen are parsed too (their errors count)
+                    p.cfg_select_rest.borrow_mut().push((body_lo, body_hi));
+                }
+            }
+            if let Some(g) = selected {
+                return Ok(g);
+            }
+            return Err("none of the predicates in this `cfg_select` evaluated to true".to_string());
         }
         Builtin::IncludeStr | Builtin::IncludeBytes => {
             let (path, data) = include_input(p, lo, hi, call_lo)?;
             return if b == Builtin::IncludeStr {
-                let s = String::from_utf8(data).map_err(|_| format!("`{}` is not UTF-8 -- use include_bytes!", path))?;
-                Ok(str_lit(&s))
+                let s = String::from_utf8(data).map_err(|_| format!("`{}` wasn't a utf-8 file", path))?;
+                Ok(one_str(&s))
             } else {
                 // the bytes travel as a payload behind a short marker literal (escaping a
                 // font into `b"\x.."` text and lexing / unescaping it again cost ~4 bytes of
                 // work per byte, three times): lower::unescape_bytes resolves the marker
-                Ok(format!("b\"{}{}\"", PAYLOAD_MARK, register_payload(data)))
+                Ok(one(T::ByteStr, &format!("b\"{}{}\"", PAYLOAD_MARK, register_payload(&path, data))))
             };
         }
         _ => {}
@@ -868,8 +1025,7 @@ fn expand_text(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo:
     let span_of = |a: u32, z: u32| Span { file: 0, lo: a, hi: z, start: LineColumn { line: 1, column: 1 }, end: LineColumn { line: 1, column: 1 } };
     let input = to_stream_buf(buf, toks, lo, hi, &span_of).ok_or_else(|| "unbalanced delimiters in macro input".to_string())?;
     if b == Builtin::Bitflags {
-        let c = if p.krate == "bitflags" { "crate".to_string() } else { "::__relax_crate_bitflags".to_string() };
-        return crate::bitflags_native::expand(&input, &c, p.bctx.as_ref().map(|x| &x.cfg));
+        return crate::bitflags_native::expand(&input, crate::crates::base_crate_name(&p.krate) == "bitflags", p.bctx.as_ref().map(|x| &x.cfg), p.edition);
     }
     let _ = (call_lo, call_hi);
     Err("not a built-in macro".to_string())
@@ -1074,7 +1230,7 @@ fn env_value_inner(ctx: Option<&FileCtx>, name: &str) -> Option<String> {
             "CARGO_MANIFEST_DIR" => return Some(c.manifest_dir.clone()),
             "CARGO_PKG_NAME" => return Some(c.pkg_name.clone()),
             "CARGO_PKG_VERSION" => return Some(c.pkg_version.clone()),
-            "CARGO_CRATE_NAME" => return Some(c.krate.clone()),
+            "CARGO_CRATE_NAME" => return Some(crate::crates::base_crate_name(&c.krate).to_string()),
             _ => {}
         }
     }
@@ -1158,14 +1314,12 @@ fn eval_lit(p: &crate::parser::Parser, a: usize, z: usize) -> Result<(String, bo
         let name = text(i - 1);
         let b = lookup(&name);
         if b != Builtin::None && z >= i + 3 {
-            let out = expand_text(p, b as u8, i + 2, z - 1, toks.at(a).lo, toks.at(z - 1).hi)?;
-            let mut lt = Vec::new();
-            crate::lexer::lex(out.as_bytes(), 2021, &mut lt).map_err(|_| "nested macro output does not lex".to_string())?;
-            if lt.len() >= 1 {
-                let s = &out[lt[0].lo as usize..lt[0].hi as usize];
-                return match lt[0].kind {
+            let out = expand_buf(p, b as u16, i + 2, z - 1, toks.at(a).lo, toks.at(z - 1).hi)?;
+            if let Some(t0) = out.toks.first() {
+                let s = &out.s[t0.lo as usize..t0.hi as usize];
+                return match t0.kind {
                     T::Str | T::RawStr => Ok((lit_str_value(s).unwrap_or_default(), true)),
-                    T::Int | T::Float => Ok((num_lit_value(s, lt[0].kind == T::Int), false)),
+                    T::Int | T::Float => Ok((num_lit_value(s, t0.kind == T::Int), false)),
                     _ => Ok((s.to_string(), false)),
                 };
             }
@@ -1227,7 +1381,7 @@ fn trace_on(what: &str) -> bool {
 }
 
 fn item_location(p: &crate::parser::Parser, mut origin: u32) -> (usize,usize) {
-    for _ in 0..64 {
+    for _ in 0..4096 {
         if origin < p.src.len() as u32 { break; }
         match p.exp_map.iter_rev().find(|(lo,hi,_)| *lo <= origin && origin <= *hi) {
             Some((_,_,at)) if at != origin => origin = at,
@@ -1237,18 +1391,69 @@ fn item_location(p: &crate::parser::Parser, mut origin: u32) -> (usize,usize) {
     if origin >= p.src.len() as u32 {
         if let Some(span) = p.input_span(origin, origin + 1) { return (span.start.line as usize, span.start.column as usize); }
     }
-    crate::lexer::line_col(p.src,origin)
+    // the file's line starts are worked out once (FileCtx), not by counting from byte 0 per item
+    match &p.bctx {
+        Some(c) => c.byte_line_col(p.src, origin),
+        None => crate::lexer::line_col(p.src, origin),
+    }
+}
+
+fn same_tokens(a: &[Tok], b: &[Tok]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.kind == y.kind && x.lo == y.lo && x.hi == y.hi)
+}
+
+/// What a token the parser split in place (`>>` -> `>`, `&&` -> `&`, ..) or unraw'd was in the source.
+const SPLIT_FORMS: [(&[u8], T); 10] = [
+    (b">>", T::Shr), (b">=", T::Ge), (b">>=", T::ShrEq), (b"<<", T::Shl), (b"<=", T::Le),
+    (b"<<=", T::ShlEq), (b"<-", T::LArrow), (b"&&", T::AndAnd), (b"||", T::OrOr), (b"+=", T::PlusEq),
+];
+
+/// The token as the lexer made it: `t` follows a gap that starts at `prev_hi`.
+fn unsplit(buf: &Buf, prev_hi: u32, t: Tok) -> Tok {
+    match t.kind {
+        T::Ident if t.lo >= prev_hi + 2 && buf.get(t.lo - 2, t.lo) == b"r#" => Tok { kind: T::RawIdent, lo: t.lo - 2, hi: t.hi },
+        T::Gt | T::Eq | T::Ge | T::Lt | T::Le | T::Minus | T::And | T::Or => {
+            for n in [2u32, 1] {
+                if t.lo < prev_hi + n {
+                    continue;
+                }
+                let text = buf.get(t.lo - n, t.hi);
+                if let Some(&(_, kind)) = SPLIT_FORMS.iter().find(|(s, _)| *s == text) {
+                    return Tok { kind, lo: t.lo - n, hi: t.hi };
+                }
+            }
+            t
+        }
+        _ => t,
+    }
+}
+
+/// The tokens `lo..hi` of the parser, as the source spelled them, with positions relative to
+/// `item_lo` and a closing Eof (what lexing the item's text gives).
+fn item_tokens(p: &crate::parser::Parser, buf: &Buf, lo: usize, hi: usize, item_lo: u32) -> Vec<Tok> {
+    let mut v = Vec::with_capacity(hi - lo + 1);
+    let mut prev_hi = item_lo;
+    for i in lo..hi {
+        let t = unsplit(buf, prev_hi, p.toks.at(i));
+        prev_hi = t.hi;
+        v.push(Tok { kind: t.kind, lo: t.lo - item_lo, hi: t.hi - item_lo });
+    }
+    let e = prev_hi - item_lo;
+    v.push(Tok { kind: T::Eof, lo: e, hi: e });
+    v
 }
 
 /// Derives of one item, from its source bytes (`item_lo`: its position, for diagnostics).
 /// Linked derives run natively, the rest through the JIT host (pmhost.rs; any thread).
-fn expand_item(sess: &std::sync::Arc<crate::Session>, path: &str, item: &[u8], item_lo: u32, location: (usize, usize), cfg: Option<&CfgSet>, edition: u16, authored: Option<&dyn Fn(u32, u32) -> Option<Span>>) -> Result<ItemOut, (u32, String)> {
+fn expand_item(sess: &std::sync::Arc<crate::Session>, krate: &str, path: &str, item: &[u8], fresh: Vec<Tok>, item_lo: u32, location: (usize, usize), cfg: Option<&CfgSet>, edition: u16, authored: Option<&dyn Fn(u32, u32) -> Option<Span>>) -> Result<ItemOut, (u32, String)> {
     let span_of = |a: u32, z: u32| authored.and_then(|f| f(item_lo + a, item_lo + z)).unwrap_or(Span { file: 0, lo: item_lo + a, hi: item_lo + z, start: LineColumn { line: 1, column: 1 }, end: LineColumn { line: 1, column: 1 } });
-    // lexed from the item's own text: parsing rewrites tokens in place (`>>` closing two
-    // generic lists becomes `>`), so the parser's token list no longer spells the source
-    let mut fresh = Vec::new();
-    if crate::lexer::lex(item, 2021, &mut fresh).is_err() {
-        return Err((item_lo, "derive input does not lex".to_string()));
+    // the item's own tokens (parsing rewrites tokens in place, `>>` closing two generic lists
+    // becomes `>`: callers hand over the tokens as the source spelled them)
+    if crate::parser::verify_tokens() {
+        let mut lexed = Vec::new();
+        if crate::lexer::lex(item, 2021, &mut lexed).is_err() || !same_tokens(&lexed, &fresh) {
+            crate::tokbuf::verify_fail(&format!("derive input tokens differ from the lexed item text at {item_lo}: lexed {:?} given {:?} in `{}`", lexed.iter().map(|t| (t.kind, t.lo, t.hi)).collect::<Vec<_>>(), fresh.iter().map(|t| (t.kind, t.lo, t.hi)).collect::<Vec<_>>(), String::from_utf8_lossy(item)));
+        }
     }
     let input = match to_stream_buf(Buf::plain(item), &fresh, 0, fresh.len(), &span_of) {
         Some(s) => s,
@@ -1269,7 +1474,7 @@ fn expand_item(sess: &std::sync::Arc<crate::Session>, path: &str, item: &[u8], i
     let mut scratch = Vec::new();
     for name in names {
         // The host selects a source-matched linked library or the sandboxed JIT.
-        let r = match crate::macro_reg::run_derive(sess, &name, &item_ts, call) {
+        let r = match crate::macro_reg::run_derive_in(sess, krate, &name, &item_ts, call) {
             Some(r) => r,
             // no host for this derive: leave the item as it is
             None => return Ok(ItemOut::Nothing),
@@ -1283,10 +1488,8 @@ fn expand_item(sess: &std::sync::Arc<crate::Session>, path: &str, item: &[u8], i
                 }
                 let (line,col) = location;
                 crate::macro_reg::derive_failed(path, item_lo, line as u32,col as u32, &name, &m);
-                let e = format!("compile_error!({:?});", format!("derive({}): {}", name, m));
-                let mut et = Vec::new();
-                let _ = crate::lexer::lex(e.as_bytes(), 2021, &mut et);
-                emit_lexed(&e, &et, call.into(), &mut out);
+                let e = TokBuf::compile_error(edition, &format!("derive({}): {}", name, m), true);
+                emit_lexed(&e.s, &e.toks, call.into(), &mut out);
                 continue;
             }
         };
@@ -1431,6 +1634,13 @@ fn emit_tokens(trees: &[TokenTree], edition: u16, out: &mut Expansion, scratch: 
     Ok(())
 }
 
+/// Proc-macro style trees as tokens over their own text (no origins).
+pub fn trees_to_buf(trees: &[TokenTree], edition: u16) -> Result<TokBuf, String> {
+    let mut out = Expansion { text: String::new(), toks: Vec::new(), origins: Vec::new() };
+    emit_tokens(trees, edition, &mut out, &mut Vec::new())?;
+    Ok(TokBuf::from_parts(edition, out.text, out.toks))
+}
+
 fn push_tok(out: &mut Expansion, s: &str, kind: T, source: SourceSpan) {
     let lo = out.text.len() as u32;
     out.text.push_str(s);
@@ -1466,7 +1676,7 @@ fn single_punct(c: char) -> Option<T> {
     })
 }
 
-crate::gen_local! {
+crate::memo_local! {
     /// derive expansions computed ahead in parallel (pre_expand_derives): (file, item byte range)
     static PRE: std::cell::RefCell<crate::fxhash::HashMap<(String, u32, u32), Result<Option<Expansion>, (u32, String)>>>;
 }
@@ -1526,8 +1736,20 @@ fn derive_items_inner(p: &crate::parser::Parser, attrs: &[crate::ast::Attr], lo:
     // MAKEPAD_RUN_REUSE_VERIFY=1: every reused derive expansion is recomputed and must be identical.
     if reused.is_some() && std::env::var_os("MAKEPAD_RUN_REUSE_VERIFY").is_none() { return Ok(reused); }
     crate::macro_reg::add_pre(false);
+    // an item of expansion text has its tokens (as the source spelled them); an authored item's
+    // tokens are the source's own (the parser's are the configured view: `#[cfg_attr]` expanded,
+    // disabled items gone, synthetic `#[`)
+    let fresh = if item_lo >= p.src.len() as u32 {
+        item_tokens(p, &buf, lo, hi, item_lo)
+    } else {
+        let mut v = Vec::new();
+        if crate::lexer::lex(buf.get(item_lo, item_hi), 2021, &mut v).is_err() {
+            return Err((item_lo, "derive input does not lex".to_string()));
+        }
+        v
+    };
     let cfg = p.bctx.as_ref().map(|c| &c.cfg);
-    let r = expand_item(sess, p.bctx.as_ref().map_or("", |c| c.path.as_str()), buf.get(item_lo, item_hi), item_lo, item_location(p,item_lo), cfg, p.edition, Some(&|lo, hi| p.input_span(lo, hi)));
+    let r = expand_item(sess, &p.krate, p.bctx.as_ref().map_or("", |c| c.path.as_str()), buf.get(item_lo, item_hi), fresh, item_lo, item_location(p,item_lo), cfg, p.edition, Some(&|lo, hi| p.input_span(lo, hi)));
     match r? {
         ItemOut::Done(x) => {
             if let Some(reused) = reused {
@@ -1543,15 +1765,15 @@ fn derive_items_inner(p: &crate::parser::Parser, attrs: &[crate::ast::Attr], lo:
 }
 
 /// The attribute macro on an item (`attrs`, as parsed): the index of the first attribute naming
-/// a registered `#[proc_macro_attribute]` (last path segment) that is not a helper attribute of
+/// a registered `#[proc_macro_attribute]` and its entry, excluding a helper attribute of
 /// one of the item's derives (rustc: an attribute in scope as both would be ambiguous; makepad's
-/// derives own many plain names). Only attributes written as `#[..]` (not cfg_attr output).
-pub fn attr_macro_at(p: &crate::parser::Parser, attrs: &[crate::ast::Attr]) -> Option<usize> {
+/// derives own many plain names). cfg_attr output is already in attribute order.
+pub fn attr_macro_at(p: &crate::parser::Parser, attrs: &[crate::ast::Attr]) -> Option<(usize, crate::macro_reg::Entry)> {
     let buf = Buf { src: p.src, ext: p.ext.view() };
     let toks = &p.toks;
     let text = |i: usize| std::str::from_utf8(buf.get(toks.at(i).lo, toks.at(i).hi)).unwrap_or("").trim_start_matches("r#").to_string();
     let mut derives: Vec<String> = Vec::new();
-    let mut cand: Option<(usize, String)> = None;
+    let mut cand = None;
     for (k, a) in attrs.iter().enumerate() {
         let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
         if hi <= lo || hi > toks.len() {
@@ -1566,7 +1788,7 @@ pub fn attr_macro_at(p: &crate::parser::Parser, attrs: &[crate::ast::Attr]) -> O
             }
             continue;
         }
-        if cand.is_some() || lo < 2 || toks.at(lo - 2).kind != T::Pound || toks.at(lo - 1).kind != T::OpenBracket || toks.get(hi).map(|t| t.kind) != Some(T::CloseBracket) {
+        if cand.is_some() {
             continue;
         }
         // the path: idents joined by `::`
@@ -1583,18 +1805,92 @@ pub fn attr_macro_at(p: &crate::parser::Parser, attrs: &[crate::ast::Attr]) -> O
         // `#[relax(O2)]` / `#[relax(O3)]` / `#[relax(O3, always)]` (makepad-relax): read by Relax
         // itself from the item's attributes (relax_level), never expanded; other arguments run
         // the macro, whose compile_error! reports them
-        if last == "relax" && relax_level_toks(&text, toks, i, hi).is_some() {
+        if last == "relax" && (relax_level_toks(&text, toks, i, hi).is_some() || relax_keep_toks(&text, toks, i, hi)) {
             continue;
         }
-        if !last.is_empty() && crate::macro_reg::has_attr(&last) {
-            cand = Some((k, last));
+        let entry = if i == lo + 1 && matches!(last.as_str(), "test" | "bench" | "test_case") {
+            test_attr_entry(p, lo, &last)
+        } else {
+            crate::macro_reg::attr_entry_for(&p.krate, &last)
+        };
+        if let Some(entry) = entry {
+            cand = Some((k, last, entry));
         }
     }
-    let (k, name) = cand?;
+    let (k, name, entry) = cand?;
     if crate::macro_reg::is_derive_helper(&name, &derives) {
         return None;
     }
-    Some(k)
+    Some((k, entry))
+}
+
+/// compiler/rustc_resolve/src/ident.rs `visit_scopes` / `hygienic_lexical_parent`:
+/// module/block imports, then macro_use, then the std prelude. library/core/src/macros/mod.rs
+/// defines test, bench and test_case as builtins; library/core/src/prelude/v1.rs exports them.
+fn test_attr_entry(p: &crate::parser::Parser, mut at: usize, name: &str) -> Option<crate::macro_reg::Entry> {
+    if crate::macro_reg::in_world() { return None; }
+    let scope = p.macros.as_ref()?;
+    let module = p.cur_module();
+    // The prescan's CrateMods flattens block imports into modules. Scan the enclosing
+    // ranges instead, including later uses (Reference names/scopes.md: item scopes),
+    // skipping sibling blocks/modules and stopping at the nearest module boundary.
+    let mut ranges = Vec::new();
+    loop {
+        let start = (0..at).rev().find(|&i| p.toks.at(i).kind == T::Eof).map_or(0, |i| i + 1);
+        let end = (at..p.toks.len()).find(|&i| p.toks.at(i).kind == T::Eof).unwrap_or(p.toks.len());
+        let mut local = vec![(start, end)];
+        let mut module_boundary = false;
+        let mut i = start;
+        while i < at {
+            if matches!(p.toks.at(i).kind, T::OpenBrace | T::OpenParen | T::OpenBracket) {
+                let close = p.tok_close_of(i, end)?;
+                if close >= at && p.toks.at(i).kind == T::OpenBrace {
+                    if i >= 2 && p.toks.at(i - 2).kind == T::KwMod {
+                        local.clear();
+                        module_boundary = true;
+                    }
+                    local.push((i + 1, close));
+                    i += 1;
+                } else {
+                    i = close + 1;
+                }
+            } else { i += 1; }
+        }
+        ranges.extend(local.into_iter().rev());
+        if module_boundary { break; }
+        // Expansion tokens are appended after EOF; their outer scopes are at the call.
+        let pos = p.toks.at(at).lo;
+        let Some((_, (lo, hi, call))) = p.exp_map.floor(pos) else { break };
+        if pos < lo || pos >= hi { break; }
+        let Some(call_at) = (0..start).rev().find(|&i| p.toks.at(i).lo <= call && call < p.toks.at(i).hi) else { break };
+        at = call_at;
+    }
+    let view = crate::parser::lazy_bodies::TokView::new(p.src, &p.toks, &p.ext);
+    for (start, end) in ranges {
+        let mut uses = Vec::new();
+        let mut i = start;
+        while i < end {
+            match p.toks.at(i).kind {
+                T::KwUse => {
+                    let stop = (i + 1..end).find(|&j| p.toks.at(j).kind == T::Semi)?;
+                    let active = p.bctx.as_ref().map_or(true, |ctx| {
+                        let attrs = crate::cfg::attrs_before(view.src(), i, &ctx.cfg);
+                        crate::cfg::active(view.src(), &attrs, &ctx.cfg)
+                    });
+                    if active {
+                        let toks = p.toks.range(i + 1, stop);
+                        let text = |k: usize| String::from_utf8_lossy(p.tok_text(toks[k])).trim_start_matches("r#").to_string();
+                        crate::preload::use_tree(&text, &toks, 0, toks.len(), &[], &module, false, &mut uses);
+                    }
+                    i = stop + 1;
+                }
+                T::OpenBrace | T::OpenParen | T::OpenBracket => i = p.tok_close_of(i, end)? + 1,
+                _ => i += 1,
+            }
+        }
+        if let Some(entry) = scope.attr_import(&p.krate, &module, &uses, name) { return entry; }
+    }
+    scope.attr_macro_use(&p.krate, name)
 }
 
 /// Optimisation level of a `relax(..)` attribute's arguments at tokens [i, hi) (i at the `(`):
@@ -1612,19 +1908,22 @@ pub fn relax_level_toks(text: &dyn Fn(usize) -> String, toks: &(impl TokSeq + ?S
     }
 }
 
-/// Runs the attribute macro of attribute `attr` on the item at tokens [lo, hi) (its own
-/// attributes included, that one removed): its output replaces the item. The arguments are the
+/// Whether a `relax(..)` attribute's arguments at tokens [i, hi) are `(keep_reachable)`.
+pub fn relax_keep_toks(text: &dyn Fn(usize) -> String, toks: &(impl TokSeq + ?Sized), i: usize, hi: usize) -> bool {
+    i < hi && toks.at(i).kind == T::OpenParen && (i + 1..hi).map(|k| text(k)).collect::<Vec<_>>() == ["keep_reachable", ")"]
+}
+
+/// Runs attribute `attrs[k]` on tokens [lo, hi); `head` follows the outer attributes.
+/// That attribute is removed and its output replaces the item. The arguments are the
 /// tokens of the attribute's delimited group after the path (none for a bare `#[name]`). A
 /// failed expansion leaves a `compile_error!` item and is a reported failure (derive_failed).
-pub fn expand_attr_macro(p: &crate::parser::Parser, attr: &crate::ast::Attr, lo: usize, hi: usize) -> Result<Expansion, (u32, String)> {
+pub fn expand_attr_macro(p: &crate::parser::Parser, attrs: &[crate::ast::Attr], k: usize, entry: &crate::macro_reg::Entry, lo: usize, head: usize, hi: usize) -> Result<Expansion, (u32, String)> {
     let _timing = crate::parse_work::time(3);
     let buf = Buf { src: p.src, ext: p.ext.view() };
     let toks = &p.toks;
-    let (alo, ahi) = (attr.toks.lo as usize, attr.toks.hi as usize);
+    let (alo, ahi) = (attrs[k].toks.lo as usize, attrs[k].toks.hi as usize);
     let item_lo = toks.at(lo).lo;
     let item_hi = toks.at(hi.saturating_sub(1)).hi;
-    let cut_lo = toks.at(alo - 2).lo;
-    let cut_hi = toks.at(ahi).hi;
     let path = p.bctx.as_ref().map_or("", |c| c.path.as_str());
     // the attribute's name and arguments
     let mut i = alo;
@@ -1642,31 +1941,68 @@ pub fn expand_attr_macro(p: &crate::parser::Parser, attr: &crate::ast::Attr, lo:
     };
     // a pure attribute macro's expansion is a function of the item's tokens and spans
     // (the derive reuse rule; the key covers the attribute, its arguments and the item)
-    let key = if crate::macro_reg::reusable_attr(&name) {
-        crate::parse_work::key_tokens(p, &format!("hosted-attr-{name}"), item_lo, item_hi, lo..hi, item_location(p, item_lo))
+    let key = if crate::macro_reg::reusable_attr(entry) {
+        crate::parse_work::key_tokens(p, &format!("hosted-attr-{}-{}", entry.unit, entry.fname), item_lo, item_hi, lo..hi, item_location(p, item_lo))
     } else { None };
     let reused = crate::parse_work::get(&key);
     // MAKEPAD_RUN_REUSE_VERIFY=1: every reused expansion is recomputed and must be identical.
     if reused.is_some() && std::env::var_os("MAKEPAD_RUN_REUSE_VERIFY").is_none() { return Ok(reused.unwrap()); }
-    // the item without that attribute
-    let mut item: Vec<u8> = buf.get(item_lo, cut_lo).to_vec();
-    item.push(b' ');
-    item.extend_from_slice(buf.get(cut_hi, item_hi));
     let span_of = |a: u32, z: u32| p.input_span(a, z).unwrap_or(Span { file: 0, lo: a, hi: z, start: LineColumn { line: 1, column: 1 }, end: LineColumn { line: 1, column: 1 } });
-    let stream = |text: &[u8], offset: &dyn Fn(u32) -> u32| -> Result<TokenStream, (u32, String)> {
+    let stream = |text: &[u8], offset: u32| -> Result<TokenStream, (u32, String)> {
         let mut t = Vec::new();
         if crate::lexer::lex(text, 2021, &mut t).is_err() {
             return Err((item_lo, format!("#[{}] input does not lex", name)));
         }
-        to_stream_buf(Buf::plain(text), &t, 0, t.len(), &|a, z| span_of(offset(a), offset(z))).ok_or_else(|| (item_lo, format!("unbalanced delimiters in #[{}] input", name)))
+        to_stream_buf(Buf::plain(text), &t, 0, t.len(), &|a, z| span_of(offset + a, offset + z)).ok_or_else(|| (item_lo, format!("unbalanced delimiters in #[{}] input", name)))
     };
     let args_lo = if i + 1 < ahi { toks.at(i + 1).lo.min(toks.at(ahi - 1).lo) } else { item_lo };
-    let attr_ts = stream(&args, &|a| args_lo + a)?;
-    let before = cut_lo - item_lo;
-    let item_ts = stream(&item, &|a| if a <= before { item_lo + a } else { cut_hi + a - before - 1 })?;
+    let attr_ts = stream(&args, args_lo)?;
+    // compiler/rustc_expand/src/config.rs: StripUnconfigured::process_cfg_attr/expand_cfg_attr;
+    // expand.rs: InvocationCollector::take_first_attr. Configure before resolving, then remove
+    // only the selected attribute. cfg_attr leaves sub-ranges, not literal `#[..]` wrappers.
+    let body_lo = toks.at(head).lo;
+    // Doc comments are attributes too, but are absent from the parser's Attr list.
+    let prefix = buf.get(item_lo, body_lo);
+    let mut leading = Vec::new();
+    let opts = crate::lexer::LexOptions { edition: p.edition, mode: crate::lexer::Mode::Rust, trivia: true };
+    crate::lexer::lex_with(prefix, &opts, &mut leading).map_err(|_| (item_lo, format!("#[{}] input does not lex", name)))?;
+    let mut docs = Vec::new();
+    let mut depth = 0;
+    for t in leading {
+        match t.kind {
+            T::OpenParen | T::OpenBracket | T::OpenBrace => depth += 1,
+            T::CloseParen | T::CloseBracket | T::CloseBrace => depth -= 1,
+            T::DocComment if depth == 0 => {
+                let doc = to_stream_buf(Buf::plain(prefix), &[t][..], 0, 1, &|a, z| span_of(item_lo + a, item_lo + z)).unwrap();
+                docs.push((item_lo + t.lo, doc));
+            }
+            _ => {}
+        }
+    }
+    let mut docs = docs.into_iter().peekable();
+    let mut trees = Vec::new();
+    for (j, a) in attrs.iter().enumerate() {
+        if a.toks.lo == a.toks.hi { continue; }
+        let start = toks.at(a.toks.lo as usize).lo;
+        while docs.peek().is_some_and(|(lo, _)| *lo < start) {
+            trees.extend(docs.next().unwrap().1.trees);
+        }
+        if j == k { continue; }
+        let end = toks.at(a.toks.hi as usize - 1).hi;
+        let span = span_of(start, end);
+        let mut hash = Punct::new('#', Spacing::Alone);
+        hash.set_span(span);
+        trees.push(TokenTree::Punct(hash));
+        let mut group = Group::new(Delimiter::Bracket, stream(buf.get(start, end), start)?);
+        group.set_span(span);
+        trees.push(TokenTree::Group(group));
+    }
+    for (_, doc) in docs { trees.extend(doc.trees); }
+    trees.extend(stream(buf.get(body_lo, item_hi), body_lo)?.trees);
+    let item_ts = TokenStream { trees };
     let call = span_of(item_lo, item_hi);
     let mut out = Expansion { text: String::from(" "), toks: Vec::new(), origins: Vec::new() };
-    match crate::macro_reg::run_attr(p.session, &name, &attr_ts, &item_ts, call) {
+    match crate::macro_reg::run_attr(p.session, &p.krate, entry, &attr_ts, &item_ts, call) {
         Ok(ts) => {
             emit_tokens(&ts.trees, p.edition, &mut out, &mut Vec::new()).map_err(|m| (item_lo, m))?;
             if trace_on("expand:attr") {
@@ -1683,10 +2019,8 @@ pub fn expand_attr_macro(p: &crate::parser::Parser, attr: &crate::ast::Attr, lo:
         Err(m) => {
             let (line,col) = item_location(p,item_lo);
             crate::macro_reg::derive_failed(path, item_lo,line as u32,col as u32, &format!("#[{}]", name), &m);
-            let e = format!("compile_error!({:?});", format!("#[{}]: {}", name, m));
-            let mut et = Vec::new();
-            let _ = crate::lexer::lex(e.as_bytes(), 2021, &mut et);
-            emit_lexed(&e, &et, call.into(), &mut out);
+            let e = TokBuf::compile_error(p.edition, &format!("#[{}]: {}", name, m), true);
+            emit_lexed(&e.s, &e.toks, call.into(), &mut out);
         }
     }
     out.text.push('\n');
@@ -1696,7 +2030,7 @@ pub fn expand_attr_macro(p: &crate::parser::Parser, attr: &crate::ast::Attr, lo:
 /// Expands the derives of a crate's files ahead of parsing, in parallel (the parser takes
 /// the results by item position; anything missed is expanded when parsed). `files`: (path,
 /// source, tokens) as the macro prescan lexed them.
-pub fn pre_expand_derives(files: &[(&str, &[u8], &[Tok])], cfg: &CfgSet, edition: u16) {
+pub fn pre_expand_derives(krate: &str, files: &[(&str, &[u8], &[Tok])], cfg: &CfgSet, edition: u16) {
     let sess = &cfg.session;
     if !cfg.session.options.derives || !cfg.session.options.pre_derives {
         return;
@@ -1719,10 +2053,10 @@ pub fn pre_expand_derives(files: &[(&str, &[u8], &[Tok])], cfg: &CfgSet, edition
     let t_wall = std::time::Instant::now();
     let jobs = crate::preload::jobs();
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let results: Vec<Vec<(usize, Result<ItemOut, (u32, String)>)>> = std::thread::scope(|sc| {
+    let results: Vec<Vec<(usize, Result<ItemOut, (u32, String)>)>> = crate::pool::scope(|sc| {
         let mut hs = Vec::new();
         for _ in 0..jobs.min(sites.len()) {
-            hs.push(sc.spawn(|| { let _z = crate::zone_alloc::compiler_thread();
+            hs.push(sc.spawn(|| {
                 let mut out = Vec::new();
                 loop {
                     let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1731,7 +2065,7 @@ pub fn pre_expand_derives(files: &[(&str, &[u8], &[Tok])], cfg: &CfgSet, edition
                     }
                     let (fi, lo, hi) = sites[k];
                     let src = files[fi].1;
-                    out.push((k, expand_item(sess, files[fi].0, &src[lo as usize..hi as usize], lo, crate::lexer::line_col_at(&lines[fi], src.len(), lo), Some(cfg), edition, None)));
+                    out.push((k, expand_item(sess, krate, files[fi].0, &src[lo as usize..hi as usize], site_tokens(files[fi].2, lo, hi), lo, crate::lexer::line_col_at(&lines[fi], src.len(), lo), Some(cfg), edition, None)));
                 }
                 out
             }));
@@ -1759,6 +2093,15 @@ pub fn pre_expand_derives(files: &[(&str, &[u8], &[Tok])], cfg: &CfgSet, edition
         }
     });
     crate::macro_reg::add_pre_wall(t_wall.elapsed().as_nanos() as u64);
+}
+
+/// The prescan's tokens of the byte range `lo..hi`, relative to `lo`, with a closing Eof.
+fn site_tokens(toks: &[Tok], lo: u32, hi: u32) -> Vec<Tok> {
+    let a = toks.partition_point(|t| t.lo < lo);
+    let b = toks.partition_point(|t| t.hi <= hi);
+    let mut v: Vec<Tok> = toks[a..b.max(a)].iter().filter(|t| t.kind != T::Eof).map(|t| Tok { kind: t.kind, lo: t.lo - lo, hi: t.hi - lo }).collect();
+    v.push(Tok { kind: T::Eof, lo: hi - lo, hi: hi - lo });
+    v
 }
 
 /// Items carrying a `derive(..)` attribute that names a derive Relax runs (is_derive): `f(item lo, item hi)`
@@ -2007,6 +2350,9 @@ pub fn cfg_holds(pred: &[TokenTree], cfg: Option<&CfgSet>) -> bool {
                 _ => false,
             }
         }
+        // `cfg(true)` / `cfg(false)` (boolean literals, stable since 1.88)
+        [TokenTree::Ident(n)] if n.to_string() == "true" => true,
+        [TokenTree::Ident(n)] if n.to_string() == "false" => false,
         [TokenTree::Ident(n)] => cfg.set.iter().any(|x| *x == n.to_string()),
         [TokenTree::Ident(n), TokenTree::Punct(e), TokenTree::Literal(v)] if e.as_char() == '=' => {
             let v = v.to_string();
@@ -2135,8 +2481,8 @@ pub fn prescan_defs(cfg: &CfgSet, name: &str, arg_src: &[u8], krate: &str) -> Ve
         Some(s) => s,
         None => return v,
     };
-    let r = match crate::macro_reg::bang_index(name) {
-        Some(i) => crate::macro_reg::run_bang(sess, i, input, Span::DUMMY),
+    let r = match crate::macro_reg::bang_index_for(krate, name).or_else(|| crate::macro_reg::bang_index(name)) {
+        Some(i) => crate::macro_reg::run_bang_in(sess, krate, i, input, Span::DUMMY),
         None => return v,
     };
     let text = match r.map(|ts| render(&ts)) {
@@ -2199,7 +2545,7 @@ fn prescan_rules(tb: &[u8], krate: &str, cfg: &CfgSet) -> Vec<crate::macros::Mac
             let exported = attrs.iter().find(|a| a.toks.hi > a.toks.lo && tx(a.toks.lo as usize) == b"macro_export");
             let mt: Vec<crate::macros::MTok> =
                 t2[open + 1..close.min(t2.len())].iter().map(|t| crate::macros::MTok { kind: t.kind, text: String::from_utf8_lossy(&tb[t.lo as usize..t.hi as usize]).into_owned(), pos: u32::MAX }).collect();
-            if let Ok(mut def) = crate::macros::parse_def(&mname, krate, &mt) {
+            if let Ok(mut def) = crate::macros::parse_def(&mname, krate, 2021, &mt) {
                 def.exported = exported.is_some();
                 if exported.is_some_and(|a| (a.toks.lo..a.toks.hi).any(|k| tx(k as usize) == b"local_inner_macros")) {
                     crate::macros::local_inner_macros(&mut def);
@@ -2215,6 +2561,13 @@ fn prescan_rules(tb: &[u8], krate: &str, cfg: &CfgSet) -> Vec<crate::macros::Mac
 
 #[cfg(test)]
 mod pm_input_tests {
+
+    /// An expansion given as text, lexed here (the parser takes tokens only).
+    fn expand_lexed(p: &mut crate::parser::Parser, text: &str, call_lo: u32) -> usize {
+        let mut toks = Vec::new();
+        assert!(crate::lexer::lex(text.as_bytes(), 2021, &mut toks).is_ok());
+        p.expand_toks(text, &toks, call_lo)
+    }
     use super::*;
 
     #[test]
@@ -2311,7 +2664,7 @@ mod pm_input_tests {
         p.token_input = true;
         p.sources = Some(sources);
         p.bctx = Some(std::rc::Rc::new(FileCtx::new("test", "/fake/module.rs", "test", &CfgSet::host(&sess, &[]))));
-        let start = p.expand_text("forward", "r#type", base).unwrap_or_else(|e| panic!("{}", e.msg));
+        let start = expand_lexed(&mut p, "r#type", base);
         let nested = p.toks.at(start).lo;
         p.tok_origin.push((nested, base, 6));
         for needed in [false, true] {
@@ -2363,20 +2716,66 @@ mod pm_input_tests {
         // expansion index. Deliberately use a single long line, as generated text does.
         p.ext.extend(std::iter::repeat_n(b' ', 2_000_000 - p.ext.len()));
         compare(&p, 0, p.toks.len(), 0, src.len() as u32);
-        let start = p.expand_text("test", "(forwarded >>= 2)", 0).unwrap_or_else(|e| panic!("{}", e.msg));
+        let start = expand_lexed(&mut p, "(forwarded >>= 2)", 0);
         let base = p.toks.at(start).lo;
         p.tok_origin.push((base + 1, 0, 2));
         compare(&p, start, p.toks.len(), base, p.toks.last().unwrap().hi);
         // Nested substitution, resolving a fragment through the preceding expansion.
-        let start = p.expand_text("test", "[forwarded]", base).unwrap_or_else(|e| panic!("{}", e.msg));
+        let start = expand_lexed(&mut p, "[forwarded]", base);
         let nested = p.toks.at(start).lo;
         p.tok_origin.push((nested + 1, base + 1, 2));
         compare(&p, start, p.toks.len(), nested, p.toks.last().unwrap().hi);
         // No call-site mapping: exercise the lazy expansion index, Unicode and EOF.
         p.exp_map.clear();
         p.tok_origin.clear();
-        let start = p.expand_text("test", "\n(\"é中🦀\", x)", u32::MAX).unwrap_or_else(|e| panic!("{}", e.msg));
+        let start = expand_lexed(&mut p, "\n(\"é中🦀\", x)", u32::MAX);
         p.exp_map.clear();
         compare(&p, start, p.toks.len(), p.toks.at(start).lo, p.toks.last().unwrap().hi);
+    }
+}
+
+#[cfg(test)]
+mod payload_tests {
+    use super::*;
+
+    fn marker_bytes(text: &str) -> Vec<u8> {
+        let mut b = b"\0relax-include:".to_vec();
+        b.extend_from_slice(text.as_bytes());
+        b
+    }
+
+    fn forget(key_text: &str) {
+        let key = key_text.split_once(':').unwrap().0;
+        PAYLOADS.lock().unwrap().as_mut().unwrap().remove(key);
+    }
+
+    /// A marker from an older compiler generation (or a front image) resolves although the table
+    /// lost its key: the file is read again and checked against the key.
+    #[test]
+    fn marker_resolves_after_the_table_lost_it() {
+        let dir = std::env::temp_dir().join(format!("relax-payload-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("data \"q\" \u{e9}.bin");
+        let data: Vec<u8> = (0..1000u32).map(|i| (i * 7) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+        let p = path.to_str().unwrap();
+        let text = register_payload(p, data.clone());
+        assert_eq!(*payload_of(&marker_bytes(&text)).unwrap(), data);
+        forget(&text);
+        assert_eq!(*payload_of(&marker_bytes(&text)).unwrap(), data);
+        // the escaped literal the expansion emits unescapes to the same marker
+        assert_eq!(crate::lit::unescape_bytes(&format!("b\"{}{}\"", PAYLOAD_MARK, text)), data);
+        // a lost key whose file changed (or is gone) is an internal error naming the key
+        forget(&text);
+        std::fs::write(&path, b"other").unwrap();
+        let e = std::panic::catch_unwind(|| payload_of(&marker_bytes(&text))).unwrap_err();
+        let msg = e.downcast_ref::<String>().unwrap();
+        assert!(msg.contains("internal error") && msg.contains(text.split_once(':').unwrap().0) && msg.contains("changed"), "{msg}");
+        std::fs::remove_file(&path).unwrap();
+        let e = std::panic::catch_unwind(|| payload_of(&marker_bytes(&text))).unwrap_err();
+        assert!(e.downcast_ref::<String>().unwrap().contains("could not be read"));
+        let _ = std::fs::remove_dir(&dir);
+        // a plain literal that only starts like a marker is not one
+        assert!(payload_of(b"\0relax").is_none());
     }
 }

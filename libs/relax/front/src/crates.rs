@@ -14,10 +14,75 @@ pub struct CrateUnit {
     pub features: Vec<String>,
     /// (unit index, extern crate name)
     pub deps: Vec<(usize, String)>,
+    /// Host-side resolution when the same source also has a target-side unit.
+    pub host: Option<HostUnit>,
     pub proc_macro: bool,
+    /// the unit is a binary target (its `main` is checked)
+    pub bin: bool,
     pub build_script: bool,
     /// package version from cargo's pkg_id ("1.15.1")
     pub version: String,
+    /// the package comes from a registry or git source (its cargo pkg_id is not `path+`): a
+    /// third-party crate, wherever its sources are stored
+    pub registry: bool,
+}
+
+pub struct HostUnit {
+    pub features: Vec<String>,
+    pub deps: Vec<(usize, String)>,
+}
+
+/// Returns the original crate name before any `__relax_v` multi-version suffix.
+pub fn base_crate_name(s: &str) -> &str {
+    match s.find("__relax_v") {
+        Some(i) => &s[..i],
+        None => s,
+    }
+}
+
+/// Gives multi-version library crates a canonical identifier-safe name (`<name>__relax_v<ver>`)
+/// when more than one non-bin, non-build-script unit in the graph shares `name` with distinct
+/// `src_path`s (leaving the highest version unsuffixed).
+pub fn disambiguate_multi_version_crates(units: &mut [CrateUnit]) {
+    let mut by_name: std::collections::HashMap<String, Vec<usize>> = Default::default();
+    for (i, u) in units.iter().enumerate() {
+        if !u.bin {
+            by_name.entry(u.name.clone()).or_default().push(i);
+        }
+    }
+    for (_, mut idxs) in by_name {
+        if idxs.len() <= 1 {
+            continue;
+        }
+        let first_src = &units[idxs[0]].src_path;
+        if idxs.iter().all(|&i| &units[i].src_path == first_src) {
+            continue;
+        }
+        idxs.sort_by(|&a, &b| {
+            let key = |u: &CrateUnit| -> Vec<u64> {
+                u.version.split(|c: char| !c.is_ascii_digit()).filter(|s| !s.is_empty()).filter_map(|s| s.parse().ok()).collect()
+            };
+            key(&units[a]).cmp(&key(&units[b])).then_with(|| units[a].version.cmp(&units[b].version)).then_with(|| units[a].src_path.cmp(&units[b].src_path))
+        });
+        let keep = *idxs.last().unwrap();
+        let mut used = std::collections::HashSet::new();
+        for &i in &idxs {
+            if i == keep {
+                continue;
+            }
+            let ver_tag: String = units[i].version.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+            let mut cand = if ver_tag.is_empty() {
+                format!("{}__relax_v_{}", units[i].name, i)
+            } else {
+                format!("{}__relax_v{}", units[i].name, ver_tag)
+            };
+            if !used.insert(cand.clone()) {
+                cand = format!("{}_{}", cand, i);
+                used.insert(cand.clone());
+            }
+            units[i].name = cand;
+        }
+    }
 }
 
 /// Crates Relax provides itself (std/substitutes.txt: `<name> <version prefix> <root>`):
@@ -44,7 +109,7 @@ pub fn apply_substitutes(sess: &std::sync::Arc<crate::Session>, units: &mut [Cra
         }
         let (name, ver, root) = (parts[0], parts[1], parts[2]);
         for u in units.iter_mut() {
-            if u.name != name || u.proc_macro {
+            if base_crate_name(&u.name) != name || u.proc_macro {
                 continue;
             }
             let matches = u.version == ver || u.version.starts_with(&format!("{}.", ver));
@@ -55,6 +120,7 @@ pub fn apply_substitutes(sess: &std::sync::Arc<crate::Session>, units: &mut [Cra
             u.edition = 2021;
             u.features.clear();
             u.deps.clear();
+            u.host = None;
         }
     }
     // proc-macro crates run in the JIT proc-macro host; the app graph sees them empty
@@ -200,7 +266,7 @@ pub fn load_units(path: &str) -> Result<Vec<CrateUnit>, String> {
             None => String::new(),
         };
         map.push(out.len());
-        out.push(CrateUnit { name, src_path, edition, features, deps,  proc_macro: kind_pm, build_script, version });
+        out.push(CrateUnit { name, src_path, edition, features, deps, host: None, proc_macro: kind_pm, bin: false, build_script, version, registry: !pkg.starts_with("path+") });
     }
     // remap dependency indices to deduplicated crate indices; drop build-script deps
     for c in out.iter_mut() {
@@ -212,6 +278,7 @@ pub fn load_units(path: &str) -> Result<Vec<CrateUnit>, String> {
         }
         c.deps = nd;
     }
+    disambiguate_multi_version_crates(&mut out);
 
     Ok(out)
 }
@@ -329,9 +396,9 @@ pub fn discover(sess: &std::sync::Arc<crate::Session>, crates: &[CrateUnit], cfg
             s.queue.push(Job { crate_idx: i as u32, path: crates[i].src_path.clone(), edition: crates[i].edition, mod_rs: true, active: true });
         }
     }
-    std::thread::scope(|scope| {
+    crate::pool::scope(|scope| {
         for _ in 0..threads {
-            scope.spawn(|| { let _z = crate::zone_alloc::compiler_thread(); loop {
+            scope.spawn(|| { loop {
                 let job = {
                     let mut s = state.lock().unwrap();
                     loop {

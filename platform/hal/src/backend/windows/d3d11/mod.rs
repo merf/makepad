@@ -8,6 +8,7 @@
 mod capture;
 mod chain;
 mod complete;
+pub(crate) mod dcomp;
 pub(crate) mod device;
 mod frame;
 mod pipeline;
@@ -49,6 +50,7 @@ struct Pipe {
 
 pub struct D3d11 {
     shell: Option<&'static win32::Shared>,
+    a11y_update: Option<win32::a11y::Update>,
     dev: Arc<Device>,
     info: HalInfo,
     tex: HashMap<(u32, u32), Tex>,
@@ -58,6 +60,11 @@ pub struct D3d11 {
     programs: HashMap<u64, Vec<Weak<PipeState>>>,
     /// windows' retained images, by (owner, index)
     win: HashMap<(u32, u32), Tex>,
+    /// session 0's windows with a badge layer (by index), and the image each last presented: its
+    /// retained image with the layer drawn over (what a snapshot of the window reads)
+    badged: HashMap<u32, Option<Tex>>,
+    /// the composed image the badge frame being encoded draws into
+    compose: Option<Arc<Texture>>,
     aliases: HashMap<(u32, Id), Id>,
     /// the id target of each window's newest pick frame, and the targets missing a draw
     pick_ids: HashMap<(u32, Id), Id>,
@@ -68,6 +75,18 @@ pub struct D3d11 {
     acquired: Vec<Arc<Texture>>,
     fallback: HashMap<u32, Arc<Texture>>,
     chains: chain::Chains,
+    /// the image of each upper segment of a window with native layers, by (owner, index, gap)
+    segments: HashMap<(u32, u32, usize), Arc<Texture>>,
+    /// their depth targets, for passes with depth
+    segment_depths: HashMap<(u32, u32, usize), Arc<Texture>>,
+    /// the upper segment the pass being encoded renders into
+    segment: Option<frame::SegTarget>,
+    /// native layers past the composited budget, told unsupported once
+    over_budget: std::collections::HashSet<(u32, Id)>,
+    /// windows whose native layers draw nothing (logged once)
+    native_fallback: std::collections::HashSet<(u32, Id)>,
+    /// the composition device was lost: the device reset in progress makes it again too
+    dcomp_reset: bool,
     batch: complete::Batch,
     cb_arena: Arena,
     word_arena: Arena,
@@ -108,7 +127,8 @@ impl D3d11 {
             formats: dev.formats,
             msaa: 1,
             dpi: shell.map_or_else(win32::system_dpi, |s| s.dpi()),
-            flags: info_flags::GPU_TIMESTAMPS,
+            // offscreen too: a badge layer is composed into the retained image's copy either way
+            flags: info_flags::GPU_TIMESTAMPS | info_flags::WINDOW_BADGES,
             max_texture: 16384,
             max_window: [16384, 16384],
             max_buffer: (u32::MAX as u64) & !15,
@@ -128,6 +148,7 @@ impl D3d11 {
         }
         Ok(Self {
             shell,
+            a11y_update: None,
             cb_arena: Arena::new(&dev, 256 * 1024, true)?,
             word_arena: Arena::new(&dev, 256 * 1024, false)?,
             scratch: Default::default(),
@@ -138,6 +159,8 @@ impl D3d11 {
             pipe: HashMap::new(),
             programs: HashMap::new(),
             win: HashMap::new(),
+            badged: HashMap::new(),
+            compose: None,
             aliases: HashMap::new(),
             pick_ids: HashMap::new(),
             pick_pending: Default::default(),
@@ -145,6 +168,12 @@ impl D3d11 {
             captures: Vec::new(),
             fallback: HashMap::new(),
             chains: chain::Chains::default(),
+            segments: HashMap::new(),
+            segment_depths: HashMap::new(),
+            segment: None,
+            over_budget: Default::default(),
+            native_fallback: Default::default(),
+            dcomp_reset: false,
             batch: complete::Batch::default(),
             mailbox,
             complete,
@@ -192,9 +221,9 @@ impl D3d11 {
     }
 
     /// Presents a window's image on its swapchain; an offscreen window's frame is done as rendered.
-    fn present(&mut self, key: (u32, Id), image: &Arc<Texture>) -> bool {
+    fn present(&mut self, key: (u32, Id), image: &Arc<Texture>, layered: Option<chain::Layered>) -> bool {
         match self.shell {
-            Some(shell) => self.chains.present(&self.dev, shell, key, image),
+            Some(shell) => self.chains.present(&self.dev, shell, key, image, layered),
             None => true,
         }
     }
@@ -202,9 +231,20 @@ impl D3d11 {
     /// A lost device (removed, reset, or a simulated loss) is replaced here: the sessions hear
     /// `DeviceLost` once, then `exec::device_reset` runs until a device can be made.
     fn recover(&mut self, world: &mut World) {
+        // a lost composition device takes every window's content with it: the device reset
+        // makes the swapchains, trees and native layer visuals again, and the apps repaint
+        if self.shell.is_some() && !self.dcomp_reset && dcomp::lost() {
+            self.dcomp_reset = true;
+            self.simulate = true;
+        }
         if self.simulate_at_ns.is_some_and(|t| crate::clock_ns() >= t) {
             self.simulate_at_ns = None;
             self.simulate = true;
+            // the composition device goes too: the whole recovery runs
+            if self.shell.is_some() {
+                dcomp::simulate_loss();
+                self.dcomp_reset = true;
+            }
         }
         if self.simulate {
             self.simulate = false;
@@ -294,8 +334,21 @@ impl D3d11 {
 }
 
 impl Backend for D3d11 {
+    /// Complete once submitted: a shared texture's keyed mutex, released at the end of the pass
+    /// that drew it, orders the reader's GPU use after it.
+    fn frame_completion(&mut self, _session: u32, _notify: std::sync::Arc<dyn Fn() + Send + Sync>) -> Result<crate::completion::Completion, String> {
+        Ok(crate::completion::Completion::done())
+    }
     fn info(&self) -> HalInfo {
         self.info
+    }
+    /// The process ends next: the open batch is handed on, the HLSL compilers and the
+    /// completion thread (GPU event waits, readback maps) run out and are joined.
+    fn before_exit(&mut self) {
+        let batch = std::mem::take(&mut self.batch);
+        self.complete.submit(batch);
+        for compiler in &mut self.compilers { compiler.stop(); }
+        self.complete.stop();
     }
     fn submit(&mut self, world: &mut World, sid: u32, view: &CmdView) {
         self.recover(world);
@@ -338,6 +391,11 @@ impl Backend for D3d11 {
         self.buf.retain(|k, _| k.0 != sid);
         self.pipe.retain(|k, _| k.0 != sid);
         self.win.retain(|k, _| k.0 != sid);
+        self.segments.retain(|k, _| k.0 != sid);
+        self.segment_depths.retain(|k, _| k.0 != sid);
+        self.over_budget.retain(|k| k.0 != sid);
+        self.native_fallback.retain(|k| k.0 != sid);
+        if sid == HOST { self.badged.clear(); }
         self.aliases.retain(|k, _| k.0 != sid);
         self.pick_ids.retain(|k, _| k.0 != sid);
         self.pick_pending.retain(|k| k.0 != sid);
@@ -373,10 +431,18 @@ impl exec::DeviceReset for D3d11 {
         self.drain(world);
         if let Some(shell) = self.shell {
             self.chains.clear(shell);
+            if std::mem::take(&mut self.dcomp_reset) {
+                for (key, visual) in dcomp::replace_device() {
+                    shell.web_view_retarget(key, visual);
+                }
+            }
         }
         self.tex.clear();
         self.buf.clear();
         self.win.clear();
+        self.segments.clear();
+        self.segment_depths.clear();
+        for composed in self.badged.values_mut() { *composed = None; }
         self.pick_ids.clear();
         self.pick_pending.clear();
         self.captures.clear();
@@ -421,6 +487,46 @@ impl exec::DeviceReset for D3d11 {
 }
 
 impl Gpu for D3d11 {
+    /// Web layers are system web views hosted in composition mode on the shell thread: their
+    /// visuals are made here (the window tree places them per frame), their content there.
+    fn native_layer(&mut self, _world: &mut World, sid: u32, command: &crate::cmds::HalCmd) -> bool {
+        use crate::cmds::HalCmd;
+        use crate::native_layer::{kind, mode, state};
+        let Some(shell) = self.shell else { return false };
+        match *command {
+            HalCmd::NativeLayerCreate { id, kind: kind::WEB, params } => {
+                match dcomp::native_create((sid, id)) {
+                    Ok(visual) => shell.web_view_create((sid, id), params.to_vec(), visual),
+                    Err(e) => {
+                        eprintln!("[hal-d3d11] web layer {id:?}: REALIZED UNSUPPORTED: {e}");
+                        shell.push((sid, id), |q, id| q.native_layer_state(id, state::REALIZED, mode::UNSUPPORTED, 0, e.as_bytes()));
+                    }
+                }
+                true
+            }
+            HalCmd::NativeLayerOp { id, op, arg, data } if dcomp::native_known((sid, id)) => {
+                shell.web_view_op((sid, id), op, arg, data.to_vec());
+                true
+            }
+            HalCmd::NativeLayerDestroy { id } => {
+                if dcomp::native_known((sid, id)) {
+                    self.chains.native_destroyed((sid, id));
+                    shell.web_view_destroy((sid, id));
+                }
+                self.over_budget.remove(&(sid, id));
+                // the executor answers CLOSED for every native content kind
+                false
+            }
+            _ => false,
+        }
+    }
+    fn a11y_prepare(&mut self, window: u64, update: &makepad_a11y::TreeUpdate) {
+        if self.shell.is_some() { self.a11y_update = Some(win32::a11y::prepare(window, update)); }
+    }
+    fn a11y_notify(&mut self, window: u64, notifications: &[makepad_a11y::Notification]) {
+        if let (Some(shell), Some(update)) = (self.shell, self.a11y_update.take()) { win32::a11y::queue(shell, window, update, notifications); }
+    }
+
     fn media(&mut self, s: &mut Session, c: &crate::cmds::HalCmd) -> bool {
         self.media.command(&mut super::media::Sink { dev: &self.dev, tex: &mut self.tex, now: crate::clock_ns() }, s, c)
     }
@@ -428,10 +534,9 @@ impl Gpu for D3d11 {
         self.dev.budget()
     }
 
-    fn window_overlay(&mut self, s: &mut Session, _id: Id, rect: Option<[f32; 4]>, _now: u64) {
-        if rect.is_some() {
-            s.stats.overlay_unsupported += 1;
-        }
+    fn badges(&self) -> bool { true }
+    fn badge_layer(&mut self, window: Id, on: bool) {
+        if on { self.badged.entry(window.index).or_insert(None); } else { self.badged.remove(&window.index); }
     }
 
     fn os(&mut self, sid: u32, command: exec::OsCmd) -> bool {
@@ -561,6 +666,10 @@ impl Gpu for D3d11 {
     }
     fn window_closed(&mut self, sid: u32, id: Id) {
         self.win.remove(&(sid, id.index));
+        self.segments.retain(|k, _| (k.0, k.1) != (sid, id.index));
+        self.segment_depths.retain(|k, _| (k.0, k.1) != (sid, id.index));
+        self.native_fallback.remove(&(sid, id));
+        if sid == HOST { self.badged.remove(&id.index); }
         self.pick_ids.remove(&(sid, id));
         if let Some(shell) = self.shell {
             self.chains.remove(shell, (sid, id));

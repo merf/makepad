@@ -24,6 +24,7 @@ impl CfgSet {
             crate::options::CheckTarget::MacosArm64 => CfgSet::macos_arm64(sess, features),
             crate::options::CheckTarget::LinuxX64 => CfgSet::linux_x64(sess, features),
             crate::options::CheckTarget::AndroidArm64 => CfgSet::android_arm64(sess, features),
+            crate::options::CheckTarget::Web(w) => CfgSet::web(sess, w, features),
             // machine() adds the extra cfgs itself
             crate::options::CheckTarget::Host => return CfgSet::machine(sess, features),
         };
@@ -192,9 +193,40 @@ impl CfgSet {
         }
         CfgSet { session: sess.clone(), set }
     }
+    /// A web target as the trace host runs it: `rustc --print cfg --target wasm32-unknown-unknown`
+    /// (1.98; wasm64-unknown-unknown for `PtrWidth::W64`). The explicit threaded profile adds
+    /// `atomics` (cargo makepad wasm's default). std/core/alloc
+    /// are read with this set too (lib.rs `std_cfg`, plus `relax_web`): Relax std's web layer is
+    /// rustc's wasm32-unknown-unknown std.
+    pub fn web(sess: &std::sync::Arc<crate::Session>, w: crate::options::PtrWidth, features: &[String]) -> CfgSet {
+        let (arch, width) = match w {
+            crate::options::PtrWidth::W32 => ("target_arch=wasm32", "target_pointer_width=32"),
+            crate::options::PtrWidth::W64 => ("target_arch=wasm64", "target_pointer_width=64"),
+        };
+        let mut set: Vec<String> = [
+            arch, "target_os=unknown", "target_family=wasm", "target_env=", "target_abi=",
+            "target_vendor=unknown", width, "target_endian=little", "panic=abort",
+            "target_feature=bulk-memory", "target_feature=multivalue", "target_feature=mutable-globals",
+            "target_feature=nontrapping-fptoint", "target_feature=reference-types", "target_feature=sign-ext",
+            "target_has_atomic=8", "target_has_atomic=16", "target_has_atomic=32", "target_has_atomic=64",
+            "target_has_atomic=ptr",
+        ].iter().map(|s| s.to_string()).collect();
+        if sess.options.web_threads == crate::options::WebThreads::On {
+            set.push("target_feature=atomics".into());
+        }
+        for f in features {
+            set.push(format!("feature={}", f));
+        }
+        CfgSet { session: sess.clone(), set }
+    }
+
     /// The target triple of this cfg set (build scripts' TARGET / HOST).
     pub fn triple(&self) -> &'static str {
-        if self.has("target_os=windows") {
+        if self.has("target_arch=wasm32") {
+            crate::options::CheckTarget::web_triple(crate::options::PtrWidth::W32)
+        } else if self.has("target_arch=wasm64") {
+            crate::options::CheckTarget::web_triple(crate::options::PtrWidth::W64)
+        } else if self.has("target_os=windows") {
             "x86_64-pc-windows-gnu"
         } else if self.has("target_os=android") {
             "aarch64-linux-android"
@@ -205,33 +237,25 @@ impl CfgSet {
         }
     }
 
-    /// The CARGO_CFG_* variables cargo gives a build script for the target's basic cfgs (OS, arch,
-    /// env, vendor, family, endianness, pointer width, and the family flag `unix` / `windows`).
+    /// The CARGO_CFG_* variables cargo gives a build script for the target's cfgs (OS, arch,
+    /// env, vendor, family, endianness, pointer width, target_has_atomic, target_feature, panic,
+    /// and the family flag `unix` / `windows`), plus any `--cfg` from RUSTFLAGS.
     pub fn build_script_env(&self) -> Vec<(String, String)> {
-        let mut v = Vec::new();
-        for key in ["target_endian", "target_pointer_width", "target_family", "target_os", "target_arch", "target_env", "target_vendor"] {
-            let prefix = format!("{}=", key);
-            if let Some(e) = self.set.iter().find(|e| e.starts_with(&prefix)) {
-                v.push((format!("CARGO_CFG_{}", key.to_uppercase()), e[prefix.len()..].to_string()));
+        let mut v: Vec<(String, String)> = Vec::new();
+        for e in self.set.iter().chain(self.session.options.cfgs.iter()) {
+            if e.starts_with("feature=") {
+                continue;
             }
-        }
-        for flag in ["unix", "windows"] {
-            if self.has(flag) {
-                v.push((format!("CARGO_CFG_{}", flag.to_uppercase()), String::new()));
-            }
-        }
-        // cargo gives a build script every `--cfg` of RUSTFLAGS the same way: `CARGO_CFG_CUSTOM`
-        // (empty) for `--cfg custom`, `CARGO_CFG_KEY=value` for `--cfg key="value"` (several
-        // values of one key are joined by commas)
-        for e in &self.session.options.cfgs {
             let (k, val) = e.split_once('=').unwrap_or((e.as_str(), ""));
             let name = format!("CARGO_CFG_{}", k.to_uppercase());
             match v.iter_mut().find(|(n, _)| *n == name) {
                 Some((_, old)) if !val.is_empty() => {
-                    if !old.is_empty() {
-                        old.push(',');
+                    if !old.split(',').any(|x| x == val) {
+                        if !old.is_empty() {
+                            old.push(',');
+                        }
+                        old.push_str(val);
                     }
-                    old.push_str(val);
                 }
                 Some(_) => {}
                 None => v.push((name, val.to_string())),
@@ -312,6 +336,15 @@ pub fn tok_str<'a>(p: Src<'a>, i: usize) -> &'a [u8] {
 fn pred(p: Src, i: &mut usize, end: usize, cfg: &CfgSet) -> bool {
     if *i >= end {
         return false;
+    }
+    // a macro's `$e:expr` argument arrives parenthesized (macros.rs transcribe): `(any(..))`
+    if p.tok(*i).kind == T::OpenParen {
+        *i += 1;
+        let r = pred(p, i, end, cfg);
+        if *i < end && p.tok(*i).kind == T::CloseParen {
+            *i += 1;
+        }
+        return r;
     }
     let name = tok_str(p, *i);
     *i += 1;
@@ -481,28 +514,55 @@ pub fn expand_cfg_attr_list(p: Src, attrs: &[Attr], cfg: &CfgSet) -> Vec<Attr> {
         if !pred(p, &mut i, end, cfg) {
             continue;
         }
-        let mut parts = Vec::new();
-        while i < end {
-            if p.tok(i).kind == T::Comma {
-                i += 1;
-                continue;
-            }
-            let start = i;
-            let mut depth = 0i32;
-            while i < end {
-                match p.tok(i).kind {
-                    T::OpenParen | T::OpenBracket | T::OpenBrace => depth += 1,
-                    T::CloseParen | T::CloseBracket | T::CloseBrace => depth -= 1,
-                    T::Comma if depth == 0 => break,
-                    _ => {}
-                }
-                i += 1;
-            }
-            if i > start {
-                parts.push(Attr { inner: a.inner, toks: TokRange { lo: start as u32, hi: i as u32 } });
-            }
-        }
+        let parts = cfg_attr_parts(p, a, i);
         out.extend(expand_cfg_attr_list(p, &parts, cfg));
     }
     out
+}
+
+/// The attributes of `cfg_attr(pred, a1, a2(..))` whose predicate ends before token `from`
+/// (the first token after it): `[a1, a2(..)]`, sub-ranges of the original tokens.
+pub fn cfg_attr_parts(p: Src, a: &Attr, from: usize) -> Vec<Attr> {
+    let end = a.toks.hi as usize - 1; // the closing paren
+    let mut i = from;
+    let mut parts = Vec::new();
+    while i < end {
+        if p.tok(i).kind == T::Comma {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut depth = 0i32;
+        while i < end {
+            match p.tok(i).kind {
+                T::OpenParen | T::OpenBracket | T::OpenBrace => depth += 1,
+                T::CloseParen | T::CloseBracket | T::CloseBrace => depth -= 1,
+                T::Comma if depth == 0 => break,
+                _ => {}
+            }
+            i += 1;
+        }
+        if i > start {
+            parts.push(Attr { inner: a.inner, toks: TokRange { lo: start as u32, hi: i as u32 } });
+        }
+    }
+    parts
+}
+
+/// The token after the predicate of `cfg_attr(pred, ...)` (the predicate starts after the
+/// opening paren at `a.toks.lo + 2`).
+pub fn cfg_attr_pred_end(p: Src, a: &Attr) -> usize {
+    let end = a.toks.hi as usize - 1;
+    let mut i = a.toks.lo as usize + 2;
+    let mut depth = 0i32;
+    while i < end {
+        match p.tok(i).kind {
+            T::OpenParen | T::OpenBracket | T::OpenBrace => depth += 1,
+            T::CloseParen | T::CloseBracket | T::CloseBrace => depth -= 1,
+            T::Comma if depth == 0 => break,
+            _ => {}
+        }
+        i += 1;
+    }
+    i
 }

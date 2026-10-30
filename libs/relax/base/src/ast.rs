@@ -819,7 +819,7 @@ pub enum GenericArg {
     /// `Item = T`
     Binding(Ident, GenericArgsId, TyId),
     /// `Item: Bound`
-    Constraint(Ident, List<Bound>),
+    Constraint(Ident, GenericArgsId, List<Bound>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -829,6 +829,8 @@ pub enum Bound {
         hrtb: List<GenericParam>,
         maybe: bool,
         konst: bool,
+        /// `async Fn()` (async_trait_bounds)
+        async_: bool,
         path: Path,
     },
     /// `use<'a, T>` precise capture
@@ -1019,6 +1021,20 @@ pub struct AsmArgs {
 pub const ASM_NORETURN: u32 = 1;
 pub const ASM_RAW: u32 = 2;
 pub const ASM_ATT_SYNTAX: u32 = 4;
+pub const ASM_NOMEM: u32 = 8;
+pub const ASM_READONLY: u32 = 16;
+pub const ASM_PURE: u32 = 32;
+pub const ASM_PRESERVES_FLAGS: u32 = 64;
+pub const ASM_NOSTACK: u32 = 128;
+pub const ASM_MAY_UNWIND: u32 = 256;
+/// `clobber_abi("C")` / `"system"` / `"efiapi"` (the target's C convention)
+pub const ASM_CLOBBER_C: u32 = 1 << 16;
+/// `clobber_abi("sysv64")`
+pub const ASM_CLOBBER_SYSV64: u32 = 1 << 17;
+/// `clobber_abi("win64")`
+pub const ASM_CLOBBER_WIN64: u32 = 1 << 18;
+/// an ABI `clobber_abi` names that is none of these (an error when the block is checked)
+pub const ASM_CLOBBER_UNKNOWN: u32 = 1 << 19;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AsmDir {
@@ -1097,6 +1113,8 @@ pub struct ForRow {
 pub struct ClosureRow {
     pub is_move: bool,
     pub is_async: bool,
+    /// `static || ..` (coroutine syntax)
+    pub is_static: bool,
     pub params: List<ClosureParam>,
     pub ret: Option<TyId>,
     pub body: ExprId,
@@ -1250,6 +1268,7 @@ pub struct FnSig {
     pub abi: Option<Option<Ident>>, // extern / extern "C"
     pub generics: Generics,
     pub self_param: Option<SelfParam>,
+    pub self_param_pos: u32, // receiver token position (0 when absent)
     pub params: List<Param>,
     pub variadic: bool,
     pub ret: Option<TyId>,
@@ -1353,6 +1372,8 @@ pub struct ImplItem {
 pub struct ForeignModItem {
     pub abi: Option<Ident>,
     pub items: List<ItemId>,
+    /// `unsafe extern { .. }` (a u32 keeps the row free of padding: it is a Pod image row)
+    pub unsafe_: u32,
 }
 
 /// An item's kind in 16 bytes: the kinds with generics or other big payloads keep them in a row
@@ -1477,6 +1498,12 @@ pub struct Ast {
     pub impl_items: crate::arena::Arena<ImplItem>,
     pub foreign_mods: crate::arena::Arena<ForeignModItem>,
     pub vis_paths: crate::arena::Arena<Path>,
+    /// lint-level attributes (`#[allow(..)]` ..) of expression statements: cfg stripping drops the
+    /// statement wrapper, this keeps the attributes for the lint passes (expression -> attributes)
+    pub stmt_attrs: Vec<(ExprId, List<Attr>)>,
+    /// syntax the parser met that a feature gates, wherever it is written (cfg'd-out code and
+    /// macro arguments included; rustc ParseSess::gated_spans): (feature, position)
+    pub gated_syntax: Vec<(&'static str, u32)>,
     /// first id of each arena (in `ends` order): 0 for a file's tree; a file's lazily parsed
     /// fn bodies (`part`) continue its ids
     pub base: Bases,
@@ -1766,6 +1793,14 @@ impl Ast {
                 Some((a.expr, a.semi))
             }
             _ => None,
+        }
+    }
+    /// The lint-level attributes an expression statement was written with.
+    pub fn stmt_attrs(&self, e: ExprId) -> List<Attr> {
+        if let Some((_, l)) = self.stmt_attrs.iter().find(|(x, _)| *x == e) { return *l; }
+        match self.part.get() {
+            Some(p) => p.stmt_attrs(e),
+            None => List::EMPTY,
         }
     }
     /// A block's statements.

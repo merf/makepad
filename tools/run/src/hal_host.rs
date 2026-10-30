@@ -25,7 +25,7 @@ impl Host {
         let domain = launch.domain;
         let hook = launch.clone();
         let primary = crate::hal_run::spec(domain);
-        let privileged = primary.is_some() && crate::PRIVILEGED.load(std::sync::atomic::Ordering::Relaxed);
+        let privileged = primary.is_some() && relax_runner::privileged();
         let around: Around = Arc::new(move |run: &mut dyn FnMut()| with_caps(Caps { privileged }, || with_launch(&hook, || run())));
         let mut spec = primary.unwrap_or_else(|| AppSpec {
             package: launch.app.clone(), args: launch.args.split_terminator('\0').map(str::to_string).collect(), ..Default::default()
@@ -62,19 +62,57 @@ impl DomainHost for Host {
         relax_compiler::inspect::events::release_domain(domain);
         let how = if mode == domain_stop::KILL { domain::Stop::Kill } else { domain::Stop::Quit };
         if let Err(e) = domain::stop(domain, how) { eprintln!("makepad-run domain: {domain}: {e}"); }
+        // A stop that timed out (`Leaked`: its threads still alive) waits once more, 5 s
+        // (`MAKEPAD_RUN_RELAUNCH_GRACE_MS`), for threads that end late. The HAL makes a relaunched
+        // domain's session again only after this returns: a late thread of the old run must never
+        // find the new run's session under its id (it took that session's events as its own and
+        // never ended).
+        if matches!(domain::state(domain), Some(DomainState::Leaked { .. })) {
+            let grace = std::env::var("MAKEPAD_RUN_RELAUNCH_GRACE_MS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(5000);
+            domain::wait_thread_done(domain, Duration::from_millis(grace));
+        }
         report_stop(domain);
     }
 
-    // The HAL stopped the old run (`stop(QUIT)` returned) and freed its session: start again.
+    // The HAL stopped the old run (`stop(QUIT)` returned, including its wait for late threads)
+    // and freed its session: start again. Threads that ended late hand the domain over and the
+    // app relaunches in place. A run that still owns its domain, or a start that fails, never
+    // leaves the app dead: the process starts again (same command line, the app's state carried
+    // over), or, where it cannot (a window manager's child, no exec), the domain ends crashed
+    // with the reason.
     fn relaunch(&self, launch: DomainLaunch) -> Result<(), String> {
         let id = launch.domain;
-        crate::hal_run::restarting(id);
-        let result = self.launch(launch);
-        if let Err(e) = &result {
-            eprintln!("makepad-run domain: {id}: {e}");
-            crate::hal_run::observe(id, &DomainState::Crashed(e.clone()));
+        if let Some(held) = domain::still_owned(id) {
+            return self.relaunch_failed(id, format!("domain {id} still owns its previous run ({held})"));
         }
-        result
+        crate::hal_run::restarting(id);
+        match self.launch(launch) {
+            Ok(()) => Ok(()),
+            Err(e) => self.relaunch_failed(id, e),
+        }
+    }
+}
+
+impl Host {
+    fn relaunch_failed(&self, id: u32, why: String) -> Result<(), String> {
+        // the run window shows what follows (its relaunch began; the stop is over)
+        crate::hal_run::restarting(id);
+        if relax_compiler::run::app_domain() == Some(id) {
+            eprintln!("makepad-run domain: {id}: the relaunch in place failed: {why}; restarting the process instead (same command line, the app's state carried over)");
+            match relax_compiler::reload::restart_process(&why) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let message = format!("relaunch failed: {why}; the process restart failed too: {e}; restart the app");
+                    eprintln!("makepad-run domain: {id}: {message}");
+                    crate::hal_run::observe(id, &DomainState::Crashed(message.clone()));
+                    return Err(message);
+                }
+            }
+        }
+        let message = format!("relaunch failed: {why}; start the app again");
+        eprintln!("makepad-run domain: {id}: {message}");
+        crate::hal_run::observe(id, &DomainState::Crashed(message.clone()));
+        Err(message)
     }
 }
 
@@ -186,10 +224,23 @@ fn observe(id: domain::DomainId, state: &DomainState) {
 pub fn register() {
     let _kept = relax_compiler::zone_alloc::kept();
     #[cfg(not(target_arch = "wasm32"))]
+    relax_compiler::inspect::register_host_inspect("ui", makepad_hal::a11y::dispatch);
+    #[cfg(not(target_arch = "wasm32"))]
     relax_compiler::inspect::register_host_inspect("gpu", makepad_hal::inspect::dispatch);
+    relax_compiler::inspect::register_host_service("gpuprof", 1, makepad_hal::gpu_prof::stream_service());
+    makepad_hal::gpu_prof::start_from_env();
     #[cfg(not(target_arch = "wasm32"))]
     relax_compiler::inspect::register_host_inspect("hal", makepad_hal::inspect::dispatch);
+    #[cfg(not(target_arch = "wasm32"))]
+    relax_compiler::inspect::register_host_inspect("cap", makepad_hal::inspect::dispatch);
     Hal::global().set_domain_host(Arc::new(Host::default()));
+    // a callback an app registers (audio entry, fence notify, main-thread work) runs in that
+    // app's domain on whatever thread the HAL calls it: its statics, its heap
+    makepad_hal::call_scope::set_call_scope(makepad_hal::call_scope::CallScope {
+        capture: domain::foreign_scope,
+        enter: |scope| domain::foreign_enter(scope).into_words(),
+        leave: |saved| domain::foreign_leave(domain::ForeignSaved::from_words(saved)),
+    });
     domain::set_observer(observe);
 }
 

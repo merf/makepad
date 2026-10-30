@@ -291,6 +291,14 @@ impl Texture {
         TextureId(self.0.id, self.0.generation)
     }
 
+    /// Whether the GPU has completed the last pass that drew into this texture
+    /// (false before one did): another GPU user may read its pixels now (an
+    /// encoder taking a shared texture by its handle). Polls completions.
+    pub fn gpu_drawn(&self, cx: &mut Cx) -> bool {
+        let serial = cx.textures[self.texture_id()].producer_serial;
+        serial != 0 && cx.frame_completion_serial() >= serial
+    }
+
     /// Queue a full RenderBGRAu8 attachment without waiting for the GPU. The
     /// request follows its pending producer, or issues only an ordered copy
     /// when already rendered. On the HAL a SharedBGRAu8 image that no pass of
@@ -416,6 +424,8 @@ impl FrameSerials {
 #[derive(Default)]
 pub(crate) struct TextureLifetime {
     pub(crate) serials: Arc<FrameSerials>,
+    /// Serials of the latest passes the HAL completed with draws left out (`FramePartial`).
+    pub(crate) partial: std::collections::VecDeque<u64>,
     #[cfg(target_arch = "wasm32")]
     pub(crate) retired: Vec<RetiredTexture>,
     pub(crate) readbacks: TextureReadbacks,
@@ -534,6 +544,14 @@ pub enum CompressedTextureFormat {
 }
 
 impl CompressedTextureFormat {
+    fn pixel(self) -> TexturePixel {
+        match self {
+            CompressedTextureFormat::Bc7 => TexturePixel::Bc7,
+            CompressedTextureFormat::Bc5 => TexturePixel::Bc5,
+            CompressedTextureFormat::Astc4x4 => TexturePixel::Astc4x4,
+        }
+    }
+
     /// Bytes of one mip level of `width` x `height` texels.
     pub fn level_bytes(width: usize, height: usize) -> usize {
         width.max(1).div_ceil(4) * height.max(1).div_ceil(4) * 16
@@ -587,6 +605,31 @@ pub enum TextureFormat {
     VecMipCompressed {
         width: usize,
         height: usize,
+        format: CompressedTextureFormat,
+        data: Option<Vec<u8>>,
+        max_level: Option<usize>,
+        wrap: TextureWrap,
+        updated: TextureUpdated,
+    },
+    /// A sampled 2D array (`texture_2d_array` in a shader; the layer is the
+    /// coordinate's z, an integer). `layers` images of `width` x `height`,
+    /// layer-major: each layer's mip chain as in [`TextureFormat::VecMipBGRAu8_32`]
+    /// (levels 0..=max_level concatenated), then the next layer's.
+    VecArrayMipBGRAu8_32 {
+        width: usize,
+        height: usize,
+        layers: usize,
+        data: Option<Vec<u32>>,
+        max_level: Option<usize>,
+        wrap: TextureWrap,
+        updated: TextureUpdated,
+    },
+    /// The block-compressed [`TextureFormat::VecArrayMipBGRAu8_32`]: each
+    /// layer's mip chain as in [`TextureFormat::VecMipCompressed`], layer-major.
+    VecArrayMipCompressed {
+        width: usize,
+        height: usize,
+        layers: usize,
         format: CompressedTextureFormat,
         data: Option<Vec<u8>>,
         max_level: Option<usize>,
@@ -669,11 +712,34 @@ pub enum TextureFormat {
         size: TextureSize,
         initial: bool,
     },
+    /// Single-channel half-float render target (R16F): a filterable data
+    /// copy (an SDF brick render copy sampled with hardware bilinear).
+    /// Draw shaders rendering into it declare `color_format: @Rf16`.
+    RenderRf16 {
+        size: TextureSize,
+        initial: bool,
+    },
+    /// Single-channel 8-bit unorm render target (R8): small per-texel data
+    /// (material slots as `slot / 255`). Draw shaders rendering into it
+    /// declare `color_format: @Ru8`; read it with `texel_fetch` or
+    /// `sample_nearest`.
+    RenderRu8 {
+        size: TextureSize,
+        initial: bool,
+    },
 
     SharedBGRAu8 {
         width: usize,
         height: usize,
         id: crate::shared_framebuf::PresentableImageId,
+        initial: bool,
+    },
+    /// A two-plane 4:2:0 picture an encoder reads where it lies (`Cx::create_shared_nv12_texture`):
+    /// a pass renders into one plane (`DrawPass::set_color_texture_face`: 0 luma at its size,
+    /// 1 chroma U V at half). D3D11 alone.
+    SharedNv12 {
+        width: usize,
+        height: usize,
         initial: bool,
     },
     /// A single YUV plane texture (Y, U, or V). Backend-managed — the render
@@ -711,6 +777,14 @@ impl std::fmt::Debug for TextureFormat {
             TextureFormat::VecMipRGBAf32 { width, height, .. } => write!(
                 f,
                 "TextureFormat::VecMipRGBAf32(width:{width},height:{height})"
+            ),
+            TextureFormat::VecArrayMipBGRAu8_32 { width, height, layers, .. } => write!(
+                f,
+                "TextureFormat::VecArrayMipBGRAu8_32(width:{width},height:{height},layers:{layers})"
+            ),
+            TextureFormat::VecArrayMipCompressed { width, height, layers, format, .. } => write!(
+                f,
+                "TextureFormat::VecArrayMipCompressed({format:?},width:{width},height:{height},layers:{layers})"
             ),
             TextureFormat::VecMipCompressed { width, height, format, .. } => write!(
                 f,
@@ -756,10 +830,17 @@ impl std::fmt::Debug for TextureFormat {
             TextureFormat::RenderRu32 { size, .. } => {
                 write!(f, "TextureFormat::RenderRu32(size:{:?})", size)
             }
+            TextureFormat::RenderRf16 { size, .. } => {
+                write!(f, "TextureFormat::RenderRf16(size:{:?})", size)
+            }
+            TextureFormat::RenderRu8 { size, .. } => {
+                write!(f, "TextureFormat::RenderRu8(size:{:?})", size)
+            }
             TextureFormat::SharedBGRAu8 { width, height, .. } => write!(
                 f,
                 "TextureFormat::SharedBGRAu8(width:{width},height:{height})"
             ),
+            TextureFormat::SharedNv12 { width, height, .. } => write!(f, "TextureFormat::SharedNv12(width:{width},height:{height})"),
             TextureFormat::VideoYuvPlane => write!(f, "TextureFormat::VideoYuvPlane"),
             TextureFormat::VideoExternal => write!(f, "TextureFormat::VideoExternal"),
             TextureFormat::VideoGlMemoryRgba => write!(f, "TextureFormat::VideoGlMemoryRgba"),
@@ -804,6 +885,8 @@ pub enum TextureCategory {
     Vec,
     VecMip,
     VecCube,
+    /// a sampled 2D array of this many layers
+    VecArray(usize),
     Render,
     RenderCube,
     DepthBuffer,
@@ -830,6 +913,7 @@ impl PartialEq for TextureCategory {
                     false
                 }
             }
+            Self::VecArray(n) => matches!(other, Self::VecArray(m) if m == n),
             Self::VecCube { .. } => {
                 if let Self::VecCube { .. } = other {
                     true
@@ -929,6 +1013,7 @@ pub(crate) enum TexturePixel {
     Rf32,
     RGf16,
     Ru32,
+    Rf16,
     D32,
     /// YUV plane pixel type. Individual planes are R8 (luma, I420 chroma) or
     /// RG8 (NV12 chroma); the actual GPU format is set at upload/wrap time.
@@ -943,6 +1028,8 @@ pub(crate) enum TexturePixel {
     Bc7,
     Bc5,
     Astc4x4,
+    /// Two-plane 4:2:0 (a shared encoder picture).
+    Nv12,
 }
 
 impl CxTexture {
@@ -966,6 +1053,8 @@ impl CxTexture {
             TextureFormat::VecMipBGRAu8_32 { updated, .. } => updated,
             TextureFormat::VecMipRGBAf32 { updated, .. } => updated,
             TextureFormat::VecMipCompressed { updated, .. } => updated,
+            TextureFormat::VecArrayMipBGRAu8_32 { updated, .. } => updated,
+            TextureFormat::VecArrayMipCompressed { updated, .. } => updated,
             TextureFormat::VecRGBAf32 { updated, .. } => updated,
             TextureFormat::VecRu8 { updated, .. } => updated,
             TextureFormat::VecRGu8 { updated, .. } => updated,
@@ -985,7 +1074,10 @@ impl CxTexture {
             TextureFormat::RenderRf32 { initial, .. } => initial,
             TextureFormat::RenderRGf16 { initial, .. } => initial,
             TextureFormat::RenderRu32 { initial, .. } => initial,
+            TextureFormat::RenderRf16 { initial, .. } => initial,
+            TextureFormat::RenderRu8 { initial, .. } => initial,
             TextureFormat::SharedBGRAu8 { initial, .. } => initial,
+            TextureFormat::SharedNv12 { initial, .. } => initial,
             _ => panic!(),
         }
     }
@@ -998,6 +1090,8 @@ impl CxTexture {
             TextureFormat::VecMipBGRAu8_32 { updated, .. } => updated,
             TextureFormat::VecMipRGBAf32 { updated, .. } => updated,
             TextureFormat::VecMipCompressed { updated, .. } => updated,
+            TextureFormat::VecArrayMipBGRAu8_32 { updated, .. } => updated,
+            TextureFormat::VecArrayMipCompressed { updated, .. } => updated,
             TextureFormat::VecRGBAf32 { updated, .. } => updated,
             TextureFormat::VecRu8 { updated, .. } => updated,
             TextureFormat::VecRGu8 { updated, .. } => updated,
@@ -1016,7 +1110,10 @@ impl CxTexture {
             TextureFormat::RenderRf32 { initial, .. } => initial,
             TextureFormat::RenderRGf16 { initial, .. } => initial,
             TextureFormat::RenderRu32 { initial, .. } => initial,
+            TextureFormat::RenderRf16 { initial, .. } => initial,
+            TextureFormat::RenderRu8 { initial, .. } => initial,
             TextureFormat::SharedBGRAu8 { initial, .. } => initial,
+            TextureFormat::SharedNv12 { initial, .. } => initial,
             _ => panic!(),
         } = initial;
     }
@@ -1126,14 +1223,15 @@ impl TextureFormat {
             TextureFormat::VecRu8 { data, .. } | TextureFormat::VecRGu8 { data, .. } => {
                 data.as_ref().map_or(0, |data| data.capacity())
             }
-            TextureFormat::VecMipCompressed { data, .. } => data.as_ref().map_or(0, |data| data.capacity()),
+            TextureFormat::VecMipCompressed { data, .. } | TextureFormat::VecArrayMipCompressed { data, .. } => data.as_ref().map_or(0, |data| data.capacity()),
+            TextureFormat::VecArrayMipBGRAu8_32 { data, .. } => data.as_ref().map_or(0, |data| data.capacity().saturating_mul(4)),
             _ => 0,
         }
     }
 
     pub fn is_shared(&self) -> bool {
         match self {
-            Self::SharedBGRAu8 { .. } => true,
+            Self::SharedBGRAu8 { .. } | Self::SharedNv12 { .. } => true,
             _ => false,
         }
     }
@@ -1144,6 +1242,7 @@ impl TextureFormat {
             Self::VecMipBGRAu8_32 { .. } => true,
             Self::VecMipRGBAf32 { .. } => true,
             Self::VecMipCompressed { .. } => true,
+            Self::VecArrayMipBGRAu8_32 { .. } | Self::VecArrayMipCompressed { .. } => true,
             Self::VecRGBAf32 { .. } => true,
             Self::VecRu8 { .. } => true,
             Self::VecRGu8 { .. } => true,
@@ -1161,6 +1260,8 @@ impl TextureFormat {
             Self::RenderRf32 { .. } => true,
             Self::RenderRGf16 { .. } => true,
             Self::RenderRu32 { .. } => true,
+            Self::RenderRf16 { .. } => true,
+            Self::RenderRu8 { .. } => true,
             _ => false,
         }
     }
@@ -1198,7 +1299,8 @@ impl TextureFormat {
     /// so OpenGL matches the shader's `sample_*_repeat` sampler.
     pub fn wrap(&self) -> TextureWrap {
         match self {
-            Self::VecMipBGRAu8_32 { wrap, .. } | Self::VecMipCompressed { wrap, .. } => *wrap,
+            Self::VecMipBGRAu8_32 { wrap, .. } | Self::VecMipCompressed { wrap, .. }
+            | Self::VecArrayMipBGRAu8_32 { wrap, .. } | Self::VecArrayMipCompressed { wrap, .. } => *wrap,
             _ => TextureWrap::ClampToEdge,
         }
     }
@@ -1210,6 +1312,7 @@ impl TextureFormat {
             Self::VecMipBGRAu8_32 { width, height, .. } => Some((*width, *height)),
             Self::VecMipRGBAf32 { width, height, .. } => Some((*width, *height)),
             Self::VecMipCompressed { width, height, .. } => Some((*width, *height)),
+            Self::VecArrayMipBGRAu8_32 { width, height, .. } | Self::VecArrayMipCompressed { width, height, .. } => Some((*width, *height)),
             Self::VecRGBAf32 { width, height, .. } => Some((*width, *height)),
             Self::VecRu8 { width, height, .. } => Some((*width, *height)),
             Self::VecRGu8 { width, height, .. } => Some((*width, *height)),
@@ -1268,12 +1371,20 @@ impl TextureFormat {
             Self::VecMipCompressed { width, height, format, .. } => Some(TextureAlloc {
                 width: *width,
                 height: *height,
-                pixel: match format {
-                    CompressedTextureFormat::Bc7 => TexturePixel::Bc7,
-                    CompressedTextureFormat::Bc5 => TexturePixel::Bc5,
-                    CompressedTextureFormat::Astc4x4 => TexturePixel::Astc4x4,
-                },
+                pixel: format.pixel(),
                 category: TextureCategory::VecMip,
+            }),
+            Self::VecArrayMipBGRAu8_32 { width, height, layers, .. } => Some(TextureAlloc {
+                width: *width,
+                height: *height,
+                pixel: TexturePixel::BGRAu8,
+                category: TextureCategory::VecArray(*layers),
+            }),
+            Self::VecArrayMipCompressed { width, height, layers, format, .. } => Some(TextureAlloc {
+                width: *width,
+                height: *height,
+                pixel: format.pixel(),
+                category: TextureCategory::VecArray(*layers),
             }),
             Self::VecRu8 { width, height, .. } => Some(TextureAlloc {
                 width: *width,
@@ -1362,6 +1473,24 @@ impl TextureFormat {
                     category: TextureCategory::Render,
                 })
             }
+            Self::RenderRf16 { size, .. } => {
+                let (width, height) = size.width_height(width, height);
+                Some(TextureAlloc {
+                    width,
+                    height,
+                    pixel: TexturePixel::Rf16,
+                    category: TextureCategory::Render,
+                })
+            }
+            Self::RenderRu8 { size, .. } => {
+                let (width, height) = size.width_height(width, height);
+                Some(TextureAlloc {
+                    width,
+                    height,
+                    pixel: TexturePixel::Ru8,
+                    category: TextureCategory::Render,
+                })
+            }
             _ => None,
         }
     }
@@ -1420,6 +1549,12 @@ impl TextureFormat {
                 width: *width,
                 height: *height,
                 pixel: TexturePixel::BGRAu8,
+                category: TextureCategory::Shared,
+            }),
+            Self::SharedNv12 { width, height, .. } => Some(TextureAlloc {
+                width: *width,
+                height: *height,
+                pixel: TexturePixel::Nv12,
                 category: TextureCategory::Shared,
             }),
             _ => None,

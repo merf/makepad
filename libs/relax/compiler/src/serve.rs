@@ -100,7 +100,7 @@ impl Session {
                 if let Ok(plan) = crate::reload::classify(&unit.prog, file, &v.pf, &path) {
                     if plan.changes.is_empty() && plan.added.is_empty() && plan.removed.is_empty() && plan.removed_uses.is_empty() && !plan.attributes_changed {
                         if let Ok(f) = unit.prog.commit_body_version(v, &plan.pairs) {
-                            unit.prog.lower_body_declarations(&[]);
+                            unit.prog.lower_body_declarations(&[], &[f]);
                             primed.push(file);
                             primed.push(f);
                             files.insert(path, f);
@@ -181,7 +181,7 @@ impl Session {
                     if let crate::typeck::Res::Def(d) = r { edges.push(*d); }
                 }
                 for m in body.methods.values().chain(body.binops.values()) { edges.push(m.def); }
-                for (d, _) in body.ov_derefs.values().chain(body.ov_index.values()).chain(body.for_next.values()) { edges.push(*d); }
+                for (d, _) in body.overloaded_derefs().map(|(_, _, ov)| ov).collect::<Vec<_>>().iter().chain(body.ov_index.values()).chain(body.for_next.values()) { edges.push(*d); }
                 for (d, _, _) in body.for_into.values() { edges.push(*d); }
                 for (d, _, _) in body.try_branch.values() { edges.push(*d); }
                 for (d, _) in body.try_from_residual.values() { edges.push(*d); }
@@ -189,7 +189,7 @@ impl Session {
                 // Check concrete instances reached in the package, with diagnostics owned by
                 // the caller. Closure bodies are already checked in their enclosing Body.
                 let cx = crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &state);
-                for (callee, args) in u.tcx.with_errors(&cx, || crate::jit::body_callees(&u.prog, &u.tcx, &body, false)).0 {
+                for (callee, args) in u.tcx.with_errors(&cx, || crate::jit::body_callees(&u.prog, &u.tcx, &body, false, None)).0 {
                     edges.push(callee);
                     if self.own_crates.contains(&u.prog.def(callee).krate) && !args.is_empty() { queue.push((callee, args)); }
                 }
@@ -372,10 +372,18 @@ impl Session {
         }
         let parsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         if rebuild.is_empty() {
-            self.unit.prog.lower_body_declarations(&legacy_owners);
+            self.unit.prog.lower_body_declarations(&legacy_owners, &body_files);
             // The edited versions' body inputs, as reload.rs publish_reload.
             self.unit.tcx.queries.register_files(self.unit.prog.files.len());
             self.unit.tcx.publish_file_bodies(&body_files);
+            // the commits' new defs (closures of the edited bodies) have declaration cells
+            self.unit.tcx.grow_to(&self.unit.prog);
+            // items added inside an edited body (a `use` in a closure) got defs at the commit
+            let body_added = self.unit.prog.take_body_added();
+            if !body_added.is_empty() {
+                // (its errors stay in tcx.errors, where collect_added put them)
+                let _ = self.unit.tcx.collect_added(&self.unit.prog, &body_added, false);
+            }
             self.refresh_front();
             // Include callers before invalidating hidden opaque types: an unchanged
             // caller's inferred return can change when its callee's body changes.
@@ -453,7 +461,7 @@ impl Session {
                 match self.unit.prog.recollect_check_crate(krate, files) {
                     Ok(defs) => {
                         self.unit.tcx.errors.retain(|e| !self.files.iter().any(|(p, f)| self.unit.prog.file_crate[*f as usize] == krate && e.starts_with(p)));
-                        self.unit.consts.clear(); self.unit.statics.clear(); self.unit.static_spans.clear();
+                        self.unit.consts.clear(); self.unit.statics.clear(); self.unit.static_spans.clear(); self.unit.tls_places.clear();
                         self.unit.tcx.collect_check(&self.unit.prog, &defs);
                     }
                     Err(e) => { self.parse_errors.insert(String::new(), crate::diag::from_legacy(&e, "resolve")); }
@@ -499,7 +507,16 @@ impl Session {
     fn rebuild_sources(&mut self, edits: Vec<(String, std::io::Result<Vec<u8>>)>, check_bodies: bool, force_eager: bool) {
         let start = Instant::now();
         for (path, text) in edits {
-            let path = self.file(&path).map(|f| self.unit.prog.file_paths[f as usize].clone()).unwrap_or_else(|| crate::vfs::normalize_path(&path));
+            // the program's own spelling of the file: the overlay is looked up by it. A skipped
+            // file has no id: an alias (macOS /var -> /private/var) maps to the path the program
+            // knows it by, else the edit would sit under a name the rebuild never reads.
+            let path = match self.file(&path) {
+                Some(f) => self.unit.prog.file_paths[f as usize].clone(),
+                None => {
+                    let spelling = Self::source_spelling(&path);
+                    self.paths().into_iter().find(|p| Self::source_spelling(p) == spelling).unwrap_or_else(|| crate::vfs::normalize_path(&path))
+                }
+            };
             let canonical = Self::source_spelling(&path);
             // Skipped files have no file ID yet. Remove old aliases too, so an
             // earlier overlay cannot overwrite the newest edit.

@@ -1,15 +1,16 @@
 //! The local carrier: a Unix socket `$TMPDIR/makepad-remote-<pid>.sock` (0600, same-uid peers
-//! only) next to the discovery file `makepad-remote-<pid>.json`. On Windows the same
+//! only); its discovery file `makepad-remote-<pid>.json` is in the user's registry dir
+//! ([`crate::discovery::registry_dir`], the same for every process whatever its TMPDIR). On Windows the same
 //! discovery file points at the loopback carrier (`carrier::loopback`: TCP on 127.0.0.1 behind a token).
 
-use crate::endpoint::Endpoint;
-use std::io;
 use std::path::PathBuf;
 
 /// The socket and discovery file paths of process `pid`.
 pub fn paths(pid: u32) -> (PathBuf, PathBuf) {
-    let dir = std::env::temp_dir();
-    (dir.join(format!("makepad-remote-{pid}.sock")), dir.join(format!("makepad-remote-{pid}.json")))
+    (
+        std::env::temp_dir().join(format!("makepad-remote-{pid}.sock")),
+        crate::discovery::registry_dir().join(format!("makepad-remote-{pid}.json")),
+    )
 }
 
 /// Removes the socket and discovery file of this process (at exit).
@@ -22,6 +23,8 @@ extern "C" fn cleanup() {
 #[cfg(unix)]
 mod imp {
     use super::*;
+    use crate::endpoint::Endpoint;
+    use std::io;
     use crate::carrier::Carrier;
     use crate::frame::FrameReader;
     use std::os::unix::net::{UnixListener, UnixStream};
@@ -159,6 +162,8 @@ pub use imp::*;
 #[cfg(windows)]
 mod imp {
     use super::*;
+    use crate::endpoint::Endpoint;
+    use std::io;
     /// No Unix sockets here: the endpoint listens on loopback TCP (ephemeral port) behind a random
     /// token, both written to the discovery file `{"pid","app","socket":"tcp:127.0.0.1:PORT",
     /// "token","started_ms","caps"}` (+ `extra`). Returns `tcp:127.0.0.1:PORT`.
@@ -187,8 +192,30 @@ mod imp {
         unsafe { atexit(cleanup) };
         Ok(PathBuf::from(socket))
     }
-    pub fn listen_at(_ep: &Endpoint, _path: &std::path::Path) -> io::Result<()> {
-        Err(io::Error::new(io::ErrorKind::Unsupported, "makepad-remote is not available on Windows yet"))
+    /// Serves `ep` at a fixed address such as the hub's: loopback TCP behind a fresh token, both
+    /// written to the file at `path` (`{"pid","socket":"tcp:127.0.0.1:PORT","token"}`, in the
+    /// user's own temp folder, which only that user can read). [`resolve`] is the dial side.
+    pub fn listen_at(ep: &Endpoint, path: &std::path::Path) -> io::Result<()> {
+        let token = crate::carrier::loopback::new_token()?;
+        let addr = crate::carrier::loopback::serve(ep, &token)?;
+        let info = format!(
+            "{{\"pid\":{},\"app\":{},\"socket\":{},\"token\":{},\"started_ms\":{},\"caps\":[]}}\n",
+            std::process::id(),
+            crate::cmd::json_str(ep.app()),
+            crate::cmd::json_str(&format!("tcp:{addr}")),
+            crate::cmd::json_str(&token),
+            crate::cmd::wall_ms()
+        );
+        let _ = std::fs::remove_file(path);
+        makepad_network::tls::write_private(path, info.as_bytes())
+    }
+
+    /// The loopback address and token a [`listen_at`] file at `path` names.
+    pub fn resolve(path: &std::path::Path) -> io::Result<(String, String)> {
+        let text = std::fs::read_to_string(path)?;
+        let app = crate::discovery::parse(&text).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("{}: not an endpoint file", path.display())))?;
+        let addr = app.socket.strip_prefix("tcp:").ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("{}: no tcp: socket", path.display())))?;
+        Ok((addr.to_string(), app.text("token").unwrap_or_default()))
     }
 }
 

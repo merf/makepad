@@ -415,12 +415,35 @@ pub(crate) fn default_app_id() -> String {
         .unwrap_or_else(|| "Makepad".to_string())
 }
 
+/// The lane a test instance runs for (`MAKEPAD_TEST_LANE`, set by devhub for every lane run).
+pub fn test_lane() -> Option<&'static str> {
+    static LANE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    LANE.get_or_init(|| {
+        let lane: String = std::env::var("MAKEPAD_TEST_LANE").ok()?.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')).take(48).collect();
+        (!lane.is_empty()).then_some(lane)
+    })
+    .as_deref()
+}
+
+/// A window's title as people see it: a lane's test instance says so first (`TEST: lane <name>`,
+/// in the OS title and the app-drawn caption alike), an agent's `--remote` run says so last.
+pub fn badge_window_title(title: String) -> String {
+    let title = match test_lane() {
+        Some(lane) => {
+            let badge = format!("TEST: lane {lane} · ");
+            if title.starts_with(&badge) { title } else { format!("{badge}{title}") }
+        }
+        None => title,
+    };
+    crate::remote::tag_window_title(title)
+}
+
 impl WindowHandle {
     pub fn new(cx: &mut Cx) -> Self {
         let window = cx.windows.alloc();
         let cxwindow = &mut cx.windows[window.window_id()];
         cxwindow.is_created = false;
-        cxwindow.create_title = crate::remote::tag_window_title("Makepad".to_string());
+        cxwindow.create_title = crate::window::badge_window_title("Makepad".to_string());
         cxwindow.create_inner_size = None;
         cxwindow.create_position = None;
         cxwindow.create_app_id = default_app_id();
@@ -520,6 +543,10 @@ pub struct ScriptWindowHandle {
     pub backdrop_intensity: f32,
     #[live(MacosWindowConfig::default())]
     pub macos: MacosWindowConfig,
+    /// A tray app's dropdown (`WindowHandle::configure_dropdown`); give it `create_on_start: false`
+    /// on the `Window` and show it with `show_at_tray`.
+    #[live]
+    pub dropdown: bool,
     /// Wayland only. Server-side decorations are requested by default; set
     /// this to `ClientSide` to explicitly use Makepad's window frame.
     #[live(WaylandDecorationPreference::ServerSide)]
@@ -586,6 +613,9 @@ impl ScriptHook for ScriptWindowHandle {
         let macos = self.macos.normalized();
         cx.windows[window_id].macos = macos;
         if !cx.windows[window_id].is_created {
+            cx.windows[window_id].dropdown = self.dropdown;
+        }
+        if !cx.windows[window_id].is_created {
             cx.windows[window_id].wayland_decorations = self.wayland_decorations;
         }
         if cx.windows[window_id].window_visuals() != visuals {
@@ -607,7 +637,7 @@ impl ScriptHook for ScriptWindowHandle {
 
 impl WindowHandle {
     pub fn set_title(&self, cx: &mut Cx, title: String) {
-        let title = crate::remote::tag_window_title(title);
+        let title = crate::window::badge_window_title(title);
         let window_id = self.window_id();
         if cx.windows[window_id].create_title == title {
             return;
@@ -636,11 +666,38 @@ impl WindowHandle {
         title: String,
     ) {
         let window = &mut cx.windows[self.window_id()];
-        window.create_title = crate::remote::tag_window_title(title);
+        window.create_title = crate::window::badge_window_title(title);
         window.create_position = Some(position);
         window.create_inner_size = Some(inner_size);
         window.is_fullscreen = is_fullscreen;
     }
+    /// Makes this (not yet created) window a tray app's dropdown: borderless, not resizable,
+    /// above the other windows, without a Dock / taskbar entry of its own. It is not created at
+    /// start (`create_on_start: false` on a `Window`): `show_at_tray` creates it on first use.
+    /// When it loses the focus (a click anywhere else) the app gets `Event::PopupDismissed`
+    /// for it and hides it (`set_visible(cx, false)`); Esc is the app's to handle too.
+    pub fn configure_dropdown(&mut self, cx: &mut Cx) {
+        let window = &mut cx.windows[self.window_id()];
+        if !window.is_created {
+            window.dropdown = true;
+        }
+    }
+
+    /// Shows dropdown window (`configure_dropdown`) at tray `tray`'s icon, `size` points large:
+    /// under the macOS status item, next to the Windows notification icon, fitted into that
+    /// screen's visible area, in front and with the focus. Again while it shows (a new size)
+    /// re-places it. Creates the window the first time. Where the desktop has no tray
+    /// (`Cx::has_tray` false) it shows the window where the window system puts it.
+    pub fn show_at_tray(&mut self, cx: &mut Cx, tray: LiveId, size: Vec2d) {
+        let id = self.window_id();
+        if !cx.windows[id].is_created && !cx.platform_ops.iter().any(|op| matches!(op, CxOsOp::CreateWindow(w) if *w == id)) {
+            cx.windows[id].create_inner_size = Some(size);
+            cx.platform_ops.push_back(CxOsOp::CreateWindow(id));
+        }
+        cx.platform_ops.retain(|op| !matches!(op, CxOsOp::HideWindow(w) | CxOsOp::ShowWindow(w) | CxOsOp::ShowWindowAtTray(w, ..) if *w == id));
+        cx.platform_ops.push_back(CxOsOp::ShowWindowAtTray(id, tray, size));
+    }
+
     pub fn configure_macos_window(&mut self, cx: &mut Cx, config: MacosWindowConfig) {
         cx.windows[self.window_id()].macos = config.normalized();
     }
@@ -791,8 +848,38 @@ impl WindowHandle {
         cx.push_unique_platform_op(CxOsOp::RestoreWindow(self.window_id()));
     }
 
+    /// What the window's own close button does: the app is asked (`Event::WindowCloseRequested`,
+    /// a tray app hides the window there) and the window closes when it accepts. `close` closes
+    /// it without asking.
+    pub fn request_close(&mut self, cx: &mut Cx) {
+        cx.push_unique_platform_op(CxOsOp::RequestCloseWindow(self.window_id()));
+    }
+
     pub fn close(&mut self, cx: &mut Cx) {
         cx.push_unique_platform_op(CxOsOp::CloseWindow(self.window_id()));
+    }
+
+    /// Shows the window: made first when it is not yet (`create_on_start: false`), else shown
+    /// again in front like `set_visible(cx, true)`. A tray app makes its regular window this way
+    /// when the person asks for it.
+    pub fn show(&mut self, cx: &mut Cx) {
+        let id = self.window_id();
+        if !cx.windows[id].is_created {
+            if !cx.platform_ops.iter().any(|op| matches!(op, CxOsOp::CreateWindow(w) if *w == id)) {
+                cx.platform_ops.push_back(CxOsOp::CreateWindow(id));
+            }
+            return;
+        }
+        self.set_visible(cx, true);
+    }
+
+    /// Hides the window (it keeps its state and comes back with `set_visible(cx, true)`), or
+    /// shows it again in front of the others with the app activated. A tray app hides its
+    /// window on `WindowCloseRequested` (`accept_close.set(false)`) and shows it from its menu.
+    pub fn set_visible(&mut self, cx: &mut Cx, visible: bool) {
+        let id = self.window_id();
+        cx.platform_ops.retain(|op| !matches!(op, CxOsOp::HideWindow(w) | CxOsOp::ShowWindow(w) | CxOsOp::ShowWindowAtTray(w, ..) if *w == id));
+        cx.platform_ops.push_back(if visible { CxOsOp::ShowWindow(id) } else { CxOsOp::HideWindow(id) });
     }
 }
 
@@ -830,6 +917,8 @@ pub struct CxWindow {
     pub main_pass_id: Option<DrawPassId>,
     pub is_fullscreen: bool,
     pub is_popup: bool,
+    /// a tray app's dropdown (`WindowHandle::configure_dropdown`)
+    pub dropdown: bool,
     pub popup_parent: Option<WindowId>,
     pub popup_position: Option<Vec2d>,
     pub popup_size: Option<Vec2d>,
@@ -871,6 +960,7 @@ impl Default for CxWindow {
             main_pass_id: None,
             is_fullscreen: false,
             is_popup: false,
+            dropdown: false,
             popup_parent: None,
             popup_position: None,
             popup_size: None,
@@ -1448,6 +1538,7 @@ mod tests {
                 macos: MacosWindowConfig::floating_panel(),
                 wayland_decorations: WaylandDecorationPreference::ClientSide,
                 caption_bar_height_override: None,
+                dropdown: false,
             };
 
             script_window.on_after_apply(vm, &Apply::New, &mut Scope::empty(), NIL);

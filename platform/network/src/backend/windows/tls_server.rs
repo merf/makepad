@@ -15,6 +15,7 @@ use std::ffi::c_void;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::ptr::{null, null_mut};
+use std::sync::Arc;
 
 type SecurityStatus = i32;
 
@@ -167,6 +168,7 @@ extern "system" {
 extern "system" {
     fn CertCreateCertificateContext(encoding: u32, der: *const u8, len: u32) -> *const c_void;
     fn CertFreeCertificateContext(cert: *const c_void) -> i32;
+    fn CertEnumCertificatesInStore(store: *mut c_void, previous: *const c_void) -> *const c_void;
     fn CertSetCertificateContextProperty(cert: *const c_void, prop: u32, flags: u32, data: *const c_void) -> i32;
 }
 
@@ -221,6 +223,17 @@ extern "system" {
         flags: u32,
     ) -> i32;
     fn BCryptDestroyKey(key: *mut c_void) -> i32;
+    fn BCryptSecretAgreement(private_key: *mut c_void, public_key: *mut c_void, secret: *mut *mut c_void, flags: u32) -> i32;
+    fn BCryptDeriveKey(
+        secret: *mut c_void,
+        kdf: *const u16,
+        parameters: *mut c_void,
+        out: *mut u8,
+        out_len: u32,
+        result: *mut u32,
+        flags: u32,
+    ) -> i32;
+    fn BCryptDestroySecret(secret: *mut c_void) -> i32;
     fn BCryptVerifySignature(
         key: *mut c_void,
         padding: *mut c_void,
@@ -271,14 +284,27 @@ const SEC_E_OK: i32 = 0;
 const SEC_I_CONTINUE_NEEDED: i32 = 0x0009_0312;
 const SEC_I_CONTEXT_EXPIRED: i32 = 0x0009_0317;
 const SEC_I_RENEGOTIATE: i32 = 0x0009_0321;
+/// The server asked for a client certificate (FTPS servers often do).
+const SEC_I_INCOMPLETE_CREDENTIALS: i32 = 0x0009_0320;
 const SEC_E_INCOMPLETE_MESSAGE: i32 = 0x8009_0318u32 as i32;
 const SECPKG_ATTR_STREAM_SIZES: u32 = 4;
+const SECPKG_ATTR_SESSION_INFO: u32 = 0x5d;
+const SSL_SESSION_RECONNECT: u32 = 1;
+
+#[repr(C)]
+struct SessionInfo {
+    flags: u32,
+    session_id_len: u32,
+    session_id: [u8; 32],
+}
 
 const X509_ASN_ENCODING: u32 = 0x1 | 0x10000;
 const CERT_KEY_PROV_INFO_PROP_ID: u32 = 2;
 const NCRYPTBUFFER_PKCS_KEY_NAME: u32 = 45;
 const NCRYPT_OVERWRITE_KEY_FLAG: u32 = 0x80;
 const ECDSA_PRIVATE_P256_MAGIC: u32 = 0x3253_4345;
+const ECDH_PRIVATE_P256_MAGIC: u32 = 0x324b_4345;
+const ECDH_PUBLIC_P256_MAGIC: u32 = 0x314b_4345;
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
@@ -342,6 +368,56 @@ pub fn generate_p256() -> io::Result<[u8; 97]> {
     let mut out = [0u8; 97];
     out[0] = 0x04;
     out[1..].copy_from_slice(&blob[8..]);
+    Ok(out)
+}
+
+pub fn ecdh_p256(key: &[u8; 97], peer_point: &[u8]) -> io::Result<[u8; 32]> {
+    let mut alg = null_mut();
+    let st = unsafe { BCryptOpenAlgorithmProvider(&mut alg, wide("ECDH_P256").as_ptr(), null(), 0) };
+    if st != 0 {
+        return Err(status_error("BCryptOpenAlgorithmProvider(ECDH_P256)", st));
+    }
+    let alg = Alg(alg);
+    let mut blob = ecc_private_blob(key);
+    blob[..4].copy_from_slice(&ECDH_PRIVATE_P256_MAGIC.to_le_bytes());
+    let mut private = null_mut();
+    let st = unsafe {
+        BCryptImportKeyPair(alg.0, null_mut(), wide("ECCPRIVATEBLOB").as_ptr(), &mut private, blob.as_ptr(), blob.len() as u32, 0)
+    };
+    if st != 0 {
+        return Err(status_error("BCryptImportKeyPair(ECDH private)", st));
+    }
+    let private = BKey(private);
+    let mut blob = Vec::with_capacity(8 + 64);
+    blob.extend_from_slice(&ECDH_PUBLIC_P256_MAGIC.to_le_bytes());
+    blob.extend_from_slice(&32u32.to_le_bytes());
+    blob.extend_from_slice(&peer_point[1..65]);
+    let mut peer = null_mut();
+    // With flags = 0, CNG validates the imported public point.
+    let st = unsafe {
+        BCryptImportKeyPair(alg.0, null_mut(), wide("ECCPUBLICBLOB").as_ptr(), &mut peer, blob.as_ptr(), blob.len() as u32, 0)
+    };
+    if st != 0 {
+        return Err(status_error("BCryptImportKeyPair(ECDH peer)", st));
+    }
+    let peer = BKey(peer);
+    let mut secret = null_mut();
+    let st = unsafe { BCryptSecretAgreement(private.0, peer.0, &mut secret, 0) };
+    if st != 0 {
+        return Err(status_error("BCryptSecretAgreement", st));
+    }
+    let mut out = [0u8; 32];
+    let mut len = 0u32;
+    let st = unsafe {
+        // BCRYPT_KDF_RAW_SECRET (TRUNCATE) returns the raw secret little-endian.
+        let st = BCryptDeriveKey(secret, wide("TRUNCATE").as_ptr(), null_mut(), out.as_mut_ptr(), 32, &mut len, 0);
+        BCryptDestroySecret(secret);
+        st
+    };
+    if st != 0 || len != 32 {
+        return Err(status_error("BCryptDeriveKey(RAW_SECRET)", st));
+    }
+    out.reverse();
     Ok(out)
 }
 
@@ -626,9 +702,9 @@ pub struct ServerStream {
     tcp: TcpStream,
     cred: SecHandle,
     ctx: SecHandle,
-    /// Client side (pinned connect): owns its credential handle and runs
-    /// post-handshake messages through InitializeSecurityContext.
-    client: Option<Vec<u16>>,
+    /// Client side (pinned connect): runs post-handshake messages through
+    /// InitializeSecurityContext.
+    client: Option<ClientSide>,
     sizes: StreamSizes,
     incoming: Vec<u8>,
     plain: Vec<u8>,
@@ -705,10 +781,10 @@ impl ServerStream {
         let mut attrs = 0u32;
         let st = unsafe {
             match &self.client {
-                Some(target) => InitializeSecurityContextW(
+                Some(client) => InitializeSecurityContextW(
                     &mut self.cred,
                     &mut self.ctx,
-                    target.as_ptr(),
+                    client.target.as_ptr(),
                     ISC_FLAGS,
                     0,
                     0,
@@ -756,11 +832,31 @@ impl Drop for ServerStream {
     fn drop(&mut self) {
         unsafe {
             DeleteSecurityContext(&mut self.ctx);
-            if self.client.is_some() {
-                FreeCredentialsHandle(&mut self.cred);
-            }
         }
     }
+}
+
+/// A client credential handle. Schannel caches client sessions per
+/// credential and target name, so connections that resume each other's
+/// session share one.
+struct ClientCred(SecHandle);
+
+impl Drop for ClientCred {
+    fn drop(&mut self) {
+        unsafe {
+            FreeCredentialsHandle(&mut self.0);
+        }
+    }
+}
+
+// The handle is only read after creation; SSPI handles are process-wide.
+unsafe impl Send for ClientCred {}
+unsafe impl Sync for ClientCred {}
+
+struct ClientSide {
+    target: Vec<u16>,
+    /// Freed when the last connection on it is dropped (after its context).
+    cred: Arc<ClientCred>,
 }
 
 fn client_credentials() -> io::Result<SecHandle> {
@@ -828,17 +924,52 @@ struct CertContext {
     store: *mut c_void,
 }
 
+impl ServerStream {
+    pub(crate) fn peer_chain_der(&mut self) -> io::Result<Vec<Vec<u8>>> {
+        let mut cert: *const c_void = null();
+        let status = unsafe { QueryContextAttributesW(&mut self.ctx, SECPKG_ATTR_REMOTE_CERT_CONTEXT, &mut cert as *mut _ as *mut c_void) };
+        if status != SEC_E_OK || cert.is_null() { return Err(status_error("server certificate", status)); }
+        let chain = unsafe {
+            let leaf = &*(cert as *const CertContext);
+            let mut chain = vec![std::slice::from_raw_parts(leaf.encoded, leaf.encoded_len as usize).to_vec()];
+            // The remote context's store holds the certificates sent by the
+            // peer. Enumeration releases each previous certificate context.
+            if !leaf.store.is_null() {
+                let mut next = null();
+                loop {
+                    next = CertEnumCertificatesInStore(leaf.store, next);
+                    if next.is_null() { break; }
+                    let c = &*(next as *const CertContext);
+                    let der = std::slice::from_raw_parts(c.encoded, c.encoded_len as usize).to_vec();
+                    if !chain.contains(&der) { chain.push(der); }
+                }
+            }
+            CertFreeCertificateContext(cert);
+            chain
+        };
+        Ok(chain)
+    }
+}
+
 /// Client handshake on Schannel without chain validation (self-signed
-/// servers); returns the server certificate's SHA-256 with the stream.
-pub fn connect_capture(mut tcp: TcpStream, host: &str) -> io::Result<(ServerStream, [u8; 32])> {
-    let cred = client_credentials()?;
+/// servers); returns the server leaf certificate DER with the stream.
+/// `resume`: an earlier client connection to the same host whose session
+/// this one resumes (its credential handle is shared).
+pub fn connect_capture(mut tcp: TcpStream, host: &str, resume: Option<&ServerStream>) -> io::Result<(ServerStream, Vec<u8>)> {
+    let cred = match resume {
+        Some(earlier) => match &earlier.client {
+            Some(client) => client.cred.clone(),
+            None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "no client TLS session to resume")),
+        },
+        None => Arc::new(ClientCred(client_credentials()?)),
+    };
     let target = wide(host);
-    // The stream owns cred and ctx from here; its Drop frees them.
+    // The stream owns ctx (and a share of cred) from here; its Drop frees them.
     let mut stream = ServerStream {
         tcp: tcp.try_clone()?,
-        cred,
+        cred: cred.0,
         ctx: SecHandle::default(),
-        client: Some(target.clone()),
+        client: Some(ClientSide { target: target.clone(), cred }),
         sizes: StreamSizes::default(),
         incoming: Vec::new(),
         plain: Vec::new(),
@@ -850,6 +981,7 @@ pub fn connect_capture(mut tcp: TcpStream, host: &str) -> io::Result<(ServerStre
     let mut have_ctx = false;
     let mut buf = vec![0u8; 16 * 1024];
     let mut need_read = false;
+    let mut certificate_requests = 0;
     loop {
         if need_read {
             let n = tcp.read(&mut buf)?;
@@ -895,6 +1027,12 @@ pub fn connect_capture(mut tcp: TcpStream, host: &str) -> io::Result<(ServerStre
         }
         match st {
             SEC_E_INCOMPLETE_MESSAGE => need_read = true,
+            // We have no client certificate: calling again with the same
+            // input continues the handshake without one.
+            SEC_I_INCOMPLETE_CREDENTIALS if have_ctx && certificate_requests == 0 => {
+                certificate_requests += 1;
+                need_read = false;
+            }
             SEC_E_OK | SEC_I_CONTINUE_NEEDED => {
                 if have_ctx && in_bufs[1].kind == SECBUFFER_EXTRA && in_bufs[1].cb > 0 {
                     let keep = in_bufs[1].cb as usize;
@@ -928,12 +1066,20 @@ pub fn connect_capture(mut tcp: TcpStream, host: &str) -> io::Result<(ServerStre
         std::slice::from_raw_parts(c.encoded, c.encoded_len as usize).to_vec()
     };
     unsafe { CertFreeCertificateContext(cert) };
-    let got = crate::digest::sha256_hash(&der);
     let st = unsafe { QueryContextAttributesW(&mut stream.ctx, SECPKG_ATTR_STREAM_SIZES, &mut stream.sizes as *mut _ as *mut c_void) };
     if st != SEC_E_OK {
         return Err(status_error("QueryContextAttributes(STREAM_SIZES)", st));
     }
-    Ok((stream, got))
+    if resume.is_some() {
+        let mut info = SessionInfo { flags: 0, session_id_len: 0, session_id: [0; 32] };
+        let st = unsafe { QueryContextAttributesW(&mut stream.ctx, SECPKG_ATTR_SESSION_INFO, &mut info as *mut _ as *mut c_void) };
+        if st != SEC_E_OK || info.flags & SSL_SESSION_RECONNECT == 0 {
+            // Seen with servers that lack the extended master secret
+            // (RFC 7627): Schannel does not resume their sessions.
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "the TLS session was not resumed (Schannel resumes no sessions without the extended master secret)"));
+        }
+    }
+    Ok((stream, der))
 }
 
 impl Read for ServerStream {
@@ -970,18 +1116,57 @@ impl Read for ServerStream {
 }
 
 impl ServerStream {
-    /// Sends what an earlier write left of its encrypted record. A send timeout keeps the rest
-    /// (`pending_pos` marks how far it got) and returns `WouldBlock`; call again to resume.
+    /// Sends what an earlier write left of its encrypted record. Past the socket's write timeout
+    /// the rest is kept (`pending_pos` marks how far it got) and `WouldBlock` returned; call
+    /// again to resume.
+    ///
+    /// The timeout is kept here, not by Winsock: a blocking send that runs into SO_SNDTIMEO
+    /// leaves the socket "indeterminate" (bytes of it may have gone out although it reports
+    /// none), and sending them again duplicated TLS bytes on the wire: the peer's next record
+    /// failed to decrypt (macOS: errSSLDecryptionFail, -9845) and the connection broke. So with a
+    /// timeout the socket sends non-blocking, where WouldBlock means nothing was taken.
     fn drain_pending(&mut self) -> io::Result<()> {
-        while self.pending_pos < self.pending.len() {
+        if self.pending_pos >= self.pending.len() {
+            self.pending.clear();
+            self.pending_pos = 0;
+            return Ok(());
+        }
+        let Some(limit) = self.tcp.write_timeout()? else {
+            while self.pending_pos < self.pending.len() {
+                match self.tcp.write(&self.pending[self.pending_pos..]) {
+                    Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "TLS record not sent")),
+                    Ok(n) => self.pending_pos += n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            self.pending.clear();
+            self.pending_pos = 0;
+            return Ok(());
+        };
+        let deadline = std::time::Instant::now() + limit;
+        self.tcp.set_nonblocking(true)?;
+        let result = loop {
+            if self.pending_pos >= self.pending.len() {
+                break Ok(());
+            }
             match self.tcp.write(&self.pending[self.pending_pos..]) {
-                Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "TLS record not sent")),
+                Ok(0) => break Err(io::Error::new(io::ErrorKind::WriteZero, "TLS record not sent")),
                 Ok(n) => self.pending_pos += n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) if e.kind() == io::ErrorKind::TimedOut => return Err(io::Error::new(io::ErrorKind::WouldBlock, "TLS send timed out")),
-                Err(e) => return Err(e),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        break Err(io::Error::new(io::ErrorKind::WouldBlock, "TLS send timed out"));
+                    }
+                    // the send buffer is full: the peer reads slower than we write
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(e) => break Err(e),
             }
-        }
+        };
+        let restored = self.tcp.set_nonblocking(false);
+        result?;
+        restored?;
         self.pending.clear();
         self.pending_pos = 0;
         Ok(())

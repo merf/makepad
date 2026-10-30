@@ -60,7 +60,7 @@ impl EvalCtxt<'_, '_> {
             self.try_assemble_bounds_via_registered_opaques(env, &goal, from, &mut candidates)?;
             return Ok((candidates, failed));
         }
-        if self.delegate.typing_mode.is_coherence() {
+        if self.delegate.typing_mode.get().is_coherence() {
             let local_crate = self.delegate.coherence_crate.expect("coherence crate context");
             if coherence::trait_ref_is_knowable(self,env,&goal.trait_ref(self),local_crate)?.is_err() {
                 // assembly/mod.rs:1022-1060: a known-false supertrait disproves
@@ -97,7 +97,7 @@ impl EvalCtxt<'_, '_> {
         if matches!(from, AssembleCandidatesFrom::All) {
             self.assemble_builtin_impl_candidates(env, &goal, &mut candidates)?;
             let mut shadowed = false;
-            if !self.delegate.typing_mode.is_coherence() {
+            if !self.delegate.typing_mode.get().is_coherence() {
                 for c in &candidates { if matches!(c.source, CandidateSource::ParamEnv(false) | CandidateSource::AliasBound(_)) && has_no_inference_or_external_constraints(&self.delegate.tcx.tys, &c.result) { shadowed = true; } }
             }
             if !shadowed { self.assemble_impl_candidates(env, &goal, &mut candidates)?; self.assemble_object_bound_candidates(env, &goal, &mut candidates)?; }
@@ -121,7 +121,7 @@ impl EvalCtxt<'_, '_> {
     }
     pub(super) fn match_assumption(&mut self, env: &ParamEnvId, goal: &GoalKind, p: &Predicate) -> Result<(), NoSolutionOrRerunNonErased> {
         let kind = self.delegate.instantiate_predicate_binder_with_infer(p);
-        let p = self.normalize_predicate(env, &Predicate::dummy(kind))?;
+        let p = Predicate::dummy(kind);
         match (goal, p.kind) {
             (GoalKind::Trait(goal), PredicateKind::Clause(ClauseKind::Trait(p))) => self.eq_args(env, &goal.trait_ref.args, &p.trait_ref.args),
             (GoalKind::NormalizesTo(goal), PredicateKind::Clause(ClauseKind::Projection(p))) => {
@@ -188,6 +188,7 @@ impl EvalCtxt<'_, '_> {
         then: impl FnOnce(&mut EvalCtxt<'_, '_>) -> QueryResultOrRerunNonErased) -> Result<Option<Candidate>, NoSolutionOrRerunNonErased> {
         let tcx = self.delegate.tcx; let tr = goal.trait_ref(self);
         let d = self.solver.prog.def(imp);
+        if let Some(view) = self.delegate.impl_view { if !self.solver.prog.crate_sees(view, d.krate) { return Ok(None); } }
         let negative = { let ast = &self.solver.prog.files[d.file as usize].ast; ast.as_impl(&ast.item(d.item).kind).is_some_and(|i| i.negative) };
         let wanted_negative = matches!(goal, GoalKind::Trait(TraitClause { polarity: ClausePolarity::Negative, .. }));
         if negative != wanted_negative { return Ok(None); }
@@ -228,16 +229,11 @@ impl EvalCtxt<'_, '_> {
         for (i, c) in candidates.iter().enumerate() {
             if c.result.value.certainty.is_yes() && has_no_inference_or_external_constraints(&self.delegate.tcx.tys, &c.result) { return Some((c.result.clone(), Some(i))); }
         }
-        let one = candidates.first()?;
-        let mut one_no_regions = one.result.clone(); one_no_regions.value.external_constraints.region_constraints.clear();
-        let mut equal_regions = true;
-        for c in &candidates[1..] {
-            let mut no_regions = c.result.clone(); no_regions.value.external_constraints.region_constraints.clear();
-            if no_regions != one_no_regions { return None; }
-            equal_regions &= c.result.value.external_constraints.region_constraints == one.result.value.external_constraints.region_constraints;
-        }
-        if equal_regions { return Some((one.result.clone(), None)); }
-        for c in candidates { if c.result.value.external_constraints.region_constraints.is_empty() { return Some((c.result.clone(), None)); } }
+        // rustc 1.97 (solve/mod.rs try_merge_candidates): otherwise only identical responses merge.
+        // Candidates that differ in their region constraints alone are ambiguous (the later
+        // nightly `Or` of region constraints is not in 1.97: ambiguity-due-to-uniquification-*).
+        let one = &candidates.first()?.result;
+        if candidates[1..].iter().all(|c| c.result == *one) { return Some((one.clone(), None)); }
         None
     }
     pub(super) fn flounder(&self, candidates: &[Candidate]) -> QueryResultOrRerunNonErased {
@@ -249,7 +245,7 @@ impl EvalCtxt<'_, '_> {
     pub(super) fn merge_trait_candidates(&mut self, tr: &TraitRef, mut candidates: Vec<Candidate>, failed: CandidateHeadUsages) -> Result<(canonical::Canonical<Response>, Option<TraitGoalProvenVia>), NoSolutionOrRerunNonErased> {
         if candidates.is_empty() { return Err(NoSolution.into()); }
         // trait_goals.rs:1628-1633: coherence does not prefer environment/object candidates.
-        if self.delegate.typing_mode.is_coherence() {
+        if self.delegate.typing_mode.get().is_coherence() {
             return Ok(match self.try_merge_candidates(&candidates) {
                 Some((response, _)) => (response, Some(TraitGoalProvenVia::Misc)),
                 None => (self.flounder(&candidates)?, None),
@@ -275,10 +271,12 @@ impl EvalCtxt<'_, '_> {
         for c in &candidates { if !seen_object && matches!(c.source, CandidateSource::BuiltinImpl(BuiltinImplSource::Object(_))) { seen_object = true; object = has_only_region_constraints(&self.delegate.tcx.tys, &c.result); } all_global &= c.source == CandidateSource::ParamEnv(true); }
         if all_global { return Ok(match self.try_merge_candidates(&candidates) { Some((r,_)) => (r,Some(TraitGoalProvenVia::ParamEnv)), None => (self.flounder(&candidates)?,None) }); }
         candidates.retain(|c| c.source != CandidateSource::ParamEnv(true) && !(object && matches!(c.source, CandidateSource::Impl(_))));
-        let mut all_builtin = true; for c in &candidates { all_builtin &= matches!(c.source, CandidateSource::BuiltinImpl(_)); }
-        if candidates.len() == 1 { return Ok((candidates.remove(0).result, Some(TraitGoalProvenVia::Misc))); }
-        if all_builtin { if let Some((r,_)) = self.try_merge_candidates(&candidates) { return Ok((r,Some(TraitGoalProvenVia::Misc))); } }
-        Ok((self.flounder(&candidates)?, None))
+        // trait_goals.rs:1523-1567 (merge_trait_candidates): every remaining candidate, impls
+        // included, merges when one always applies or all responses are equal.
+        match self.try_merge_candidates(&candidates) {
+            Some((response, _)) => Ok((response, Some(TraitGoalProvenVia::Misc))),
+            None => Ok((self.flounder(&candidates)?, None)),
+        }
     }
     pub(super) fn compute_trait_goal(&mut self, env: ParamEnvId, goal: TraitClause) -> QueryResultOrRerunNonErased {
         self.compute_trait_goal_with_source(&env, &goal).map(|r| r.0)

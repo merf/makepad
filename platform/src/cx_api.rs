@@ -86,71 +86,9 @@ pub struct XrFrameCpuBreakdown {
     pub resize_projection_ms: f64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct SystemBrowserId(pub LiveId);
-
-impl From<LiveId> for SystemBrowserId {
-    fn from(value: LiveId) -> Self {
-        Self(value)
-    }
-}
-
-pub struct CxSystemBrowser<'a> {
-    cx: &'a mut Cx,
-    id: SystemBrowserId,
-}
-
-impl<'a> CxSystemBrowser<'a> {
-    pub fn id(&self) -> SystemBrowserId {
-        self.id
-    }
-
-    pub fn spawn(&mut self, url: &str) {
-        if self.cx.script_data.std.host_io_only() { return; }
-        self.cx.platform_ops.push_back(CxOsOp::SpawnSystemBrowser {
-            browser_id: self.id.0,
-            url: url.to_string(),
-        });
-    }
-
-    pub fn update(&mut self, area: Area, visible: bool) {
-        self.cx.platform_ops.push_back(CxOsOp::UpdateSystemBrowser {
-            browser_id: self.id.0,
-            area,
-            visible,
-        });
-    }
-
-    pub fn detach(&mut self) {
-        self.cx.platform_ops.push_back(CxOsOp::DetachSystemBrowser {
-            browser_id: self.id.0,
-        });
-    }
-
-    pub fn set_url(&mut self, url: &str, replace: bool) {
-        if self.cx.script_data.std.host_io_only() { return; }
-        self.cx.platform_ops.push_back(CxOsOp::SetSystemBrowserUrl {
-            browser_id: self.id.0,
-            url: url.to_string(),
-            replace,
-        });
-    }
-
-    pub fn history_go(&mut self, delta: i32) {
-        if self.cx.script_data.std.host_io_only() { return; }
-        self.cx
-            .platform_ops
-            .push_back(CxOsOp::SystemBrowserHistoryGo {
-                browser_id: self.id.0,
-                delta,
-            });
-    }
-
-    pub fn close(&mut self) {
-        self.cx.platform_ops.push_back(CxOsOp::CloseSystemBrowser {
-            browser_id: self.id.0,
-        });
-    }
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    static XR_HAPTICS: std::cell::RefCell<Vec<crate::event::xr::XrHapticPulse>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// A system haptic (`Cx::haptic_feedback`).
@@ -229,25 +167,22 @@ pub trait CxOsApi {
         None
     }
 
+    /// The view and projection of each eye the next XR frame draws with, in tracking space:
+    /// what a renderer culls and picks levels of detail by under XR.
+    fn xr_eye_matrices(&self) -> Option<[(crate::makepad_math::Mat4f, crate::makepad_math::Mat4f); 2]> {
+        None
+    }
+
+    /// The newest XR frame as the HAL gave it: its predicted display time (HAL clock, ns) and the
+    /// frame (head, eyes, controllers, hands) in its wire form (`makepad_hal::XrFrame`,
+    /// `buffers::Wire`): what a remote renderer is sent to draw that frame.
+    fn xr_frame_wire(&self) -> Option<(u64, Vec<u8>)> {
+        None
+    }
+
     /*
     fn web_socket_open(&mut self, url: String, rec: WebSocketAutoReconnect) -> WebSocket;
     fn web_socket_send(&mut self, socket: WebSocket, data: Vec<u8>);*/
-}
-
-/// Type-erased accessibility tree update payload. PartialEq always returns
-/// false — accessibility updates are never deduplicated.
-pub struct AccessibilityUpdatePayload(pub Box<dyn std::any::Any + Send>);
-
-impl PartialEq for AccessibilityUpdatePayload {
-    fn eq(&self, _other: &Self) -> bool {
-        false
-    }
-}
-
-impl std::fmt::Debug for AccessibilityUpdatePayload {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "AccessibilityUpdatePayload(..)")
-    }
 }
 
 /// A set of screen edges, for [`Cx::defer_system_gestures`].
@@ -319,12 +254,24 @@ pub enum CxOsOp {
     NormalizeWindow(WindowId),
     RestoreWindow(WindowId),
     HideWindow(WindowId),
+    /// Shows a hidden window again and brings it (and the app) to the front.
+    ShowWindow(WindowId),
+    /// The window's own close button (an app-drawn caption's): the app gets
+    /// `WindowCloseRequested`, as for a native close, and the window closes if it accepts.
+    RequestCloseWindow(WindowId),
+    /// A dropdown window (`WindowHandle::show_at_tray`): sized to the points given, shown at
+    /// the tray's icon.
+    ShowWindowAtTray(WindowId, LiveId, Vec2d),
     HideWindowButtons(WindowId),
     ShowWindowButtons(WindowId),
     /// Centre the native window buttons (macOS traffic lights) on this
     /// distance below the window's top edge, in points: a caption row of
     /// another height than the system's keeps them in line. No-op elsewhere.
     CenterWindowButtons(WindowId, f64),
+    /// The caption this window draws (the strip that drags it) and the window buttons in it
+    /// (layout points, zero: none) and whether it is dark: the HAL's `WindowCaption`, by which
+    /// `makepad run` places its JIT ring in the caption. Pushed when it changes.
+    SetWindowCaption(WindowId, Rect, Rect, bool),
     SetTopmost(WindowId, bool),
     /// `true`: drop the native maximized-state border/titlebar strip a
     /// backend would otherwise keep (Windows only; other backends ignore
@@ -398,9 +345,12 @@ pub enum CxOsOp {
     /// immediate, synthetic in-window drag protocol.
     StartExternalDragging {
         window_id: WindowId,
-        items: Vec<DragItem>,
+        items: Vec<crate::event::DragOutFile>,
+        image: Option<crate::event::DragImage>,
     },
     UpdateMacosMenu(MacosMenu),
+    SetTray(crate::tray::TrayIcon),
+    RemoveTray(LiveId),
     ShowClipboardActions {
         has_selection: bool,
         rect: Rect,
@@ -419,7 +369,8 @@ pub enum CxOsOp {
         end: Vec2d,
     },
     HideSelectionHandles,
-    AccessibilityUpdate(AccessibilityUpdatePayload),
+    A11yUpdate { window: WindowId, bytes: Vec<u8> },
+    A11yActionDone { req: u64, result: u8 },
 
     CheckPermission {
         permission: crate::permission::Permission,
@@ -463,41 +414,16 @@ pub enum CxOsOp {
         bool,
         bool,
     ),
-    AttachCameraNativePreview {
-        video_id: LiveId,
-        area: Area,
+    NativeLayerCreate {
+        id: crate::native_layer::NativeLayerId,
+        content: crate::native_layer::NativeContent,
     },
-    UpdateCameraNativePreview {
-        video_id: LiveId,
-        area: Area,
-        visible: bool,
+    NativeLayerOp {
+        id: crate::native_layer::NativeLayerId,
+        op: crate::native_layer::NativeLayerOperation,
     },
-    DetachCameraNativePreview {
-        video_id: LiveId,
-    },
-    SpawnSystemBrowser {
-        browser_id: LiveId,
-        url: String,
-    },
-    UpdateSystemBrowser {
-        browser_id: LiveId,
-        area: Area,
-        visible: bool,
-    },
-    DetachSystemBrowser {
-        browser_id: LiveId,
-    },
-    SetSystemBrowserUrl {
-        browser_id: LiveId,
-        url: String,
-        replace: bool,
-    },
-    SystemBrowserHistoryGo {
-        browser_id: LiveId,
-        delta: i32,
-    },
-    CloseSystemBrowser {
-        browser_id: LiveId,
+    NativeLayerDestroy {
+        id: crate::native_layer::NativeLayerId,
     },
     PrepareAudioPlayback(LiveId, VideoSource, bool, bool),
     BeginVideoPlayback(LiveId),
@@ -512,19 +438,6 @@ pub enum CxOsOp {
     SelectVideoTrack(LiveId, usize),
     SelectAudioTrack(LiveId, usize),
 
-    CreateWebView {
-        id: LiveId,
-        area: Area,
-        texture: Texture,
-        url: String,
-    },
-    UpdateWebView {
-        id: LiveId,
-        area: Area,
-    },
-    CloseWebView {
-        id: LiveId,
-    },
     SaveFileDialog(FileDialog),
     SelectFileDialog(FileDialog),
     SaveFolderDialog(FileDialog),
@@ -571,9 +484,13 @@ impl CxOsOp {
             Self::NormalizeWindow(..) => "NormalizeWindow",
             Self::RestoreWindow(..) => "RestoreWindow",
             Self::HideWindow(..) => "HideWindow",
+            Self::ShowWindow(..) => "ShowWindow",
+            Self::RequestCloseWindow(..) => "RequestCloseWindow",
+            Self::ShowWindowAtTray(..) => "ShowWindowAtTray",
             Self::HideWindowButtons(..) => "HideWindowButtons",
             Self::ShowWindowButtons(..) => "ShowWindowButtons",
             Self::CenterWindowButtons(..) => "CenterWindowButtons",
+            Self::SetWindowCaption(..) => "SetWindowCaption",
             Self::SetTopmost(..) => "SetTopmost",
             Self::SetChromelessWhenMaximized(..) => "SetChromelessWhenMaximized",
             Self::SetWindowTitle(..) => "SetWindowTitle",
@@ -600,6 +517,8 @@ impl CxOsOp {
             Self::StartDragging(..) => "StartDragging",
             Self::StartExternalDragging { .. } => "StartExternalDragging",
             Self::UpdateMacosMenu(..) => "UpdateMacosMenu",
+            Self::SetTray(..) => "SetTray",
+            Self::RemoveTray(..) => "RemoveTray",
             Self::ShowClipboardActions { .. } => "ShowClipboardActions",
             Self::HideClipboardActions => "HideClipboardActions",
             Self::CopyToClipboard(..) => "CopyToClipboard",
@@ -608,7 +527,8 @@ impl CxOsOp {
             Self::ShowSelectionHandles { .. } => "ShowSelectionHandles",
             Self::UpdateSelectionHandles { .. } => "UpdateSelectionHandles",
             Self::HideSelectionHandles => "HideSelectionHandles",
-            Self::AccessibilityUpdate(..) => "AccessibilityUpdate",
+            Self::A11yUpdate { .. } => "A11yUpdate",
+            Self::A11yActionDone { .. } => "A11yActionDone",
 
             Self::CheckPermission { .. } => "CheckPermission",
             Self::RequestPermission { .. } => "RequestPermission",
@@ -624,16 +544,10 @@ impl CxOsOp {
             #[cfg(target_arch = "wasm32")]
             Self::StorageRequestError { .. } => "StorageRequestError",
 
+            Self::NativeLayerCreate { .. } => "NativeLayerCreate",
+            Self::NativeLayerOp { .. } => "NativeLayerOp",
+            Self::NativeLayerDestroy { .. } => "NativeLayerDestroy",
             Self::PrepareVideoPlayback(..) => "PrepareVideoPlayback",
-            Self::AttachCameraNativePreview { .. } => "AttachCameraNativePreview",
-            Self::UpdateCameraNativePreview { .. } => "UpdateCameraNativePreview",
-            Self::DetachCameraNativePreview { .. } => "DetachCameraNativePreview",
-            Self::SpawnSystemBrowser { .. } => "SpawnSystemBrowser",
-            Self::UpdateSystemBrowser { .. } => "UpdateSystemBrowser",
-            Self::DetachSystemBrowser { .. } => "DetachSystemBrowser",
-            Self::SetSystemBrowserUrl { .. } => "SetSystemBrowserUrl",
-            Self::SystemBrowserHistoryGo { .. } => "SystemBrowserHistoryGo",
-            Self::CloseSystemBrowser { .. } => "CloseSystemBrowser",
             Self::PrepareAudioPlayback(..) => "PrepareAudioPlayback",
             Self::BeginVideoPlayback(..) => "BeginVideoPlayback",
             Self::PauseVideoPlayback(..) => "PauseVideoPlayback",
@@ -646,9 +560,6 @@ impl CxOsOp {
             Self::SetVideoPlaybackRate(..) => "SetVideoPlaybackRate",
             Self::SelectVideoTrack(..) => "SelectVideoTrack",
             Self::SelectAudioTrack(..) => "SelectAudioTrack",
-            Self::CreateWebView { .. } => "CreateWebView",
-            Self::UpdateWebView { .. } => "UpdateWebView",
-            Self::CloseWebView { .. } => "CloseWebView",
             Self::SaveFileDialog(..) => "SaveFileDialog",
             Self::SelectFileDialog(..) => "SelectFileDialog",
             Self::SaveFolderDialog(..) => "SaveFolderDialog",
@@ -893,6 +804,16 @@ impl Cx {
         <Self as CxOsApi>::xr_effective_frame_rate_hz(self)
     }
 
+    /// The eyes of the next XR frame (`CxOsApi::xr_eye_matrices`): `[(view, projection); 2]`.
+    pub fn xr_eye_matrices(&self) -> Option<[(crate::makepad_math::Mat4f, crate::makepad_math::Mat4f); 2]> {
+        <Self as CxOsApi>::xr_eye_matrices(self)
+    }
+
+    /// The newest XR frame in its wire form (`CxOsApi::xr_frame_wire`).
+    pub fn xr_frame_wire(&self) -> Option<(u64, Vec<u8>)> {
+        <Self as CxOsApi>::xr_frame_wire(self)
+    }
+
     pub fn geometry_pool_slot_count(&self) -> usize {
         self.geometries.0.slot_count()
     }
@@ -966,14 +887,27 @@ impl Cx {
             }
             // Linux PRIO_PROCESS, who=0 addresses the current task/thread,
             // not the whole process. Keep SCHED_OTHER; no realtime privilege.
-            // Interactive uses nice 0 (unprivileged), light 1 and utility 5.
-            let nice = match priority {
+            // Interactive uses the process's nice (0 normally), light +1 and
+            // utility +5. The ladder is relative to the nice the process was
+            // started with: an unprivileged thread can raise its nice but not
+            // lower it, so under `nice 10` absolute values below 10 would fail.
+            // A boosted (negative) process keeps the absolute ladder.
+            static BASE: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+            let base = *BASE.get_or_init(|| {
+                unsafe extern "C" {
+                    fn getpid() -> i32;
+                }
+                // the thread group leader's nice: the nice the process was started with
+                unsafe { getpriority(0, getpid() as u32) }.clamp(0, 19)
+            });
+            let step = match priority {
                 CxThreadPriority::Normal | CxThreadPriority::UserInteractive => 0,
                 CxThreadPriority::UserInitiated => 1,
                 CxThreadPriority::Utility => 5,
                 CxThreadPriority::Background => 10,
                 CxThreadPriority::Idle => 15,
             };
+            let nice = (base + step).min(19);
             let applied = unsafe { setpriority(0, 0, nice) == 0 && getpriority(0, 0) == nice };
             if applied {
                 PriorityStatus::Applied
@@ -1197,6 +1131,24 @@ impl Cx {
         self.redraw_id
     }
 
+    /// The drawing being recorded: one per draw event, however many draw
+    /// contexts it makes (a second window's, an offscreen bake's), and one per
+    /// draw context made outside a draw event. A recorder that keeps state
+    /// between frames counts frames by it, not by `redraw_id`.
+    pub fn drawing_id(&self) -> u64 {
+        self.drawing_id
+    }
+
+    /// A draw context begins (`CxDraw::new`): a new `redraw_id` for the lists
+    /// it records, and, outside a draw event, a drawing of its own.
+    pub fn begin_draw_context(&mut self) {
+        if !self.in_draw_event {
+            self.drawing_id += 1;
+            self.drawing_start = self.redraw_id;
+        }
+        self.redraw_id += 1;
+    }
+
     pub fn os_type(&self) -> &OsType {
         &self.os_type
     }
@@ -1257,6 +1209,209 @@ impl Cx {
         self.platform_ops.push_back(CxOsOp::UpdateMacosMenu(menu));
     }
 
+    /// A head-mounted display shows this app (`xr_start_presenting` gives it a stereo view).
+    /// The XR display has no display of its own (`info_flags::XR_OFFSCREEN`, a remote headset):
+    /// the XR passes render into their own colour and depth textures, both eyes side by side,
+    /// and the app hands them on (an encoder); they paint before every other pass.
+    pub fn xr_offscreen(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        { self.hal_info_flags() & makepad_hal::info_flags::XR_OFFSCREEN != 0 }
+        #[cfg(target_arch = "wasm32")]
+        { false }
+    }
+
+    /// Repaints that painted a window since the start: with a remote headset streaming, what
+    /// the desktop renders for itself (it renders nothing for the headset's frames alone).
+    pub fn window_paints(&self) -> u64 {
+        self.window_paints
+    }
+
+    /// Supersampling of an offscreen XR display's passes (`xr_offscreen`; a no-op elsewhere):
+    /// they render at `scale` (0.5..2) of the eye pixels per axis, both eyes side by side, and
+    /// the app filters them down (or scales them up) to the eye size itself (a remote headset's
+    /// encoder input).
+    pub fn xr_set_supersample(&mut self, scale: f32) {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.hal_xr_supersample(scale);
+        #[cfg(target_arch = "wasm32")]
+        let _ = scale;
+    }
+
+    /// Multisampling of the XR passes (both eyes): `samples` per pixel (2, 4 or 8 where the
+    /// GPU has that count, `xr_msaa_counts`; 1 or anything else: none), resolved into the
+    /// passes' colour and depth textures at the end of each eye.
+    pub fn xr_set_msaa(&mut self, samples: u32) {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.hal_xr_msaa(samples);
+        #[cfg(target_arch = "wasm32")]
+        let _ = samples;
+    }
+
+    /// The XR passes' samples per pixel now (1: no MSAA).
+    pub fn xr_msaa(&self) -> u32 {
+        #[cfg(not(target_arch = "wasm32"))]
+        { self.hal_xr_msaa_now() }
+        #[cfg(target_arch = "wasm32")]
+        { 1 }
+    }
+
+    /// The MSAA sample counts this GPU has (bit n: 2^n samples per pixel; 1: none).
+    pub fn xr_msaa_counts(&self) -> u32 {
+        #[cfg(not(target_arch = "wasm32"))]
+        { self.hal.info.map_or(1, |i| i.msaa) }
+        #[cfg(target_arch = "wasm32")]
+        { 1 }
+    }
+
+    /// The offscreen XR passes' pixels per eye pixel (1 without supersampling).
+    pub fn xr_supersample(&self) -> f32 {
+        #[cfg(not(target_arch = "wasm32"))]
+        { self.hal_xr_supersample_now() }
+        #[cfg(target_arch = "wasm32")]
+        { 1.0 }
+    }
+
+    pub fn xr_display(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        { self.hal_info_flags() & makepad_hal::info_flags::XR != 0 }
+        #[cfg(target_arch = "wasm32")]
+        { false }
+    }
+
+    /// The display time (HAL clock, ns) of the frame that acquired the current environment
+    /// depth image (its age at use: a frame's display time less this).
+    pub fn xr_environment_depth_display_ns(&self) -> u64 {
+        #[cfg(not(target_arch = "wasm32"))]
+        { self.hal.xr.as_ref().map_or(0, |xr| xr.env_depth_ns) }
+        #[cfg(target_arch = "wasm32")]
+        { 0 }
+    }
+
+    /// The headset's newest environment depth image (where the room is, as its depth cameras
+    /// saw it): the runtime's image itself as a `texture_2d_array` texture, one layer per eye
+    /// (`header.layers`), the depth `d` (0..1) in .r (`header.near`/`far` projection; far 0 or
+    /// infinite: `z = near / (1 - d)`; the first row is the bottom of the view), and its header
+    /// (size, each eye's depth camera). For per-pixel tests against the room (real things in
+    /// front of virtual ones).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn xr_environment_depth(&self) -> Option<(crate::texture::Texture, makepad_hal::XrDepth)> {
+        self.hal.xr.as_ref()?.env_depth.clone()
+    }
+
+    /// Whether this app uses the headset's room field (`xr_tsdf`: its physics, particles or
+    /// field view). Off at start: the headset's environment depth is then only the GPU image
+    /// (`xr_environment_depth`, occlusion); on, it is read back and integrated into the field
+    /// (a core of a headset's CPU), and a remote headset is asked for its field (the serving
+    /// side forwards `xr_room_field_wanted`). Call it whenever the need changes (every frame is
+    /// fine).
+    pub fn xr_set_room_field(&mut self, on: bool) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if crate::os::hal::xr::ROOM_FIELD.swap(on, std::sync::atomic::Ordering::AcqRel) != on {
+            makepad_hal::hal_xr_depth_readback(on);
+            if !on { if let Some(xr) = self.hal.xr.as_mut() { xr.depth_writer = None; } }
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = on; // no headset on the web
+    }
+
+    /// Whether this app uses the room field (`xr_set_room_field`).
+    pub fn xr_room_field_wanted(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        return crate::os::hal::xr::ROOM_FIELD.load(std::sync::atomic::Ordering::Acquire);
+        #[cfg(target_arch = "wasm32")]
+        false
+    }
+
+    /// The XR window's next frame shows with these eyes instead of its `XrFrame`'s: a picture
+    /// rendered elsewhere for other eyes (a streamed one) is drawn over the whole view and the
+    /// headset's compositor reprojects it from the eyes it was rendered with to the display's
+    /// pose. `focus_m`: the depth (metres along the view) of what the picture shows, for the
+    /// compositor's positional correction (0: rotation only). Set before the frame is drawn; it
+    /// holds for that one frame.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn xr_present_eyes(&mut self, eyes: [makepad_hal::XrEye; 2], focus_m: f32) {
+        self.hal_xr_present_eyes(eyes, focus_m);
+    }
+
+    /// The headset's display runs at its supported refresh rate nearest to `hz` (0: the
+    /// runtime's default). The rate in effect: `xr_display_refresh_rate_hz`.
+    pub fn xr_set_refresh_rate(&mut self, hz: f32) {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.hal_xr_refresh_rate((hz.max(0.0) * 1000.0) as u32);
+        #[cfg(target_arch = "wasm32")]
+        let _ = hz;
+    }
+
+    /// The XR frames' poses (head, eyes, hands, controllers) are predicted `lead_ns` past their
+    /// display time: for a picture rendered elsewhere from them that shows that much later (a
+    /// stream's measured latency). 0 (the default): at the display time.
+    pub fn xr_set_pose_lead(&mut self, lead_ns: u64) {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.hal_xr_pose_lead(lead_ns);
+        #[cfg(target_arch = "wasm32")]
+        let _ = lead_ns;
+    }
+
+    /// A short buzz on a controller (`hand` 0 left, 1 right; `amplitude` 0..1): a remote
+    /// headset's server sends it down the link ([`Cx::xr_take_haptics`]); a headset of this
+    /// process's own plays it on its controller. Nothing without a headset.
+    pub fn xr_haptic(&mut self, hand: usize, amplitude: f32, seconds: f32) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let pulse = crate::event::xr::XrHapticPulse { hand: hand.min(1) as u8, amplitude: amplitude.clamp(0.0, 1.0), seconds: seconds.clamp(0.0, 1.0) };
+            XR_HAPTICS.with(|q| {
+                let mut q = q.borrow_mut();
+                // a backlog (no server draining it) never grows: the newest pulses win
+                if q.len() >= 16 {
+                    q.remove(0);
+                }
+                q.push(pulse);
+            });
+            self.hal_xr_haptic(pulse);
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = (hand, amplitude, seconds);
+    }
+
+    /// The controller buzzes asked for since the last call (`xr_haptic`), for a remote
+    /// headset's server to send; `into` is cleared first.
+    pub fn xr_take_haptics(&mut self, into: &mut Vec<crate::event::xr::XrHapticPulse>) {
+        into.clear();
+        #[cfg(not(target_arch = "wasm32"))]
+        XR_HAPTICS.with(|q| into.append(&mut q.borrow_mut()));
+    }
+
+    /// The headset's view is see-through: the room shows wherever the XR passes leave alpha 0
+    /// (mixed reality, a passthrough under the projection on headsets that have one).
+    pub fn xr_set_see_through(&mut self, on: bool) {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.hal_xr_see_through(on);
+        #[cfg(target_arch = "wasm32")]
+        let _ = on;
+    }
+
+    /// Whether the app asked for a see-through view (`xr_set_see_through`; a remote headset's
+    /// server tells the headset).
+    pub fn xr_see_through(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        { self.hal_xr_see_through_now() }
+        #[cfg(target_arch = "wasm32")]
+        { false }
+    }
+
+    /// Where the XR passes' scene space sits in the room: `m` maps a scene point into the
+    /// headset's tracking space, and the eye views the XR passes draw with become `view * m`,
+    /// so shaders see scene (world) coordinates while the headset sees the room. A vehicle the
+    /// view rides with, or a world shown at another scale, is this one matrix instead of a
+    /// transform on every draw. Set per frame; identity (the default) = the scene is the room.
+    /// The eyes `xr_eye_matrices` and `xr_frame_wire` report stay in tracking space.
+    pub fn xr_set_scene_to_room(&mut self, m: crate::makepad_math::Mat4f) {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.hal_xr_scene_to_room(m);
+        #[cfg(target_arch = "wasm32")]
+        let _ = m;
+    }
+
     pub fn xr_start_presenting(&mut self) {
         self.platform_ops.push_back(CxOsOp::XrStartPresenting);
     }
@@ -1290,6 +1445,7 @@ impl Cx {
         if std::env::var_os("MAKEPAD_HAL_LOG").is_some() {
             eprintln!("[hal-linux] Cx::quit queued at {}", std::panic::Location::caller());
         }
+        crate::cx::relax_quit_started();
         self.platform_ops.push_back(CxOsOp::Quit);
     }
 
@@ -1326,13 +1482,6 @@ impl Cx {
     pub fn browser_history_go(&mut self, delta: i32) {
         if self.script_data.std.host_io_only() { return; }
         <Self as CxOsApi>::browser_history_go(self, delta);
-    }
-
-    pub fn system_browser(&mut self, id: impl Into<SystemBrowserId>) -> CxSystemBrowser<'_> {
-        CxSystemBrowser {
-            cx: self,
-            id: id.into(),
-        }
     }
 
     // Determines whether to show your application in the dock when it runs. The default value is true.
@@ -1677,17 +1826,6 @@ impl Cx {
             .push_back(CxOsOp::SetPrimarySelection(content.to_owned()));
     }
 
-    /// Forward an accessibility tree update to the platform adapter.
-    ///
-    /// The `update` is a type-erased `accesskit::TreeUpdate`. Platform backends
-    /// downcast it when an accessibility adapter is active.
-    pub fn update_accessibility_tree(&mut self, update: Box<dyn std::any::Any + Send>) {
-        self.platform_ops
-            .push_back(CxOsOp::AccessibilityUpdate(AccessibilityUpdatePayload(
-                update,
-            )));
-    }
-
     /// Show native selection handles at the given start and end positions (mobile).
     pub fn show_selection_handles(&mut self, start: Vec2d, end: Vec2d) {
         self.platform_ops
@@ -1739,24 +1877,30 @@ impl Cx {
         }
     }
 
-    /// Starts a native drag-and-drop session that can leave the Makepad app.
-    ///
-    /// `FilePath` items must contain absolute paths to existing regular files
-    /// and must not carry an `internal_id`. The source window is explicit so
-    /// a multi-window application never starts the session from a stale Cocoa
-    /// event or the wrong native surface. Unsupported item/platform
-    /// combinations are rejected by the platform adapter. Every accepted or
-    /// rejected request completes with `Event::DragEnd`, allowing callers to
-    /// release gesture state without platform-specific timeouts.
-    pub fn start_external_dragging(&mut self, window_id: WindowId, items: Vec<DragItem>) {
+    /// Starts a native drag-and-drop session that can leave the Makepad app, from the press
+    /// in progress in `window_id`: files another app can take (a chat, a mail, the file
+    /// manager), each an existing file by absolute path or a [`crate::event::FilePromise`] whose
+    /// producer starts now, on its own thread. The source window is explicit so a multi-window
+    /// application never starts the session from a stale event or the wrong native surface.
+    /// Every accepted or rejected request completes with `Event::DragEnd`, so callers release
+    /// their gesture state without platform-specific timeouts.
+    pub fn start_external_dragging(&mut self, window_id: WindowId, drag: crate::event::DragOut) {
         if self.script_data.std.host_io_only() { return; }
         self.platform_ops.iter().for_each(|op| {
             if matches!(op, CxOsOp::StartExternalDragging { .. }) {
                 panic!("start external drag twice");
             }
         });
+        let items = drag
+            .items
+            .into_iter()
+            .map(|item| match item {
+                crate::event::DragOutItem::File(path) => crate::event::DragOutFile::File(path),
+                crate::event::DragOutItem::Promise(promise) => promise.start(),
+            })
+            .collect();
         self.platform_ops
-            .push_back(CxOsOp::StartExternalDragging { window_id, items });
+            .push_back(CxOsOp::StartExternalDragging { window_id, items, image: drag.image });
     }
 
     pub fn set_cursor(&mut self, cursor: MouseCursor) {
@@ -2013,13 +2157,7 @@ impl Cx {
     pub fn get_pass_rect(&self, draw_pass_id: DrawPassId, dpi: f64) -> Option<Rect> {
         let size = |size: Vec2d| Self::pass_logical_size(size, dpi);
         match self.passes[draw_pass_id].pass_rect {
-            Some(CxDrawPassRect::Area(area)) => {
-                let rect = area.rect(self);
-                Some(Rect {
-                    pos: ((rect.pos * dpi) + 0.01).floor() / dpi,
-                    size: size(rect.size),
-                })
-            }
+            Some(CxDrawPassRect::Area(area)) => Some(Self::pass_device_rect(area.rect(self), dpi)),
             Some(CxDrawPassRect::AreaOrigin(area, origin)) => {
                 let rect = area.rect(self);
                 Some(Rect {
@@ -2043,6 +2181,16 @@ impl Cx {
     }
 
     /// A pass's logical size snapped to its whole pixels (`pass_pixel_size` / dpi).
+    /// Where a texture pass for `rect` lies in whole device pixels: its origin floored to a pixel
+    /// (a hundredth of a pixel is rounding) and its size [`Self::pass_pixel_size`]. A cached view
+    /// or capture renders its content relative to this rect, so it must also be drawn back at
+    /// exactly this rect: drawn at the raw rect (26 pt below the top at 1.75x is 45.5 px) the
+    /// texture was resampled half a pixel off and up to a pixel squeezed -- every window and every
+    /// glyph of the WM blurred at fractional scales.
+    pub fn pass_device_rect(rect: Rect, dpi: f64) -> Rect {
+        Rect { pos: ((rect.pos * dpi) + 0.01).floor() / dpi, size: Self::pass_logical_size(rect.size, dpi) }
+    }
+
     pub fn pass_logical_size(size: Vec2d, dpi: f64) -> Vec2d {
         let (w, h) = Self::pass_pixel_size(size, dpi);
         dvec2(w as f64 / dpi, h as f64 / dpi)
@@ -2095,6 +2243,9 @@ impl Cx {
     /// backends service this work on their ordinary next-render path.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn request_remote_window_present(&mut self, window_id: WindowId) {
+        // an external request waits for this window's frame: it paints also while a headset
+        // streams
+        self.window_redrawn = true;
         if let Some(pass) = self.windows[window_id].main_pass_id {
             self.repaint_pass_and_child_passes(pass);
         }
@@ -2173,9 +2324,19 @@ impl Cx {
     }
 
     #[track_caller]
+    /// A redraw asked for: unless it is a remote headset's frame (`in_xr_update`), the windows
+    /// paint with it.
+    #[inline]
+    pub(crate) fn note_window_redraw(&mut self) {
+        if !self.in_xr_update {
+            self.window_redrawn = true;
+        }
+    }
+
     pub fn redraw_all(&mut self) {
         self.frame_requests += 1;
         crate::frame_sources::note(crate::frame_sources::Kind::Redraw, std::panic::Location::caller());
+        self.note_window_redraw();
         self.new_draw_event.redraw_all = true;
     }
 
@@ -2206,6 +2367,7 @@ impl Cx {
         }
         self.frame_requests += 1;
         crate::frame_sources::note(crate::frame_sources::Kind::Redraw, std::panic::Location::caller());
+        self.note_window_redraw();
         self.redraw_list_in_draw(draw_list_id);
     }
 
@@ -2229,6 +2391,7 @@ impl Cx {
         }
         self.frame_requests += 1;
         crate::frame_sources::note(crate::frame_sources::Kind::Redraw, std::panic::Location::caller());
+        self.note_window_redraw();
         if self
             .new_draw_event
             .draw_lists_and_children
@@ -2519,25 +2682,6 @@ impl Cx {
                 }
             }
         }
-    }
-
-    pub fn attach_camera_native_preview(&mut self, video_id: LiveId, area: Area) {
-        self.platform_ops
-            .push_back(CxOsOp::AttachCameraNativePreview { video_id, area });
-    }
-
-    pub fn update_camera_native_preview(&mut self, video_id: LiveId, area: Area, visible: bool) {
-        self.platform_ops
-            .push_back(CxOsOp::UpdateCameraNativePreview {
-                video_id,
-                area,
-                visible,
-            });
-    }
-
-    pub fn detach_camera_native_preview(&mut self, video_id: LiveId) {
-        self.platform_ops
-            .push_back(CxOsOp::DetachCameraNativePreview { video_id });
     }
 
     pub fn begin_video_playback(&mut self, video_id: LiveId) {
@@ -2850,6 +2994,28 @@ macro_rules! register_component_factory {
 mod tests {
     use super::*;
 
+    /// A cached view (the WM's whole desk, `WmScene`) is drawn back at the rect its pass renders:
+    /// whole device pixels at every scale, and a draw-back at that rect snaps to itself. At 1.75 the
+    /// desk sits 26 pt (45.5 px) below the top; drawn there its texture was resampled half a pixel
+    /// off and squeezed a pixel, and every window and glyph of the WM blurred (WMSYNC).
+    #[test]
+    fn a_cached_pass_is_drawn_back_on_whole_pixels_at_its_own_rect() {
+        for step in 100..=300 {
+            let dpi = step as f64 / 100.0;
+            for (x, y, w, h) in [(0.0, 26.0, 2194.2857142857, 1208.2857142857), (976.15, 458.46, 1000.77, 699.23), (0.3, 0.7, 333.3, 77.7)] {
+                let rect = Rect { pos: dvec2(x, y), size: dvec2(w, h) };
+                let snapped = Cx::pass_device_rect(rect, dpi);
+                for v in [snapped.pos.x, snapped.pos.y, snapped.size.x, snapped.size.y] {
+                    let px = v * dpi;
+                    assert!((px - px.round()).abs() < 1e-6, "{rect:?} at {dpi}: {snapped:?} is not on whole pixels");
+                }
+                assert_eq!(Cx::pass_device_rect(snapped, dpi), snapped, "{rect:?} at {dpi}: snapping is not idempotent");
+                let (tw, th) = Cx::pass_pixel_size(rect.size, dpi);
+                assert_eq!(((snapped.size.x * dpi).round() as usize, (snapped.size.y * dpi).round() as usize), (tw, th));
+            }
+        }
+    }
+
     /// A texture pass and its render target come out the same pixel size for every scale and
     /// window size: the target sized with `pass_pixel_size` of the logical size the pass is set
     /// to, the pass by `get_pass_rect` (snapped to `pass_logical_size`) and then the frame's
@@ -3131,6 +3297,15 @@ impl Cx {
         self.publications.set_envelope(bytes);
     }
 
+    /// Whether a pass submitted with a serial in `first..=last` completed with draws left out:
+    /// a pipeline they use was still being built for its target's layout (the HAL's
+    /// `FramePartial`; they come with a later paint). A pass's owner sees it painted when it was
+    /// built, so an offscreen render that takes its pictures checks this once the frame's passes
+    /// completed (`Texture::gpu_drawn`) and draws the frame again. The latest 256 are kept.
+    pub fn frames_partial(&self, first: u64, last: u64) -> bool {
+        self.textures.1.partial.iter().any(|serial| (first..=last).contains(serial))
+    }
+
     /// Last observed completed prefix, without polling the backend. Progress
     /// timers use `frame_completion_serial` to refresh this nonblocking snapshot.
     pub fn frame_completed_serial(&self) -> u64 {
@@ -3194,8 +3369,10 @@ mod host_io_tests {
         cx.open_system_openfile_dialog();
         cx.open_system_openfolder_dialog();
         cx.open_system_savefolder_dialog();
-        cx.system_browser(LiveId::unique()).spawn("https://example.invalid/private");
-        cx.system_browser(LiveId::unique()).set_url("https://example.invalid/private", false);
+        let layer = cx.native_layer_new(crate::native_layer::NativeContent::Web {
+            url: "https://example.invalid/private".to_string(),
+        });
+        cx.native_layer(layer.id()).navigate("https://example.invalid/private", false);
         cx.prepare_audio_playback(LiveId::unique(), VideoSource::Network("https://example.invalid/private".into()), false, false);
         cx.prepare_audio_playback(LiveId::unique(), VideoSource::Filesystem("/etc/passwd".into()), false, false);
         assert_eq!(cx.platform_ops.len(), before);

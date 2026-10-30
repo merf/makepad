@@ -3,6 +3,7 @@
 //! avoiding per-analysis engine monomorphization. Effects must be monotone under join.
 
 pub mod bitset;
+pub mod interval;
 mod cursor;
 mod direction;
 mod initialized;
@@ -10,10 +11,11 @@ mod locals;
 mod visitor;
 
 pub use bitset::{BitMatrix, BitSet};
+pub use interval::IntervalSet;
 pub use cursor::ResultsCursor;
 pub use direction::{CallReturnPlaces, Direction, SwitchTargetIndex, TerminatorEdges};
 pub use initialized::{EverInitializedPlaces, MaybeInitializedPlaces, MaybeUninitializedPlaces};
-pub use locals::{always_storage_live_locals, MaybeBorrowedLocals, MaybeLiveLocals, MaybeStorageDead, MaybeStorageLive};
+pub use locals::{always_storage_live_locals, MaybeBorrowedLocals, MaybeLiveLocals, MaybeRequiresStorage, MaybeStorageDead, MaybeStorageLive};
 pub use visitor::{visit_reachable_results, visit_results, ResultsVisitor};
 
 use super::*;

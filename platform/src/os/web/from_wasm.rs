@@ -6,6 +6,19 @@ use crate::{
 // WebBrowser API
 
 #[derive(FromWasm)]
+pub struct FromWasmA11yUpdate {
+    pub window: u32,
+    pub bytes: WasmDataU8,
+}
+
+#[derive(FromWasm)]
+pub struct FromWasmA11yActionDone {
+    pub req_lo: u32,
+    pub req_hi: u32,
+    pub result: u32,
+}
+
+#[derive(FromWasm)]
 pub struct FromWasmStartTimer {
     pub repeats: bool,
     pub timer_id: f64,
@@ -251,6 +264,7 @@ impl DrawShaderTextureInput {
         let ty = match self.tex_type {
             TextureType::TextureDepth => "sampler2DShadow",
             TextureType::TextureCube | TextureType::TextureCubeArray => "samplerCube",
+            TextureType::Texture2dArray => "sampler2DArray",
             _ => "sampler2D",
         };
         WTextureInput {
@@ -456,6 +470,17 @@ pub struct FromWasmAllocTextureCube_BGRAu8_32 {
     pub data: WasmPtrU32,
 }
 
+/// A 2D array's level 0: `layers` images of width x height, layer-major.
+#[allow(non_camel_case_types)]
+#[derive(FromWasm)]
+pub struct FromWasmAllocTextureArray_BGRAu8_32 {
+    pub texture_id: usize,
+    pub width: usize,
+    pub height: usize,
+    pub layers: usize,
+    pub data: WasmPtrU32,
+}
+
 #[derive(FromWasm, Default)]
 pub struct WColorTarget {
     pub texture_id: usize,
@@ -571,6 +596,17 @@ pub struct FromWasmStartAudioOutput {
 
 #[derive(FromWasm)]
 pub struct FromWasmStopAudioOutput {}
+
+/// A page opened with `?test=1`: an app's media clock for a test harness
+/// (`Cx::web_test_clock`). `film`: the time the picture shows; `rendered`:
+/// the media time at the end of the audio rendered so far; `speed`: media
+/// seconds per second there.
+#[derive(FromWasm)]
+pub struct FromWasmTestClock {
+    pub film: f64,
+    pub rendered: f64,
+    pub speed: f64,
+}
 
 // Video Playback API
 

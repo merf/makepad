@@ -3,7 +3,7 @@ use super::*;
 use super::resolve_bound_vars::{BinderId, LifetimeId, LifetimeKey};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) enum LifetimeRes { Param(LifetimeId), Static, Infer, Error }
+pub(crate) enum LifetimeRes { Param(LifetimeId), Static, Infer, Error }
 
 #[derive(Clone, Debug)]
 pub(super) struct LifetimeDecl {
@@ -22,6 +22,28 @@ pub(crate) struct LifetimeResolution {
 }
 
 impl LifetimeResolution {
+    /// The resolution of the elided lifetime of the reference type `ty` (`&T`).
+    pub(crate) fn reference(&self, ty: u32) -> Option<LifetimeRes> { self.uses.get(&LifetimeKey::Reference(ty)).copied() }
+    /// The resolution of the lifetime written at `lo..hi` (`'a`, `'_`, `'static`).
+    pub(crate) fn named(&self, lo: u32, hi: u32) -> Option<LifetimeRes> { self.uses.get(&LifetimeKey::Named(lo, hi)).copied() }
+    /// The lifetime declared by the parameter whose name is at `pos` (a `for<'a>` binder's).
+    pub(crate) fn declared_at(&self, pos: u32) -> Option<LifetimeRes> { self.declarations.iter().find(|d| d.span == pos).map(|d| LifetimeRes::Param(d.id)) }
+    /// The resolution of the elided lifetime of an `&self` receiver.
+    pub(crate) fn self_reference(&self) -> Option<LifetimeRes> { self.uses.get(&LifetimeKey::SelfReference).copied() }
+    /// The resolution of the `index`th hidden lifetime of path segment `seg` (`Foo` for `Foo<'a>`).
+    pub(crate) fn path(&self, seg: u32, index: u32) -> Option<LifetimeRes> { self.uses.get(&LifetimeKey::Path(seg, index)).copied() }
+    /// The lifetimes in scope of the item itself: inherited from its parents, declared by its own
+    /// generics, and the anonymous ones its signature creates (a fn's late-bound lifetimes).
+    pub(crate) fn in_scope_lifetimes(&self) -> Vec<LifetimeId> {
+        self.inherited.iter().map(|d| d.id).chain(self.declarations.iter().filter(|d| d.binder == BinderId::Item).map(|d| d.id)).collect()
+    }
+    /// The named lifetimes in scope of the item: (id, name, position, declared by the item itself),
+    /// inherited ones first.
+    pub(crate) fn named_in_scope(&self) -> Vec<(LifetimeId, String, u32, bool)> {
+        let inh = self.inherited.iter().filter_map(|d| d.name.clone().map(|n| (d.id, n, d.span, false)));
+        let own = self.declarations.iter().filter(|d| d.binder == BinderId::Item).filter_map(|d| d.name.clone().map(|n| (d.id, n, d.span, true)));
+        inh.chain(own).collect()
+    }
     /// No lifetime declared, inherited or used anywhere in the owner (most items).
     fn is_empty(&self) -> bool { self.inherited.is_empty() && self.declarations.is_empty() && self.uses.is_empty() && self.binders.is_empty() }
     /// The answer to share: every empty resolution is the same value, kept once.
@@ -59,6 +81,42 @@ pub(crate) fn resolve_lifetimes(tcx: &Tcx, prog: &Program, owner: DefId, parent:
     resolver.resolution
 }
 
+/// late.rs:2214-2296: the segments of `path` whose declaration's lifetimes are elided (no
+/// lifetime argument written), with how many: the resolved prefix (`proj_start`) picks the one
+/// segment that declares them.
+pub(super) fn elided_path_lifetimes(tcx: &Tcx, prog: &Program, owner: DefId, file: u32, module: u32, path: &ast::Path) -> Vec<(usize, u32)> {
+    let ast = &prog.files[file as usize].ast;
+    let segs = ast.segs(path.segs);
+    let mut out = Vec::new();
+    let mut proj_start = segs.len();
+    let base = loop {
+        if proj_start == 0 { return out; }
+        let prefix = ast::Path { segs: path.segs.prefix(proj_start), ..*path };
+        if let Some(def) = tcx.lifetime_path_def(prog, owner, file, module, &prefix) { break def; }
+        proj_start -= 1;
+    };
+    let has_generic_args = |i: usize| ast.gargs(segs[i].args()).is_some();
+    for (i, segment) in segs.iter().enumerate() {
+        if matches!(ast.gargs(segment.args()), Some(GenericArgs::Angle(args)) if ast.list(*args).iter().any(|a| matches!(a, GenericArg::Lifetime(_)))) { continue; }
+        let type_def = match prog.def(base).kind {
+            DefKind::AssocTy if i + 2 == proj_start => prog.def(base).parent,
+            DefKind::Variant if i + 2 == proj_start && has_generic_args(i) => prog.def(base).parent,
+            DefKind::Variant if i + 1 == proj_start && !(i > 0 && has_generic_args(i - 1)) => prog.def(base).parent,
+            DefKind::Struct | DefKind::Union | DefKind::Enum | DefKind::TypeAlias | DefKind::Trait if i + 1 == proj_start => base,
+            _ => continue,
+        };
+        let d = prog.def(type_def);
+        let a = &prog.files[d.file as usize].ast;
+        let generics = match a.item(d.item).kind {
+            ItemKind::Fn(..) | ItemKind::Impl(_) => continue,
+            k => match a.kind_generics(&k) { Some(g) => *g, None => continue },
+        };
+        let count = a.list(generics.params).iter().filter(|param| matches!(param.kind, GenericParamKind::Lifetime(_))).count() as u32;
+        if count != 0 { out.push((i, count)); }
+    }
+    out
+}
+
 #[derive(Clone, Copy)]
 enum LifetimeRibKind {
     Item,
@@ -94,13 +152,19 @@ impl LifetimeResolver<'_> {
     fn declare(&mut self, binder: BinderId, name: Option<ast::Ident>, span: u32) -> LifetimeId {
         let id = LifetimeId { owner: self.owner, local: self.resolution.declarations.len() as u32 };
         self.resolution.declarations.push(LifetimeDecl {
-            id, binder, name: name.map(|n| self.prog.files[self.file as usize].text(n).to_owned()), span,
+            id, binder, name: name.map(|n| self.prog.files[self.file as usize].lifetime_text(n).into_owned()), span,
         });
         self.resolution.binders.entry(binder).or_default().push(id);
         id
     }
 
+    /// The where-predicate whose binder encloses the current position.
+    fn pred(&self) -> Option<u32> {
+        self.ribs.iter().rev().find_map(|rib| match rib.kind { LifetimeRibKind::Generics { binder: Some(BinderId::Where(n)), .. } => Some(n), _ => None })
+    }
+
     fn record_lifetime_use(&mut self, key: LifetimeKey, res: LifetimeRes) {
+        if let Some(pred) = self.pred() { self.resolution.uses.insert(key.scoped(Some(pred)), res); }
         self.resolution.uses.insert(key, res);
         if matches!(res, LifetimeRes::Param(_) | LifetimeRes::Static) {
             if let Some(candidates) = &mut self.candidates { candidates.push(res); }
@@ -108,7 +172,8 @@ impl LifetimeResolver<'_> {
     }
 
     fn resolve_lifetime(&mut self, key: LifetimeKey, name: Option<ast::Ident>, span: u32, in_path: bool) {
-        let text = name.map(|n| self.prog.files[self.file as usize].text(n));
+        let text = name.map(|n| self.prog.files[self.file as usize].lifetime_text(n));
+        let text = text.as_deref();
         if text == Some("'static") { self.record_lifetime_use(key, LifetimeRes::Static); return; }
         if text.is_none() || text == Some("'_") {
             self.resolve_anonymous_lifetime(key, span, in_path && name.is_none());
@@ -173,7 +238,7 @@ impl LifetimeResolver<'_> {
         let mut bindings = Vec::new();
         for p in self.prog.files[self.file as usize].ast.list(params) {
             if !matches!(p.kind, GenericParamKind::Lifetime(_)) { continue; }
-            let name = self.prog.files[self.file as usize].text(p.name).to_owned();
+            let name = self.prog.files[self.file as usize].lifetime_text(p.name).into_owned();
             if name == "'static" || name == "'_" { self.error(p.name.lo, &format!("E0262: invalid lifetime parameter name: `{}`", name)); }
             if bindings.iter().any(|(n, _)| *n == name) { self.error(p.name.lo, &format!("E0403: the name `{}` is already used for a generic parameter in this item's generic parameters", name)); }
             if self.ribs.iter().any(|r| r.bindings.iter().any(|(n, _)| *n == name)) {
@@ -181,6 +246,7 @@ impl LifetimeResolver<'_> {
             }
             let id = self.declare(binder, Some(p.name), p.name.lo);
             self.resolution.uses.insert(LifetimeKey::Named(p.name.lo, p.name.hi), LifetimeRes::Param(id));
+            if let BinderId::Where(n) = binder { self.resolution.uses.insert(LifetimeKey::Named(p.name.lo, p.name.hi).scoped(Some(n)), LifetimeRes::Param(id)); }
             bindings.push((name, id));
         }
         self.ribs.push(LifetimeRib { kind: LifetimeRibKind::Generics { binder: Some(binder), poly_trait: matches!(binder, BinderId::Trait(_)) }, bindings });
@@ -450,7 +516,12 @@ impl LifetimeResolver<'_> {
                             self.ribs.pop();
                             self.visit_ty(ty);
                         }
-                        GenericArg::Constraint(_, bounds) => self.visit_bounds(bounds),
+                        GenericArg::Constraint(_, args, bounds) => {
+                            self.push(LifetimeRibKind::AnonymousReportError);
+                            self.visit_generic_args(args);
+                            self.ribs.pop();
+                            self.visit_bounds(bounds);
+                        }
                     }
                 }
             }
@@ -495,39 +566,18 @@ impl LifetimeResolver<'_> {
         }
     }
 
-    /// late.rs:2214-2296: the resolved prefix (`proj_start`) picks the one segment whose
-    /// declaration's lifetimes are elided; expression and pattern paths infer them.
+    /// late.rs:2214-2296. Expression and pattern paths (PathSource::Expr/Pat/Struct/TupleStruct)
+    /// infer their elided lifetimes: nothing is recorded for them (a use without an entry is an
+    /// inference variable to every reader, as a recorded Infer is), so their paths are not
+    /// resolved here at all -- most body paths are locals and calls, whose type-namespace lookup
+    /// only misses (cold Stage: 2.4% of all CPU was this lookup).
     fn resolve_elided_lifetimes_in_path(&mut self, path: &ast::Path, inferred: bool) {
-        let ast = &self.prog.files[self.file as usize].ast;
-        let segs = ast.segs(path.segs);
-        let mut proj_start = segs.len();
-        let base = loop {
-            if proj_start == 0 { return; }
-            let prefix = ast::Path { segs: path.segs.prefix(proj_start), ..*path };
-            if let Some(def) = self.tcx.lifetime_path_def(self.prog, self.owner, self.file, self.module, &prefix) { break def; }
-            proj_start -= 1;
-        };
-        let has_generic_args = |i: usize| ast.gargs(segs[i].args()).is_some();
-        for (i, segment) in segs.iter().enumerate() {
-            if matches!(ast.gargs(segment.args()), Some(GenericArgs::Angle(args)) if ast.list(*args).iter().any(|a| matches!(a, GenericArg::Lifetime(_)))) { continue; }
-            let type_def = match self.prog.def(base).kind {
-                DefKind::AssocTy if i + 2 == proj_start => self.prog.def(base).parent,
-                DefKind::Variant if i + 2 == proj_start && has_generic_args(i) => self.prog.def(base).parent,
-                DefKind::Variant if i + 1 == proj_start && !(i > 0 && has_generic_args(i - 1)) => self.prog.def(base).parent,
-                DefKind::Struct | DefKind::Union | DefKind::Enum | DefKind::TypeAlias | DefKind::Trait if i + 1 == proj_start => base,
-                _ => continue,
-            };
-            let d = self.prog.def(type_def);
-            let a = &self.prog.files[d.file as usize].ast;
-            let generics = match a.item(d.item).kind {
-                ItemKind::Fn(..) | ItemKind::Impl(_) => continue,
-                k => match a.kind_generics(&k) { Some(g) => *g, None => continue },
-            };
-            let count = a.list(generics.params).iter().filter(|param| matches!(param.kind, GenericParamKind::Lifetime(_))).count() as u32;
+        if inferred { return; }
+        let segs = self.prog.files[self.file as usize].ast.segs(path.segs);
+        for (i, count) in elided_path_lifetimes(self.tcx, self.prog, self.owner, self.file, self.module, path) {
+            let name = segs[i].name.lo;
             for index in 0..count {
-                let key = LifetimeKey::Path(path.segs.lo + i as u32, index);
-                if inferred { self.record_lifetime_use(key, LifetimeRes::Infer); }
-                else { self.resolve_lifetime(key, None, segment.name.lo, true); }
+                self.resolve_lifetime(LifetimeKey::Path(path.segs.lo + i as u32, index), None, name, true);
             }
         }
     }
@@ -543,7 +593,21 @@ impl LifetimeResolver<'_> {
             ast::Ty::Ptr(_, inner) | ast::Ty::Slice(inner) | ast::Ty::Paren(inner) => self.visit_ty(inner),
             ast::Ty::Array(inner, length) => { self.visit_ty(inner); self.visit_anon_const(length); }
             ast::Ty::Tuple(types) => for &ty in ast.list(types) { self.visit_ty(ty); },
-            ast::Ty::Path(path) => self.visit_path(&path, false),
+            ast::Ty::Path(path) => {
+                // late.rs:925-945: a path naming a trait is a bare trait object; its Fn-sugar
+                // anonymous lifetimes are placed in a poly-trait rib of its own
+                let bare_trait = path.no_qself() && self.tcx.lifetime_path_def(self.prog, self.owner, self.file, self.module, &path).is_some_and(|def| self.prog.def(def).kind == DefKind::Trait);
+                if bare_trait {
+                    self.push_generics(BinderId::Trait(path.segs.lo), ast::List::EMPTY);
+                    self.visit_path(&path, false);
+                    let rib = self.ribs.pop().unwrap();
+                    if let Some(candidates) = &mut self.candidates {
+                        candidates.retain(|res| !rib.bindings.iter().any(|(_, id)| *res == LifetimeRes::Param(*id)));
+                    }
+                } else {
+                    self.visit_path(&path, false);
+                }
+            }
             ast::Ty::Fn(pointer) => {
                 let pointer = ast.fn_ptr(pointer);
                 let outer = self.candidates.take();
@@ -719,7 +783,7 @@ fn argument_types(ast: &ast::Ast, args: ast::GenericArgsId, out: &mut Vec<ast::T
             match *arg {
                 GenericArg::Type(ty) => out.push(ty),
                 GenericArg::Binding(_, args, ty) => { argument_types(ast, args, out); out.push(ty); }
-                GenericArg::Constraint(_, bounds) => bound_types(ast, bounds, out),
+                GenericArg::Constraint(_, _, bounds) => bound_types(ast, bounds, out),
                 _ => {}
             }
         },

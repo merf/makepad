@@ -17,10 +17,12 @@ pub mod collections {
     pub use core::collections::binary_heap;
     pub use core::collections::btree_map;
     pub use core::collections::btree_set;
+    pub use core::collections::linked_list;
     pub use core::collections::vec_deque;
     pub use core::collections::BTreeMap;
     pub use core::collections::BTreeSet;
     pub use core::collections::BinaryHeap;
+    pub use core::collections::LinkedList;
     pub use core::collections::TryReserveError;
     pub use core::collections::VecDeque;
 }
@@ -67,7 +69,7 @@ pub mod sync {
 }
 
 pub mod vec {
-    pub use core::vec::{from_elem, Drain, IntoIter, Vec};
+    pub use core::vec::{from_elem, Drain, ExtractIf, IntoIter, Vec};
 }
 
 pub mod task {

@@ -38,11 +38,11 @@ pub fn from_fn<T, const N: usize, F: FnMut(usize) -> T>(f: F) -> [T; N] {
     unsafe { out.assume_init() }
 }
 
-pub fn from_ref<T>(s: &T) -> &[T; 1] {
+pub const fn from_ref<T>(s: &T) -> &[T; 1] {
     unsafe { &*(s as *const T as *const [T; 1]) }
 }
 
-pub fn from_mut<T>(s: &mut T) -> &mut [T; 1] {
+pub const fn from_mut<T>(s: &mut T) -> &mut [T; 1] {
     unsafe { &mut *(s as *mut T as *mut [T; 1]) }
 }
 
@@ -66,7 +66,7 @@ impl crate::error::Error for TryFromSliceError {}
 
 #[cfg(not(relax_check))]
 impl<T, const N: usize> [T; N] {
-    pub fn map<U, F: FnMut(T) -> U>(self, f: F) -> [U; N] {
+    pub const fn map<U, F: FnMut(T) -> U>(self, f: F) -> [U; N] {
         let mut f = f;
         let src = ManuallyDrop::new(self);
         let sp = &*src as *const [T; N] as *const T;
@@ -75,13 +75,20 @@ impl<T, const N: usize> [T; N] {
     pub const fn as_slice(&self) -> &[T] {
         self
     }
-    pub fn as_mut_slice(&mut self) -> &mut [T] {
+    pub const fn as_mut_slice(&mut self) -> &mut [T] {
         self
     }
-    pub fn each_ref(&self) -> [&T; N] {
+    pub const fn each_ref(&self) -> [&T; N] {
         from_fn(|i| &self[i])
     }
+    pub const fn each_mut(&mut self) -> [&mut T; N] {
+        let p = self as *mut [T; N] as *mut T;
+        from_fn(|i| unsafe { &mut *im::ptr_add_mut(p, i) })
+    }
 }
+
+// library/core/src/array/mod.rs:461
+unsafe impl<T: crate::clone::TrivialClone, const N: usize> crate::clone::TrivialClone for [T; N] {}
 
 impl<T: Clone, const N: usize> Clone for [T; N] {
     fn clone(&self) -> [T; N] {
@@ -235,6 +242,7 @@ impl<T, const N: usize> IntoIterator for [T; N] {
 }
 
 /// By-value array iterator.
+#[rustc_insignificant_dtor]
 pub struct IntoIter<T, const N: usize> {
     data: ManuallyDrop<[T; N]>,
     start: usize,
@@ -279,6 +287,7 @@ impl<T, const N: usize> DoubleEndedIterator for IntoIter<T, N> {
 }
 
 impl<T, const N: usize> ExactSizeIterator for IntoIter<T, N> {}
+unsafe impl<T, const N: usize> crate::iter::TrustedLen for IntoIter<T, N> {}
 impl<T, const N: usize> crate::iter::FusedIterator for IntoIter<T, N> {}
 
 impl<T: Clone, const N: usize> Clone for IntoIter<T, N> {
@@ -325,3 +334,28 @@ impl<T, const N: usize> Drop for IntoIter<T, N> {
         }
     }
 }
+
+impl<T> From<(T,)> for [T; 1] { fn from(t: (T,)) -> [T; 1] { [t.0] } }
+impl<T> From<(T, T)> for [T; 2] { fn from(t: (T, T)) -> [T; 2] { [t.0, t.1] } }
+impl<T> From<(T, T, T)> for [T; 3] { fn from(t: (T, T, T)) -> [T; 3] { [t.0, t.1, t.2] } }
+impl<T> From<(T, T, T, T)> for [T; 4] { fn from(t: (T, T, T, T)) -> [T; 4] { [t.0, t.1, t.2, t.3] } }
+impl<T> From<(T, T, T, T, T)> for [T; 5] { fn from(t: (T, T, T, T, T)) -> [T; 5] { [t.0, t.1, t.2, t.3, t.4] } }
+impl<T> From<(T, T, T, T, T, T)> for [T; 6] { fn from(t: (T, T, T, T, T, T)) -> [T; 6] { [t.0, t.1, t.2, t.3, t.4, t.5] } }
+impl<T> From<(T, T, T, T, T, T, T)> for [T; 7] { fn from(t: (T, T, T, T, T, T, T)) -> [T; 7] { [t.0, t.1, t.2, t.3, t.4, t.5, t.6] } }
+impl<T> From<(T, T, T, T, T, T, T, T)> for [T; 8] { fn from(t: (T, T, T, T, T, T, T, T)) -> [T; 8] { [t.0, t.1, t.2, t.3, t.4, t.5, t.6, t.7] } }
+impl<T> From<(T, T, T, T, T, T, T, T, T)> for [T; 9] { fn from(t: (T, T, T, T, T, T, T, T, T)) -> [T; 9] { [t.0, t.1, t.2, t.3, t.4, t.5, t.6, t.7, t.8] } }
+impl<T> From<(T, T, T, T, T, T, T, T, T, T)> for [T; 10] { fn from(t: (T, T, T, T, T, T, T, T, T, T)) -> [T; 10] { [t.0, t.1, t.2, t.3, t.4, t.5, t.6, t.7, t.8, t.9] } }
+impl<T> From<(T, T, T, T, T, T, T, T, T, T, T)> for [T; 11] { fn from(t: (T, T, T, T, T, T, T, T, T, T, T)) -> [T; 11] { [t.0, t.1, t.2, t.3, t.4, t.5, t.6, t.7, t.8, t.9, t.10] } }
+impl<T> From<(T, T, T, T, T, T, T, T, T, T, T, T)> for [T; 12] { fn from(t: (T, T, T, T, T, T, T, T, T, T, T, T)) -> [T; 12] { [t.0, t.1, t.2, t.3, t.4, t.5, t.6, t.7, t.8, t.9, t.10, t.11] } }
+impl<T> From<[T; 1]> for (T,) { fn from([a]: [T; 1]) -> (T,) { (a,) } }
+impl<T> From<[T; 2]> for (T, T) { fn from([a, b]: [T; 2]) -> (T, T) { (a, b) } }
+impl<T> From<[T; 3]> for (T, T, T) { fn from([a, b, c]: [T; 3]) -> (T, T, T) { (a, b, c) } }
+impl<T> From<[T; 4]> for (T, T, T, T) { fn from([a, b, c, d]: [T; 4]) -> (T, T, T, T) { (a, b, c, d) } }
+impl<T> From<[T; 5]> for (T, T, T, T, T) { fn from([a, b, c, d, e]: [T; 5]) -> (T, T, T, T, T) { (a, b, c, d, e) } }
+impl<T> From<[T; 6]> for (T, T, T, T, T, T) { fn from([a, b, c, d, e, f]: [T; 6]) -> (T, T, T, T, T, T) { (a, b, c, d, e, f) } }
+impl<T> From<[T; 7]> for (T, T, T, T, T, T, T) { fn from([a, b, c, d, e, f, g]: [T; 7]) -> (T, T, T, T, T, T, T) { (a, b, c, d, e, f, g) } }
+impl<T> From<[T; 8]> for (T, T, T, T, T, T, T, T) { fn from([a, b, c, d, e, f, g, h]: [T; 8]) -> (T, T, T, T, T, T, T, T) { (a, b, c, d, e, f, g, h) } }
+impl<T> From<[T; 9]> for (T, T, T, T, T, T, T, T, T) { fn from([a, b, c, d, e, f, g, h, i]: [T; 9]) -> (T, T, T, T, T, T, T, T, T) { (a, b, c, d, e, f, g, h, i) } }
+impl<T> From<[T; 10]> for (T, T, T, T, T, T, T, T, T, T) { fn from([a, b, c, d, e, f, g, h, i, j]: [T; 10]) -> (T, T, T, T, T, T, T, T, T, T) { (a, b, c, d, e, f, g, h, i, j) } }
+impl<T> From<[T; 11]> for (T, T, T, T, T, T, T, T, T, T, T) { fn from([a, b, c, d, e, f, g, h, i, j, k]: [T; 11]) -> (T, T, T, T, T, T, T, T, T, T, T) { (a, b, c, d, e, f, g, h, i, j, k) } }
+impl<T> From<[T; 12]> for (T, T, T, T, T, T, T, T, T, T, T, T) { fn from([a, b, c, d, e, f, g, h, i, j, k, l]: [T; 12]) -> (T, T, T, T, T, T, T, T, T, T, T, T) { (a, b, c, d, e, f, g, h, i, j, k, l) } }

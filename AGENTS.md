@@ -77,6 +77,27 @@ in [Change reports](docs/agents/change-report.md); the steps:
 8. Tell the person the report id the Builder (or the server's
    `{"ok":true,"id":N}`) returned.
 
+## Clean up after work
+
+Standing order: once a lane's work is merged (or abandoned by the user's
+decision), its owner cleans up what it created, the same day. On every machine
+it used (this one and any build or bench node):
+
+- Remove its git worktrees (`git worktree remove`) and delete its merged
+  branches. First check that every commit's content is on the branch it was
+  merged into; a branch or worktree with unmerged commits is kept and reported,
+  never deleted.
+- Delete its build output (cargo `target` dirs, alternate target dirs), its
+  scratch and temp dirs, sweep/bench outputs that were already summarised in a
+  report, and its per-lane directories on remote nodes.
+- Stop its processes and hidden app instances by recorded PID (never by
+  pattern), and release any lock or slot it held.
+- Keep reports and plans under `local/`, and leave alone anything another lane,
+  a running service or the user owns. Untracked files the user created are
+  kept; when unsure whether something is still needed, copy it aside and ask.
+- When a machine runs low on disk, clean up finished lanes first, then report
+  what is left and who owns it.
+
 ## Software installation requires explicit approval
 
 - NEVER install, upgrade, bootstrap, or download and run external software
@@ -272,8 +293,8 @@ in [Change reports](docs/agents/change-report.md); the steps:
    launch your own instance with `--remote` (a Unix socket, no TCP port).
 2. Read its startup line `[makepad-remote] pid=<pid> app=<app> socket=<path>`.
 3. Run `makepad-remote app <pid> help` for the running binary's commands.
-4. Use `snap q=...` to find widget rectangles, then inject input.
-5. Inspect results through snapshots/logs and, when needed, `grab`.
+4. Use `ui find q=...` to find semantic nodes, then `ui act node=ID press wait=1`.
+5. Inspect results through `ui`, `ui diff`, and logs and, when needed, `grab`.
 6. Finish with `gq` and confirm shutdown.
 
 Commands are `makepad-remote app <pid|app-name|socket> <command> [k=v ...]`

@@ -500,6 +500,11 @@ impl ScriptBodies {
         self.bodies.borrow_mut()
     }
 
+    /// The bodies, unless they are being edited (inspect reads them at a safe point).
+    pub(crate) fn try_borrow(&self) -> Option<Ref<'_, Vec<ScriptBody>>> {
+        self.bodies.try_borrow().ok()
+    }
+
     #[inline(always)]
     pub(crate) fn epoch(&self) -> u64 {
         self.epoch.get()
@@ -1473,6 +1478,17 @@ impl ScriptCode {
         if let Some(text) = found { out.push(&text); true } else { false }
     }
 
+    pub(crate) fn ip_body_text_native(&self, ip: ScriptIp, out: &mut crate::vm_api::ScriptTextOut, at: &mut crate::vm_api::ScriptLineCol) -> bool {
+        let bodies = self.bodies.borrow();
+        let Some(body) = bodies.get(ip.body as usize) else { return false };
+        at.line = match &body.source {
+            ScriptSource::Mod(script_mod) => script_mod.line as u32,
+            _ => 0,
+        };
+        out.push(body.code_text());
+        true
+    }
+
     /// True when `ip` is in the body of an adopted fn ([`ScriptVm::adopt_fn`]).
     pub fn ip_is_adopted(&self, ip: ScriptIp) -> bool {
         self.bodies.borrow().get(ip.body as usize).is_some_and(|b| !b.real_file.is_empty())
@@ -1979,6 +1995,7 @@ impl<'a> ScriptVm<'a> {
     /// the like are inline decoders of): `req.mode` says what, see [`ScriptCallReq`].
     #[relax_api]
     pub fn vm_call(&mut self, req: &mut ScriptCallReq) -> ScriptValue {
+        crate::inspect_query::safe_point(&self.bx);
         match req.mode {
             CALL_ARGS => self.call_with_me_impl(req.fnobj, req.args, req.me),
             CALL_OBJECT => self.call_with_args_object_with_me_impl(req.fnobj, req.args_obj, req.me),
@@ -2428,6 +2445,11 @@ impl<'a> ScriptVm<'a> {
             // SAFETY: the buffer can only move or be freed through
             // `bodies.borrow_mut()`, which advances the epoch checked above.
             let opcode = unsafe { *opcodes_ptr.add(ip_index) };
+
+            // a Splash line probe (`probe add game.splash:76`): one relaxed load while none exists
+            if crate::inspect_query::line_probes_on() {
+                crate::inspect_query::line_probe_check(&self.bx, body_index, ip_index);
+            }
 
             if self.bx.debug_trace {
                 let stack_len = self.bx.threads.cur_ref().stack.len();
@@ -3106,8 +3128,19 @@ impl<'a> ScriptVm<'a> {
         }
         let scope = self.bx.code.bodies.borrow()[body_id as usize].scope.obj;
         self.bx.heap.objects[scope].proto = parent.into();
+        self.ref_reparented_scope(scope);
         let v = self.eval_body(body_id, ScriptObject::ZERO);
         v.as_object().filter(|o| self.bx.heap.as_fn(*o).is_some())
+    }
+
+    /// A body scope given a new proto keeps the REFFED invariant (`ScriptHeap::ref_object_chain`):
+    /// if the scope is REFFED, so is the chain it now reads through.
+    fn ref_reparented_scope(&mut self, scope: ScriptObject) {
+        if self.bx.heap.objects[scope].tag.is_reffed() {
+            if let Some(parent) = self.bx.heap.objects[scope].proto.as_object() {
+                self.bx.heap.ref_object_chain(parent);
+            }
+        }
     }
 
     /// The scope the last body evaluated from `file` ended in (its top-level
@@ -3151,6 +3184,7 @@ impl<'a> ScriptVm<'a> {
                 req.body = self.add_script_mod_with(req.module.to_owned(), false);
                 let scope = self.bx.code.bodies.borrow()[req.body as usize].scope.obj;
                 self.bx.heap.objects[scope].proto = req.scope.into();
+                self.ref_reparented_scope(scope);
                 self.eval_body(req.body, ScriptObject::ZERO)
             }
             EVAL_MODULE => {
@@ -3221,6 +3255,8 @@ impl<'a> ScriptVm<'a> {
             }
             // lets point our thread to it
             let result = self.run_root(body_id);
+            self.bx.heap.touch_evaluated_body(body_id);
+            self.bx.heap.touch_map(&self.bx.code);
             // Mark the result object with FROM_EVAL flag
             if let Some(result_obj) = result.as_object() {
                 self.bx.heap.set_from_eval(result_obj);

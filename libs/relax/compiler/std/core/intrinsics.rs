@@ -15,6 +15,8 @@ pub mod intrinsics {
         pub fn trunc_f32(x: f32) -> f32;
         pub fn rint_f64(x: f64) -> f64;
         pub fn rint_f32(x: f32) -> f32;
+        pub fn round_f64(x: f64) -> f64;
+        pub fn round_f32(x: f32) -> f32;
         pub fn fabs_f64(x: f64) -> f64;
         pub fn fabs_f32(x: f32) -> f32;
         pub fn fmin_f64(x: f64, y: f64) -> f64;
@@ -32,23 +34,121 @@ pub mod intrinsics {
         /// true when this target (arm64; x86-64 with FMA3) fuses in hardware: a constant per run
         pub fn fma_native() -> bool;
     }
+    pub use super::intrinsics_simd as simd;
+    /// rustc's `intrinsics::assume` (UB when false): hint::assert_unchecked
+    pub use crate::hint::assert_unchecked as assume;
+}
+
+/// rustc's generic SIMD intrinsics (`core::intrinsics::simd`) on `#[repr(simd)]` types, lane-wise
+/// (lowered per 16-byte chunk to Relax's vector IR; lower/simd.rs). Signatures as rustc's.
+pub mod intrinsics_simd {
+    extern "relax-intrinsic" {
+        pub fn simd_add<T>(x: T, y: T) -> T;
+        pub fn simd_sub<T>(lhs: T, rhs: T) -> T;
+        pub fn simd_mul<T>(x: T, y: T) -> T;
+        pub fn simd_div<T>(lhs: T, rhs: T) -> T;
+        pub fn simd_shl<T>(lhs: T, rhs: T) -> T;
+        pub fn simd_shr<T>(lhs: T, rhs: T) -> T;
+        pub fn simd_and<T>(x: T, y: T) -> T;
+        pub fn simd_or<T>(x: T, y: T) -> T;
+        pub fn simd_xor<T>(x: T, y: T) -> T;
+        pub fn simd_neg<T>(x: T) -> T;
+        pub fn simd_fabs<T>(x: T) -> T;
+        pub fn simd_fsqrt<T>(x: T) -> T;
+        pub fn simd_floor<T>(x: T) -> T;
+        pub fn simd_ceil<T>(x: T) -> T;
+        pub fn simd_trunc<T>(x: T) -> T;
+        pub fn simd_round<T>(x: T) -> T;
+        pub fn simd_minimum_number_nsz<T>(x: T, y: T) -> T;
+        pub fn simd_maximum_number_nsz<T>(x: T, y: T) -> T;
+        pub fn simd_saturating_add<T>(x: T, y: T) -> T;
+        pub fn simd_saturating_sub<T>(lhs: T, rhs: T) -> T;
+        pub fn simd_eq<T, U>(x: T, y: T) -> U;
+        pub fn simd_ne<T, U>(x: T, y: T) -> U;
+        pub fn simd_lt<T, U>(x: T, y: T) -> U;
+        pub fn simd_le<T, U>(x: T, y: T) -> U;
+        pub fn simd_gt<T, U>(x: T, y: T) -> U;
+        pub fn simd_ge<T, U>(x: T, y: T) -> U;
+        pub fn simd_select<M, T>(mask: M, if_true: T, if_false: T) -> T;
+        // lane by lane in scalar code (lower/simd.rs simd_per_lane)
+        pub fn simd_rem<T>(lhs: T, rhs: T) -> T;
+        pub fn simd_ctpop<T>(x: T) -> T;
+        pub fn simd_ctlz<T>(x: T) -> T;
+        pub fn simd_cttz<T>(x: T) -> T;
+        pub fn simd_bswap<T>(x: T) -> T;
+        pub fn simd_bitreverse<T>(x: T) -> T;
+        pub fn simd_round_ties_even<T>(x: T) -> T;
+        pub fn simd_fma<T>(x: T, y: T, z: T) -> T;
+        pub fn simd_relaxed_fma<T>(x: T, y: T, z: T) -> T;
+        pub fn simd_cast<T, U>(x: T) -> U;
+        pub fn simd_as<T, U>(x: T) -> U;
+        pub fn simd_splat<T, U>(value: U) -> T;
+        pub fn simd_extract<T, U>(x: T, idx: u32) -> U;
+        pub fn simd_extract_dyn<T, U>(x: T, idx: u32) -> U;
+        pub fn simd_insert<T, U>(x: T, idx: u32, val: U) -> T;
+        pub fn simd_insert_dyn<T, U>(x: T, idx: u32, val: U) -> T;
+        pub fn simd_shuffle<T, U, V>(x: T, y: T, idx: U) -> V;
+        pub fn simd_bitmask<T, U>(x: T) -> U;
+        pub fn simd_select_bitmask<M, T>(m: M, yes: T, no: T) -> T;
+        pub fn simd_reduce_add_ordered<T, U>(x: T, y: U) -> U;
+        pub fn simd_reduce_add_unordered<T, U>(x: T) -> U;
+        pub fn simd_reduce_mul_ordered<T, U>(x: T, y: U) -> U;
+        pub fn simd_reduce_mul_unordered<T, U>(x: T) -> U;
+        pub fn simd_reduce_all<T>(x: T) -> bool;
+        pub fn simd_reduce_any<T>(x: T) -> bool;
+        pub fn simd_reduce_max<T, U>(x: T) -> U;
+        pub fn simd_reduce_min<T, U>(x: T) -> U;
+        pub fn simd_reduce_and<T, U>(x: T) -> U;
+        pub fn simd_reduce_or<T, U>(x: T) -> U;
+        pub fn simd_reduce_xor<T, U>(x: T) -> U;
+        pub fn simd_gather<T, U, V>(val: T, ptr: U, mask: V) -> T;
+        pub fn simd_scatter<T, U, V>(val: T, ptr: U, mask: V);
+        pub fn simd_masked_load<V, U, T, const ALIGN: SimdAlign>(mask: V, ptr: U, val: T) -> T;
+        pub fn simd_masked_store<V, U, T, const ALIGN: SimdAlign>(mask: V, ptr: U, val: T);
+        pub fn simd_arith_offset<T, U>(ptr: T, offset: U) -> T;
+        pub fn simd_cast_ptr<T, U>(ptr: T) -> U;
+        pub fn simd_expose_provenance<T, U>(ptr: T) -> U;
+        pub fn simd_with_exposed_provenance<T, U>(addr: T) -> U;
+        pub fn simd_funnel_shl<T>(a: T, b: T, shift: T) -> T;
+        pub fn simd_funnel_shr<T>(a: T, b: T, shift: T) -> T;
+    }
+
+    /// Alignment options of the masked load/store intrinsics (rustc core/src/intrinsics/simd)
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum SimdAlign {
+        /// No alignment requirements on the pointer
+        Unaligned = 0,
+        /// The pointer must be aligned to the element type of the SIMD vector
+        Element = 1,
+        /// The pointer must be aligned to the SIMD vector type
+        Vector = 2,
+    }
 }
 
 /// Memory, pointers and type information.
 pub mod intrinsics_mem {
     extern "relax-intrinsic" {
+        /// A linear-memory offset as a program pointer (the trace host may map
+        /// wasm64 memory at a nonzero native base; the exported module uses zero).
+        #[cfg(relax_web)]
+        pub fn web_memory_ptr(offset: usize) -> *mut u8;
         pub fn size_of<T>() -> usize;
         pub fn align_of<T>() -> usize;
-        /// Size/alignment of the value behind a (possibly fat) reference: slices, str, dyn.
-        pub fn size_of_val<T: ?Sized>(v: &T) -> usize;
-        pub fn align_of_val<T: ?Sized>(v: &T) -> usize;
+        /// Size/alignment from a (possibly fat) raw pointer, as in rustc's intrinsics.
+        pub fn size_of_val<T: ?Sized>(v: *const T) -> usize;
+        pub fn align_of_val<T: ?Sized>(v: *const T) -> usize;
         pub fn needs_drop<T>() -> bool;
         /// `T: Copy` for this instantiation (a constant per instance): std's Copy fast paths
         /// (real std specializes Clone-for-Copy into memcpy)
         pub fn is_copy<T>() -> bool;
+        /// Integer, float, bool or char: every byte belongs to the scalar value.
+        pub fn is_primitive_scalar<T>() -> bool;
         /// `T: Freeze` for this instantiation: no UnsafeCell outside indirection (rustc's auto
         /// trait)
         pub fn is_freeze<T>() -> bool;
+        /// `T: TrustedLen` for this instantiation (a constant per instance): Vec's extend takes
+        /// one loop per iterator type, as real alloc's SpecExtend specialization picks one
+        pub fn is_trusted_len<T>() -> bool;
         pub fn drop_in_place<T: crate::marker::PointeeSized>(p: *mut T);
         pub fn ptr_read<T>(p: *const T) -> T;
         pub fn ptr_write<T>(p: *mut T, v: T);
@@ -58,6 +158,15 @@ pub mod intrinsics_mem {
         /// `p + n * size_of::<T>()`
         pub fn ptr_add<T>(p: *const T, n: usize) -> *const T;
         pub fn ptr_add_mut<T>(p: *mut T, n: usize) -> *mut T;
+        /// `p` moved back by `n` elements, in bounds (core's `sub`: `offset` by `-n`)
+        pub fn ptr_sub<T>(p: *const T, n: usize) -> *const T;
+        /// `p` moved by `n` elements with wrapping arithmetic, keeping its provenance (core::intrinsics::arith_offset)
+        pub fn arith_offset<T>(p: *const T, n: isize) -> *const T;
+        /// `(p - origin) / size_of::<T>()` of two pointers into one allocation (core::intrinsics::ptr_offset_from)
+        pub fn ptr_offset_from<T>(p: *const T, origin: *const T) -> isize;
+        /// `p` is null: its address at run time; in const evaluation `ptr_guaranteed_cmp(p, null)`, which may
+        /// not know (core::ptr is_null's const_eval_select)
+        pub fn ptr_is_null(p: *const u8) -> bool;
         pub fn slice_from_raw<'a, T>(p: *const T, len: usize) -> &'a [T];
         pub fn slice_from_raw_mut<'a, T>(p: *mut T, len: usize) -> &'a mut [T];
         pub fn slice_ptr<T>(s: &[T]) -> *const T;
@@ -123,6 +232,9 @@ pub mod intrinsics_rt {
         pub fn panic_impl(msg: *const u8, msg_len: usize, file: *const u8, file_len: usize, line: u32, col: u32) -> !;
         /// The location of the caller of the enclosing #[track_caller] fn (or this call).
         pub fn caller_location() -> &'static crate::panic::Location<'static>;
+        /// This thread's thread-local block: word 0 the domain base, word 1 the runtime's per-thread
+        /// record (thread-local keys: `std::thread::local`). An inline TLS access, not a call.
+        pub fn tls_block() -> *mut usize;
         pub fn abort() -> !;
         /// Runs `f(data)` under a recovery point; true if it panicked or faulted (live: the
         /// panic was reported and the stack reset here; AOT: panics abort). std::thread uses it
@@ -146,6 +258,13 @@ pub mod intrinsics_rt {
         /// Writes this thread's floating-point control register (flush-to-zero,
         /// denormals-are-zero, rounding, ...).
         pub fn fp_env_set(x: u64);
+        /// The allocator shim (rustc_codegen_ssa allocator shim: `__rust_alloc` and the others):
+        /// a call of core::heap's `__rg_*::<A>(&STATIC, ..)` when the program has a
+        /// `#[global_allocator] static STATIC: A`, else of the default `__rdl_*` (System).
+        pub fn rust_alloc(size: usize, align: usize) -> *mut u8;
+        pub fn rust_alloc_zeroed(size: usize, align: usize) -> *mut u8;
+        pub fn rust_dealloc(ptr: *mut u8, size: usize, align: usize);
+        pub fn rust_realloc(ptr: *mut u8, old_size: usize, align: usize, new_size: usize) -> *mut u8;
     }
 }
 
@@ -177,18 +296,22 @@ pub mod intrinsics_vx {
     // 17/18 zip low/high, 19 pack i16->u8, 20 pack i16->i8,
     // 21 pack i32->i16, 22 pack i32->u16, 23 madd i16, 24 sad u8,
     // 25 pshufb, 26 multiply low, 27 madd u8*i8, 29 unsigned greater.
-    // 40..45 f32 add/sub/mul/div/Intel min/max; 46..51 eq/ne/lt/le/gt/ge.
+    // 40..45 SSE float add/sub/mul/div/Intel min/max; 46..51 eq/ne/lt/le/gt/ge
+    // (width 32: f32 lanes, 64: f64 lanes; Intel NaN results).
     // 52/53 f32 NEON min/max (NaN propagation and signed-zero ordering).
     // 60..63 NEON f32 add/sub/mul/div.
     // SHA binary (width 32): 70 x86 sha1nexte, 71 sha1msg1, 72 sha1msg2,
     // 73 sha256msg1, 74 sha256msg2; 80 Arm sha1su1, 81 sha256su0.
     // Ternary: 0 x86 sha256rnds2; 1/2/3 Arm sha1c/p/m (b is u32),
     // 4 Arm sha1su0, 5 sha256h, 6 sha256h2, 7 sha256su1 (b is a vector).
-    // 8 / 9 NEON f32 fused a + b * c / a - b * c (FMLA / FMLS .4s).
+    // 8 / 9 NEON f32 fused a + b * c / a - b * c (FMLA / FMLS .4s); 10 bitwise select
+    // (a & b) | (!a & c) (BSL; a, the mask, is passed as T).
     // vx_sha1rnds4: x86, immediate FUNC in 0..=3, checked at lowering.
     // vx_sha1h: Arm, scalar u32 -> u32 through lane 0 of a V128.
     // Unary: 0 abs, 1 shl, 2 unsigned shr, 3 signed shr, 4 shuffle i32,
-    // 5/6 byte shift right/left, 7 sqrt f32, 8 abs f32, 9 NEON sqrt f32. Narrow: 19/20/21 as above,
+    // 5/6 byte shift right/left, 7 SSE sqrt, 8 float abs, 9 NEON sqrt f32, 10 float neg
+    // 11 SSE4.1 round to integral, imm & 3 = nearest-even / down / up / toward zero
+    // (7/8/10/11: width 32 f32, 64 f64). Narrow: 19/20/21 as above,
     // 30 unsigned u16->u8. Narrow results are 8 bytes, all other vectors 16.
 
     extern "relax-intrinsic" {
@@ -202,7 +325,7 @@ pub mod intrinsics_vx {
         pub fn vx_store<T>(p: *mut u8, a: T);
         pub fn vx_narrow<T, U>(a: T, op: u32) -> U;
         pub fn vx_table<T, U>(a: T, b: U) -> T;
-        pub fn vx_mask<T>(a: T) -> i32;
+        pub fn vx_mask<T>(a: T, width: u32) -> i32;
         pub fn vx_blend<T>(a: T, b: T, mask: T) -> T;
     }
 }

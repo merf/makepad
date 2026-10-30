@@ -43,6 +43,9 @@ impl From<io::Error> for Error {
     }
 }
 
+/// Makes a fresh carrier for a [`Target::Dialer`] client (authenticated, before the HELLO).
+pub type Dialer = dyn Fn() -> io::Result<Carrier> + Send + Sync;
+
 /// Where a client dials.
 #[derive(Clone)]
 pub enum Target {
@@ -54,6 +57,8 @@ pub enum Target {
     /// `host:port` and the credentials of the pairing
     #[cfg(not(target_arch = "wasm32"))]
     Tcp(String, Arc<makepad_network::tunnel::ClientCredentials>),
+    /// a carrier made by the caller (its own transport and authentication); called on every dial
+    Dialer(Arc<Dialer>),
     /// a command whose stdin/stdout speak makepad-remote (`ssh host makepad remote-relay`)
     Command(Vec<String>),
     /// an endpoint behind a hub (`<host>:<app|pid>`): every channel is the hub's `route` to it
@@ -83,7 +88,8 @@ impl Client {
         Client(Arc::new(Inner { target, name: name.to_string(), link_id: link_id(), conn: Mutex::new(None), ever: Mutex::new(false), seqs: Mutex::new(HashMap::new()), caps: Mutex::new(Vec::new()), timeout: Mutex::new(None) }))
     }
 
-    /// Dials a local endpoint: `spec` is a socket path, a pid or an app name (discovery files).
+    /// Dials a local endpoint: `spec` is a socket path, a discovery file's `tcp:` socket (Windows),
+    /// a pid or an app name (discovery files).
     pub fn connect(spec: &str) -> Result<Client, Error> {
         let target = if spec.contains('/') || spec.ends_with(".sock") {
             Target::Unix(PathBuf::from(spec))
@@ -114,31 +120,40 @@ impl Client {
         Ok(c)
     }
 
-    fn carrier(&self) -> io::Result<(Carrier, Option<Box<dyn FnOnce() + Send>>)> {
+    /// A fresh carrier, what ends its handshake timeout, and the token its HELLO carries.
+    fn carrier(&self) -> io::Result<(Carrier, Option<Box<dyn FnOnce() + Send>>, String)> {
         match &self.0.target {
             Target::Unix(p) => {
                 #[cfg(unix)]
                 {
                     let (c, keep) = carrier::unix::dial(p)?;
-                    Ok((c, Some(Box::new(move || carrier::unix::settle(&keep)))))
+                    Ok((c, Some(Box::new(move || carrier::unix::settle(&keep))), String::new()))
                 }
-                #[cfg(not(unix))]
+                // no Unix sockets: the path is a file naming a loopback endpoint and its token
+                #[cfg(windows)]
+                {
+                    let (addr, token) = carrier::unix::resolve(p)?;
+                    let (c, keep) = carrier::loopback::dial(&addr)?;
+                    Ok((c, Some(Box::new(move || carrier::loopback::settle(&keep))), token))
+                }
+                #[cfg(not(any(unix, windows)))]
                 {
                     let _ = p;
-                    Err(io::Error::new(io::ErrorKind::Unsupported, "makepad-remote is not available on Windows yet"))
+                    Err(io::Error::new(io::ErrorKind::Unsupported, "no local carrier on this platform"))
                 }
             }
             #[cfg(not(target_arch = "wasm32"))]
-            Target::Loopback(addr, _) => {
+            Target::Loopback(addr, token) => {
                 let (c, keep) = carrier::loopback::dial(addr)?;
-                Ok((c, Some(Box::new(move || carrier::loopback::settle(&keep)))))
+                Ok((c, Some(Box::new(move || carrier::loopback::settle(&keep))), token.clone()))
             }
             #[cfg(not(target_arch = "wasm32"))]
-            Target::Tcp(addr, creds) => Ok((carrier::tcp::dial(addr, creds)?, None)),
+            Target::Tcp(addr, creds) => Ok((carrier::tcp::dial(addr, creds)?, None, String::new())),
+            Target::Dialer(dial) => Ok((dial()?, None, String::new())),
             Target::Routed(..) => Err(io::Error::new(io::ErrorKind::Unsupported, "a routed client opens its channels through the hub")),
             Target::Command(argv) => {
                 let (first, rest) = argv.split_first().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty command"))?;
-                Ok((carrier::stdio::spawn(std::process::Command::new(first).args(rest))?, None))
+                Ok((carrier::stdio::spawn(std::process::Command::new(first).args(rest))?, None, String::new()))
             }
         }
     }
@@ -151,13 +166,8 @@ impl Client {
                 return Ok(c.clone());
             }
         }
-        let (mut car, settle) = self.carrier().map_err(|e| Error::LinkLost(e.to_string()))?;
+        let (mut car, settle, token) = self.carrier().map_err(|e| Error::LinkLost(e.to_string()))?;
         car.reader.deadline = Some(std::time::Instant::now() + Duration::from_secs(10));
-        let token = match &self.0.target {
-            #[cfg(not(target_arch = "wasm32"))]
-            Target::Loopback(_, token) => token.clone(),
-            _ => String::new(),
-        };
         let hello = Hello { name: self.0.name.clone(), link_id: self.0.link_id.clone(), token, ..Hello::default() };
         let ok = match hello::client_handshake(&mut car.reader, &mut *car.writer, &hello) {
             Ok(ok) => ok,

@@ -7,9 +7,16 @@ use crate::types::{RegionId, RegionKind, TyId, TyKind};
 #[derive(Clone, Debug, Default)]
 pub struct ImpliedBounds {
     pub outlives: Vec<(RegionId, RegionId)>,
+    /// How many leading `outlives` are the param-env's region-outlives clauses (rustc inserts those
+    /// into the universal region relations before the regions themselves, the implied ones after).
+    pub explicit_outlives: usize,
     /// Generic and alias subjects are retained as types, not flattened slots.
     pub type_outlives: Vec<(TyId, RegionId)>,
     pub obligations: Vec<OutlivesPredicate>,
+    /// `inferred_outlives_of` per ADT, in terms of its identity parameters (computed on demand).
+    inferred: crate::fxhash::HashMap<crate::program::DefId, Vec<OutlivesPredicate>>,
+    /// `inferred_outlives_of` of the component being solved: its members' current sets
+    provisional: crate::fxhash::HashMap<crate::program::DefId, Vec<OutlivesPredicate>>,
 }
 
 impl ImpliedBounds {
@@ -24,7 +31,11 @@ impl ImpliedBounds {
             obligations,
             ..Self::default()
         };
-        for p in predicates {
+        for p in predicates.iter().filter(|p| matches!(p, OutlivesPredicate::Region(..))) {
+            result.assume(tcx, *p);
+        }
+        result.explicit_outlives = result.outlives.len();
+        for p in predicates.iter().filter(|p| matches!(p, OutlivesPredicate::Type(..))) {
             result.assume(tcx, *p);
         }
         for i in 0..raw.len().max(normalized.len()) {
@@ -33,7 +44,11 @@ impl ImpliedBounds {
         }
         // Relation insertion order determines nightly's SCC representatives.
         let mut seen = crate::fxhash::HashSet::default();
-        result.outlives.retain(|p| seen.insert(*p));
+        let explicit = result.explicit_outlives;
+        let mut index = 0;
+        let mut kept_explicit = 0;
+        result.outlives.retain(|p| { let keep = seen.insert(*p); if keep && index < explicit { kept_explicit += 1; } index += 1; keep });
+        result.explicit_outlives = kept_explicit;
         let mut seen = crate::fxhash::HashSet::default();
         result.type_outlives.retain(|p| seen.insert(*p));
         result
@@ -100,6 +115,10 @@ impl ImpliedBounds {
         }
     }
 
+    /// `inferred_outlives_of`: the outlives requirements the fields of `def` put on its own parameters.
+    pub fn inferred_outlives(tcx: &Tcx, prog: &Program, def: crate::program::DefId) -> Vec<OutlivesPredicate> {
+        Self::default().inferred_outlives_of(tcx, prog, def, &mut vec![])
+    }
     fn implied(&mut self, tcx: &Tcx, prog: &Program, t: TyId) {
         self.implied_wf_args(tcx,prog,vec![t]);
     }
@@ -123,6 +142,14 @@ impl ImpliedBounds {
             TyKind::Adt(d, args, rs) => {
                 if let Some(adt) = tcx.adts.get(d) {
                     self.nominal(tcx,&adt.region_contract,tcx.tys.list(*args),&tcx.tys.region_args(adt.region_params),*rs);
+                    // The ADT is only well-formed where its fields' types are (RFC 2093): `struct S<'a, T>(&'a T)`
+                    // implies `T: 'a` wherever an `S<'a, T>` is.
+                    let inferred = self.inferred_outlives_of(tcx,prog,*d,&mut vec![]);
+                    for p in inferred {
+                        let p = instantiate(tcx,p,tcx.tys.list(*args),&tcx.tys.region_args(adt.region_params),&tcx.tys.region_args(*rs));
+                        if matches!(p,OutlivesPredicate::Type(t,_) if tcx.tys.has_vars_bound_at_or_above(t,0)) { continue; }
+                        self.assume(tcx,p);
+                    }
                 }
                 for t in tcx.tys.list(*args) {
                     wf_args.push(*t);
@@ -154,7 +181,10 @@ impl ImpliedBounds {
             }
             TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { def_id: d }, args, regions: rs }) => {
                 if let Some(decl) = tcx.opaques.get(d) {
-                    let params: Vec<_> = decl.region_contract.regions.iter().map(|p| p.1).collect();
+                    // The alias's region arguments are the opaque's lifetime parameters by index (the
+                    // parent's, then the captured ones); the contract also lists late-bound ones.
+                    let params: Vec<_> = if (d.0 as usize) < prog.defs.len() { tcx.generic_indices_of(prog, *d).lifetimes.iter().map(|&i| tcx.tys.intern_region(RegionKind::ReEarlyParam(i))).collect() }
+                        else { decl.region_contract.regions.iter().map(|p| p.1).collect() }; // (a fixture's opaque is no program item)
                     self.nominal(tcx,&decl.region_contract,tcx.tys.list(*args),&params,*rs);
                 }
                 wf_args.extend(tcx.tys.list(*args));
@@ -170,6 +200,18 @@ impl ImpliedBounds {
                 wf_args.push(*upvars);
             }
             TyKind::Dyn(d,args,_,rs,r,_,_) => {
+                // The projection bounds (the object's own and its supertraits') are well-formed terms:
+                // `dyn Foo<'a, T>` with `Foo: Bar<Assoc = &'a T>` implies `T: 'a`.
+                if !tcx.tys.has_vars_bound_at_or_above(t,0) && (d.0 as usize) < prog.defs.len() && tcx.tys.list(*args).len() + 1 == tcx.generic_indices_of(prog, *d).types_consts.len() {
+                    use crate::next_solver::{ClauseKind, PredicateKind, Term};
+                    let mut clauses = tcx.object_predicates(prog, t);
+                    if let Some(principal) = clauses.first().cloned() { clauses.extend(tcx.supertraits(prog, principal)); }
+                    for p in clauses {
+                        if let PredicateKind::Clause(ClauseKind::Projection(pc)) = p.kind {
+                            if let Term::Ty(term) = pc.term { if !tcx.tys.has_vars_bound_at_or_above(term,0) { wf_args.push(term); } }
+                        }
+                    }
+                }
                 // Object WF: the explicit bound implies each elaborated Self
                 // bound. Generic argument WF is deliberately NOT required.
                 if !tcx.tys.has_vars_bound_at_or_above(t,0) {
@@ -187,6 +229,169 @@ impl ImpliedBounds {
                     }
                 }
             }
+            _ => {}
+        }
+    }
+    /// rustc_hir_analysis/src/outlives/implicit_infer.rs: the outlives predicates the field types of `def`
+    /// require, with those of the ADTs they name (`insert_required_predicates_to_be_wf`). rustc iterates every
+    /// item of the crate until no item's set grows (`infer_predicates`); here the ADTs `def`'s fields reach are
+    /// solved one strongly connected component at a time, dependencies first: a component's sets start empty and
+    /// are recomputed together until none grows, then all of them are final (cached in `tcx.inferred_outlives`).
+    /// (A depth-first search that cached only cycle heads recomputed every member of a large mutually recursive
+    /// type graph -- syn's AST -- once per path to it: seconds per proc-macro compile.) A component whose sets
+    /// still grow after the recursion limit's count of rounds is rustc's "overflow computing implied lifetime
+    /// bounds" (recorded in `tcx.inferred_outlives_overflow` for the members that grew).
+    fn inferred_outlives_of(&mut self, tcx: &Tcx, prog: &Program, def: crate::program::DefId, _visiting: &mut Vec<crate::program::DefId>) -> Vec<OutlivesPredicate> {
+        if let Some(done) = self.inferred.get(&def) { return done.clone(); }
+        if let Some(done) = tcx.inferred_outlives.get(&def) { return (*done).clone(); }
+        if tcx.adts.get(&def).is_none() { return vec![]; }
+        self.solve_components(tcx, prog, def);
+        self.inferred.get(&def).cloned().unwrap_or_default()
+    }
+
+    /// The ADTs (with definitions, not yet solved) that `required_to_be_wf` of `ty` asks for.
+    fn adt_refs(&self, tcx: &Tcx, ty: TyId, out: &mut Vec<crate::program::DefId>) {
+        let tys = &tcx.tys;
+        match tys.kind(ty).clone() {
+            TyKind::Adt(d, args, _) => {
+                if tcx.adts.get(&d).is_some() && !self.inferred.contains_key(&d) && tcx.inferred_outlives.get(&d).is_none() && !out.contains(&d) { out.push(d); }
+                for t in tys.list(args).to_vec() { self.adt_refs(tcx, t, out); }
+            }
+            TyKind::Ref(_, inner, r) => {
+                if matches!(tys.region_kind(r), RegionKind::ReBound(..)) || tys.has_vars_bound_at_or_above(inner, 0) { return; }
+                self.adt_refs(tcx, inner, out);
+            }
+            TyKind::Tuple(ts) => { for t in tys.list(ts).to_vec() { self.adt_refs(tcx, t, out); } }
+            TyKind::Array(t, _) | TyKind::Slice(t) | TyKind::Ptr(_, t) => self.adt_refs(tcx, t, out),
+            _ => {}
+        }
+    }
+
+    /// Tarjan's components of the unsolved ADTs reachable from `root` through field types, each solved as
+    /// soon as it is complete (its dependencies are solved by then).
+    fn solve_components(&mut self, tcx: &Tcx, prog: &Program, root: crate::program::DefId) {
+        use crate::program::DefId;
+        let succs = |this: &Self, d: DefId| -> Vec<DefId> {
+            let mut out = Vec::new();
+            if let Some(adt) = tcx.adts.get(&d) {
+                for variant in &adt.variants { for field in &variant.fields { this.adt_refs(tcx, field.ty, &mut out); } }
+            }
+            out
+        };
+        let mut index: crate::fxhash::HashMap<DefId, (usize, usize)> = Default::default(); // (index, lowlink)
+        let mut on_stack: crate::fxhash::HashSet<DefId> = Default::default();
+        let mut stack: Vec<DefId> = Vec::new();
+        // (node, its successors, next successor)
+        let mut work: Vec<(DefId, Vec<DefId>, usize)> = Vec::new();
+        let mut next = 0usize;
+        index.insert(root, (next, next)); next += 1; stack.push(root); on_stack.insert(root);
+        work.push((root, succs(self, root), 0));
+        while let Some((v, vs, i)) = work.last_mut() {
+            let v = *v;
+            if *i < vs.len() {
+                let w = vs[*i];
+                *i += 1;
+                if let Some(&(wi, _)) = index.get(&w) {
+                    if on_stack.contains(&w) {
+                        let e = index.get_mut(&v).unwrap();
+                        e.1 = e.1.min(wi);
+                    }
+                } else {
+                    index.insert(w, (next, next)); next += 1; stack.push(w); on_stack.insert(w);
+                    let ws = succs(self, w);
+                    work.push((w, ws, 0));
+                }
+                continue;
+            }
+            let (vi, vl) = index[&v];
+            work.pop();
+            if let Some((u, _, _)) = work.last() {
+                let ul = index.get_mut(u).unwrap();
+                ul.1 = ul.1.min(vl);
+            }
+            if vl == vi {
+                let mut comp = Vec::new();
+                loop {
+                    let w = stack.pop().unwrap();
+                    on_stack.remove(&w);
+                    comp.push(w);
+                    if w == v { break; }
+                }
+                comp.reverse();
+                let cyclic = comp.len() > 1 || succs(self, v).contains(&v);
+                self.solve_component(tcx, prog, &comp, cyclic);
+            }
+        }
+    }
+
+    fn solve_component(&mut self, tcx: &Tcx, prog: &Program, comp: &[crate::program::DefId], cyclic: bool) {
+        for &m in comp { self.provisional.insert(m, Vec::new()); }
+        let mut round = 0usize;
+        loop {
+            let mut grew = Vec::new();
+            for &m in comp {
+                let required = self.required_of(tcx, prog, m);
+                if required.len() > self.provisional.get(&m).map_or(0, |p| p.len()) { grew.push(m); }
+                self.provisional.insert(m, required);
+            }
+            if !cyclic || grew.is_empty() { break; }
+            round += 1;
+            let over: Vec<_> = grew.iter().copied().filter(|&m| round > crate::tcx::RecursionLimit::for_item(prog, m).0).collect();
+            if !over.is_empty() {
+                for m in over { tcx.inferred_outlives_overflow.insert(m, ()); }
+                break;
+            }
+        }
+        for &m in comp {
+            let required = self.provisional.remove(&m).unwrap_or_default();
+            tcx.inferred_outlives.insert(m, std::sync::Arc::new(required.clone()));
+            self.inferred.insert(m, required);
+        }
+    }
+
+    /// One round of `def`'s set: what its fields require, the ADTs they name giving their solved (or, in
+    /// `def`'s component, current) sets; only `def`'s own early-bound parameters kept.
+    fn required_of(&mut self, tcx: &Tcx, prog: &Program, def: crate::program::DefId) -> Vec<OutlivesPredicate> {
+        let Some(adt) = tcx.adts.get(&def) else { return vec![] };
+        let mut required: Vec<OutlivesPredicate> = vec![];
+        for variant in &adt.variants {
+            for field in &variant.fields { self.required_to_be_wf(tcx, prog, field.ty, &mut Vec::new(), &mut required); }
+        }
+        required.retain(|p| match *p {
+            OutlivesPredicate::Region(a, b) => [a, b].iter().all(|&r| matches!(tcx.tys.region_kind(r), RegionKind::ReEarlyParam(_))),
+            OutlivesPredicate::Type(t, r) => matches!(tcx.tys.kind(t), TyKind::Param(_) | TyKind::Alias(..)) && matches!(tcx.tys.region_kind(r), RegionKind::ReEarlyParam(_)),
+        });
+        required
+    }
+
+    fn required_to_be_wf(&mut self, tcx: &Tcx, prog: &Program, ty: TyId, visiting: &mut Vec<crate::program::DefId>, out: &mut Vec<OutlivesPredicate>) {
+        let tys = &tcx.tys;
+        let push = |p: OutlivesPredicate, out: &mut Vec<OutlivesPredicate>| if !out.contains(&p) { out.push(p) };
+        match tys.kind(ty).clone() {
+            TyKind::Adt(d, args, rs) => {
+                if let Some(adt) = tcx.adts.get(&d) {
+                    let params = tys.region_args(adt.region_params);
+                    let explicit = adt.region_contract.predicates.clone();
+                    // a member of the component being solved: its current set
+                    let inferred = match self.provisional.get(&d) { Some(p) => p.clone(), None => self.inferred_outlives_of(tcx, prog, d, visiting) };
+                    for p in explicit.into_iter().chain(inferred) {
+                        let p = instantiate(tcx, p, tys.list(args), &params, &tys.region_args(rs));
+                        if !matches!(p, OutlivesPredicate::Type(t, _) if tys.has_vars_bound_at_or_above(t, 0)) { push(p, out); }
+                    }
+                }
+                for t in tys.list(args).to_vec() { self.required_to_be_wf(tcx, prog, t, visiting, out); }
+            }
+            TyKind::Ref(_, inner, r) => {
+                // `&'r T` requires `T: 'r`: the components of T each outlive 'r.
+                if matches!(tys.region_kind(r), RegionKind::ReBound(..)) || tys.has_vars_bound_at_or_above(inner, 0) { return; }
+                let mut components = ImpliedBounds::default();
+                components.components(tcx, inner, r);
+                for (a, b) in components.outlives { push(OutlivesPredicate::Region(a, b), out); }
+                for (t, r) in components.type_outlives { push(OutlivesPredicate::Type(t, r), out); }
+                self.required_to_be_wf(tcx, prog, inner, visiting, out);
+            }
+            TyKind::Tuple(ts) => { for t in tys.list(ts).to_vec() { self.required_to_be_wf(tcx, prog, t, visiting, out); } }
+            TyKind::Array(t, _) | TyKind::Slice(t) | TyKind::Ptr(_, t) => self.required_to_be_wf(tcx, prog, t, visiting, out),
             _ => {}
         }
     }
@@ -213,23 +418,11 @@ impl ImpliedBounds {
     }
 
     // rustc_trait_selection::traits::implied_outlives_bounds @8d1a764.
-    // Match only ParamSet and references to it, not arbitrary nested arguments.
     pub fn consider_implied_bounds_compat(&mut self, tcx: &Tcx, prog: &crate::program::Program,
-        mut ty: TyId, registered_since_snapshot: &[OutlivesPredicate]) {
-        loop {
-            match tcx.tys.kind(ty) {
-                TyKind::Ref(_,inner,_) => ty = *inner,
-                TyKind::Adt(d,_,_) => {
-                    let def = prog.def(*d);
-                    if prog.name(*d) == "ParamSet" && prog.syms.str(prog.crates[def.krate as usize].name) == "bevy_ecs" {
-                        for &p in registered_since_snapshot {
-                            if matches!(p,OutlivesPredicate::Type(..)) { self.assume(tcx,p); }
-                        }
-                    }
-                    break;
-                }
-                _ => break,
-            }
+        ty: TyId, registered_since_snapshot: &[OutlivesPredicate]) {
+        if !contains_bevy_param_set(tcx, prog, ty) { return; }
+        for &p in registered_since_snapshot {
+            if matches!(p,OutlivesPredicate::Type(..)) { self.assume(tcx,p); }
         }
     }
 
@@ -237,8 +430,13 @@ impl ImpliedBounds {
     pub fn instantiate_query_bounds(&mut self, tcx: &Tcx, replacements: &[(RegionId,RegionId)]) {
         let region = |r| replacements.iter().find(|p| p.0 == r).map_or(r,|p| p.1);
         let placeholder = |r| matches!(tcx.tys.region_kind(r),RegionKind::RePlaceholder { .. });
-        self.outlives = self.outlives.iter().map(|&(a,b)| (region(a),region(b)))
-            .filter(|&(a,b)| !placeholder(a) && !placeholder(b)).collect();
+        let explicit = self.explicit_outlives;
+        let mut kept_explicit = 0;
+        let mapped: Vec<(RegionId, RegionId)> = self.outlives.iter().enumerate().map(|(i, &(a,b))| (i, (region(a),region(b))))
+            .filter(|&(_, (a,b))| !placeholder(a) && !placeholder(b))
+            .map(|(i, p)| { if i < explicit { kept_explicit += 1; } p }).collect();
+        self.outlives = mapped;
+        self.explicit_outlives = kept_explicit;
         self.type_outlives = self.type_outlives.iter().filter_map(|&(t,r)| {
             let r = region(r);
             let has_placeholder = std::cell::Cell::new(placeholder(r));
@@ -246,6 +444,37 @@ impl ImpliedBounds {
             if has_placeholder.get() || contains_type_placeholder(tcx,t) { None } else { Some((t,r)) }
         }).collect();
     }
+}
+/// `ContainsBevyParamSet`: `ParamSet<T>` of crate `bevy_ecs`, or a reference to one (references only; the
+/// arguments of other types are not searched).
+pub(crate) fn contains_bevy_param_set(tcx: &Tcx, prog: &crate::program::Program, mut ty: TyId) -> bool {
+    loop {
+        match tcx.tys.kind(ty) {
+            TyKind::Ref(_,inner,_) => ty = *inner,
+            TyKind::Adt(d,_,_) => {
+                let def = prog.def(*d);
+                return prog.name(*d) == "ParamSet" && prog.crates[def.krate as usize].crate_name(prog) == "bevy_ecs";
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// The search of `compute_implied_outlives_bounds` through `ty`'s well-formedness: every WF obligation is
+/// deeply normalized (which selects impls and registers their outlives obligations), and each WF predicate it
+/// yields is searched in turn. Only the registered region obligations matter to the bevy compatibility rule.
+fn normalize_wf_obligations(infcx: &crate::infer::InferCtxt<'_>, ocx: &mut crate::next_solver::fulfill::ObligationCtxt<'_, '_>, prog: &Program, param_env: &crate::next_solver::ParamEnvId, tys: &[TyId]) -> Result<(), crate::next_solver::NoSolution> {
+    use crate::next_solver::{ClauseKind, PredicateKind, Term};
+    let mut checked: crate::fxhash::HashSet<Term> = Default::default();
+    let mut wf_args: Vec<Term> = tys.iter().map(|&t| Term::Ty(t)).collect();
+    while let Some(arg) = wf_args.pop() {
+        if !checked.insert(arg) { continue; }
+        for goal in crate::next_solver::wf::unnormalized_obligations(infcx, prog, param_env, arg)?.into_iter().flatten() {
+            let pred = ocx.deeply_normalize_predicate(param_env, &goal.predicate)?;
+            if let PredicateKind::Clause(ClauseKind::WellFormed(term)) = pred.kind { wf_args.push(term); }
+        }
+    }
+    Ok(())
 }
 fn contains_type_placeholder(tcx: &Tcx, t: TyId) -> bool {
     tcx.tys.flags(t).intersects(crate::types::TypeFlags::HAS_TY_PLACEHOLDER)
@@ -302,21 +531,22 @@ pub fn mir_borrowck_implied_outlives_bounds(
     let mut ocx = crate::next_solver::fulfill::ObligationCtxt::new(&infcx, prog);
     let erase_vars = |ty: TyId| tcx.tys.map_regions(ty, &|r, _| if matches!(tcx.tys.region_kind(r), RegionKind::ReVar(_)) { RegionId::ERASED } else { r }, 0);
     let registered_since = |snapshot: usize| -> Vec<OutlivesPredicate> {
-        infcx.inner.borrow().region_obligations()[snapshot..].iter().map(|&(t, r)| OutlivesPredicate::Type(erase_vars(t), if matches!(tcx.tys.region_kind(r), RegionKind::ReVar(_)) { RegionId::ERASED } else { r })).collect()
+        infcx.inner.borrow().region_obligations()[snapshot..].iter().map(|&(t, r, _)| OutlivesPredicate::Type(erase_vars(t), if matches!(tcx.tys.region_kind(r), RegionKind::ReVar(_)) { RegionId::ERASED } else { r })).collect()
     };
     let mut bounds = ImpliedBounds::create(tcx,prog,predicates,&[],&[],vec![]);
     let mut normalized_inputs_and_output = vec![];
     let failed = std::cell::Cell::new(false);
     for &ty in inputs_and_output {
         let snapshot = infcx.inner.borrow().region_obligations().len();
-        let normalized_ty = crate::borrowck::tyx::with_foreign_region_vars(&infcx, ty, |ty| crate::borrowck::tyx::in_signature_binder(&tcx.tys, ty, |ty| ocx.deeply_normalize_ty(param_env, ty).map_err(|_| failed.set(true)).ok())).unwrap_or(ty);
+        let normalized_ty = crate::type_queries::place_types::with_foreign_region_vars(&infcx, ty, |ty| crate::type_queries::place_types::in_signature_binder(&tcx.tys, ty, |ty| ocx.deeply_normalize_ty(param_env, ty).map_err(|_| failed.set(true)).ok())).unwrap_or(ty);
         if failed.get() { return Err(crate::next_solver::NoSolution); }
         bounds.implied_wf_args(tcx,prog,vec![ty,normalized_ty]);
+        if contains_bevy_param_set(tcx, prog, ty) && normalize_wf_obligations(&infcx, &mut ocx, prog, param_env, &[ty, normalized_ty]).is_err() { return Err(crate::next_solver::NoSolution); }
         bounds.consider_implied_bounds_compat(tcx,prog,normalized_ty,&registered_since(snapshot));
         normalized_inputs_and_output.push(normalized_ty);
     }
     for &ty in assumed_wf {
-        let normalized_ty = crate::borrowck::tyx::with_foreign_region_vars(&infcx, ty, |ty| crate::borrowck::tyx::in_signature_binder(&tcx.tys, ty, |ty| ocx.deeply_normalize_ty(param_env, ty).map_err(|_| failed.set(true)).ok())).unwrap_or(ty);
+        let normalized_ty = crate::type_queries::place_types::with_foreign_region_vars(&infcx, ty, |ty| crate::type_queries::place_types::in_signature_binder(&tcx.tys, ty, |ty| ocx.deeply_normalize_ty(param_env, ty).map_err(|_| failed.set(true)).ok())).unwrap_or(ty);
         if failed.get() { return Err(crate::next_solver::NoSolution); }
         // Impl-header normalization obligations do not enter the compatibility rule.
         let snapshot = infcx.inner.borrow().region_obligations().len();
@@ -344,7 +574,9 @@ pub fn implied_bounds_query_var_values(tcx: &Tcx, inputs_and_output: &[TyId], is
     }
     values.into_inner()
 }
-pub fn replace_erased_regions_with_placeholders(tcx: &Tcx, inputs_and_output: &[TyId]) -> Vec<TyId> {
+/// The placeholders are numbered from `base`: a nested body's are numbered after those it inherits from its creator,
+/// so that its own external regions stay different from the creator's.
+pub fn replace_erased_regions_with_placeholders(tcx: &Tcx, inputs_and_output: &[TyId], base: u32) -> Vec<TyId> {
     use crate::types::fold::TypeFolder;
     struct Replacer { next: u32 }
     impl TypeFolder for Replacer {
@@ -355,6 +587,6 @@ pub fn replace_erased_regions_with_placeholders(tcx: &Tcx, inputs_and_output: &[
             } else { r }
         }
     }
-    let mut replacer = Replacer { next:0 };
+    let mut replacer = Replacer { next:base };
     inputs_and_output.iter().map(|&ty| replacer.fold_ty(&tcx.tys,ty,0)).collect()
 }

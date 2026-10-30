@@ -67,6 +67,7 @@ pub const OP_COPY_OBJECT: u32 = 83;
 pub const OP_TRANSPOSE: u32 = 84;
 pub const OP_SAMPLED_IMAGE: u32 = 86;
 pub const OP_IMAGE_SAMPLE_IMPLICIT_LOD: u32 = 87;
+pub const OP_IMAGE: u32 = 100;
 pub const OP_IMAGE_SAMPLE_EXPLICIT_LOD: u32 = 88;
 pub const OP_IMAGE_SAMPLE_DREF_IMPLICIT_LOD: u32 = 89;
 pub const OP_IMAGE_SAMPLE_DREF_EXPLICIT_LOD: u32 = 90;
@@ -279,6 +280,8 @@ pub const EXEC_MODEL_GL_COMPUTE: u32 = 5;
 pub const EXEC_MODE_LOCAL_SIZE: u32 = 17;
 pub const EXEC_MODE_ORIGIN_UPPER_LEFT: u32 = 7;
 pub const EXEC_MODE_DEPTH_REPLACING: u32 = 12;
+pub const EXEC_MODE_DEPTH_GREATER: u32 = 14;
+pub const EXEC_MODE_DEPTH_LESS: u32 = 15;
 
 // Storage classes.
 pub const SC_UNIFORM_CONSTANT: u32 = 0;
@@ -302,6 +305,7 @@ pub const DECO_FLAT: u32 = 14;
 pub const DECO_INVARIANT: u32 = 18;
 pub const DECO_NON_WRITABLE: u32 = 24;
 pub const DECO_LOCATION: u32 = 30;
+pub const DECO_NO_CONTRACTION: u32 = 42;
 pub const DECO_BINDING: u32 = 33;
 pub const DECO_DESCRIPTOR_SET: u32 = 34;
 pub const DECO_OFFSET: u32 = 35;

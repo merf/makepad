@@ -34,7 +34,8 @@ impl Backend for Headless {
             session: 0,
             backend: backend_id::HEADLESS,
             dialect: dialect::NONE,
-            flags: 0,
+            // a badge layer is kept and drawn like any frame here: nothing
+            flags: info_flags::WINDOW_BADGES,
             formats: (1u64 << format::COUNT) - 1,
             msaa: 1,
             dpi: 1.0,
@@ -42,6 +43,7 @@ impl Backend for Headless {
             max_window: [MAX_TEXTURE, MAX_TEXTURE],
             max_buffer: 0,
             working_set: 0,
+            ..Default::default()
         }
     }
 
@@ -105,6 +107,7 @@ impl Gpu for Headless {
             deps, window,
         })
     }
+    fn badges(&self) -> bool { true }
     fn pick(&mut self, s: &mut Session, _window: Id, req: u32, _pos: [f32; 2]) {
         s.events.pick_result(req, &[]);
     }
@@ -113,7 +116,6 @@ impl Gpu for Headless {
         s.events.readback(req, readback::NO_RASTER, [0, 0, g[2] as u32, g[3] as u32], &[]);
     }
     fn window_closed(&mut self, _sid: u32, _id: Id) {}
-    fn window_overlay(&mut self, _s: &mut Session, _id: Id, _rect: Option<[f32; 4]>, _now: u64) {}
     fn completes_inline(&self) -> bool {
         true
     }
@@ -130,10 +132,19 @@ fn frame(s: &mut Session, sid: u32, _target: Id, _kind: u32, packet: u32, view: 
         let a = r.off as usize;
         a.checked_add(r.len as usize).filter(|e| *e <= len).map(|e| a..e)
     };
-    let (Some(pr), Some(_)) = (slice(p.passes, view.passes.len()), slice(p.draws, view.draws.len())) else {
+    let (Some(pr), Some(_), Some(lr)) = (slice(p.passes, view.passes.len()), slice(p.draws, view.draws.len()), slice(p.layers, view.layers.len())) else {
         s.stats.bad_args += 1;
         return None;
     };
+    s.last_frame_layers.clear();
+    s.last_frame_occluders.clear();
+    for layer in &view.layers[lr] {
+        let mut layer = *layer;
+        let off = s.last_frame_occluders.len() as u32;
+        s.last_frame_occluders.extend(crate::buffers::read_rects(view.arena, layer.occluders));
+        layer.occluders = Range { off, len: s.last_frame_occluders.len() as u32 - off };
+        s.last_frame_layers.push(layer);
+    }
     let frame = p.frame;
     s.frame = frame;
     s.font_frames.submitted(frame);

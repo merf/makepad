@@ -338,6 +338,10 @@ pub struct FleetQwenChatProvider<T: FleetTransport> {
     /// Exact fleet model requested by the caller. `None` keeps the normal
     /// provider preference order.
     preferred_model: Option<String>,
+    /// The bases whose last probe listed `preferred_model` (available or
+    /// not): an unavailable pinned model reports those nodes' reasons, and
+    /// one no node offers says so in one line.
+    wanted_listed: Vec<String>,
     /// `None` leaves the field off the wire so the serving node chooses its
     /// own default. A positive value is forwarded without alteration.
     max_tokens: Option<u32>,
@@ -368,9 +372,37 @@ pub struct FleetQwenChatProvider<T: FleetTransport> {
     /// history strips thinking for storage and display; this mirror exists
     /// because the KV cannot (the recurrent layers never rewind).
     wire: Vec<WireTurn>,
-    pending_images: Vec<String>,
+    /// Pictures for the next turn's newest row, labelled.
+    pending_images: Vec<RowPicture>,
     /// Re-send pictures on their original history rows to preserve the KV prefix.
-    row_images: Vec<(ChatRole, String, Vec<String>)>,
+    row_images: Vec<(ChatRole, String, Vec<RowPicture>)>,
+}
+
+/// A picture riding on one history row: what it shows (from the tool or
+/// the person) and the PNG as base64.
+#[derive(Clone, Debug, PartialEq)]
+struct RowPicture {
+    label: String,
+    b64: String,
+}
+
+/// What an older tool result's pictures leave behind once a newer result
+/// brought its own.
+fn superseded_note(pictures: &[RowPicture]) -> String {
+    let labels: Vec<&str> = pictures.iter().map(|picture| picture.label.trim()).filter(|label| !label.is_empty()).collect();
+    format!("\n[{} earlier picture(s) no longer attached (a newer result has its own){}{}]", pictures.len(), if labels.is_empty() { "" } else { ": " }, labels.join("; "))
+}
+
+/// The line a row's text gains for its pictures, so the model reads what
+/// each one shows right where they arrive (the pictures follow the text).
+fn pictures_note(pictures: &[RowPicture]) -> String {
+    let mut note = String::new();
+    let count = pictures.len();
+    for (index, picture) in pictures.iter().enumerate() {
+        let label = picture.label.trim();
+        note.push_str(&format!("\n[attached picture {} of {count}{}{label}]", index + 1, if label.is_empty() { "" } else { ": " }));
+    }
+    note
 }
 
 /// One wire turn: the session-history role it mirrors, and the exact text
@@ -414,6 +446,7 @@ impl<T: FleetTransport> FleetQwenChatProvider<T> {
             transport,
             bases,
             preferred_model: None,
+            wanted_listed: Vec::new(),
             // NOT a policy number: the client requests the maximum and the
             // serving lane clamps to its physics (context minus prompt).
             // Every policy cap tried here got observed cutting a real
@@ -440,24 +473,42 @@ impl<T: FleetTransport> FleetQwenChatProvider<T> {
         }
     }
 
-    fn remember_images(&mut self, input: &TurnInput) -> Result<(), String> {
+    /// `fresh_reader`: the model reads the whole conversation anew each turn
+    /// (the hub's Claude, no resident KV). It then gets only the newest tool
+    /// result's pictures: with every earlier render re-sent it took the
+    /// oldest for the current state. Earlier tool pictures keep their
+    /// labels as a note; the person's own pictures (references) stay.
+    fn remember_images(&mut self, input: &TurnInput, fresh_reader: bool) -> Result<(), String> {
         self.row_images.retain(|(role, text, _)| {
             input.messages.iter().any(|m| m.role == *role && m.text == *text)
         });
         if self.pending_images.is_empty() { return Ok(()); }
-        let row = input.messages.iter().rev().find(|m| m.role == ChatRole::User)
-            .ok_or("cannot attach pictures without a user message")?;
+        // Pictures belong to the row they came with: the person's newest line,
+        // or the tool result that produced them. Hanging a tool's render on an
+        // older user line put it far above the result that names it, and the
+        // model reported the render "came back without any image".
+        let row = input.messages.last()
+            .filter(|m| matches!(m.role, ChatRole::User | ChatRole::Tool))
+            .ok_or("pictures go with a user line or a tool result")?;
         let index = self.row_images.iter().position(|(role, text, _)| *role == row.role && *text == row.text)
             .unwrap_or_else(|| {
                 self.row_images.push((row.role, row.text.clone(), Vec::new()));
                 self.row_images.len() - 1
             });
+        if fresh_reader && row.role == ChatRole::Tool {
+            for (role, _, pictures) in self.row_images.iter_mut() {
+                if *role == ChatRole::Tool {
+                    pictures.iter_mut().for_each(|picture| picture.b64.clear());
+                }
+            }
+        }
         let images = &mut self.row_images[index].2;
+        images.retain(|picture| !picture.b64.is_empty());
         for image in std::mem::take(&mut self.pending_images) {
             if !images.contains(&image) { images.push(image); }
         }
         let mut trimmed = false;
-        // Tool continuations can add more pictures to the same user row.
+        // A row re-sent with more pictures keeps the newest.
         if images.len() > crate::protocol::MAX_CHAT_IMAGES {
             images.drain(..images.len() - crate::protocol::MAX_CHAT_IMAGES);
             trimmed = true;
@@ -465,7 +516,7 @@ impl<T: FleetTransport> FleetQwenChatProvider<T> {
         let mut distinct = HashSet::new();
         let mut oldest = 0;
         for (index, (_, _, images)) in self.row_images.iter().enumerate().rev() {
-            distinct.extend(images.iter().map(String::as_str));
+            distinct.extend(images.iter().filter(|picture| !picture.b64.is_empty()).map(|picture| picture.b64.as_str()));
             if distinct.len() > crate::protocol::MAX_CHAT_IMAGES {
                 oldest = index + 1;
                 break;
@@ -546,6 +597,7 @@ impl<T: FleetTransport> FleetQwenChatProvider<T> {
             ));
         }
         let mut reasons = Vec::new();
+        self.wanted_listed.clear();
         let mut order = self.bases.clone();
         if let Some(last) = self.picks.last_base() {
             // The last good node goes first, but never ahead of a better tier
@@ -617,6 +669,20 @@ impl<T: FleetTransport> FleetQwenChatProvider<T> {
         }) {
             self.picks.remember(base.clone(), model.clone(), text_fallback);
             return Ok((base, model, text_fallback));
+        }
+        if let Some(wanted) = &self.preferred_model {
+            if self.wanted_listed.is_empty() {
+                let unreachable = reasons.iter().filter(|r| r.contains("probe failed") || r.contains("recently unreachable")).count();
+                let heard = self.bases.len();
+                let hubs = if heard == 1 { "hub" } else { "hubs" };
+                return Err(if unreachable > 0 {
+                    format!("no fleet hub offers {wanted} ({heard} {hubs} heard, {unreachable} unreachable)")
+                } else {
+                    format!("no fleet hub offers {wanted} ({heard} {hubs} heard)")
+                });
+            }
+            let listed = &self.wanted_listed;
+            reasons.retain(|r| listed.iter().any(|base| r.starts_with(&format!("{base}:"))));
         }
         Err(if reasons.is_empty() {
             "no fleet node advertises a chat or Qwen text model".to_string()
@@ -707,6 +773,14 @@ impl<T: FleetTransport> FleetQwenChatProvider<T> {
                 continue;
             };
             if !matches!(domain, "chat" | "text") { continue; }
+            if wanted == Some(id) && !self.wanted_listed.iter().any(|b| b == base) {
+                self.wanted_listed.push(base.to_string());
+            }
+            // claude-cli (a hub's own Claude Code) is never a fallback pick:
+            // only a client that names it gets it.
+            if row.get("backend").and_then(Value::as_str) == Some(crate::claude_cli::BACKEND) && wanted != Some(id) {
+                continue;
+            }
             if !crate::fleet::role_allows(base, domain) || (domain == "chat" && !has_chat) {
                 reasons.push(format!("{base}: {id} is excluded by role or capability"));
                 continue;
@@ -745,7 +819,7 @@ impl<T: FleetTransport> FleetQwenChatProvider<T> {
             }
         }
         if let Some(wanted) = wanted {
-            if preferred_chat.is_none() && preferred_text.is_none() {
+            if preferred_chat.is_none() && preferred_text.is_none() && self.wanted_listed.iter().any(|b| b == base) {
                 reasons.push(format!("{base}: {wanted} is not eligible"));
             }
         }
@@ -950,6 +1024,56 @@ fn preferred_rank(id: &str) -> usize {
         .unwrap_or(PREFERRED.len())
 }
 
+/// One chat model a hub offers, as its `/models` lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatOffer {
+    /// The registry id a client names to get it (`qwen3.5-4b`, `claude-cli`).
+    pub model: String,
+    /// The backend that serves it (`claude-cli` is the hub's own Claude Code).
+    pub backend: String,
+}
+
+/// The chat models `base` would serve a client that names them: the rows the
+/// election's probe (`probe_one`) accepts there — role and capability allow
+/// chat, available, resident or ready; a text model only when it is a Qwen —
+/// including the hub's Claude (`claude-cli`), which the election only gives a
+/// client that names it. Two GETs (`/health`, `/models`), nothing loaded.
+pub fn chat_offers<T: FleetTransport>(transport: &mut T, base: &str) -> Result<Vec<ChatOffer>, String> {
+    if !crate::fleet::role_allows(base, "chat") {
+        return Err(format!("{base}: role excludes chat"));
+    }
+    let health = transport.get_json(&format!("{base}/health"))?;
+    if legacy_chat_cache(&health) {
+        return Err(format!("{base}: AIHub 0.3 or newer is required"));
+    }
+    let has_chat = health.get("capabilities").and_then(Value::as_arr)
+        .is_some_and(|caps| caps.iter().any(|c| c.as_str() == Some("chat")));
+    let models = transport.get_json(&format!("{base}/models"))?;
+    let rows = models.get("models").and_then(Value::as_arr).ok_or_else(|| format!("{base}: malformed models response"))?;
+    let mut offers = Vec::new();
+    for row in rows {
+        let domain = row.get("domain").and_then(Value::as_str).unwrap_or("");
+        let Some(id) = row.get("id").and_then(Value::as_str) else { continue };
+        let eligible = match domain {
+            "chat" => has_chat,
+            "text" => id.to_ascii_lowercase().contains("qwen"),
+            _ => false,
+        };
+        if !eligible || !crate::fleet::role_allows(base, domain) || row.get("available").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        if row.get("state").and_then(Value::as_str).is_some_and(|state| !matches!(state, "loaded" | "ready")) {
+            continue;
+        }
+        if offers.iter().any(|o: &ChatOffer| o.model == id) {
+            continue;
+        }
+        let backend = row.get("backend").and_then(Value::as_str).unwrap_or("").to_string();
+        offers.push(ChatOffer { model: id.to_string(), backend });
+    }
+    Ok(offers)
+}
+
 fn legacy_chat_cache(health: &Value) -> bool {
     let Some(version) = health.get("version").and_then(Value::as_str) else { return false; };
     let mut parts = version.split('.').filter_map(|part| part.parse::<u32>().ok());
@@ -988,8 +1112,16 @@ impl<T: FleetTransport> ChatProvider for FleetQwenChatProvider<T> {
         self.wire.clear();
     }
 
+    /// Pinned to the hub's Claude (`claude-cli`), the model reasons on
+    /// its own channel; the fleet's Qwen reasons in text.
+    fn reasons_natively(&self) -> bool {
+        self.preferred_model.as_deref() == Some(crate::claude_cli::MODEL_ID)
+    }
+
+    /// Pinned to a hub's Claude, this is the fleet's Claude: a cloud model
+    /// (it runs at Anthropic), whatever route reaches it.
     fn kind(&self) -> ProviderKind {
-        ProviderKind::FleetQwen
+        if self.reasons_natively() { ProviderKind::FleetClaude } else { ProviderKind::FleetQwen }
     }
 
     fn availability(&mut self) -> ProviderAvailability {
@@ -1001,9 +1133,10 @@ impl<T: FleetTransport> ChatProvider for FleetQwenChatProvider<T> {
 
     fn attach_tool_images(&mut self, images: Vec<crate::providers::provider::ToolImage>) -> Result<(), String> {
         crate::providers::provider::validate_tool_images(&images)?;
-        self.pending_images = images.into_iter().map(|image| {
-            String::from_utf8(makepad_base64::base64_encode(&image.png, &makepad_base64::BASE64_STANDARD))
-                .expect("base64 is ASCII")
+        self.pending_images = images.into_iter().map(|image| RowPicture {
+            label: image.label,
+            b64: String::from_utf8(makepad_base64::base64_encode(&image.png, &makepad_base64::BASE64_STANDARD))
+                .expect("base64 is ASCII"),
         }).collect();
         Ok(())
     }
@@ -1019,7 +1152,7 @@ impl<T: FleetTransport> ChatProvider for FleetQwenChatProvider<T> {
         })) {
             return Err("this node's model cannot look at pictures".into());
         }
-        self.remember_images(input)?;
+        self.remember_images(input, self.reasons_natively() || model == crate::claude_cli::MODEL_ID)?;
         // Older nodes do not advertise the prefill shape, so retain the
         // historical model/request inference only as a compatibility fallback.
         let inferred_open_think = self.thinking != Some(false)
@@ -1079,14 +1212,20 @@ impl<T: FleetTransport> ChatProvider for FleetQwenChatProvider<T> {
             .iter()
             .zip(&input.messages)
             .map(|(w, m)| {
-                let mut fields = vec![
-                    ("role", json::s(w.wire_role)),
-                    ("text", json::s(w.text.clone())),
-                ];
-                if let Some((_, _, images)) = self.row_images.iter().find(|(role, text, _)| *role == m.role && *text == m.text) {
-                    fields.push(("images", Value::Arr(images.iter().cloned().map(json::s).collect())));
+                match self.row_images.iter().find(|(role, text, _)| *role == m.role && *text == m.text).map(|(_, _, pictures)| pictures) {
+                    Some(pictures) if pictures.iter().all(|picture| picture.b64.is_empty()) => json::obj(vec![
+                        ("role", json::s(w.wire_role)),
+                        ("text", json::s(format!("{}{}", w.text, superseded_note(pictures)))),
+                    ]),
+                    // The same row renders the same text every turn, so the
+                    // node's KV prefix holds.
+                    Some(pictures) => json::obj(vec![
+                        ("role", json::s(w.wire_role)),
+                        ("text", json::s(format!("{}{}", w.text, pictures_note(pictures)))),
+                        ("images", Value::Arr(pictures.iter().map(|picture| json::s(picture.b64.clone())).collect())),
+                    ]),
+                    None => json::obj(vec![("role", json::s(w.wire_role)), ("text", json::s(w.text.clone()))]),
                 }
-                json::obj(fields)
             })
             .collect();
         let last_user = input
@@ -1559,6 +1698,8 @@ mod wire_transcript_tests {
         replies: Rc<RefCell<VecDeque<String>>>,
         polls: Rc<RefCell<VecDeque<Value>>>,
         think_open: Rc<RefCell<Option<bool>>>,
+        /// The node serves only a hub's claude-cli model.
+        claude_only: bool,
     }
 
     impl FleetTransport for Scripted {
@@ -1580,9 +1721,20 @@ mod wire_transcript_tests {
                 )]));
             }
             if url.ends_with("/models") {
+                let claude = json::obj(vec![
+                    ("id", json::s("claude-cli")),
+                    ("domain", json::s("chat")),
+                    ("backend", json::s("claude-cli")),
+                    ("available", Value::Bool(true)),
+                    ("state", json::s("ready")),
+                ]);
+                if self.claude_only {
+                    return Ok(json::obj(vec![("models", Value::Arr(vec![claude]))]));
+                }
                 return Ok(json::obj(vec![(
                     "models",
                     Value::Arr(vec![
+                        claude,
                         json::obj(vec![
                             ("id", json::s("qwen3.8-27b")),
                             ("domain", json::s("chat")),
@@ -1666,6 +1818,93 @@ mod wire_transcript_tests {
             transport.generates.borrow()[0].get("model").and_then(Value::as_str),
             Some("qwen3.6-27b")
         );
+    }
+
+    #[test]
+    fn claude_cli_is_picked_only_when_named() {
+        let transport = Scripted { claude_only: true, ..Scripted::default() };
+        let mut provider = FleetQwenChatProvider::new(transport.clone(), vec!["http://n1:1".into()]);
+        assert!(matches!(provider.availability(), ProviderAvailability::Unavailable { .. }));
+        let transport = Scripted::default();
+        let mut provider = FleetQwenChatProvider::new(transport.clone(), vec!["http://n1:1".into()]);
+        provider.begin_turn(&TurnInput::new("SYS", vec![user("hello")])).unwrap();
+        assert_eq!(transport.generates.borrow()[0].get("model").and_then(Value::as_str), Some("qwen3.8-27b"));
+        let transport = Scripted::default();
+        let mut provider = FleetQwenChatProvider::new(transport.clone(), vec!["http://n1:1".into()])
+            .with_preferred_model(Some("claude-cli".into()));
+        provider.begin_turn(&TurnInput::new("SYS", vec![user("hello")])).unwrap();
+        let body = &transport.generates.borrow()[0];
+        assert_eq!(body.get("model").and_then(Value::as_str), Some("claude-cli"));
+        assert_eq!(body.get("domain").and_then(Value::as_str), Some("chat"));
+        assert_eq!(body.get("chat_system").and_then(Value::as_str), Some("SYS"));
+        // Claude reasons natively (no <think> instructions); the fleet Qwen does not.
+        assert!(provider.reasons_natively());
+        assert!(!FleetQwenChatProvider::new(Scripted::default(), vec![]).reasons_natively());
+    }
+
+    #[test]
+    fn the_hubs_claude_is_the_cloud_fleet_claude_kind() {
+        let qwen = FleetQwenChatProvider::new(Scripted::default(), vec![]);
+        assert_eq!(qwen.kind(), ProviderKind::FleetQwen);
+        let claude = FleetQwenChatProvider::new(Scripted::default(), vec![])
+            .with_preferred_model(Some(crate::claude_cli::MODEL_ID.into()));
+        assert_eq!(claude.kind(), ProviderKind::FleetClaude);
+        assert_eq!(claude.kind().locality(), crate::chat_wire::Locality::Cloud);
+        assert_eq!(ProviderKind::from_slug("fleet-claude"), Some(ProviderKind::FleetClaude));
+    }
+
+    /// A hub without Claude says nothing per node: the picker gets one line.
+    #[derive(Clone, Default)]
+    struct QwenOnly;
+    impl FleetTransport for QwenOnly {
+        fn post_json(&mut self, url: &str, _body: &Value) -> Result<Value, String> { Err(format!("no post {url}")) }
+        fn get_json(&mut self, url: &str) -> Result<Value, String> {
+            if url.ends_with("/health") {
+                return Ok(json::obj(vec![("capabilities", Value::Arr(vec![json::s("chat")]))]));
+            }
+            if url.contains("down") { return Err("connect refused".into()); }
+            let available = !url.contains("tired");
+            let mut models = vec![json::obj(vec![
+                ("id", json::s("qwen3.8-27b")), ("domain", json::s("chat")),
+                ("available", Value::Bool(true)), ("state", json::s("loaded")),
+            ])];
+            if url.contains("claude") || url.contains("tired") {
+                let mut row = vec![
+                    ("id", json::s("claude-cli")), ("domain", json::s("chat")),
+                    ("backend", json::s("claude-cli")), ("available", Value::Bool(available)), ("state", json::s("ready")),
+                ];
+                if !available { row.push(("unavailable_reason", json::s("Claude Code login expired"))); }
+                models.push(json::obj(row));
+            }
+            Ok(json::obj(vec![("models", Value::Arr(models))]))
+        }
+    }
+
+    #[test]
+    fn fleet_claude_reasons_name_only_the_hubs_that_offer_it() {
+        let claude = || Some(crate::claude_cli::MODEL_ID.to_string());
+        let mut none = FleetQwenChatProvider::new(QwenOnly, vec!["http://n1:1".into(), "http://n2:1".into()])
+            .with_preferred_model(claude());
+        assert_eq!(none.availability(), ProviderAvailability::Unavailable {
+            reason: "no fleet hub offers claude-cli (2 hubs heard)".into(),
+        });
+        let mut tired = FleetQwenChatProvider::new(QwenOnly, vec!["http://n1:1".into(), "http://tired:1".into()])
+            .with_preferred_model(claude());
+        match tired.availability() {
+            ProviderAvailability::Unavailable { reason } => {
+                assert!(reason.starts_with("http://tired:1: claude-cli"), "{reason}");
+                assert!(reason.contains("login expired"), "{reason}");
+                assert!(!reason.contains("n1"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let mut found = FleetQwenChatProvider::new(QwenOnly, vec!["http://n1:1".into(), "http://claude:1".into()])
+            .with_preferred_model(claude());
+        assert!(matches!(found.availability(),
+            ProviderAvailability::Available { model, detail } if model == "claude-cli" && detail == "http://claude:1"));
+        // The fleet's Qwen never lands on the hub's Claude.
+        let mut qwen = FleetQwenChatProvider::new(QwenOnly, vec!["http://claude:1".into()]);
+        assert!(matches!(qwen.availability(), ProviderAvailability::Available { model, .. } if model == "qwen3.8-27b"));
     }
 
     #[test]

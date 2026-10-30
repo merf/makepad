@@ -9,6 +9,11 @@
 //! [`types`], the command and event tables in [`cmds`] and [`events`], the GPU ledger in
 //! [`ledger`]. This crate ships the headless backend; the platform backends come with their phases.
 
+/// The HAL's maps of objects, keyed by small ids ((session, index) pairs, string ids): hashed
+/// with the in-tree FxHash. The per-draw path looks textures, buffers and pipelines up in them
+/// many times a frame, where std's SipHash was ~4% of the main thread's encode samples.
+pub type FastMap<K, V> = std::collections::HashMap<K, V, fxhash::FxBuildHasher>;
+
 pub mod backend;
 #[cfg(target_os = "linux")]
 pub mod dmabuf;
@@ -23,9 +28,14 @@ pub mod glsl;
 pub mod gl_interop;
 pub mod automation;
 pub mod buffers;
+pub mod call_scope;
+pub mod completion;
 pub mod clock;
+#[cfg_attr(not(any(test, target_os = "android")), allow(dead_code))]
+mod xr_carry;
 pub mod fake_camera;
 pub mod clipboard;
+pub mod drag_promise;
 pub mod direct;
 #[cfg(target_os = "linux")]
 pub mod wide_desktop;
@@ -37,6 +47,9 @@ pub mod wm_socket;
 pub mod linux_ipc;
 #[cfg(target_os = "linux")]
 pub mod hosted_ipc;
+/// The native-layer bridge used by process-hosted Cx; the WM HAL shell uses it directly.
+#[cfg(target_os = "linux")]
+pub use backend::linux::wm::native as hosted_native;
 pub mod cmds;
 pub mod codec;
 pub mod events;
@@ -44,13 +57,31 @@ pub mod font;
 pub mod ledger;
 pub mod gpu_debug;
 pub mod gpu_limits;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod gpu_prof;
 pub mod gpu_pressure;
+pub mod h264_bits;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub mod stream_encode;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod stream_decode;
+pub mod stream_pack;
+pub mod xr_remote;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub mod frame_tap;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod framecap;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod inspect;
+pub mod a11y;
 pub mod media;
+pub mod native_layer;
 pub mod profile;
+pub mod threadcpu;
 pub mod session;
 pub mod types;
+pub mod window_controls;
+pub use window_controls::{host_caption, host_window_controls, HostCaption, WindowControls};
 
 #[cfg(target_vendor = "apple")]
 pub use backend::apple::media::{can_play_type, video_h264_probe};
@@ -73,7 +104,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
 
-pub use session::{CloseAs, DomainLaunch, ExecRecord};
+pub use session::{AppCaption, CAPTION_BADGE_ROOM, CloseAs, DomainLaunch, ExecRecord};
 
 /// What the relax host provides so a privileged session can start, stop and relaunch apps
 /// (`DomainStart` / `DomainStop` / `DomainRelaunch`): host-native code, registered with
@@ -105,6 +136,8 @@ struct State {
     backend: Option<(u32, Box<dyn Backend>)>,
     /// how many times a backend instance was created (stays 1 across relaunches)
     backend_inits: u32,
+    /// `before_exit` ran: the process is ending, no backend is made again
+    exited: bool,
 }
 
 /// Who has something to pick up: one blocking queue per session, plus the all-sessions wake.
@@ -315,6 +348,14 @@ mod open_file_limit_tests {
     }
 }
 
+/// The backend's capabilities with what the HAL itself adds: a remote headset slot
+/// (`xr_remote`) under any GPU backend.
+fn backend_info_of(b: &dyn Backend) -> HalInfo {
+    let mut info = b.info();
+    info.flags |= xr_remote::info_flags();
+    info
+}
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -324,7 +365,7 @@ impl Hal {
         raise_open_file_limit();
         Arc::new_cyclic(|me| Hal {
             me: me.clone(),
-            state: Mutex::new(State { world: World::new(), backend: None, backend_inits: 0 }),
+            state: Mutex::new(State { world: World::new(), backend: None, backend_inits: 0, exited: false }),
             sig: Arc::new(Sig { signal: Mutex::new(Signal::default()), cv: Condvar::new() }),
             next_req: AtomicU32::new(1),
             runners: Mutex::new(Default::default()),
@@ -359,6 +400,8 @@ impl Hal {
     }
 
     fn open_as(&self, req: &OpenReq, caps: Caps, trusted: bool, host_session: bool) -> HalInfo {
+        #[cfg(target_os = "linux")]
+        backend::linux::atspi::start();
         let refused = HalInfo { backend: backend_id::NONE, ..Default::default() };
         let mut guard = lock(&self.state);
         let st = &mut *guard;
@@ -430,10 +473,13 @@ impl Hal {
             // AUTO takes the backend the first open selected
             Some((id, _)) if *id != req.backend && req.backend != backend_id::AUTO => return refused,
             Some(_) => {}
+            None if st.exited => return refused,
             None => match make(req.backend) {
                 Some(b) => {
                     st.backend = Some((b.info().backend, b));
                     st.backend_inits += 1;
+                    // a remote headset slot's XR window events wake the pumps like the backend's
+                    xr_remote::set_wake(notify.clone());
                 }
                 None => return refused,
             },
@@ -442,7 +488,7 @@ impl Hal {
         if st.world.font_notify.is_none() {
             st.world.font_notify = Some(notify.clone());
         }
-        let mut info = st.backend.as_ref().expect("backend").1.info();
+        let mut info = backend_info_of(&*st.backend.as_ref().expect("backend").1);
         if req.parent != 0 || req.flags & open_flags::OFFSCREEN_WINDOWS != 0 {
             info.flags &= !info_flags::DIRECT_DISPLAY;
         }
@@ -597,6 +643,11 @@ impl Hal {
         lock(&self.state).backend_inits
     }
 
+    /// The backend this Hal runs (`backend_id`) and its shader dialect, once one is open.
+    pub fn backend_info(&self) -> Option<HalInfo> {
+        lock(&self.state).backend.as_ref().map(|(_, b)| backend_info_of(&**b))
+    }
+
     /// Executes a batch. The slices in `buf` are read during this call only.
     pub fn submit(&self, buf: &CmdBuf) {
         let sid = buf.session;
@@ -674,6 +725,7 @@ impl Hal {
                 let st = &mut *guard;
                 if let Some((_, b)) = st.backend.as_mut() {
                     b.step(&mut st.world, sid);
+                    xr_remote::drain_events(sid, &mut st.world);
                     // glyphs the font workers finished go to the atlas and to the sessions
                     if let Some(gpu) = b.host_gpu() {
                         font::service(gpu, &mut st.world);
@@ -783,13 +835,23 @@ impl Hal {
         self.wake();
     }
 
-    /// The host is about to end the process (its sessions are done, its app domains stopped):
-    /// the backend's driver threads run out first, so exit() does not unload the driver under
-    /// them. A host API, called once at the end of the run.
+    /// The host ends the process next (its sessions are done, its app domains stopped): the
+    /// backend leaves the Hal -- no call reaches it any more, no backend is made again -- and its
+    /// driver threads stop and are joined (work in flight completes or is abandoned), so exit()
+    /// never runs the driver's exit handlers under a thread inside the driver. Returns once
+    /// they are gone. A host API, the last HAL call of every way the host ends; once is enough.
     pub fn before_exit(&self) {
-        let mut guard = lock(&self.state);
-        if let Some((_, b)) = guard.backend.as_mut() {
+        let backend = {
+            let mut guard = lock(&self.state);
+            guard.exited = true;
+            guard.backend.take()
+        };
+        // outside the state lock: a worker's last jobs may still deliver to the sessions
+        if let Some((_, mut b)) = backend {
             b.before_exit();
+            // the process ends: its GPU objects go with it (destroying them now would only be
+            // more driver calls on the way out)
+            std::mem::forget(b);
         }
     }
 
@@ -992,6 +1054,14 @@ pub fn run_main_loop() {
     main_loop::run()
 }
 
+/// The app lives in the menu bar (macOS): it starts as an accessory app (no Dock icon, no menu
+/// bar) like a bundle whose Info.plist says `LSUIElement`, for a binary that is not such a bundle
+/// (a host a launcher bundle starts). Set before the window system starts. A host API.
+#[cfg(target_os = "macos")]
+pub fn set_menu_bar_app(on: bool) {
+    backend::apple::appkit::MENU_BAR_APP.store(on, std::sync::atomic::Ordering::Release);
+}
+
 /// A display: its extent and what is left of it after the menu bar and Dock, as x, y, w, h in the
 /// window system's global points (macOS: bottom-left origin, the space window frames are in).
 #[relax_api(plain)]
@@ -1001,6 +1071,22 @@ pub struct ScreenInfo {
     pub bounds: [f64; 4],
     pub work_area: [f64; 4],
     pub is_primary: bool,
+}
+
+/// The identity a launcher gave this process (MAKEPAD_APP_ID, set by `makepad app <id>` for the
+/// OS entry of an app: its .desktop file names the same id): `nl.makepad.<id>`, which a Linux
+/// window takes as its Wayland app_id and X11 WM_CLASS so the desktop groups it with its entry.
+/// None without one (the window is named after the executable).
+pub fn app_identity() -> Option<String> {
+    app_id().map(|id| format!("nl.makepad.{id}"))
+}
+
+/// The launcher's app id itself (MAKEPAD_APP_ID when it is a valid one): Windows names the
+/// process and its windows `Makepad.<id>`, the AppUserModelID of the app's Start menu entry.
+pub fn app_id() -> Option<String> {
+    let id = std::env::var("MAKEPAD_APP_ID").ok()?;
+    let ok = !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    ok.then_some(id)
 }
 
 /// The displays attached right now, as the window system last saw them (readable from any
@@ -1352,14 +1438,19 @@ pub fn hal_socket_timeout(id: i64, read: u32, ms: i32) {
     backend::android::socket::set_timeout(id, read != 0, ms)
 }
 
-/// Writes the SHA-256 of the server certificate (once handshaken) into `out` (32 bytes). Returns 32,
-/// or -1 when there is none.
+/// Copies the server's leaf certificate DER into `out` when it fits. Returns the required
+/// byte length (call with an empty buffer to query it), or -1 when there is no certificate.
 #[cfg(target_os = "android")]
 #[relax_api]
-pub fn hal_socket_fingerprint(id: i64, out: &mut [u8]) -> i64 {
-    match backend::android::socket::peer_fingerprint(id) {
-        Some(fp) if fp.len() == 32 && out.len() >= 32 => { out[..32].copy_from_slice(&fp); 32 }
-        _ => -1,
+pub fn hal_socket_certificate(id: i64, out: &mut [u8]) -> i64 {
+    match backend::android::socket::peer_certificate(id) {
+        Some(der) => {
+            if out.len() >= der.len() {
+                out[..der.len()].copy_from_slice(&der);
+            }
+            der.len() as i64
+        }
+        None => -1,
     }
 }
 
@@ -1389,6 +1480,220 @@ fn media_keep(id: i64, result: Result<Vec<u8>, String>) -> i64 {
     };
     media_results().lock().unwrap_or_else(|e| e.into_inner()).insert(id, result);
     len
+}
+
+/// The headset's pose for a renderer elsewhere, once per display frame (Android XR: published by
+/// the XR thread right after xrBeginFrame, located `XrPoseLead` past the display time, whether
+/// or not the app draws that frame): waits at most `timeout_ms` for one newer than the last
+/// taken, writes its `XrFrame` (`buffers::Wire`) into `out` and returns its display time (ns);
+/// 0 when none came (or elsewhere). A thread of the app's own sends it on, so the uplink keeps
+/// the display's rate and spacing whatever the app's frames do.
+#[relax_api]
+pub fn hal_xr_uplink_next(timeout_ms: u32, out: &mut [u8]) -> u64 {
+    #[cfg(target_os = "android")]
+    return backend::android::xr::uplink_next(timeout_ms, out);
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (timeout_ms, out);
+        0
+    }
+}
+
+/// The XR tracking log (Android XR, while the uplink runs): what went upstream (kind 0: the
+/// sample time, the display time it was located for, its `XrFrame`) and the poses as tracked
+/// (kind 1: a display time already past, located after it, the time it was located, the
+/// `XrFrame` without controllers). Entries from absolute index `cursor` on (the oldest kept when
+/// older) are written into `out` after an 8-byte count of them (u64 LE), each kind, time, aux
+/// (u64 LE) then the `XrFrame` ([`hal_xr_track_entry_size`] bytes each), as many whole ones as
+/// fit; returns the index after the last written. Elsewhere nothing (count 0).
+#[relax_api]
+pub fn hal_xr_track_log(cursor: u64, out: &mut [u8]) -> u64 {
+    if out.len() < 8 {
+        return cursor;
+    }
+    #[cfg(target_os = "android")]
+    {
+        let (next, bytes) = backend::android::xr::track_log(cursor, &mut out[8..]);
+        let n = (bytes / backend::android::xr::track_entry_size().max(1)) as u64;
+        out[..8].copy_from_slice(&n.to_le_bytes());
+        return next;
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        out[..8].copy_from_slice(&0u64.to_le_bytes());
+        cursor
+    }
+}
+
+/// The size of one [`hal_xr_track_log`] entry in bytes.
+#[relax_api]
+pub fn hal_xr_track_entry_size() -> usize {
+    #[cfg(target_os = "android")]
+    return backend::android::xr::track_entry_size();
+    #[cfg(not(target_os = "android"))]
+    0
+}
+
+/// Plays a recorded tracking log (entries as [`hal_xr_track_log`] writes them) instead of the
+/// runtime's poses, looping: the uplink gets the recorded predictions (moved to the replay's
+/// display times along the tracked path), the XR window's frames the tracked path. Empty: the
+/// runtime's poses again. Whether a replay runs (Android XR; elsewhere false).
+#[relax_api]
+pub fn hal_xr_replay(data: &[u8]) -> bool {
+    #[cfg(target_os = "android")]
+    return backend::android::xr::replay(data);
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = data;
+        false
+    }
+}
+
+/// The XR window's frames write linear colour (`on`): its projection chains become sRGB images
+/// without the mutable format (the GPU keeps their framebuffer compression: the stream pass's
+/// fixed cost 1.7 -> 0.1 ms on Quest 3) and the hardware encodes on write; the app's shaders then
+/// output linear colour into it ([`hal_xr_linear_frames_active`] says from which frame on).
+/// Off: sRGB-encoded colour written through UNORM views, as every app's frames. Android XR;
+/// elsewhere nothing.
+#[relax_api]
+pub fn hal_xr_linear_frames(on: bool) {
+    #[cfg(target_os = "android")]
+    backend::android::xr::linear_frames(on);
+    #[cfg(not(target_os = "android"))]
+    let _ = on;
+}
+
+/// The XR window's stereo view paused (`on`): no frame is asked of the app and none is shown
+/// (only the room: passthrough); the frame loop, the input, the uplink's poses and the depth
+/// provider go on. A streamed view whose stream is off. Android XR; elsewhere nothing.
+#[relax_api]
+pub fn hal_xr_stereo_paused(on: bool) {
+    #[cfg(target_os = "android")]
+    backend::android::xr::stereo_paused(on);
+    #[cfg(not(target_os = "android"))]
+    let _ = on;
+}
+
+/// The XR panel (the host window as a quad layer in the room): `show` 0 the default rule (shown
+/// without an XR window; over one only after a thumbstick click), 1 always, 2 never; it hangs
+/// `distance_m` away and is `width_m` wide; `follow`: it stays in front of the person, following
+/// the head lazily (it recentres smoothly once the view drifts off it), display only (no
+/// pointer). The image is the window's own frames: a window that draws nothing new costs no
+/// GPU work. Android XR; elsewhere nothing.
+#[relax_api]
+pub fn hal_xr_panel(show: u32, distance_m: f32, width_m: f32, follow: bool) {
+    #[cfg(target_os = "android")]
+    backend::android::xr::panel(show, distance_m, width_m, follow);
+    #[cfg(not(target_os = "android"))]
+    let _ = (show, distance_m, width_m, follow);
+}
+
+/// The near and far planes of every XR eye projection (metres in the room): the app's eye
+/// passes, a remote headset's stream (its depth band decoded with them) and its warp. The one
+/// definition.
+pub const XR_EYE_NEAR_M: f32 = 0.05;
+pub const XR_EYE_FAR_M: f32 = 2000.0;
+
+/// The XR window's fixed foveation (Android XR: the runtime's foveation profile in the
+/// projection chains' fragment density maps; 0 none, 1 low, 2 medium, 3 high), applied from the
+/// next display frame. Elsewhere nothing.
+#[relax_api]
+pub fn hal_xr_foveation(level: u32) {
+    #[cfg(target_os = "android")]
+    backend::android::xr::foveation(level);
+    #[cfg(not(target_os = "android"))]
+    let _ = level;
+}
+
+/// The headset's environment depth runs (`on`, the default): the occlusion and the room field
+/// read it; off stops the runtime's depth provider (its GPU and camera work). Android XR;
+/// elsewhere nothing.
+#[relax_api]
+pub fn hal_xr_environment_depth(on: bool) {
+    #[cfg(target_os = "android")]
+    backend::android::xr::environment_depth(on);
+    #[cfg(not(target_os = "android"))]
+    let _ = on;
+}
+
+/// The environment depth images are read back to the app for its room field (`on`; off at
+/// start: the app gets only the GPU image, no copy and no CPU work). Android XR; elsewhere
+/// nothing.
+#[relax_api]
+pub fn hal_xr_depth_readback(on: bool) {
+    #[cfg(target_os = "android")]
+    backend::android::xr::depth_readback(on);
+    #[cfg(not(target_os = "android"))]
+    let _ = on;
+}
+
+/// Hands and controllers tracked at once (`on`, the default) or only whichever is in use: with
+/// both, the Quest's cameras are shared with the controllers and its hand tracker runs at about
+/// 25 Hz instead of its high-frequency mode. Android XR; elsewhere nothing.
+#[relax_api]
+pub fn hal_xr_hands_and_controllers(on: bool) {
+    #[cfg(target_os = "android")]
+    backend::android::xr::hands_and_controllers(on);
+    #[cfg(not(target_os = "android"))]
+    let _ = on;
+}
+
+/// The XR window's eye buffers move between `min_percent` and `max_percent` of their start size
+/// (40..100; equal: fixed) on the runtime's measured app GPU frame time: a step down (100, 90,
+/// 80, 70) when a frame's GPU time nears the display period, back up with headroom, changing
+/// rarely; the window's geometry follows (the app renders at the new size). Default 100..100.
+/// Android XR (XR_META_performance_metrics); elsewhere nothing.
+#[relax_api]
+pub fn hal_xr_eye_scale(min_percent: u32, max_percent: u32) {
+    #[cfg(target_os = "android")]
+    backend::android::xr::eye_scale(min_percent, max_percent);
+    #[cfg(not(target_os = "android"))]
+    let _ = (min_percent, max_percent);
+}
+
+/// The XR window's eye buffer size now (percent of the start size, the high 32 bits) and the app
+/// GPU frame time the dynamic scale last measured (µs, the low 32 bits; 0 none). Android XR;
+/// elsewhere 100 and 0.
+#[relax_api]
+pub fn hal_xr_eye_scale_now() -> u64 {
+    #[cfg(target_os = "android")]
+    return { let (p, us) = backend::android::xr::eye_scale_now(); ((p as u64) << 32) | us as u64 };
+    #[cfg(not(target_os = "android"))]
+    { 100 << 32 }
+}
+
+/// The uplink's poses are located `frames` display frames past the headset's newest one (the
+/// newest is the runtime's own pipeline ahead of now: a frame located that many past it has
+/// `frames` periods from the pose's sample to its frame's start, whatever that pipeline depth
+/// does); 0: from the pose lead (`XrPoseLead`) instead. Android XR; elsewhere nothing.
+#[relax_api]
+pub fn hal_xr_pose_frames_ahead(frames: u32) {
+    #[cfg(target_os = "android")]
+    backend::android::xr::pose_frames_ahead(frames);
+    #[cfg(not(target_os = "android"))]
+    let _ = frames;
+}
+
+/// Whether the XR window's frames render into linear-output (sRGB-encoding) targets now.
+#[relax_api]
+pub fn hal_xr_linear_frames_active() -> bool {
+    #[cfg(target_os = "android")]
+    return backend::android::xr::linear_frames_active();
+    #[cfg(not(target_os = "android"))]
+    false
+}
+
+/// The device's network in its low-latency mode while `on` (Android: a low-latency Wi-Fi lock,
+/// no power save or background scans); elsewhere nothing. Whether it was applied.
+#[relax_api]
+pub fn hal_network_low_latency(on: bool) -> bool {
+    #[cfg(target_os = "android")]
+    return backend::android::media::network_low_latency(on).map_err(|e| eprintln!("[hal-android] low-latency network: {e}")).is_ok();
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = on;
+        false
+    }
 }
 
 /// Writes the largest frame the HEVC encoder takes into `out` (width, height: little-endian
@@ -1460,7 +1765,9 @@ fn video_file(id: i64) -> Result<std::sync::Arc<std::sync::Mutex<backend::androi
 /// Opens the video file at `path` (`audio_only` != 0: its sound alone) as decoder `id`. The result
 /// (`hal_media_take`) is its info: width, height, fps_num, fps_den (u32 LE), duration in
 /// microseconds (i64 LE), the picture's MIME type's length (u32 LE) and text, has_audio (u8),
-/// sample_rate (u32 LE), channels (u16 LE). Returns its length, or -1 - the error's.
+/// sample_rate (u32 LE), channels (u16 LE), then the picture track's MediaFormat colour keys as
+/// i32 LE: KEY_COLOR_STANDARD, KEY_COLOR_RANGE, KEY_COLOR_TRANSFER (0: not stated). Returns its
+/// length, or -1 - the error's.
 #[cfg(target_os = "android")]
 #[relax_api]
 pub fn hal_video_file_open(id: i64, path: &str, audio_only: u32) -> i64 {
@@ -1478,22 +1785,27 @@ pub fn hal_video_file_open(id: i64, path: &str, audio_only: u32) -> i64 {
         out.push(info.has_audio as u8);
         out.extend_from_slice(&info.sample_rate.to_le_bytes());
         out.extend_from_slice(&info.channels.to_le_bytes());
+        for v in [info.color_standard, info.color_range, info.color_transfer] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
         out
     });
     media_keep(id, result)
 }
 
-/// The next picture of decoder `id`. The result is its time in microseconds (i64 LE), then its
-/// NV12 (the info's width x height). Returns its length, 0 at the end, or -1 - the error's.
+/// The next picture of decoder `id`. The result is its time in microseconds (i64 LE), the
+/// KEY_COLOR_RANGE it is delivered in (i32 LE, 0: not stated), then its NV12 (the info's width x
+/// height). Returns its length, 0 at the end, or -1 - the error's.
 #[cfg(target_os = "android")]
 #[relax_api]
 pub fn hal_video_file_next_frame(id: i64) -> i64 {
     let result = video_file(id).and_then(|d| d.lock().unwrap_or_else(|e| e.into_inner()).next_frame());
     match result {
         Ok(None) => 0,
-        Ok(Some((time, nv12))) => {
-            let mut out = Vec::with_capacity(8 + nv12.len());
+        Ok(Some((time, range, nv12))) => {
+            let mut out = Vec::with_capacity(12 + nv12.len());
             out.extend_from_slice(&time.to_le_bytes());
+            out.extend_from_slice(&range.to_le_bytes());
             out.extend_from_slice(&nv12);
             media_keep(id, Ok(out))
         }
@@ -1570,4 +1882,104 @@ pub fn open_url(url: &str) -> bool {
             let () = msg_send![app, openURL: value options: options completionHandler: nil];
         }
     })
+}
+
+/// Fleet identity crypto on Android (native code has no libcrypto/libssl; the platform's Java
+/// security providers do the work: backend/android/fleet.rs). Keys are X9.63 (97 bytes), points
+/// 65 bytes. Byte results go into `out`; the return is the byte count, or -1 on failure.
+#[cfg(target_os = "android")]
+fn fleet_out(r: Result<Vec<u8>, String>, out: &mut [u8]) -> i64 {
+    match r {
+        Ok(v) if v.len() <= out.len() => {
+            out[..v.len()].copy_from_slice(&v);
+            v.len() as i64
+        }
+        _ => -1,
+    }
+}
+
+/// A fresh P-256 key into `out` (97 bytes).
+#[cfg(target_os = "android")]
+#[relax_api]
+pub fn hal_fleet_generate(out: &mut [u8]) -> i64 {
+    fleet_out(backend::android::fleet::generate_p256(), out)
+}
+
+/// DER ECDSA-SHA256 of `msg` by `key` into `out` (at most 72 bytes).
+#[cfg(target_os = "android")]
+#[relax_api]
+pub fn hal_fleet_sign(key: &[u8], msg: &[u8], out: &mut [u8]) -> i64 {
+    fleet_out(backend::android::fleet::sign(key, msg), out)
+}
+
+/// 1 when `sig` (DER) is `point`'s ECDSA-SHA256 of `msg`.
+#[cfg(target_os = "android")]
+#[relax_api]
+pub fn hal_fleet_verify(point: &[u8], msg: &[u8], sig: &[u8]) -> u32 {
+    backend::android::fleet::verify(point, msg, sig) as u32
+}
+
+/// The raw P-256 ECDH secret of `key` and `point` into `out` (32 bytes).
+#[cfg(target_os = "android")]
+#[relax_api]
+pub fn hal_fleet_ecdh(key: &[u8], point: &[u8], out: &mut [u8]) -> i64 {
+    fleet_out(backend::android::fleet::ecdh(key, point), out)
+}
+
+/// A TLS server context (certificate DER + key): a handle, or -1.
+#[cfg(target_os = "android")]
+#[relax_api]
+pub fn hal_fleet_tls_server(cert: &[u8], key: &[u8]) -> i64 {
+    backend::android::fleet::server(cert, key).unwrap_or(-1)
+}
+
+/// A new server session of a context: a handle, or -1.
+#[cfg(target_os = "android")]
+#[relax_api]
+pub fn hal_fleet_tls_session(server: i64) -> i64 {
+    backend::android::fleet::session(server).unwrap_or(-1)
+}
+
+/// Feeds a session ciphertext from the peer (empty: advance the handshake). Returns bit 0 =
+/// handshaking, bit 1 = closed, or -1 on failure. Output waits for `hal_fleet_tls_take`.
+#[cfg(target_os = "android")]
+#[relax_api]
+pub fn hal_fleet_tls_feed(session: i64, data: &[u8]) -> i64 {
+    match backend::android::fleet::feed(session, data) {
+        Ok((hs, closed)) => hs as i64 | (closed as i64) << 1,
+        Err(_) => -1,
+    }
+}
+
+/// Encrypts plaintext (`close` != 0: stages the close_notify instead). 0, or -1 on failure.
+#[cfg(target_os = "android")]
+#[relax_api]
+pub fn hal_fleet_tls_wrap(session: i64, data: &[u8], close: u32) -> i64 {
+    if close != 0 {
+        backend::android::fleet::close(session);
+        return 0;
+    }
+    backend::android::fleet::wrap(session, data).map_or(-1, |_| 0)
+}
+
+/// Moves waiting bytes (`app` != 0: plaintext, else ciphertext to send) into `out`: the count
+/// (0: none), -1 for an unknown handle.
+#[cfg(target_os = "android")]
+#[relax_api]
+pub fn hal_fleet_tls_take(session: i64, app: u32, out: &mut [u8]) -> i64 {
+    backend::android::fleet::take(session, app != 0, out)
+}
+
+/// Frees a server or session handle.
+#[cfg(target_os = "android")]
+#[relax_api]
+pub fn hal_fleet_tls_free(handle: i64) {
+    backend::android::fleet::free(handle)
+}
+
+/// The battery: level 0..=100 in bits 0..8, bit 8 = charging; -1 when unknown.
+#[cfg(target_os = "android")]
+#[relax_api]
+pub fn hal_battery() -> i64 {
+    backend::android::fleet::battery().map_or(-1, |(level, charging)| level as i64 | (charging as i64) << 8)
 }

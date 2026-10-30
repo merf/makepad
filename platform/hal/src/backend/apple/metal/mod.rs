@@ -15,6 +15,7 @@
 mod capture;
 mod device;
 mod frame;
+mod layers;
 mod media;
 mod pipeline;
 mod readback;
@@ -33,7 +34,7 @@ use device::{Device, Done, Mailbox};
 pub use pipeline::{compile_msl, compile_msl_kernel};
 use makepad_apple_sys::*;
 use resources::*;
-use std::collections::HashMap;
+use crate::FastMap;
 use std::sync::Arc;
 
 /// How long a transient render target may sit unbound before its GPU storage goes.
@@ -76,17 +77,23 @@ struct Win {
 pub struct Metal {
     dev: Device,
     info: HalInfo,
-    tex: HashMap<(u32, u32), Tex>,
-    buf: HashMap<(u32, u32), Buf>,
-    pipe: HashMap<(u32, u32), pipeline::Pipe>,
-    win: HashMap<(u32, u32), Win>,
+    tex: FastMap<(u32, u32), Tex>,
+    buf: FastMap<(u32, u32), Buf>,
+    pipe: FastMap<(u32, u32), pipeline::Pipe>,
+    win: FastMap<(u32, u32), Win>,
     /// App aliases resolve to host storage; lending never moves or frees that storage.
-    window_aliases: HashMap<(u32, Id), Id>,
-    overlays: HashMap<Id, frame::Overlay>,
+    window_aliases: FastMap<(u32, Id), Id>,
+    overlays: FastMap<Id, frame::Overlay>,
+    /// session 0's windows with a badge layer (by index), and the image each last presented:
+    /// its retained image with the layer drawn over (what a snapshot of the window reads)
+    badged: FastMap<u32, Option<Win>>,
+    /// a badge layer frame is being encoded: its window pass draws into the drawable, over a
+    /// copy of the window's retained image
+    composing: bool,
     /// Dismissal retries when AppKit temporarily has no drawable.
-    restores: HashMap<Id, Win>,
+    restores: FastMap<Id, Win>,
     /// per window: the id texture the newest pick frame drew into (`Pick` reads it back)
-    pick_ids: HashMap<(u32, u32), Id>,
+    pick_ids: FastMap<(u32, u32), Id>,
     /// Pick targets whose latest replay skipped a not-yet-ready draw.
     pick_pending: std::collections::HashSet<(u32, Id)>,
     batch: Option<frame::Batch>,
@@ -100,8 +107,10 @@ pub struct Metal {
     retain: bool,
     /// the drawable the window frame being encoded renders into
     frame_drawable: Option<frame::FrameDrawable>,
+    native_windows: layers::Windows,
+    native_sync: bool,
     /// the size the ledger last saw of each real window's drawables
-    layer_sizes: HashMap<(u32, u32), (u32, u32, u32)>,
+    layer_sizes: FastMap<(u32, u32), (u32, u32, u32)>,
     /// video playback, audio, camera ...: everything of os/apple that is not Metal or AppKit
     media: Media,
     /// the pool of capture buffers a recorder's frames are copied into, and when it was last used
@@ -111,6 +120,13 @@ pub struct Metal {
     depth_only_seen: Vec<(u32, bool)>,
     /// a frame capture being taken (`gpu_debug::request_capture`)
     gpu_capture: Option<capture::GpuCapture>,
+    /// the GPU profiler's encoders of the frame being encoded (moved into its ticket)
+    prof: Vec<frame::ProfPass>,
+    /// the profiled frame being encoded
+    prof_key: Option<crate::gpu_prof::FrameKey>,
+    /// Draws left out so far for a pipeline variant still compiling (a frame that adds to it is
+    /// partial, `FramePartial`).
+    pending_draws: u64,
 }
 
 impl Metal {
@@ -146,7 +162,9 @@ impl Metal {
             session: 0,
             backend: backend_id::METAL,
             dialect: dialect::MSL,
-            flags: if shell.is_some() { info_flags::DISPLAY_CLOCK } else { 0 },
+            flags: info_flags::WINDOW_LAYERS
+                | if shell.is_some() { info_flags::DISPLAY_CLOCK } else { 0 }
+                | if shell.is_some() && cfg!(target_os = "macos") { info_flags::WINDOW_BADGES } else { 0 },
             formats,
             msaa: 1,
             dpi: shell.map_or(1.0, |s| s.dpi()),
@@ -154,18 +172,27 @@ impl Metal {
             max_window: [16384, 16384],
             max_buffer: crate::gpu_limits::max_gpu_buffer_bytes(),
             working_set: crate::gpu_limits::gpu_working_set_bytes(),
+            vendor_id: 0x106b,
+            // Apple silicon shares memory with the CPU; a Mac with a discrete
+            // card reports its own name and no unified memory.
+            device_kind: if dev.unified_memory { device_kind::INTEGRATED } else { device_kind::DISCRETE },
+            device_name: Default::default(),
         };
+        let mut info = info;
+        info.set_device_name(&dev.name);
         Some(Metal {
             dev,
             info,
-            tex: HashMap::new(),
-            buf: HashMap::new(),
-            pipe: HashMap::new(),
-            win: HashMap::new(),
-            window_aliases: HashMap::new(),
-            overlays: HashMap::new(),
-            restores: HashMap::new(),
-            pick_ids: HashMap::new(),
+            tex: FastMap::default(),
+            buf: FastMap::default(),
+            pipe: FastMap::default(),
+            win: FastMap::default(),
+            window_aliases: FastMap::default(),
+            overlays: FastMap::default(),
+            badged: FastMap::default(),
+            composing: false,
+            restores: FastMap::default(),
+            pick_ids: FastMap::default(),
             pick_pending: Default::default(),
             batch: None,
             uploads: Vec::new(),
@@ -174,12 +201,17 @@ impl Metal {
             shell,
             retain: flags & open_flags::RETAIN_WINDOWS != 0,
             frame_drawable: None,
-            layer_sizes: HashMap::new(),
+            native_windows: layers::Windows::default(),
+            native_sync: false,
+            layer_sizes: FastMap::default(),
             media: Media::new(),
             capture: None,
             capture_ns: 0,
             depth_only_seen: Vec::new(),
             gpu_capture: None,
+            prof: Vec::new(),
+            prof_key: None,
+            pending_draws: 0,
         })
     }
 
@@ -192,6 +224,10 @@ impl Metal {
     }
 
     fn retained_window(&self, owner: u32, id: Id) -> Option<&Win> {
+        // a window with a badge layer reads as it was last presented: with the layer
+        if let Some(Some(composed)) = self.badged.get(&id.index).filter(|_| owner == HOST) {
+            if composed.gen == id.gen { return Some(composed); }
+        }
         self.win.get(&(owner, id.index)).filter(|w| w.gen == id.gen).or_else(|| {
             if owner != HOST { return None; }
             self.overlays.get(&id).and_then(|o| o.base.as_ref()).or_else(|| self.restores.get(&id))
@@ -207,7 +243,7 @@ impl Metal {
     }
 
     /// The first outcome of a pipeline's compile ends its pending count.
-    fn announce(pipes: &mut HashMap<(u32, u32), pipeline::Pipe>, s: &mut Session, id: Id) {
+    fn announce(pipes: &mut FastMap<(u32, u32), pipeline::Pipe>, s: &mut Session, id: Id) {
         if let Some(p) = pipes.get_mut(&(s.id, id.index)).filter(|p| p.gen == id.gen) {
             if !std::mem::replace(&mut p.announced, true) {
                 s.pipelines_pending = s.pipelines_pending.saturating_sub(1);
@@ -230,7 +266,7 @@ impl Metal {
                 continue;
             }
             match done {
-                Done::Frame { sid, target, frame, gpu_ns, present_ns, gpu_span, failed, window, kind, .. } => {
+                Done::Frame { sid, target, frame, gpu_ns, present_ns, gpu_span, failed, partial, window, kind, .. } => {
                     if window && !failed && kind & target::OVERLAY == 0 {
                         world.window_presented(sid, target, frame, gpu_ns, present_ns);
                         if let Some(shell) = self.shell {
@@ -249,7 +285,10 @@ impl Metal {
                         }
                     }
                     // the one place FrameDone is posted: the presenter, and the parent of a lent window
-                    if !failed { world.frame_done(sid, target, kind, frame, gpu_ns, present_ns, gpu_span); }
+                    if !failed {
+                        if partial { world.frame_partial(sid, target, frame); }
+                        world.frame_done(sid, target, kind, frame, gpu_ns, present_ns, gpu_span);
+                    }
                 }
                 Done::Surface { sid, window, w, h, buffer, .. } => match world.session_mut(sid) {
                     Some(s) => s.events.screen_surface(window, [w as u16, h as u16], buffer as u64),
@@ -295,6 +334,7 @@ impl Metal {
             return;
         }
         self.housekept_ns = now;
+        self.native_windows.expire();
         // recording is over (no frame asked for a capture for a while): the buffers go back
         if self.capture.is_some() && now.saturating_sub(self.capture_ns) > CAPTURE_IDLE_NS {
             self.capture = None;
@@ -364,8 +404,23 @@ impl Metal {
 unsafe impl Send for Metal {}
 
 impl Backend for Metal {
+    /// Answered once the command buffers made so far ran (an IOSurface reader on another queue
+    /// or device reads after it).
+    fn frame_completion(&mut self, _session: u32, notify: std::sync::Arc<dyn Fn() + Send + Sync>) -> Result<crate::completion::Completion, String> {
+        let (completion, reply) = crate::completion::CompletionReply::new(notify);
+        self.dev.when_completed(reply);
+        Ok(completion)
+    }
     fn info(&self) -> HalInfo {
         self.info
+    }
+
+    /// The process ends next: what was encoded is committed and the threads that call Metal
+    /// (submit, allocator) are joined. The hang watchdog only reads the in-flight list.
+    fn before_exit(&mut self) {
+        let _pool = Pool::new();
+        self.end_batch();
+        self.dev.stop_workers();
     }
 
     fn submit(&mut self, world: &mut World, sid: u32, view: &CmdView) {
@@ -411,16 +466,17 @@ impl Backend for Metal {
                 .min()
         });
         let restore = (sid == HOST && !self.restores.is_empty()).then(|| world.now() + 16_666_667);
-        timer.into_iter().chain(trim).chain(restore).min()
+        timer.into_iter().chain(trim).chain(restore).chain(self.native_windows.next_due(sid, world.now())).min()
     }
 
     fn session_closed(&mut self, world: &mut World, sid: u32) {
+        self.native_windows.close(sid, None);
         // commands this session left pending belong to its objects: they go out first
         self.end_batch();
         let lent: Vec<_> = self.window_aliases.iter().filter(|((s, _), _)| *s == sid).map(|((_, id), host)| (*id, *host)).collect();
         let now = world.now();
         for (id, host) in lent {
-            if let Some(s) = world.session_mut(HOST) { self.set_overlay(s, host, None, now); }
+            if let Some(s) = world.session_mut(HOST) { self.set_overlay(s, host, None, Id::NONE, now); }
             self.window_lent(sid, id, host, false);
         }
         if sid == HOST {
@@ -467,6 +523,16 @@ impl Backend for Metal {
 }
 
 impl Gpu for Metal {
+    #[cfg(target_os = "macos")]
+    fn a11y_notify(&mut self, window: u64, notifications: &[makepad_a11y::Notification]) {
+        super::appkit::a11y::notify(window, notifications);
+    }
+
+    #[cfg(any(target_os = "ios", target_os = "tvos"))]
+    fn a11y_notify(&mut self, window: u64, notifications: &[makepad_a11y::Notification]) {
+        super::uikit::a11y::notify(window, notifications);
+    }
+
     fn gpu_budget(&self) -> Option<(u64, u64)> {
         Some((self.info.working_set, self.dev.device_allocated()))
     }
@@ -508,20 +574,28 @@ impl Gpu for Metal {
         self.readback_texture(s, id, req, rect);
     }
 
+    fn capture_texture(&mut self, s: &mut Session, id: Id, done: Box<dyn FnOnce(Option<Vec<u8>>) + Send>) {
+        self.capture_texture_storage(s, id, done);
+    }
+
+    fn capture_buffer(&mut self, sid: u32, id: Id) -> Option<Vec<u8>> {
+        let b = self.buf.get(&(sid, id.index)).filter(|b| b.gen == id.gen)?;
+        // SAFETY: a shared buffer of at least `size` bytes; writes happen on this thread only
+        Some(unsafe { std::slice::from_raw_parts(b.contents, b.size as usize) }.to_vec())
+    }
+
     fn texture_share(&mut self, s: &mut Session, id: Id) {
         let handle = self.tex.get(&(s.id, id.index)).filter(|t| t.gen == id.gen).map_or(0, |t| t.surface_id as u64);
         s.events.texture_shared(id, handle);
     }
 
     fn texture_import(&mut self, s: &mut Session, id: Id, handle: u64, kind: u32) -> Option<TextureObj> {
-        if kind != texture_handle::NATIVE {
-            return None;
-        }
-        let (tex, w, h, fmt) = import_surface(self.dev.device, IOSurfaceID::try_from(handle).ok()?, id.gen)?;
+        let (tex, w, h, fmt) = import_surface(self.dev.device, IOSurfaceID::try_from(handle).ok()?, id.gen, kind)?;
         if let Some(old) = self.tex.insert((s.id, id.index), tex) {
             self.dev.retire(Box::new(old));
         }
-        Some(TextureObj { format: fmt, w, h, depth: 1, mips: 1, usage: usage::SAMPLED | usage::RENDER_TARGET, bytes: 0, imported: true, uploaded: 0, lent: None })
+        let usage = if kind == texture_handle::NATIVE { usage::SAMPLED | usage::RENDER_TARGET } else { usage::SAMPLED };
+        Some(TextureObj { format: fmt, w, h, depth: 1, mips: 1, usage, bytes: 0, imported: true, uploaded: 0, lent: None })
     }
 
     fn buffer_create(&mut self, s: &mut Session, id: Id, b: &mut BufferObj) -> Result<(), String> {
@@ -606,7 +680,9 @@ impl Gpu for Metal {
             }
             other => return PipeStatus::Failed(format!("no pipeline kind {other}")),
         };
-        self.pipe.insert((s.id, id.index), pipeline::Pipe { gen: id.gen, kind, desc: blob.desc, bindings: blob.bindings.as_slice().into(), announced: false });
+        let stats = crate::gpu_prof::source_stats(source).into();
+        let kept = crate::gpu_prof::keep_sources().then(|| source.into());
+        self.pipe.insert((s.id, id.index), pipeline::Pipe { gen: id.gen, kind, desc: blob.desc, bindings: blob.bindings.as_slice().into(), announced: false, stats, source: kept });
         PipeStatus::Pending
     }
 
@@ -634,7 +710,12 @@ impl Gpu for Metal {
     }
 
     fn window_closed(&mut self, sid: u32, id: Id) {
-        if sid == HOST { self.drop_overlay(id); }
+        self.native_windows.close(sid, Some(id));
+        super::shell::on_main(move || super::media::layers::close_window(sid, id));
+        if sid == HOST {
+            self.drop_overlay(id);
+            if let Some(Some(composed)) = self.badged.remove(&id.index) { self.dev.retire(Box::new(composed.tex)); }
+        }
         if let Some(w) = self.win.remove(&(sid, id.index)) {
             self.dev.retire(Box::new(w.tex));
         }
@@ -642,8 +723,23 @@ impl Gpu for Metal {
         self.layer_sizes.remove(&(sid, id.index));
     }
 
-    fn window_overlay(&mut self, s: &mut Session, id: Id, rect: Option<[f32; 4]>, now: u64) {
-        self.set_overlay(s, id, rect, now);
+    fn window_overlay(&mut self, s: &mut Session, id: Id, rect: Option<[f32; 4]>, layer: Id, now: u64) {
+        self.set_overlay(s, id, rect, layer, now);
+    }
+
+    /// Panels are composed here (`set_overlay`, `composite_overlay`), over the base frame kept for them.
+    fn overlays(&self) -> bool { true }
+
+    fn badge_layer(&mut self, window: Id, on: bool) {
+        if on {
+            self.badged.entry(window.index).or_insert(None);
+        } else if let Some(Some(composed)) = self.badged.remove(&window.index) {
+            self.dev.retire(Box::new(composed.tex));
+        }
+    }
+
+    fn badges(&self) -> bool {
+        self.shell.is_some() && cfg!(target_os = "macos")
     }
 
     fn window_lent(&mut self, sid: u32, id: Id, host: Id, attach: bool) {
@@ -660,6 +756,7 @@ impl Gpu for Metal {
     }
 
     fn media(&mut self, s: &mut Session, c: &crate::cmds::HalCmd) -> bool {
+        if let crate::cmds::HalCmd::NativeLayerDestroy { id } = c { self.native_windows.destroyed(s.id, *id); }
         let now = crate::clock_ns();
         self.media.command(&mut media::MetalSink { dev: &self.dev, tex: &mut self.tex, now }, s, c)
     }

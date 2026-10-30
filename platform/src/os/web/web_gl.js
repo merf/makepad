@@ -739,7 +739,7 @@ export class WasmWebGL extends WasmWebBrowser {
         "texture dimensions must be positive safe integers",
       );
     }
-    if (options.faces === 6 && args.width !== args.height) {
+    if (options.faces === 6 && !options.array && args.width !== args.height) {
       return this.reject_texture_upload(
         args,
         "non-square-cube",
@@ -749,7 +749,7 @@ export class WasmWebGL extends WasmWebBrowser {
 
     const limits = this.webgl_limits || {};
     const max_dimension = makepad_webgl_limit(
-      options.faces === 6
+      options.faces === 6 && !options.array
         ? limits.max_cube_map_texture_size
         : limits.max_texture_size,
     );
@@ -897,6 +897,14 @@ export class WasmWebGL extends WasmWebBrowser {
     }
   }
 
+  // The texture target a shader sampler type binds.
+  sampler_target(ty) {
+    const gl = this.gl;
+    if (ty === "samplerCube") return gl.TEXTURE_CUBE_MAP;
+    if (ty === "sampler2DArray") return gl.TEXTURE_2D_ARRAY;
+    return gl.TEXTURE_2D;
+  }
+
   configure_texture_parameters(gl, target, nearest, cube) {
     const filter = nearest ? gl.NEAREST : gl.LINEAR;
     gl.texParameteri(target, gl.TEXTURE_MAG_FILTER, filter);
@@ -949,7 +957,9 @@ export class WasmWebGL extends WasmWebBrowser {
             gl.TEXTURE_CUBE_MAP_NEGATIVE_Z,
           ]
         : [gl.TEXTURE_2D];
-      if (shadow) {
+      if (target === gl.TEXTURE_2D_ARRAY) {
+        gl.texImage3D(target, 0, gl.RGBA, 1, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+      } else if (shadow) {
         gl.texImage2D(
           gl.TEXTURE_2D,
           0,
@@ -1000,9 +1010,11 @@ export class WasmWebGL extends WasmWebBrowser {
   upload_admitted_texture(admission, upload_format, source, upload) {
     const gl = this.gl;
     const args = admission.args;
-    const target = admission.options.faces === 6
-      ? gl.TEXTURE_CUBE_MAP
-      : gl.TEXTURE_2D;
+    const target = admission.options.array
+      ? gl.TEXTURE_2D_ARRAY
+      : admission.options.faces === 6
+        ? gl.TEXTURE_CUBE_MAP
+        : gl.TEXTURE_2D;
     const old_texture = this.textures[args.texture_id];
     const replace = !!old_texture && old_texture._texture_target !== target;
     let texture = replace ? null : old_texture;
@@ -1049,7 +1061,7 @@ export class WasmWebGL extends WasmWebBrowser {
           gl,
           target,
           admission.options.nearest,
-          admission.options.faces === 6,
+          admission.options.faces === 6 && !admission.options.array,
         );
       }
       upload(gl, target, allocation_changed, source, admission);
@@ -2133,9 +2145,7 @@ export class WasmWebGL extends WasmWebBrowser {
         continue;
       }
       const texture_id = args.textures && args.textures[i];
-      const expected_target = texture_loc.ty === "samplerCube"
-        ? this.gl.TEXTURE_CUBE_MAP
-        : this.gl.TEXTURE_2D;
+      const expected_target = this.sampler_target(texture_loc.ty);
       let texture;
       if (texture_id === undefined) {
         texture = this.get_sampler_fallback_texture(expected_target, texture_loc.ty === "sampler2DShadow");
@@ -2693,9 +2703,7 @@ export class WasmWebGL extends WasmWebBrowser {
         if (!tex_loc || tex_loc.loc == null) {
           continue;
         }
-        const target = tex_loc.ty === "samplerCube"
-          ? gl.TEXTURE_CUBE_MAP
-          : gl.TEXTURE_2D;
+        const target = this.sampler_target(tex_loc.ty);
         gl.activeTexture(gl.TEXTURE0 + i);
         gl.bindTexture(target, preflight.sampler_textures[i]);
         const texture = preflight.sampler_textures[i];
@@ -2988,6 +2996,39 @@ export class WasmWebGL extends WasmWebBrowser {
     );
   }
 
+  // A 2D array's level 0 (layer-major BGRA), sampled as sampler2DArray.
+  FromWasmAllocTextureArray_BGRAu8_32(args) {
+    if (!args || !Number.isSafeInteger(args.layers) || args.layers <= 0) {
+      return this.reject_texture_upload(args, "invalid-layers", "array texture layer count must be a positive safe integer");
+    }
+    const admission = this.admit_texture_upload(args, {
+      faces: args.layers,
+      array: true,
+      bytes_per_texel: 4,
+      elements_per_texel: 1,
+      element_size: 4,
+      nearest: false,
+    });
+    if (!admission) return;
+    const source = this.make_bgra_upload_view(admission);
+    if (!source) return;
+    this.upload_admitted_texture(
+      admission,
+      // the layer count is part of the allocation
+      `array-bgra8x${args.layers}`,
+      source,
+      (gl, target, allocate, data, checked) => {
+        const w = checked.args.width;
+        const h = checked.args.height;
+        if (allocate) {
+          gl.texImage3D(target, 0, gl.RGBA, w, h, args.layers, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+        } else {
+          gl.texSubImage3D(target, 0, 0, 0, 0, w, h, args.layers, gl.RGBA, gl.UNSIGNED_BYTE, data);
+        }
+      },
+    );
+  }
+
   FromWasmBeginRenderTexture(args) {
     if (this.xr !== undefined) {
       this.xr.in_xr_pass = false;
@@ -3022,7 +3063,7 @@ export class WasmWebGL extends WasmWebBrowser {
       }
     }
     const has_r32f_target = args.color_targets.some(
-      (target) => target && target.format >= 1 && target.format <= 3,
+      (target) => target && target.format >= 1 && target.format <= 4,
     );
     if (has_r32f_target && !this.ext_color_buffer_float) {
       this.reject_render_target(
@@ -3110,23 +3151,29 @@ export class WasmWebGL extends WasmWebBrowser {
         gl_tex._requested_height = args.height;
         gl_tex._format = tgt.format;
         gl_tex._depth = false;
-        if (tgt.format >= 1 && tgt.format <= 3) {
-          // R32F data target (TextureFormat::RenderRf32). Color-renderable
-          // only with EXT_color_buffer_float; NEAREST because float
-          // filtering is a separate extension and consumers sample_nearest.
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        if (tgt.format >= 1 && tgt.format <= 5) {
+          // Data targets: 1 R32F (RenderRf32), 2 RGBA32F, 3 RGBA16F,
+          // 4 R16F (RenderRf16), 5 R8 (RenderRu8). Float targets are
+          // color-renderable only with EXT_color_buffer_float; 32-bit float
+          // filtering is a separate extension, so those stay NEAREST, while
+          // R16F and R8 filter natively in WebGL2.
+          const filter = tgt.format >= 4 ? gl.LINEAR : gl.NEAREST;
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
           gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
           gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+          const internal = [0, gl.R32F, gl.RGBA32F, gl.RGBA16F, gl.R16F, gl.R8][tgt.format];
+          const upload = tgt.format === 1 || tgt.format >= 4 ? gl.RED : gl.RGBA;
+          const type = tgt.format === 5 ? gl.UNSIGNED_BYTE : (tgt.format === 3 || tgt.format === 4 ? gl.HALF_FLOAT : gl.FLOAT);
           gl.texImage2D(
             gl.TEXTURE_2D,
             0,
-            tgt.format === 1 ? gl.R32F : (tgt.format === 2 ? gl.RGBA32F : gl.RGBA16F),
+            internal,
             gl_tex._width,
             gl_tex._height,
             0,
-            tgt.format === 1 ? gl.RED : gl.RGBA,
-            tgt.format === 3 ? gl.HALF_FLOAT : gl.FLOAT,
+            upload,
+            type,
             null,
           );
         } else {
@@ -4277,6 +4324,7 @@ const MAKEPAD_WEBGL_COMMANDS = [
   "FromWasmAllocTextureImage2D_Ru8",
   "FromWasmAllocTextureImage2D_RGBAf32",
   "FromWasmAllocTextureCube_BGRAu8_32",
+  "FromWasmAllocTextureArray_BGRAu8_32",
   "FromWasmBeginRenderTexture",
   "FromWasmBeginRenderCanvas",
   "FromWasmSetDefaultDepthAndBlendMode",

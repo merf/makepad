@@ -61,6 +61,8 @@ script_mod! {
         }
         /** the wash under selected text (a list or row that selects across its labels sets it) */
         draw_selection +: {
+            // Its own draw-call layer, opened before the text (see draw_walk).
+            draw_call_group: @selection
             color: theme.color_selection_focus
         }
         /** the line under a hovered link span (see `LabelRef::set_links`) */
@@ -380,7 +382,7 @@ impl WidgetNode for Label {
         }
     }
     fn area(&self) -> Area {
-        self.draw_text.area()
+        self.area
     }
     fn walk(&mut self, _cx: &mut Cx) -> Walk {
         self.walk
@@ -445,6 +447,23 @@ impl WidgetNode for Label {
 }
 
 impl Widget for Label {
+    fn semantics(&self, cx: &Cx, node: &mut a11y_tree::Node) {
+        node.role = a11y_tree::Role::StaticText;
+        makepad_platform::a11y::set_string(&mut node.name, self.text.as_ref());
+        let text = node.text.get_or_insert_with(Default::default);
+        makepad_platform::a11y::set_string(&mut text.content, self.text.as_ref());
+        text.selection = self.selection.map_or((0, 0), |(a, b)| (a as u32, b as u32));
+        if let Some((rect, layout)) = &self.laid {
+            crate::semantics::text_layout(
+                text,
+                layout,
+                rect.pos + self.shift(cx),
+                self.draw_text.font_scale,
+                false,
+            );
+        }
+    }
+
     /// A label reports the pointer at most (hover actions); it never takes
     /// a press, so a host's gestures (selecting, scrolling) pass over it.
     fn is_interactive(&self) -> bool {
@@ -556,6 +575,12 @@ impl Widget for Label {
         let shown: &str = if self.text.as_ref().is_empty() { " " } else { self.text.as_ref() };
         self.draw_text.max_lines = self.max_lines;
         self.draw_text.text_overflow = self.text_overflow;
+        // The selection wash needs the layout, so it is drawn after the text;
+        // its call goes in first and its draw_call_group brings the wash back
+        // to it, behind the glyphs.
+        if self.selection.is_some() {
+            self.draw_selection.new_draw_call(cx);
+        }
         let (rect, laid) = if self.links.is_empty() {
             self.draw_text.draw_walk_keep(cx, walk, self.align, shown)
         } else {
@@ -650,6 +675,14 @@ fn recolor_links(laid: &LaidoutText, links: &[(usize, usize)], base: Vec4f, ink:
         }
     }
     out
+}
+
+impl Label {
+    /// The label's whole laid-out box (its `area()` is the text's draw area, which can be one
+    /// glyph's instance): what the window keeps a caption title off.
+    pub(crate) fn box_rect(&self, cx: &Cx) -> Rect {
+        self.area.rect(cx)
+    }
 }
 
 impl Label {

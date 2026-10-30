@@ -25,10 +25,25 @@ impl SocketStream {
     }
 
     /// TLS without CA validation (self-signed servers); returns the server
-    /// certificate's SHA-256 for a known-hosts check ([`crate::tls::KnownHosts`]).
-    pub fn connect_capture(host: &str, port: &str) -> io::Result<(Self, [u8; 32])> {
-        let (inner, fp) = crate::backend::linux::socket_stream::SocketStream::connect_capture(host, port)?;
-        Ok((Self { inner }, fp))
+    /// leaf certificate DER. Hash it with [`crate::tls::fingerprint`] for a known-hosts check.
+    pub fn connect_capture(host: &str, port: &str) -> io::Result<(Self, Vec<u8>)> {
+        let (inner, der) = crate::backend::linux::socket_stream::SocketStream::connect_capture(host, port)?;
+        Ok((Self { inner }, der))
+    }
+
+    /// Like [`Self::connect_capture`], resuming the TLS session of `session_of`, an earlier
+    /// captured connection to the same host (an FTPS data channel resumes its control
+    /// connection's session; servers may refuse a data channel that does not).
+    pub fn connect_capture_resuming(host: &str, port: &str, session_of: &Self) -> io::Result<(Self, Vec<u8>)> {
+        let (inner, der) = crate::backend::linux::socket_stream::SocketStream::connect_capture_resuming(host, port, &session_of.inner)?;
+        Ok((Self { inner }, der))
+    }
+
+    /// TLS without CA validation. Returns peer certificates as DER, leaf first.
+    /// The caller must authenticate them before sending application data.
+    pub fn connect_capture_chain(host: &str, port: &str) -> io::Result<(Self, Vec<Vec<u8>>)> {
+        let (inner, chain) = crate::backend::linux::socket_stream::SocketStream::connect_capture_chain(host, port)?;
+        Ok((Self { inner }, chain))
     }
 
     pub fn into_tls(self, host: &str, ignore_ssl_cert: bool) -> io::Result<Self> {
@@ -91,10 +106,25 @@ impl SocketStream {
     }
 
     /// TLS without CA validation (self-signed servers); returns the server
-    /// certificate's SHA-256 for a known-hosts check ([`crate::tls::KnownHosts`]).
-    pub fn connect_capture(host: &str, port: &str) -> io::Result<(Self, [u8; 32])> {
-        let (inner, fp) = apple_impl::SocketStream::connect_capture(host, port)?;
-        Ok((Self { inner }, fp))
+    /// leaf certificate DER. Hash it with [`crate::tls::fingerprint`] for a known-hosts check.
+    pub fn connect_capture(host: &str, port: &str) -> io::Result<(Self, Vec<u8>)> {
+        let (inner, der) = apple_impl::SocketStream::connect_capture(host, port)?;
+        Ok((Self { inner }, der))
+    }
+
+    /// Like [`Self::connect_capture`], resuming the TLS session of `session_of`, an earlier
+    /// captured connection to the same host (an FTPS data channel resumes its control
+    /// connection's session; servers may refuse a data channel that does not).
+    pub fn connect_capture_resuming(host: &str, port: &str, session_of: &Self) -> io::Result<(Self, Vec<u8>)> {
+        let (inner, der) = apple_impl::SocketStream::connect_capture_resuming(host, port, &session_of.inner)?;
+        Ok((Self { inner }, der))
+    }
+
+    /// TLS without CA validation. Returns peer certificates as DER, leaf first.
+    /// The caller must authenticate them before sending application data.
+    pub fn connect_capture_chain(host: &str, port: &str) -> io::Result<(Self, Vec<Vec<u8>>)> {
+        let (inner, chain) = apple_impl::SocketStream::connect_capture_chain(host, port)?;
+        Ok((Self { inner }, chain))
     }
 
     pub fn into_tls(self, host: &str, ignore_ssl_cert: bool) -> io::Result<Self> {
@@ -157,10 +187,25 @@ impl SocketStream {
     }
 
     /// TLS without CA validation (self-signed servers); returns the server
-    /// certificate's SHA-256 for a known-hosts check ([`crate::tls::KnownHosts`]).
-    pub fn connect_capture(host: &str, port: &str) -> io::Result<(Self, [u8; 32])> {
-        let (inner, fp) = windows_impl::SocketStream::connect_capture(host, port)?;
-        Ok((Self { inner }, fp))
+    /// leaf certificate DER. Hash it with [`crate::tls::fingerprint`] for a known-hosts check.
+    pub fn connect_capture(host: &str, port: &str) -> io::Result<(Self, Vec<u8>)> {
+        let (inner, der) = windows_impl::SocketStream::connect_capture(host, port)?;
+        Ok((Self { inner }, der))
+    }
+
+    /// Like [`Self::connect_capture`], resuming the TLS session of `session_of`, an earlier
+    /// captured connection to the same host (an FTPS data channel resumes its control
+    /// connection's session; servers may refuse a data channel that does not).
+    pub fn connect_capture_resuming(host: &str, port: &str, session_of: &Self) -> io::Result<(Self, Vec<u8>)> {
+        let (inner, der) = windows_impl::SocketStream::connect_capture_resuming(host, port, &session_of.inner)?;
+        Ok((Self { inner }, der))
+    }
+
+    /// TLS without CA validation. Returns peer certificates as DER, leaf first.
+    /// The caller must authenticate them before sending application data.
+    pub fn connect_capture_chain(host: &str, port: &str) -> io::Result<(Self, Vec<Vec<u8>>)> {
+        let (inner, chain) = windows_impl::SocketStream::connect_capture_chain(host, port)?;
+        Ok((Self { inner }, chain))
     }
 
     pub fn into_tls(self, host: &str, ignore_ssl_cert: bool) -> io::Result<Self> {
@@ -224,13 +269,24 @@ impl SocketStream {
     }
 
     /// TLS without CA validation (self-signed servers); returns the server
-    /// certificate's SHA-256 for a known-hosts check ([`crate::tls::KnownHosts`]).
-    pub fn connect_capture(host: &str, port: &str) -> io::Result<(Self, [u8; 32])> {
+    /// leaf certificate DER. Hash it with [`crate::tls::fingerprint`] for a known-hosts check.
+    pub fn connect_capture(host: &str, port: &str) -> io::Result<(Self, Vec<u8>)> {
         let inner = crate::backend::connect_platform_socket_stream(host, port, true, true)?;
-        let fingerprint = inner.peer_fingerprint().ok_or_else(|| {
+        let der = inner.peer_certificate().ok_or_else(|| {
             io::Error::new(io::ErrorKind::Other, "the TLS server presented no certificate")
         })?;
-        Ok((Self { inner }, fingerprint))
+        Ok((Self { inner }, der))
+    }
+
+    pub fn connect_capture_resuming(_host: &str, _port: &str, _session_of: &Self) -> io::Result<(Self, Vec<u8>)> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "TLS session resumption is not available on this target",
+        ))
+    }
+
+    pub fn connect_capture_chain(_host: &str, _port: &str) -> io::Result<(Self, Vec<Vec<u8>>)> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "TLS certificate chain capture is not available on this target"))
     }
 
     pub fn into_tls(self, _host: &str, _ignore_ssl_cert: bool) -> io::Result<Self> {
@@ -288,11 +344,22 @@ impl SocketStream {
         ))
     }
 
-    pub fn connect_capture(_host: &str, _port: &str) -> io::Result<(Self, [u8; 32])> {
+    pub fn connect_capture(_host: &str, _port: &str) -> io::Result<(Self, Vec<u8>)> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "self-signed TLS is not available on this target",
         ))
+    }
+
+    pub fn connect_capture_resuming(_host: &str, _port: &str, _session_of: &Self) -> io::Result<(Self, Vec<u8>)> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "self-signed TLS is not available on this target",
+        ))
+    }
+
+    pub fn connect_capture_chain(_host: &str, _port: &str) -> io::Result<(Self, Vec<Vec<u8>>)> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "TLS certificate chain capture is not available on this target"))
     }
 
     pub fn into_tls(self, _host: &str, _ignore_ssl_cert: bool) -> io::Result<Self> {

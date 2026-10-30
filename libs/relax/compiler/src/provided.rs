@@ -54,21 +54,26 @@ pub struct ProvidedCrate {
     pub name: String,
     /// key (`type_name` of the fn item; a handle's trait ops `<path as Clone>::clone` ..) -> op
     pub shims: HashMap<String, Shim>,
-    /// opaque handles by def path: (size, align, drop)
-    pub types: HashMap<String, (u64, u64, Option<DropFn>)>,
+    /// opaque handles by def path: (size, align, drop, a struct's field offsets in declaration
+    /// order: same_layout_handles)
+    pub types: HashMap<String, (u64, u64, Option<DropFn>, &'static [u64])>,
     /// plain types by def path: rustc's (size, align, field offsets), checked against Relax's at
     /// unit creation
     pub layouts: HashMap<String, (u64, u64, &'static [u64])>,
     pub last_panic: LastPanicFn,
-    /// the source identity rustc built it from (srchash.rs; the loader's build.rs)
+    /// the source identity rustc built it from (srchash.rs; the loader's build.rs): what
+    /// check_sources compares the program's copy of the crate with
     pub source: u64,
+    /// what JIT code sees of the binding (`binding_identity`): the cache keys of code that can
+    /// reach the crate carry this, not `source` (cache/items.rs apply_bound)
+    pub binding: u64,
     /// Per-file and feature/version identity embedded by the loader build.
     pub manifest: &'static [u8],
 }
 
 impl Clone for ProvidedCrate {
     fn clone(&self) -> Self {
-        ProvidedCrate { name: self.name.clone(), shims: self.shims.clone(), types: self.types.clone(), layouts: self.layouts.clone(), last_panic: self.last_panic, source: self.source, manifest: self.manifest }
+        ProvidedCrate { name: self.name.clone(), shims: self.shims.clone(), types: self.types.clone(), layouts: self.layouts.clone(), last_panic: self.last_panic, source: self.source, binding: self.binding, manifest: self.manifest }
     }
 }
 
@@ -84,14 +89,68 @@ pub(crate) fn registered(name: &str) -> bool {
 pub fn register(
     name: &str,
     shims: HashMap<String, Shim>,
-    types: HashMap<String, (u64, u64, Option<DropFn>)>,
+    types: HashMap<String, (u64, u64, Option<DropFn>, &'static [u64])>,
     layouts: HashMap<String, (u64, u64, &'static [u64])>,
     last_panic: LastPanicFn,
     source: u64,
     manifest: &'static [u8],
 ) {
     let name = name.replace('-', "_");
-    REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).push(ProvidedCrate { name, shims, types, layouts, last_panic, source, manifest });
+    let binding = binding_identity(&name, &shims, &types, &layouts);
+    REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).push(ProvidedCrate { name, shims, types, layouts, last_panic, source, binding, manifest });
+}
+
+/// The identity of what JIT code depends on in a provided crate beyond its source text (which
+/// the interface fingerprints and body keys already cover, as for any crate): which fns are
+/// bound and their rustc signatures and argument layouts (the bridge bodies, lower.rs
+/// bridge_func, call shims by symbol), the opaque handles' rustc size, align, drop and field
+/// offsets, and the plain types' rustc layouts. The program's copy of the crate is the loader's
+/// own source (check_sources), so a change of these follows a source change; a change of the
+/// crate's native fn bodies alone (a HAL fix) keeps them, and with them every stored build of
+/// the code above the crate.
+fn binding_identity(
+    name: &str,
+    shims: &HashMap<String, Shim>,
+    types: &HashMap<String, (u64, u64, Option<DropFn>, &'static [u64])>,
+    layouts: &HashMap<String, (u64, u64, &'static [u64])>,
+) -> u64 {
+    let mut h = crate::sip::Sip128::new();
+    h.str("provided-binding");
+    h.str(name);
+    let mut keys: Vec<&String> = shims.keys().collect();
+    keys.sort_unstable();
+    h.u32(keys.len() as u32);
+    for k in keys {
+        let s = &shims[k];
+        h.str(k);
+        h.str(s.sig);
+        h.u32(s.slots.len() as u32);
+        for slot in s.slots { for x in slot { h.u64(*x); } }
+    }
+    let mut keys: Vec<&String> = types.keys().collect();
+    keys.sort_unstable();
+    h.u32(keys.len() as u32);
+    for k in keys {
+        let (size, align, drop, offsets) = &types[k];
+        h.str(k);
+        h.u64(*size);
+        h.u64(*align);
+        h.u8(drop.is_some() as u8);
+        h.u32(offsets.len() as u32);
+        for x in offsets.iter() { h.u64(*x); }
+    }
+    let mut keys: Vec<&String> = layouts.keys().collect();
+    keys.sort_unstable();
+    h.u32(keys.len() as u32);
+    for k in keys {
+        let (size, align, offsets) = &layouts[k];
+        h.str(k);
+        h.u64(*size);
+        h.u64(*align);
+        h.u32(offsets.len() as u32);
+        for x in offsets.iter() { h.u64(*x); }
+    }
+    h.finish128() as u64
 }
 
 /// The registered crates whose source in the program is what the loader was built from
@@ -100,12 +159,40 @@ static MATCHED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Compares every registered crate present in the program against its embedded library
 /// closure. Any mismatch fails with file and feature/version differences; absent crates skip.
+const IDENTITY_THREADS: usize = 4;
+
 pub fn check_sources(pkgs: &[crate::srchash::SrcPkg]) -> Result<(), String> {
     let reg: Vec<_> = REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|p| (p.name.clone(), p.source, p.manifest)).collect();
     let mut verified = Vec::new();
+    let mut files = std::collections::HashMap::new();
+    // the identity files of every package folder the registered crates reach, read and hashed
+    // by a few threads (a folder is hashed once whatever number of closures reach it)
+    let mut dirs: Vec<String> = Vec::new();
+    for (name, _, _) in &reg {
+        for (root, _) in pkgs.iter().enumerate().filter(|(_, k)| k.name.replace('-', "_") == *name) {
+            for d in crate::srchash::closure_dirs(pkgs, root) { if !dirs.contains(&d) { dirs.push(d); } }
+        }
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let done: Vec<Mutex<Option<Vec<(String, u64)>>>> = dirs.iter().map(|_| Mutex::new(None)).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..dirs.len().min(IDENTITY_THREADS) {
+            scope.spawn(|| {
+                let _z = crate::zone_alloc::compiler_thread();
+                loop {
+                    let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(dir) = dirs.get(k) else { break };
+                    *done[k].lock().unwrap_or_else(|e| e.into_inner()) = Some(crate::srchash::identity_files(std::path::Path::new(dir)));
+                }
+            });
+        }
+    });
+    for (dir, list) in dirs.iter().zip(done) {
+        if let Some(list) = list.into_inner().unwrap_or_else(|e| e.into_inner()) { files.insert(dir.clone(), list); }
+    }
     for (name, source, manifest) in &reg {
         for (root, _) in pkgs.iter().enumerate().filter(|(_, k)| k.name.replace('-', "_") == *name) {
-            let current = crate::srchash::closure_manifest(pkgs, root);
+            let current = crate::srchash::closure_manifest_with(pkgs, root, &mut files);
             if crate::srchash::manifest_hash(&current) != *source {
                 let built = crate::srchash::decode_manifest(manifest)?;
                 return Err(crate::srchash::diff_message(name, &built, &current));
@@ -120,6 +207,42 @@ pub fn check_sources(pkgs: &[crate::srchash::SrcPkg]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The boot's source check, running beside the load (`check_sources_later`).
+static PENDING: Mutex<Option<std::thread::JoinHandle<Result<(), String>>>> = Mutex::new(None);
+
+/// `check_sources`, on a thread of its own. The boot starts it as early as `check_sources` could
+/// run and goes on loading; nothing may bind a provided crate before `finish_sources` has
+/// returned Ok (`take_for`, `take_for_crates` and the boot's own join before the unit is built
+/// call it). The hashes, the manifests and the error are those of `check_sources`.
+pub fn check_sources_later(pkgs: std::sync::Arc<Vec<crate::srchash::SrcPkg>>) {
+    let _k = crate::zone_alloc::kept();
+    let spawned = std::thread::Builder::new().name("run-provided-sources".into()).spawn(move || {
+        let _z = crate::zone_alloc::compiler_thread();
+        let t = std::time::Instant::now();
+        let verdict = check_sources(&pkgs);
+        if crate::preload::trace() { eprintln!("boot-trace: provided sources checked in {:.1} ms (beside the load)", t.elapsed().as_secs_f64() * 1e3); }
+        verdict
+    });
+    match spawned {
+        Ok(h) => *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some(h),
+        Err(e) => *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::thread::spawn(move || Err(format!("provided source check: {e}")))),
+    }
+}
+
+/// The verdict of the check `check_sources_later` started, once it has ended.
+static VERDICT: Mutex<Option<Result<(), String>>> = Mutex::new(None);
+
+/// Waits for the check `check_sources_later` started, if one is running: its verdict (every
+/// caller gets it, the proc-macro world's unit as well as the program's). Ok when none started.
+pub fn finish_sources() -> Result<(), String> {
+    let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(h) = pending.take() {
+        let verdict = h.join().unwrap_or_else(|_| Err("provided source check: the thread panicked".into()));
+        *VERDICT.lock().unwrap_or_else(|e| e.into_inner()) = Some(crate::zone_alloc::kept_clone(&verdict));
+    }
+    VERDICT.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or(Ok(()))
 }
 
 /// Reads what `check_sources` reads, for the identity of every registered crate in the program,
@@ -138,6 +261,8 @@ pub fn read_identity_files(pkgs: &[crate::srchash::SrcPkg]) {
 /// The registered crates as (crate index in `prog`, entry) whose source matched (check_sources);
 /// crates not in the program are left out. Taken once per unit (Unit::new).
 pub fn take_for(prog: &Program) -> Vec<(u32, ProvidedCrate)> {
+    // nothing binds before the source check has passed (a failed one binds nothing)
+    if finish_sources().is_err() { return Vec::new(); }
     let matched = MATCHED.lock().unwrap_or_else(|e| e.into_inner());
     let mut out = Vec::new();
     for p in REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).iter() {
@@ -154,6 +279,7 @@ pub fn take_for(prog: &Program) -> Vec<(u32, ProvidedCrate)> {
 /// As [`take_for`], for the crates of `prog` named by `only` (indices a run-time load added) that
 /// are not bound yet.
 pub fn take_for_crates(prog: &Program, only: &[u32]) -> Vec<(u32, ProvidedCrate)> {
+    if finish_sources().is_err() { return Vec::new(); }
     let matched = MATCHED.lock().unwrap_or_else(|e| e.into_inner());
     let mut out = Vec::new();
     for p in REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).iter() {
@@ -473,7 +599,7 @@ pub fn unbound_reason(prog: &Program, tcx: &Tcx, krate: u32, d: DefId, opaque: &
     if s.header.abi.is_c_like() || s.header.c_variadic || s.track_caller {
         return Some("abi");
     }
-    if crate::jit::inline_attrs(prog, d) & crate::opt::ATTR_ALWAYS != 0 {
+    if crate::jit::inline_attrs(prog, d) & relax_codegen::opt::ATTR_ALWAYS != 0 {
         return Some("#[inline(always)]: compiled on the caller's side");
     }
     let parent = prog.def(def.parent);
@@ -565,3 +691,179 @@ pub fn crossing_types(prog: &Program, tcx: &Tcx, krates: &[u32], bound: &dyn Fn(
 }
 
 
+
+/// Where this binary's std keeps a `String`'s and a `Vec<T>`'s pointer, capacity and length (word
+/// indices), and the capacity word of `None` of an `Option<String>` / `Option<Vec<T>>` (the
+/// niche), read off live values. relax-compiler is rustc-built into the loader together with the
+/// provided crates, so this is the layout of their `String` and `Vec`. None: not three words, or
+/// `String` and `Vec<u64>` differ.
+fn rustc_vec_words() -> Option<([usize; 3], usize)> {
+    fn at(w: [usize; 3], ptr: usize, cap: usize, len: usize) -> Option<[usize; 3]> {
+        let f = |x: usize| w.iter().position(|y| *y == x);
+        let r = [f(ptr)?, f(cap)?, f(len)?];
+        (r[0] != r[1] && r[1] != r[2] && r[0] != r[2]).then_some(r)
+    }
+    fn words<T>(x: &T) -> [usize; 3] {
+        unsafe { *(x as *const T as *const [usize; 3]) }
+    }
+    let three = 3 * std::mem::size_of::<usize>();
+    if std::mem::size_of::<String>() != three || std::mem::size_of::<Vec<u64>>() != three || std::mem::size_of::<Option<String>>() != three || std::mem::size_of::<Option<Vec<u64>>>() != three {
+        return None;
+    }
+    let mut s = String::with_capacity(13);
+    s.push_str("ab");
+    let a = at(words(&s), s.as_ptr() as usize, s.capacity(), s.len())?;
+    let mut v: Vec<u64> = Vec::with_capacity(11);
+    v.extend([1, 2, 3]);
+    let b = at(words(&v), v.as_ptr() as usize, v.capacity(), v.len())?;
+    let (ns, nv): (Option<String>, Option<Vec<u64>>) = (std::hint::black_box(None), std::hint::black_box(None));
+    let none = words(&ns)[a[1]];
+    (a == b && words(&nv)[a[1]] == none).then_some((a, none))
+}
+
+/// What of makepad run's std is laid out as rustc's std lays it out (`rustc_vec_words`): the
+/// same bytes on both sides, so a value built by either side's std is read, grown and freed by
+/// the other's (both allocate through the loader's allocator; zone_alloc dealloc_layout frees a
+/// block of any heap).
+#[derive(Clone, Copy)]
+struct StdSame {
+    /// `Vec` (the ADT of `String`'s one field), with `String`
+    vec: DefId,
+    /// `Option<String>` / `Option<Vec<T>>`: rustc's niche (None in the capacity word)
+    option: bool,
+}
+
+fn std_vec_same(prog: &Program, tcx: &Tcx, probe: &crate::layout::Layouts) -> Option<StdSame> {
+    let lcx = crate::layout::LayoutCx::new(prog);
+    let sd = tcx.lang_items.get(LangItem::String)?;
+    let sadt = tcx.adts.get(&sd)?;
+    if sadt.variants.len() != 1 || sadt.variants[0].fields.len() != 1 {
+        return None;
+    }
+    let st = tcx.tys.intern(TyKind::Adt(sd, crate::types::List::EMPTY, crate::types::RegionArgsId::EMPTY));
+    let vt = tcx.field_ty(prog, crate::tcx::TypingEnv::fully_monomorphized(prog), sd, 0, 0, &[]);
+    let TyKind::Adt(vd, va, _) = tcx.tys.kind(vt) else { return None };
+    let (vd, va) = (*vd, *va);
+    let vadt = tcx.adts.get(&vd)?;
+    if tcx.tys.list(va).len() != 1 || vadt.variants.len() != 1 {
+        return None;
+    }
+    let pb = std::mem::size_of::<usize>() as u32;
+    let (ls, lv) = (probe.of(&lcx, tcx, st), probe.of(&lcx, tcx, vt));
+    if ls.size != 3 * pb || ls.fields.as_slice() != [0] || lv.size != 3 * pb || lv.ext.is_some() || ls.ext.is_some() {
+        return None;
+    }
+    let mut ours = [usize::MAX; 3];
+    for (i, f) in vadt.variants[0].fields.iter().enumerate() {
+        let w = match prog.syms.str(f.name) {
+            "ptr" => 0,
+            "cap" => 1,
+            "len" => 2,
+            _ => continue,
+        };
+        let off = *lv.fields.get(i)?;
+        if off % pb != 0 {
+            return None;
+        }
+        ours[w] = (off / pb) as usize;
+    }
+    let (words, none) = rustc_vec_words()?;
+    if ours != words {
+        return None;
+    }
+    // Option<String>: None is rustc's value in the capacity word, Some's payload at 0
+    let option = tcx.lang_items.get(LangItem::Option).is_some_and(|od| {
+        let ot = tcx.tys.intern(TyKind::Adt(od, tcx.tys.mk_list(&[st]), crate::types::RegionArgsId::EMPTY));
+        let lo = probe.of(&lcx, tcx, ot);
+        let none_variant = tcx.adts.get(&od).and_then(|a| a.variants.iter().position(|v| v.fields.is_empty()));
+        lo.size == 3 * pb
+            && lo.tag.is_some_and(|(off, _)| off == words[1] as u32 * pb)
+            && matches!(lo.enc, crate::layout::TagEnc::Niche { lo: l, hi: h, start, .. } if Some(l as usize) == none_variant && l == h && start as u64 == none as u64)
+            && lo.variant_fields.iter().enumerate().all(|(vi, f)| Some(vi) == none_variant || f.as_slice() == [0])
+    });
+    Some(StdSame { vec: vd, option })
+}
+
+/// The `#[relax_api(handle)]` structs among `cands` (def, rustc's size, align, field offsets)
+/// whose layout is the same on both sides: Relax lays the struct out at rustc's size, align and
+/// field offsets, and every field is the same bytes (`trusted` data, a `String` / `Vec<T>` of
+/// such data when the two stds agree (std_vec_same), or another such handle). JIT-compiled code
+/// may build these and read their fields; their drop and the trait ops the attribute lists stay
+/// rustc's. `opaque`: the types Relax uses through the crate's fns only (the candidates among
+/// them until they pass, a demoted plain type); `known`: handles found the same before (a crate
+/// an app domain added after the boot).
+pub fn same_layout_handles(prog: &Program, tcx: &Tcx, cands: &[(DefId, u32, u32, &'static [u64])], opaque: &dyn Fn(DefId) -> bool, known: &dyn Fn(DefId) -> bool) -> Vec<DefId> {
+    if cands.is_empty() {
+        return Vec::new();
+    }
+    let probe = crate::layout::Layouts::new();
+    let lcx = crate::layout::LayoutCx::new(prog);
+    let std_same = std_vec_same(prog, tcx, &probe);
+    let mut ok: std::collections::HashSet<DefId> = cands
+        .iter()
+        .filter(|(d, size, align, offs)| {
+            let adt = match tcx.adts.get(d) {
+                Some(a) if !a.is_enum && !a.is_union && a.variants.len() == 1 => a,
+                _ => return false,
+            };
+            let t = tcx.tys.intern(TyKind::Adt(*d, crate::types::List::EMPTY, crate::types::RegionArgsId::EMPTY));
+            let l = probe.of(&lcx, tcx, t);
+            !offs.is_empty()
+                && offs.len() == adt.variants[0].fields.len()
+                && l.size == *size
+                && l.align == *align
+                && l.ext.is_none()
+                && offs.len() == l.fields.len()
+                && offs.iter().zip(&l.fields).all(|(a, b)| *a == *b as u64)
+        })
+        .map(|c| c.0)
+        .collect();
+    // a field of a candidate that turns out not to be the same bytes takes its holders with it
+    loop {
+        let now = ok.clone();
+        let same = |krate: u32, t: TyId| same_bytes(prog, tcx, krate, t, &|d| now.contains(&d) || known(d), std_same, opaque, 0);
+        ok.retain(|d| {
+            let krate = prog.def(*d).krate;
+            let n = tcx.adts.get(d).map_or(0, |a| a.variants[0].fields.len());
+            (0..n).all(|fi| same(krate, tcx.field_ty(prog, crate::tcx::TypingEnv::fully_monomorphized(prog), *d, 0, fi as u32, &[])))
+        });
+        if ok.len() == now.len() {
+            break;
+        }
+    }
+    let mut v: Vec<DefId> = ok.into_iter().collect();
+    v.sort_by_key(|d| d.0);
+    v
+}
+
+/// Is a field of type `t` (in a handle of provided crate `krate`) the same bytes on both sides
+/// (same_layout_handles)?
+fn same_bytes(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, ok: &dyn Fn(DefId) -> bool, std_same: Option<StdSame>, opaque: &dyn Fn(DefId) -> bool, depth: u32) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    if let TyKind::Adt(d, a, _) = tcx.tys.kind(t) {
+        if ok(*d) {
+            return true;
+        }
+        if opaque(*d) {
+            return false;
+        }
+        if let Some(std) = std_same {
+            let args = tcx.tys.list(*a);
+            let same = |x: TyId| same_bytes(prog, tcx, krate, x, ok, std_same, opaque, depth + 1);
+            // String, Vec<T> of such T
+            let vec_like = |x: TyId| match tcx.tys.kind(x) {
+                TyKind::Adt(xd, xa, _) => tcx.lang_items.get(LangItem::String) == Some(*xd) || (*xd == std.vec && tcx.tys.list(*xa).first().is_some_and(|e| same(*e))),
+                _ => false,
+            };
+            if vec_like(t) {
+                return true;
+            }
+            if std.option && tcx.lang_items.get(LangItem::Option) == Some(*d) && args.len() == 1 && vec_like(args[0]) {
+                return true;
+            }
+        }
+    }
+    trusted_in(prog, tcx, krate, t, 0, true)
+}

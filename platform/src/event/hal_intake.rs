@@ -111,6 +111,7 @@ impl Cx {
             }
         }
         match event {
+            HalEvent::NativeLayerState { id, what, a, b, data } => self.hal_native_layer_state(id, what, a, b, data),
             // ---- pointer
             HalEvent::MouseDown { window, x, y, button, mods } => {
                 let window_id = window_id(window);
@@ -379,9 +380,9 @@ impl Cx {
             #[cfg(target_os = "linux")]
             HalEvent::DirectDisplayResult { req, command, ok, message } => self.hal_display_result(req, command, ok, message),
             #[cfg(target_os = "linux")]
-            HalEvent::DirectInput { window, mouse_speed, touchpad_speed, natural_scroll, tap_to_click } => {
+            HalEvent::DirectInput { window, mouse_speed, touchpad_speed, natural_scroll_mouse, natural_scroll_touchpad, tap_to_click } => {
                 if self.hal.direct_display.window == Some(window) {
-                    crate::linux_input::report(mouse_speed, touchpad_speed, natural_scroll, tap_to_click);
+                    crate::linux_input::report([mouse_speed, touchpad_speed], [natural_scroll_mouse, natural_scroll_touchpad], tap_to_click);
                 }
             }
             #[cfg(not(target_os = "linux"))]
@@ -578,6 +579,7 @@ impl Cx {
                 }
                 let user_closed = crate::remote::take_window_close_requested(window_id.id()) || self.windows[window_id].is_created;
                 let title = self.windows[window_id].create_title.clone();
+                self.a11y.close_window(window_id);
                 self.call_event_handler(&Event::WindowClosed(WindowClosedEvent { window_id }));
                 self.windows[window_id].is_created = false;
                 if user_closed {
@@ -591,7 +593,11 @@ impl Cx {
                     hosted.window_closed(window_id);
                 }
                 self.hal.frames.window_closed(hal_window_id(window_id));
-                if !self.hal.windows.values().any(|w| w.confirmed) {
+                // a tray app lives on in its tray without windows; an offscreen XR window (a remote
+                // headset's slot, `info_flags::XR_OFFSCREEN`) is on no screen: the app ends with its
+                // last window that is (Sandbox serving a headset closed by its caption)
+                let offscreen_xr = self.hal.xr.as_ref().filter(|_| self.xr_offscreen()).map(|xr| xr.window.0);
+                if !self.hal.windows.iter().any(|(id, w)| w.confirmed && Some(*id) != offscreen_xr) && !self.has_tray() {
                     if user_closed {
                         crate::remote::note_user_closed_last_window();
                     }
@@ -675,6 +681,13 @@ impl Cx {
             }
             HalEvent::ResizeLoop { .. } => {} // the main thread tracks the resize, the sessions run on
             HalEvent::MenuCmd { cmd } => self.call_event_handler(&Event::MacosMenuCommand(LiveId(cmd))),
+            HalEvent::TrayMenu { tray, item } => self.call_event_handler(&Event::TrayMenu(crate::tray::TrayMenuEvent { tray: LiveId(tray), item: LiveId(item) })),
+            HalEvent::TrayClick { tray, x, y, w, h, screen } => {
+                use crate::makepad_math::{dvec2, Rect};
+                let anchor = Rect { pos: dvec2(x, y), size: dvec2(w, h) };
+                let screen = Rect { pos: dvec2(screen[0] as f64, screen[1] as f64), size: dvec2(screen[2] as f64, screen[3] as f64) };
+                self.call_event_handler(&Event::TrayClick(crate::tray::TrayClickEvent { tray: LiveId(tray), anchor, screen }))
+            }
 
             // ---- app
             // (every backend paints its windows once after the app started)
@@ -725,9 +738,10 @@ impl Cx {
                         _ => AppOpenItem::Url(value),
                     })
                     .collect();
-                if !items.is_empty() {
-                    crate::app_open::post(items, AppOpenSource::System);
-                }
+                // none: the user opened the running app again with no window on screen (macOS
+                // reopen, its Dock icon): like a later launch of a single-instance app
+                let source = if items.is_empty() { AppOpenSource::SecondInstance } else { AppOpenSource::System };
+                crate::app_open::post(items, source);
             }
 
             // ---- child windows and domains (this app is a parent)
@@ -804,15 +818,46 @@ impl Cx {
                     self.hal_repaint_all();
                 }
             }
+            HalEvent::XrFrame { window: _, display_ns, frame } => {
+                self.hal_xr_frame(display_ns, frame);
+            }
+            HalEvent::XrDepth { window: _, display_ns, depth } => {
+                self.hal_xr_depth(display_ns, depth);
+            }
             HalEvent::FrameReady { window, next_ns: _ } => {
                 let window_id = window_id(window);
                 if self.windows.is_valid(window_id) {
                     self.hal.beat = true;
+                    if self.hal.xr.as_ref().is_some_and(|xr| xr.window == window_id) {
+                        self.hal.xr_beat = true;
+                    }
                     if let Some(w) = self.hal.windows.get_mut(&window_id.0) {
                         w.paced = true;
                         w.credit = true;
                     }
                     makepad_hal::profile::credit();
+                }
+            }
+            HalEvent::Redraw { window: _, owners } => {
+                if owners {
+                    self.arm_draw_owners();
+                }
+                self.redraw_all();
+            }
+            HalEvent::FramePartial { window: _, frame } => {
+                // its pipeline's PipelineReady repaints; an offscreen render asks `frames_partial`
+                let partial = &mut self.textures.1.partial;
+                if partial.len() >= 256 {
+                    partial.pop_front();
+                }
+                partial.push_back(frame);
+                // a paint the backend left draws out of was not whole after all
+                for id in self.passes.id_iter().collect::<Vec<_>>() {
+                    let pass = &mut self.passes[id];
+                    if pass.painted_frame == frame {
+                        pass.painted_serial = pass.painted_before;
+                        pass.incomplete = true;
+                    }
                 }
             }
             HalEvent::FrameDone { window, frame, gpu_ns, present_ns: _, gpu_start, gpu_end } => {
@@ -822,7 +867,8 @@ impl Cx {
                     }
                     if closes { crate::gpu_frame_timer::finish_frame(group); }
                 }
-                self.hal.frames.frame_done(window, frame);
+                let window_frame = self.hal.frames.frame_done(window, frame);
+                self.hal_a11y_presented();
                 // a draw item's backing is reusable once the frame that last read it is done
                 self.textures.1.serials.complete(frame);
                 let pool = self.task_pool();
@@ -832,14 +878,25 @@ impl Cx {
                 self.poll_texture_lifetimes();
                 self.hal.frames_done += 1;
                 match self.hal.hosted.as_mut().map(|h| h.completed(window, frame)) {
-                    Some(crate::os::hal::HostedDone::Publish(draw)) => Self::send_studio_message(crate::studio::AppToStudio::DrawCompleteAndFlip(draw)),
+                    Some(crate::os::hal::HostedDone::Publish(draw)) => {
+                        if window_frame { crate::frame_trace::note_presented(); }
+                        #[cfg(target_os = "linux")]
+                        makepad_hal::hosted_native::presented(self.hal.frames.w.session(), window, frame);
+                        Self::send_studio_message(crate::studio::AppToStudio::DrawCompleteAndFlip(draw))
+                    }
                     // a hosted frame the GPU dropped: nothing to publish, paint it again
                     #[cfg(target_os = "linux")]
                     Some(crate::os::hal::HostedDone::Dropped) => self.hal_repaint_all(),
-                    Some(crate::os::hal::HostedDone::Unknown) | None => {}
+                    // the HAL presented the window's frame itself (other targets' frames are passes)
+                    Some(crate::os::hal::HostedDone::Unknown) | None => if window_frame { crate::frame_trace::note_presented() },
                 }
                 // (the first frame the HAL finished is the first one on the glass; once per app)
                 crate::startup_trace_first_present();
+                // the JIT's fps (devhub, `jit`): under XR the frames on the glass are the stereo
+                // window's; the panel's and offscreen frames do not count
+                if self.hal.xr.as_ref().map_or(true, |xr| hal_window_id(xr.window) == window) {
+                    crate::cx::relax_frame_done();
+                }
             }
             HalEvent::PipelineReady { pipeline } => {
                 // a draw built before the pipeline was ready was skipped by the HAL: paint again
@@ -943,6 +1000,16 @@ impl Cx {
                     (K::SelectFolder | K::SaveFolder, false) => A::FolderSelected(paths.swap_remove(0)),
                 };
                 Cx::post_action(action);
+            }
+            HalEvent::A11yState { consumers, .. } => {
+                self.a11y_native_consumers = consumers;
+                if self.a11y.set_consumers(consumers | self.a11y_host_consumers) { self.redraw_all(); }
+            }
+            HalEvent::A11yAction { window, bytes } => {
+                match makepad_a11y::wire::decode_action(bytes) {
+                    Ok(action) => self.dispatch_a11y_action(window_id(window), action),
+                    Err(error) => crate::error!("{error}"),
+                }
             }
             HalEvent::Query { req, bytes } => self.hal_answer_query(req, bytes),
 
@@ -1105,8 +1172,8 @@ impl Cx {
         self.fingers.process_touch_update_end(&e.touches);
     }
 
-    /// Signals, actions and script tasks the loop services on a wake and on every beat (the
-    /// work macOS did on its timer-0 beat).
+    /// Signals, actions, script tasks and network events the loop services on a wake and on
+    /// every beat (the work macOS did on its timer-0 beat).
     pub(crate) fn hal_service_signals(&mut self) -> bool {
         let internal_signal = SignalToUI::check_and_clear_internal_signal();
         let ui_signal = SignalToUI::check_and_clear_ui_signal();
@@ -1120,10 +1187,21 @@ impl Cx {
         if ui_signal {
             self.call_event_handler(&Event::Signal);
         }
+        // a headset linked to the app's XR server: the remote headset slot is there from now on
+        // (an XR display), the app's next drawing finds it
+        if !self.hal.xr_remote_seen && makepad_hal::xr_remote::hal_xr_remote_enabled() {
+            self.hal.xr_remote_seen = true;
+            self.redraw_all();
+            did = true;
+        }
         if SignalToUI::check_and_clear_action_signal() {
             self.handle_action_receiver();
             did = true;
         }
+        // A network answer wakes the loop (the runtime's wake fn) with no frame to draw: read
+        // here it reaches the app now. Read only on a beat, an idle app (a login page waiting
+        // for its answer) left it unread until something else asked for a frame.
+        self.handle_networking_events();
         self.poll_control_channel();
         self.poll_texture_readbacks();
         self.handle_actions();

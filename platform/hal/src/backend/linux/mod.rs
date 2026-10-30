@@ -3,12 +3,13 @@
 //! Vulkan leases native handles until its presentation worker has retired their surfaces.
 
 mod input;
+pub(crate) mod atspi;
 pub mod media;
 pub(crate) mod io;
 mod wayland;
 mod x11;
 pub mod direct;
-mod wm;
+pub(crate) mod wm;
 
 use super::exec::OsCmd;
 use super::log_enabled;
@@ -194,6 +195,25 @@ impl Shared {
         std::mem::take(&mut *lock(&self.ops))
     }
     pub fn command(&self, sid: u32, cmd: OsCmd) {
+        // Trays: a makepad WM shows them in its tray area (wm.rs relays them); another desktop
+        // has none for us (no StatusNotifierItem host here), so they are dropped, said once.
+        if matches!(cmd, OsCmd::TraySet { .. } | OsCmd::TrayRemove { .. }) && !self.window_manager() {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| eprintln!("tray: this desktop has no tray for makepad apps (only the makepad WM shows them)"));
+            return;
+        }
+        // A tray dropdown needs the tray host too: the makepad WM places it under its tray item
+        // (wm.rs); on another desktop it is shown as a window of that size where the window
+        // system puts it.
+        if let OsCmd::WindowAtTray { id, w, h, .. } = cmd {
+            if !self.window_manager() {
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| eprintln!("tray dropdown: not supported on this desktop yet; shown as a window"));
+                self.command(sid, OsCmd::WindowGeom { id, geom: [f32::NAN, f32::NAN, w, h] });
+                self.command(sid, OsCmd::WindowState { id, state: window_state::SHOW });
+                return;
+            }
+        }
         if log_enabled() {
             match &cmd {
                 OsCmd::WindowCreate { id, kind, parent, geom } => eprintln!(
@@ -245,6 +265,10 @@ impl Shared {
     pub fn direct_display(&self) -> bool {
         matches!(lock(&self.run).ready.as_ref(), Some(Ok(Protocol::Direct)))
     }
+    /// A makepad window manager hosts this process's windows (wm.rs).
+    pub fn window_manager(&self) -> bool {
+        matches!(lock(&self.run).ready.as_ref(), Some(Ok(Protocol::Wm)))
+    }
     fn flags(&self) -> u32 {
         self.flags.load(Ordering::Acquire)
     }
@@ -281,6 +305,18 @@ impl Shared {
                 }
                 if e.tag == crate::events::event_tag::Closed {
                     closed.push((recipient, e.window));
+                }
+                match e.decode(p) {
+                    Some(crate::HalEvent::Geom { window, x, y, .. }) => {
+                        let known = matches!(lock(&self.run).ready, Some(Ok(Protocol::X11 | Protocol::Direct)));
+                        if !matches!(lock(&self.run).ready, Some(Ok(Protocol::Wm))) {
+                        atspi::geometry(crate::a11y::window_key(recipient, window.index),
+                            (known && x.is_finite() && y.is_finite()).then_some((x as f32, y as f32)));
+                        }
+                    }
+                    Some(crate::HalEvent::Focus { window, focused }) =>
+                        atspi::focus(crate::a11y::window_key(recipient, window.index), focused),
+                    _ => (),
                 }
                 world.window_event(recipient, e, p);
             });

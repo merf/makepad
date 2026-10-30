@@ -19,7 +19,7 @@ impl<T, E> Result<T, E> {
     pub const fn is_ok(&self) -> bool {
         matches!(*self, Ok(_))
     }
-    pub fn is_ok_and<F: FnOnce(T) -> bool>(self, f: F) -> bool {
+    pub const fn is_ok_and<F: FnOnce(T) -> bool>(self, f: F) -> bool {
         match self {
             Ok(x) => f(x),
             Err(_) => false,
@@ -28,19 +28,19 @@ impl<T, E> Result<T, E> {
     pub const fn is_err(&self) -> bool {
         !self.is_ok()
     }
-    pub fn is_err_and<F: FnOnce(E) -> bool>(self, f: F) -> bool {
+    pub const fn is_err_and<F: FnOnce(E) -> bool>(self, f: F) -> bool {
         match self {
             Ok(_) => false,
             Err(e) => f(e),
         }
     }
-    pub fn ok(self) -> Option<T> {
+    pub const fn ok(self) -> Option<T> {
         match self {
             Ok(x) => Some(x),
             Err(_) => None,
         }
     }
-    pub fn err(self) -> Option<E> {
+    pub const fn err(self) -> Option<E> {
         match self {
             Ok(_) => None,
             Err(e) => Some(e),
@@ -52,13 +52,13 @@ impl<T, E> Result<T, E> {
             Err(ref x) => Err(x),
         }
     }
-    pub fn as_mut(&mut self) -> Result<&mut T, &mut E> {
+    pub const fn as_mut(&mut self) -> Result<&mut T, &mut E> {
         match *self {
             Ok(ref mut x) => Ok(x),
             Err(ref mut x) => Err(x),
         }
     }
-    pub fn as_deref(&self) -> Result<&T::Target, &E>
+    pub const fn as_deref(&self) -> Result<&T::Target, &E>
     where
         T: Deref,
     {
@@ -67,7 +67,7 @@ impl<T, E> Result<T, E> {
             Err(e) => Err(e),
         }
     }
-    pub fn as_deref_mut(&mut self) -> Result<&mut T::Target, &mut E>
+    pub const fn as_deref_mut(&mut self) -> Result<&mut T::Target, &mut E>
     where
         T: DerefMut,
     {
@@ -76,47 +76,47 @@ impl<T, E> Result<T, E> {
             Err(e) => Err(e),
         }
     }
-    pub fn map<U, F: FnOnce(T) -> U>(self, op: F) -> Result<U, E> {
+    pub const fn map<U, F: FnOnce(T) -> U>(self, op: F) -> Result<U, E> {
         match self {
             Ok(t) => Ok(op(t)),
             Err(e) => Err(e),
         }
     }
-    pub fn map_or<U, F: FnOnce(T) -> U>(self, default: U, f: F) -> U {
+    pub const fn map_or<U, F: FnOnce(T) -> U>(self, default: U, f: F) -> U {
         match self {
             Ok(t) => f(t),
             Err(_) => default,
         }
     }
-    pub fn map_or_else<U, D: FnOnce(E) -> U, F: FnOnce(T) -> U>(self, default: D, f: F) -> U {
+    pub const fn map_or_else<U, D: FnOnce(E) -> U, F: FnOnce(T) -> U>(self, default: D, f: F) -> U {
         match self {
             Ok(t) => f(t),
             Err(e) => default(e),
         }
     }
-    pub fn map_err<F2, O: FnOnce(E) -> F2>(self, op: O) -> Result<T, F2> {
+    pub const fn map_err<F2, O: FnOnce(E) -> F2>(self, op: O) -> Result<T, F2> {
         match self {
             Ok(t) => Ok(t),
             Err(e) => Err(op(e)),
         }
     }
-    pub fn inspect<F: FnOnce(&T)>(self, f: F) -> Result<T, E> {
+    pub const fn inspect<F: FnOnce(&T)>(self, f: F) -> Result<T, E> {
         if let Ok(ref t) = self {
             f(t);
         }
         self
     }
-    pub fn inspect_err<F: FnOnce(&E)>(self, f: F) -> Result<T, E> {
+    pub const fn inspect_err<F: FnOnce(&E)>(self, f: F) -> Result<T, E> {
         if let Err(ref e) = self {
             f(e);
         }
         self
     }
-    pub fn iter(&self) -> crate::option::Iter<'_, T> {
-        crate::option::Iter::from_option(self.as_ref().ok())
+    pub const fn iter(&self) -> Iter<'_, T> {
+        Iter { inner: self.as_ref().ok() }
     }
-    pub fn iter_mut(&mut self) -> crate::option::IterMut<'_, T> {
-        crate::option::IterMut { inner: self.as_mut().ok() }
+    pub const fn iter_mut(&mut self) -> IterMut<'_, T> {
+        IterMut { inner: self.as_mut().ok() }
     }
     #[track_caller]
     pub fn expect(self, msg: &str) -> T
@@ -138,7 +138,7 @@ impl<T, E> Result<T, E> {
             Err(e) => unwrap_failed("called `Result::unwrap()` on an `Err` value", &e),
         }
     }
-    pub fn unwrap_or_default(self) -> T
+    pub const fn unwrap_or_default(self) -> T
     where
         T: Default,
     {
@@ -167,44 +167,44 @@ impl<T, E> Result<T, E> {
             Err(e) => e,
         }
     }
-    pub fn and<U>(self, res: Result<U, E>) -> Result<U, E> {
+    pub const fn and<U>(self, res: Result<U, E>) -> Result<U, E> {
         match self {
             Ok(_) => res,
             Err(e) => Err(e),
         }
     }
-    pub fn and_then<U, F: FnOnce(T) -> Result<U, E>>(self, op: F) -> Result<U, E> {
+    pub const fn and_then<U, F: FnOnce(T) -> Result<U, E>>(self, op: F) -> Result<U, E> {
         match self {
             Ok(t) => op(t),
             Err(e) => Err(e),
         }
     }
-    pub fn or<F2>(self, res: Result<T, F2>) -> Result<T, F2> {
+    pub const fn or<F2>(self, res: Result<T, F2>) -> Result<T, F2> {
         match self {
             Ok(v) => Ok(v),
             Err(_) => res,
         }
     }
-    pub fn or_else<F2, O: FnOnce(E) -> Result<T, F2>>(self, op: O) -> Result<T, F2> {
+    pub const fn or_else<F2, O: FnOnce(E) -> Result<T, F2>>(self, op: O) -> Result<T, F2> {
         match self {
             Ok(t) => Ok(t),
             Err(e) => op(e),
         }
     }
-    pub fn unwrap_or(self, default: T) -> T {
+    pub const fn unwrap_or(self, default: T) -> T {
         match self {
             Ok(t) => t,
             Err(_) => default,
         }
     }
-    pub fn unwrap_or_else<F: FnOnce(E) -> T>(self, op: F) -> T {
+    pub const fn unwrap_or_else<F: FnOnce(E) -> T>(self, op: F) -> T {
         match self {
             Ok(t) => t,
             Err(e) => op(e),
         }
     }
     #[track_caller]
-    pub unsafe fn unwrap_unchecked(self) -> T {
+    pub const unsafe fn unwrap_unchecked(self) -> T {
         match self {
             Ok(t) => t,
             Err(_) => crate::hint::unreachable_unchecked(),
@@ -213,7 +213,7 @@ impl<T, E> Result<T, E> {
 }
 
 impl<T, E> Result<Option<T>, E> {
-    pub fn transpose(self) -> Option<Result<T, E>> {
+    pub const fn transpose(self) -> Option<Result<T, E>> {
         match self {
             Ok(Some(x)) => Some(Ok(x)),
             Ok(None) => None,
@@ -223,7 +223,7 @@ impl<T, E> Result<Option<T>, E> {
 }
 
 impl<'a, T: Copy, E> Result<&'a T, E> {
-    pub fn copied(self) -> Result<T, E> {
+    pub const fn copied(self) -> Result<T, E> {
         match self {
             Ok(&v) => Ok(v),
             Err(e) => Err(e),
@@ -240,11 +240,75 @@ impl<'a, T: Clone, E> Result<&'a T, E> {
     }
 }
 
+#[inline(never)]
+#[cold]
 #[track_caller]
 fn unwrap_failed(msg: &str, error: &dyn fmt::Debug) -> ! {
     crate::panicking::panic_fmt(format_args!("{msg}: {error:?}"))
 }
 
+// core/src/result.rs: the iterators hold the `Ok` reference itself (their Debug shows `Iter { inner: .. }`)
+#[derive(Debug)]
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+pub struct Iter<'a, T: 'a> {
+    inner: Option<&'a T>,
+}
+
+impl<'a, T> Iterator for Iter<'a, T> {
+    type Item = &'a T;
+    fn next(&mut self) -> Option<&'a T> {
+        self.inner.take()
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = if self.inner.is_some() { 1 } else { 0 };
+        (n, Some(n))
+    }
+}
+
+impl<'a, T> DoubleEndedIterator for Iter<'a, T> {
+    fn next_back(&mut self) -> Option<&'a T> {
+        self.inner.take()
+    }
+}
+
+impl<T> ExactSizeIterator for Iter<'_, T> {}
+impl<T> crate::iter::FusedIterator for Iter<'_, T> {}
+unsafe impl<A> crate::iter::TrustedLen for Iter<'_, A> {}
+
+impl<T> Clone for Iter<'_, T> {
+    fn clone(&self) -> Self {
+        Iter { inner: self.inner }
+    }
+}
+
+#[derive(Debug)]
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+pub struct IterMut<'a, T: 'a> {
+    inner: Option<&'a mut T>,
+}
+
+impl<'a, T> Iterator for IterMut<'a, T> {
+    type Item = &'a mut T;
+    fn next(&mut self) -> Option<&'a mut T> {
+        self.inner.take()
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = if self.inner.is_some() { 1 } else { 0 };
+        (n, Some(n))
+    }
+}
+
+impl<'a, T> DoubleEndedIterator for IterMut<'a, T> {
+    fn next_back(&mut self) -> Option<&'a mut T> {
+        self.inner.take()
+    }
+}
+
+impl<T> ExactSizeIterator for IterMut<'_, T> {}
+impl<T> crate::iter::FusedIterator for IterMut<'_, T> {}
+unsafe impl<A> crate::iter::TrustedLen for IterMut<'_, A> {}
+
+#[derive(Clone, Debug)]
 pub struct IntoIter<T> {
     inner: Option<T>,
 }
@@ -279,16 +343,16 @@ impl<T, E> IntoIterator for Result<T, E> {
 
 impl<'a, T, E> IntoIterator for &'a Result<T, E> {
     type Item = &'a T;
-    type IntoIter = crate::option::Iter<'a, T>;
-    fn into_iter(self) -> crate::option::Iter<'a, T> {
+    type IntoIter = Iter<'a, T>;
+    fn into_iter(self) -> Iter<'a, T> {
         self.iter()
     }
 }
 
 impl<'a, T, E> IntoIterator for &'a mut Result<T, E> {
     type Item = &'a mut T;
-    type IntoIter = crate::option::IterMut<'a, T>;
-    fn into_iter(self) -> crate::option::IterMut<'a, T> {
+    type IntoIter = IterMut<'a, T>;
+    fn into_iter(self) -> IterMut<'a, T> {
         self.iter_mut()
     }
 }

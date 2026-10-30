@@ -5,7 +5,7 @@
 //! click or a caption drag, as on X11).
 
 use super::super::super::exec::OsCmd;
-use super::{clipboard, dialog, drag, ime, keys, lock, log_enabled, menu, rawinput, Key, Native, Op, Shared, WM_HAL_OPS};
+use super::{a11y, clipboard, dialog, drag, identity, ime, keys, lock, log_enabled, menu, rawinput, tray, Key, Native, Op, Shared, WM_HAL_OPS};
 use crate::types::*;
 use crate::Id;
 use makepad_windows_sys::core::PCWSTR;
@@ -19,6 +19,7 @@ use makepad_windows_sys::Win32::UI::Controls::{MARGINS, WM_MOUSELEAVE};
 use makepad_windows_sys::Win32::UI::HiDpi::*;
 use makepad_windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use makepad_windows_sys::Win32::UI::WindowsAndMessaging::*;
+use makepad_windows_sys::system_web_view::Win32::UI::{Input::KeyboardAndMouse::SetFocus, WindowsAndMessaging::{IsChild, WM_PAINT}};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -64,6 +65,8 @@ pub(super) struct Win {
     pub(super) buttons: Cell<u32>,
     last_pos: Cell<(f64, f64)>,
     no_focus: bool,
+    /// Native inspection keeps an HWND without ever showing or activating it.
+    hidden: bool,
     pub(super) ime: ime::ImeState,
     /// the app's last answer to a `DragOver` (`drag_response`): what an OLE drop gets now
     pub(super) drag_answer: Cell<u32>,
@@ -85,6 +88,10 @@ impl Win {
     }
     fn popup(&self) -> bool {
         self.kind & 0xff == window_kind::POPUP
+    }
+    /// a tray app's dropdown: shown by `WindowAtTray`, dismissed when it is deactivated
+    fn dropdown(&self) -> bool {
+        self.kind & 0xff == window_kind::DROPDOWN
     }
     fn maximized(&self) -> bool {
         unsafe { IsZoomed(self.hwnd.get()).as_bool() }
@@ -124,8 +131,38 @@ pub(super) fn win_of(hwnd: HWND) -> Option<Rc<Win>> {
     }
 }
 
+/// The window a session's commands for `key` act on: the one it owns, or the one lent to it
+/// (`Op::Lend`: makepad run's app draws into the host's window under its own id), as the X11,
+/// Wayland and AppKit backends resolve it. Without the lent case every command of a borrowing
+/// app was dropped: its drag-query answers (no drag, no caption move: a press only became a click
+/// at its release), cursors, IME areas.
 fn find(key: Key) -> Option<Rc<Win>> {
-    APP.with_borrow(|a| a.wins.get(&key).cloned())
+    APP.with_borrow(|a| a.wins.get(&key).or_else(|| a.wins.values().find(|w| w.recipient.get() == key)).cloned())
+}
+
+/// The session's main window, owned or lent to it.
+fn session_window(a: &App, sid: u32) -> Option<&Rc<Win>> {
+    a.wins.values().find(|w| (w.own.0 == sid || w.recipient.get().0 == sid) && !w.popup())
+}
+
+/// The HWND of a session's main window (shell thread).
+pub(super) fn session_hwnd(sid: u32) -> Option<usize> {
+    APP.with_borrow(|a| session_window(a, sid).map(|w| w.hwnd.get().0 as usize))
+}
+
+/// Gives the keyboard focus back to one of our windows from a hosted native view (shell
+/// thread). `tab`: the view asked to move focus on (backwards when true): Makepad hears Tab.
+pub(super) fn focus_window(hwnd: usize, tab: Option<bool>) {
+    let hwnd = HWND(hwnd as _);
+    let Some(w) = win_of(hwnd) else { return };
+    if log_enabled() { eprintln!("[hal-win32] window {:?} takes the keyboard back from its page (tab: {tab:?})", w.own); }
+    unsafe { let _ = SetFocus(Some(hwnd)); }
+    if let Some(back) = tab {
+        let mods = if back { input::MOD_SHIFT } else { 0 };
+        let tab = makepad_key_code::KeyCode::Tab.to_index();
+        w.push(|q, id| q.key_down(id, tab, false, mods));
+        w.push(|q, id| q.key_up(id, tab, mods));
+    }
 }
 
 /// The app theme the user chose (Settings > Personalization > Colors: AppsUseLightTheme).
@@ -222,6 +259,7 @@ pub(super) fn start(s: &'static Shared) -> Result<(), String> {
         }
         s.dispatch.store(dispatch.0 as usize, Ordering::Release);
         s.dpi.store(dpi.to_bits(), Ordering::Release);
+        identity::process_started();
         // the main thread is OLE's STA: drop targets and outgoing drags
         match OleInitialize(std::ptr::null()) {
             Ok(()) => OLE.set(true),
@@ -249,6 +287,7 @@ pub(super) fn message_loop(_s: &'static Shared) {
             DispatchMessageW(&msg);
         }
     }
+    super::super::media::web_view_runtime::shutdown();
 }
 
 unsafe extern "system" fn monitor_proc(monitor: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> makepad_windows_sys::core::BOOL {
@@ -296,8 +335,11 @@ unsafe extern "system" fn dispatch_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
 
 fn apply(s: &'static Shared, op: Op) {
     match op {
+        Op::A11yNotify(key, update) => a11y::notify(key, update),
         Op::Cmd(sid, cmd) => command(s, sid, cmd),
         Op::CloseSession(sid) => {
+            super::super::media::web_view_runtime::session_closed(sid);
+            a11y::close_session(sid);
             let wins: Vec<Rc<Win>> = APP.with_borrow(|a| a.wins.values().filter(|w| w.own.0 == sid).cloned().collect());
             for w in wins {
                 w.silent.set(true);
@@ -306,6 +348,7 @@ fn apply(s: &'static Shared, op: Op) {
                 }
             }
             menu::session_closed(sid);
+            tray::session_closed(sid);
             clipboard::session_closed(sid);
             if let Some(icon) = APP.with_borrow_mut(|a| a.icons.remove(&sid)) {
                 unsafe {
@@ -315,7 +358,11 @@ fn apply(s: &'static Shared, op: Op) {
         }
         Op::Lend { host, session, alias } => {
             if let Some(w) = find((crate::session::HOST, host)) {
+                let old = w.recipient.get();
+                a11y::unregister(crate::a11y::window_key(old.0, old.1.index));
                 w.recipient.set(if session == crate::session::HOST { (crate::session::HOST, host) } else { (session, alias) });
+                let new = w.recipient.get();
+                a11y::register(crate::a11y::window_key(new.0, new.1.index), w.hwnd.get());
                 publish_geom(&w);
             }
         }
@@ -327,10 +374,16 @@ fn apply(s: &'static Shared, op: Op) {
                 }
             }
         }
+        Op::SystemWebViewCreate { key, url, visual } => super::super::media::web_view_runtime::create(key, url, visual),
+        Op::SystemWebViewOp { key, op, arg, data } => super::super::media::web_view_runtime::operation(key, op, arg, &data),
+        Op::SystemWebViewPlace { key, hwnd, origin, size, visible } => super::super::media::web_view_runtime::place(key, hwnd, origin, size, visible),
+        Op::SystemWebViewRetarget { key, visual } => super::super::media::web_view_runtime::retarget(key, visual),
+        Op::SystemWebViewDestroy(key) => super::super::media::web_view_runtime::destroy(key),
     }
 }
 
 fn show(w: &Win) {
+    if w.hidden { return; }
     unsafe {
         let cmd = if w.no_focus || w.popup() { SW_SHOWNOACTIVATE } else { SW_SHOW };
         let _ = ShowWindow(w.hwnd.get(), cmd);
@@ -354,6 +407,8 @@ fn to_back(w: &Win) {
 fn style_for(kind: u32) -> (WINDOW_STYLE, WINDOW_EX_STYLE) {
     match kind & 0xff {
         window_kind::POPUP => (WS_POPUP, WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE),
+        // no taskbar button of its own, above the others; it takes the focus when shown
+        window_kind::DROPDOWN => (WS_POPUP, WS_EX_TOOLWINDOW | WS_EX_TOPMOST),
         window_kind::CHROMELESS => (WS_POPUP | WS_THICKFRAME, WS_EX_APPWINDOW),
         _ => (WS_OVERLAPPEDWINDOW, WS_EX_APPWINDOW),
     }
@@ -397,10 +452,11 @@ fn create(s: &'static Shared, sid: u32, id: Id, kind: u32, parent: Id, geom: [f3
         high_surrogate: Cell::new(0),
         cursor: Cell::new(cursor::DEFAULT),
         silent: Cell::new(false),
-        hidden_until_present: Cell::new(flags & open_flags::HIDDEN_UNTIL_PRESENT != 0 && !s.revealed.load(Ordering::Acquire)),
+        hidden_until_present: Cell::new(kind & 0xff != window_kind::DROPDOWN && flags & open_flags::HIDDEN_UNTIL_PRESENT != 0 && !s.revealed.load(Ordering::Acquire)),
         buttons: Cell::new(0),
         last_pos: Cell::new((0.0, 0.0)),
         no_focus: flags & open_flags::NO_FOCUS != 0,
+        hidden: std::env::var_os("MAKEPAD_HIDE_WINDOWS").is_some(),
         ime: ime::ImeState::default(),
         drag_answer: Cell::new(input::drag_response::NONE),
         drop_target: RefCell::new(None),
@@ -424,6 +480,7 @@ fn create(s: &'static Shared, sid: u32, id: Id, kind: u32, parent: Id, geom: [f3
         s.push(key, |q, id| q.closed(id));
         return;
     }
+    a11y::register(crate::a11y::window_key(key.0, key.1.index), hwnd);
     *win.native.borrow_mut() = Some(s.register(key, hwnd, win.popup()));
     if !win.popup() {
         unsafe {
@@ -444,6 +501,7 @@ fn create(s: &'static Shared, sid: u32, id: Id, kind: u32, parent: Id, geom: [f3
     win.dpi.set(dpi_of(hwnd));
     ime::window_created(&win);
     if !win.popup() {
+        identity::window_created(hwnd);
         apply_dark(hwnd);
         if OLE.get() {
             drag::register(&win);
@@ -453,7 +511,8 @@ fn create(s: &'static Shared, sid: u32, id: Id, kind: u32, parent: Id, geom: [f3
         }
     }
     publish_geom(&win);
-    if !win.hidden_until_present.get() {
+    // a dropdown waits for `WindowAtTray`
+    if !win.hidden_until_present.get() && !win.dropdown() {
         show(&win);
     }
     if log_enabled() {
@@ -537,8 +596,17 @@ fn command(s: &'static Shared, sid: u32, cmd: OsCmd) {
                 publish_geom(&w);
             }
         }
+        // the app-drawn caption's close: the window's own WM_CLOSE answers `CloseRequested`
+        OsCmd::WindowState { id, state: window_state::CLOSE } => {
+            if let Some(w) = target(id) {
+                unsafe {
+                    let _ = PostMessageW(Some(w.hwnd.get()), WM_CLOSE, WPARAM(0), LPARAM(0));
+                }
+            }
+        }
         OsCmd::WindowState { id, state } => {
             if let Some(w) = target(id) {
+                if w.hidden { return; }
                 // fullscreen is a maximize over the whole monitor: switching between the two
                 // goes through the normal rect, so a later restore finds it
                 let full = state == window_state::FULLSCREEN;
@@ -588,7 +656,8 @@ fn command(s: &'static Shared, sid: u32, cmd: OsCmd) {
             }
         }
         OsCmd::ActivateApp => {
-            if let Some(w) = APP.with_borrow(|a| a.wins.values().find(|w| w.own.0 == sid && !w.popup()).cloned()) {
+            if let Some(w) = APP.with_borrow(|a| session_window(a, sid).cloned()) {
+                if w.hidden { return; }
                 unsafe {
                     let _ = SetForegroundWindow(w.hwnd.get());
                 }
@@ -620,12 +689,21 @@ fn command(s: &'static Shared, sid: u32, cmd: OsCmd) {
             }
         }
         OsCmd::MenuSet { items } => menu::set(sid, items),
+        OsCmd::TraySet { tray, w, h, alpha, tooltip, items, .. } => tray::set(sid, tray, w, h, alpha, tooltip, items),
+        OsCmd::WindowAtTray { id, tray, w, h } => {
+            if let Some(win) = target(id) {
+                if win.hidden { return; }
+                tray::window_at(sid, win.hwnd.get(), tray, w, h);
+                publish_geom(&win);
+            }
+        }
+        OsCmd::TrayRemove { tray } => tray::remove(sid, tray),
         OsCmd::FileDialog { req, kind, title, location, filename, filters } => {
-            let owner = APP.with_borrow(|a| a.wins.values().find(|w| w.own.0 == sid && !w.popup()).map(|w| w.hwnd.get().0 as usize)).unwrap_or(0);
+            let owner = APP.with_borrow(|a| session_window(a, sid).map(|w| w.hwnd.get().0 as usize)).unwrap_or(0);
             dialog::open(dialog::Request { sid, req, kind, title, location, filename, filters, owner });
         }
-        OsCmd::DragStart { id, items } => match target(id) {
-            Some(w) => drag::start(&w, &items),
+        OsCmd::DragStart { id, items, .. } => match target(id) {
+            Some(w) => drag::start(&w, &crate::drag_promise::to_files(items)),
             None => s.push((sid, id), |q, id| q.drag_drop(id, -100000.0, -100000.0, false, 0, &[])),
         },
         OsCmd::PointerLock { id, mode } => {
@@ -690,6 +768,13 @@ pub(super) fn handles(cmd: &OsCmd) -> bool {
             | OsCmd::ImeHide { .. }
             | OsCmd::ImeSync { .. }
             | OsCmd::MenuSet { .. }
+            | OsCmd::TraySet { .. }
+            | OsCmd::TrayRemove { .. }
+            | OsCmd::WindowAtTray { .. }
+            | OsCmd::XrFrameEyes { .. }
+            | OsCmd::XrPoseLead { .. }
+            | OsCmd::XrRefreshRate { .. }
+            | OsCmd::XrHaptic { .. }
             | OsCmd::FileDialog { .. }
             | OsCmd::AppIcon { .. }
     )
@@ -722,7 +807,7 @@ fn set_app_icon(sid: u32, w: u32, h: u32, rgba: &[u8]) {
             return;
         }
     };
-    let wins: Vec<HWND> = APP.with_borrow(|a| a.wins.values().filter(|w| w.own.0 == sid && !w.popup()).map(|w| w.hwnd.get()).collect());
+    let wins: Vec<HWND> = APP.with_borrow(|a| a.wins.values().filter(|w| (w.own.0 == sid || w.recipient.get().0 == sid) && !w.popup()).map(|w| w.hwnd.get()).collect());
     for hwnd in &wins {
         set_icon(*hwnd, icon);
     }
@@ -754,6 +839,10 @@ fn set_visuals(w: &Win, visuals: u32, _intensity: f32) {
         _ => DWMSBT_TABBEDWINDOW,
     };
     let inset = if transparent || backdrop != 0 { -1 } else { 0 };
+    if let Some(native) = w.native.borrow().as_ref() {
+        // the window's composition swapchain carries alpha from its next frame on
+        native.see_through.store(inset != 0, Ordering::Release);
+    }
     if log_enabled() {
         eprintln!("[hal-win32] window {:?}: visuals transparent={transparent} backdrop={backdrop}", w.own);
     }
@@ -843,7 +932,7 @@ fn mouse_button(w: &Rc<Win>, button: u32, down: bool, lparam: LPARAM) {
         }
         w.buttons.set(w.buttons.get() | button);
         if !w.popup() {
-            dismiss_popups(w.own.0);
+            dismiss_popups(w.recipient.get().0);
         }
         if !w.popup() && matches!(button, 1 | 2) && w.pending.get().is_none() {
             let mut screen = POINT { x: px, y: py };
@@ -934,6 +1023,74 @@ unsafe fn min_max_info(w: &Win, info: &mut MINMAXINFO) {
     }
 }
 
+/// Pointer input inside a native layer's input region (its last committed placement) goes to
+/// the layer's content, as does everything after a press there until the buttons are up. The
+/// pointer entering a layer from Makepad's area is a leave for Makepad.
+unsafe fn route_to_layer(w: &Rc<Win>, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+    use super::super::media::web_view_runtime::{captured, route_mouse, route_pointer, Routed};
+    use makepad_windows_sys::system_web_view::Win32::UI::{Input::Pointer::GetPointerType, WindowsAndMessaging as pointer};
+    let hwnd = w.hwnd.get();
+    if matches!(msg, pointer::WM_POINTERDOWN | pointer::WM_POINTERUPDATE | pointer::WM_POINTERUP | pointer::WM_POINTERENTER
+        | pointer::WM_POINTERLEAVE | pointer::WM_POINTERCAPTURECHANGED) {
+        // touch and pen in a layer go to its content as pointer input (not promoted to mouse)
+        let id = (wparam.0 & 0xffff) as u32;
+        let mut kind = pointer::POINTER_INPUT_TYPE::default();
+        if GetPointerType(id, &mut kind).is_err() || !(kind == pointer::PT_TOUCH || kind == pointer::PT_PEN) {
+            return None;
+        }
+        let (sx, sy) = lparam_point(lparam);
+        let mut pt = POINT { x: sx, y: sy };
+        let _ = ScreenToClient(hwnd, &mut pt);
+        return route_pointer(hwnd.0 as usize, msg, id, pt.x as f32, pt.y as f32).then_some(LRESULT(0));
+    }
+    let button = matches!(msg, WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_XBUTTONDOWN | WM_XBUTTONUP);
+    let wheel = matches!(msg, WM_MOUSEWHEEL | WM_MOUSEHWHEEL);
+    if !(button || wheel || msg == WM_MOUSEMOVE || msg == WM_MOUSELEAVE) || rawinput::held(hwnd) {
+        return None;
+    }
+    // a Makepad press (or drag query) in progress keeps its pointer
+    let layer_press = captured(hwnd.0 as usize);
+    if !layer_press && (w.buttons.get() != 0 || w.pending.get().is_some()) {
+        return None;
+    }
+    if !layer_press && Shared::global().layer_regions(hwnd.0 as usize).is_none() && msg != WM_MOUSELEAVE {
+        return None;
+    }
+    let (mut px, mut py) = lparam_point(lparam);
+    if wheel {
+        let mut pt = POINT { x: px, y: py };
+        let _ = ScreenToClient(hwnd, &mut pt);
+        (px, py) = (pt.x, pt.y);
+    }
+    let keys = (wparam.0 & 0xffff) as u32;
+    let data = if wheel || matches!(msg, WM_XBUTTONDOWN | WM_XBUTTONUP) { ((wparam.0 >> 16) & 0xffff) as u16 as i16 as i32 as u32 } else { 0 };
+    let routed = route_mouse(hwnd.0 as usize, msg, keys, data, px as f32, py as f32);
+    if matches!(routed, Routed::Makepad) {
+        return None;
+    }
+    if matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN) {
+        if !w.popup() { dismiss_popups(w.recipient.get().0); }
+        SetCapture(hwnd);
+    } else if button && !captured(hwnd.0 as usize) && GetCapture() == hwnd {
+        let _ = ReleaseCapture();
+    }
+    if matches!(routed, Routed::Entered) {
+        let (x, y) = w.last_pos.get();
+        w.cursor.set(cursor::DEFAULT);
+        w.push(|q, id| q.mouse_leave(id, x, y));
+    }
+    if msg == WM_MOUSELEAVE {
+        // the leave still ends the hover
+        w.tracking.set(false);
+        return None;
+    }
+    if msg == WM_MOUSEMOVE && !w.tracking.replace(true) {
+        let mut tme = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
+        let _ = TrackMouseEvent(&mut tme);
+    }
+    Some(LRESULT(if matches!(msg, WM_XBUTTONDOWN | WM_XBUTTONUP) { 1 } else { 0 }))
+}
+
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if msg == WM_NCCREATE {
         let cs = &*(lparam.0 as *const CREATESTRUCTW);
@@ -950,7 +1107,21 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         return DefWindowProcW(hwnd, msg, wparam, lparam);
     }
     let Some(w) = win_of(hwnd) else { return DefWindowProcW(hwnd, msg, wparam, lparam) };
+    if (msg == WM_CAPTURECHANGED && lparam.0 != hwnd.0 as isize) || msg == WM_CANCELMODE {
+        super::super::media::web_view_runtime::capture_lost(hwnd.0 as usize);
+    }
+    match route_to_layer(&w, msg, wparam, lparam) {
+        Some(result) => return result,
+        None if matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN) => {
+            super::super::media::web_view_runtime::press_outside(hwnd.0 as usize);
+        }
+        None => {}
+    }
     match msg {
+        WM_GETOBJECT if lparam.0 as i32 == makepad_windows_sys::Win32::UI::Accessibility::UiaRootObjectId => {
+            let key = w.recipient.get();
+            return a11y::get_object(crate::a11y::window_key(key.0, key.1.index), hwnd, wparam, lparam);
+        }
         WM_NCCALCSIZE if wparam.0 != 0 && !w.popup() => {
             // the client covers the whole window; a maximized window keeps its frame's inset so
             // its client matches the work area (unless it is chromeless when maximized)
@@ -1003,11 +1174,29 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 return LRESULT(1);
             }
             if (lparam.0 & 0xffff) as u32 == HTCLIENT {
-                set_cursor(w.cursor.get());
+                match super::super::media::web_view_runtime::hover_cursor(hwnd.0 as usize) {
+                    // a native layer's content chose its cursor (none yet: the arrow)
+                    Some(Some(c)) => { SetCursor(Some(c)); }
+                    Some(None) => set_cursor(cursor::DEFAULT),
+                    None => set_cursor(w.cursor.get()),
+                }
                 return LRESULT(1);
             }
         }
-        WM_SIZE | WM_MOVE => publish_geom(&w),
+        WM_SIZE => {
+            // a minimized window's web views stop rendering until it is shown again
+            super::super::media::web_view_runtime::minimized(hwnd.0 as usize, wparam.0 as u32 == SIZE_MINIMIZED);
+            publish_geom(&w)
+        }
+        WM_MOVE => {
+            super::super::media::web_view_runtime::parent_moved(hwnd.0 as usize);
+            publish_geom(&w)
+        }
+        // DirectComposition repaints the windows of a lost device: the HAL looks at it
+        WM_PAINT => {
+            super::super::d3d11::dcomp::request_check();
+            Shared::global().wake_all();
+        }
         WM_DPICHANGED => {
             let r = &*(lparam.0 as *const RECT);
             let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -1031,13 +1220,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         }
         WM_ENTERSIZEMOVE => {
             if !w.popup() {
-                dismiss_popups(w.own.0);
+                dismiss_popups(w.recipient.get().0);
             }
             w.push(|q, id| q.resize_loop(id, true));
         }
         WM_NCLBUTTONDOWN | WM_NCRBUTTONDOWN => {
             if !w.popup() {
-                dismiss_popups(w.own.0);
+                dismiss_popups(w.recipient.get().0);
             }
         }
         WM_EXITSIZEMOVE => {
@@ -1048,12 +1237,35 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             ime::focus(&w);
             w.push(|q, id| q.focus(id, true));
         }
+        // a hosted native view (its own child window) taking the keyboard keeps the window focused
+        WM_KILLFOCUS if wparam.0 != 0 && IsChild(hwnd, HWND(wparam.0 as _)).as_bool() => {
+            w.alt_tap.set(false);
+            w.forwarded.set([0; 4]);
+        }
         WM_KILLFOCUS => {
             w.alt_tap.set(false);
             w.forwarded.set([0; 4]);
             w.push(|q, id| q.focus(id, false));
         }
-        WM_ACTIVATE => rawinput::activated(hwnd, (wparam.0 & 0xffff) as u32 != WA_INACTIVE),
+        WM_ACTIVATE => {
+            let active = (wparam.0 & 0xffff) as u32 != WA_INACTIVE;
+            // a click anywhere else (or another app) took the focus from a dropdown
+            if !active && w.dropdown() && unsafe { IsWindowVisible(hwnd).as_bool() } {
+                w.push(|q, id| q.popup_dismissed(id));
+            }
+            rawinput::activated(hwnd, active);
+            if !active && super::super::media::web_view_runtime::deactivated(hwnd.0 as usize) {
+                // the page had the keyboard (the window kept its focus): now the window loses it
+                w.push(|q, id| q.focus(id, false));
+            }
+            if active {
+                // the default activation focuses the window; a page that had the keyboard gets
+                // it back after that
+                let r = DefWindowProcW(hwnd, msg, wparam, lparam);
+                super::super::media::web_view_runtime::activated(hwnd.0 as usize);
+                return r;
+            }
+        }
         WM_ACTIVATEAPP => app_activation(wparam.0 != 0),
         WM_INPUT => {
             rawinput::input(&w, lparam, modifiers());
@@ -1077,6 +1289,11 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             return LRESULT(0);
         }
         WM_DESTROY => {
+            let key = w.recipient.get();
+            a11y::unregister(crate::a11y::window_key(key.0, key.1.index));
+            if !w.popup() {
+                identity::window_destroyed(hwnd);
+            }
             rawinput::destroyed(hwnd);
             drag::revoke(&w);
             let s = Shared::global();

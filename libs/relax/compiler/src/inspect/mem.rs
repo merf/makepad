@@ -38,8 +38,9 @@ fn mb(v: u64) -> String {
     format!("{:.1}", v as f64 / MB)
 }
 
+/// A signed MB delta as a JSON number (no `+`: JSON has none).
 fn smb(v: i64) -> String {
-    format!("{:+.1}", v as f64 / MB)
+    format!("{:.1}", v as f64 / MB)
 }
 
 // ------------------------------------------------------------------ the timeline ring
@@ -53,6 +54,9 @@ const RING_MAX: usize = 4096;
 
 /// A detector tick: the resident size now (every `RING_STEP`-th tick once the ring halved).
 pub fn tick(n: u64, rss: u64) {
+    if n % 4 == 0 {
+        super::flightrec::counter("rss", rss as i64);
+    }
     let step = RING_STEP.load(std::sync::atomic::Ordering::Relaxed);
     if n % step != 0 {
         return;
@@ -69,6 +73,7 @@ pub fn tick(n: u64, rss: u64) {
 
 /// A phase marker on the memory timeline (main start, first present, snapshots, the app's marks).
 pub fn mark(label: &str) {
+    let _k = crate::zone_alloc::kept();
     let mut m = MARKS.lock().unwrap_or_else(|e| e.into_inner());
     if m.len() < 1024 {
         crate::zone_alloc::kept_with(|| m.push((now_ms(), label.to_string())));
@@ -174,6 +179,9 @@ fn os_regions(s: &mut Snap) {
     }
     let page = unsafe { vm_page_size } as u64;
     let (mut addr, mut depth) = (0u64, 0u32);
+    // MAKEPAD_RUN_MEM_REGIONS=1: the largest resident regions (address, size, resident, dirtied, tag, share mode, protection)
+    let list = std::env::var_os("MAKEPAD_RUN_MEM_REGIONS").is_some();
+    let mut big: Vec<(u64, u64, u64, u64, u32, u32, u32)> = Vec::new();
     // a VM object mapped more than once (Relax's JIT code has a writable and an executable view;
     // shared libraries' pages) counts once
     let mut seen_objects: std::collections::HashSet<u64> = std::collections::HashSet::new();
@@ -198,8 +206,50 @@ fn os_regions(s: &mut Snap) {
             let shared = matches!(share_mode, 4 | 5 | 7);
             let cat = tag_name(info[5]);
             s.add(&format!("regions/{}/{}", if shared { "shared" } else { "private" }, cat), resident);
+            // pages_reusable (index 16): resident but MADV_FREE_REUSABLE -- in the resident size, not in the footprint
+            if list {
+                big.push((resident, addr, size, info[9] as u64 * page, info[5], share_mode, info[0]));
+            }
+            let reusable = info[16] as u64 * page;
+            if reusable > 0 {
+                s.add(&format!("regions reusable/{}/{}", if shared { "shared" } else { "private" }, cat), reusable);
+            }
+            let dirty = info[9] as u64 * page;
+            if dirty > 0 {
+                s.add(&format!("regions dirtied/{}/{}", if shared { "shared" } else { "private" }, cat), dirty);
+            }
         }
         addr += size;
+    }
+    if list {
+        if let Some(a) = crate::jit::unit_areas() {
+            extern "C" { fn mincore(addr: *mut u8, len: usize, vec: *mut u8) -> i32; }
+            let names = ["exec", "ro data", "rw", "syms"];
+            for k in 0..4 {
+                let (lo, hi) = match k { 0 => (a[0], a[1]), 1 => (a[1], a[2]), 2 => (a[2], a[2] + crate::jit::UNIT_RW_SIZE), _ => (a[2] + crate::jit::UNIT_RW_SIZE, a[4]) };
+                let pages = ((hi - lo) / page) as usize;
+                let mut v = vec![0u8; pages];
+                let mut res = 0usize;
+                for chunk in 0..(pages + 4095) / 4096 {
+                    let (c0, c1) = (chunk * 4096, ((chunk + 1) * 4096).min(pages));
+                    if unsafe { mincore((lo + c0 as u64 * page) as *mut u8, (c1 - c0) * page as usize, v.as_mut_ptr().add(c0)) } == 0 {
+                        res += v[c0..c1].iter().filter(|b| **b & 1 != 0).count();
+                    }
+                }
+                eprintln!("makepad-run mem unit {}: {:#x}..{:#x} ({:.0} MB) resident {:.1} MB", names[k], lo, hi, (hi - lo) as f64 / 1048576.0, res as f64 * page as f64 / 1048576.0);
+            }
+        }
+        big.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        for (res, a, size, dirty, tag, share, prot) in big.into_iter().take(14) {
+            extern "C" {
+                fn proc_regionfilename(pid: i32, address: u64, buffer: *mut u8, size: u32) -> i32;
+                fn getpid() -> i32;
+            }
+            let mut buf = [0u8; 1024];
+            let n = unsafe { proc_regionfilename(getpid(), a, buf.as_mut_ptr(), buf.len() as u32) };
+            let file = if n > 0 { String::from_utf8_lossy(&buf[..n as usize]).into_owned() } else { String::new() };
+            eprintln!("makepad-run mem region: {:#x} size {:.1} MB resident {:.1} MB dirtied {:.1} MB tag {} share {} prot {} file {}", a, size as f64 / 1048576.0, res as f64 / 1048576.0, dirty as f64 / 1048576.0, tag, share, prot, file);
+        }
     }
 }
 
@@ -327,6 +377,11 @@ fn relax_parts(s: &mut Snap, compiler: bool, partial: &mut Vec<String>) {
     let (committed, live, _) = crate::zone_alloc::burst_stats();
     s.add("makepad-run/burst arena committed", committed as u64);
     s.add("makepad-run/burst arena live", live as u64);
+    let (jobs, survivor_jobs, survivor_bytes) = crate::zone_alloc::job_stats();
+    s.add("makepad-run/job arena/jobs ended", jobs as u64);
+    s.add("makepad-run/job arena/jobs that left survivors", survivor_jobs as u64);
+    s.add("makepad-run/job arena/survivor bytes (not copied out)", survivor_bytes as u64);
+    s.add("makepad-run/settle rebuilds", crate::jit::settle_rebuild::rebuilds() as u64);
     let (ccommitted, clive, cchunks) = crate::zone_alloc::compiler_stats();
     s.add("makepad-run/compiler arena committed", ccommitted as u64);
     s.add("makepad-run/compiler arena live", clive as u64);
@@ -345,7 +400,7 @@ fn relax_parts(s: &mut Snap, compiler: bool, partial: &mut Vec<String>) {
         }
     }
     if compiler && !up.is_null() {
-        let r = crate::owner::call_within(crate::owner::Class::Background, 3000, move || crate::memreport::unit_sizes(unsafe { &*up }));
+        let r = crate::owner::call_within(crate::owner::Class::Program, 3000, move || crate::memreport::unit_sizes(unsafe { &*up }));
         match r {
             Some(rows) => {
                 for (k, v) in rows {
@@ -380,10 +435,23 @@ fn keep(name: &str, s: Snap) {
 pub fn cmd_memory(req: &Req, out: &mut Out) {
     out.line(&format!("{{\"freed_by_domain_teardown_bytes\":{}}}", crate::domain::freed_by_teardown()));
     for d in crate::domain::list() {
-        out.line(&format!("{{\"domain\":{},\"package\":{},\"state\":{},\"arena_in_use_bytes\":{},\"arena_committed_bytes\":{},\"static_committed_bytes\":{},\"threads\":{},\"thread_names\":[{}]}}",
-            d.id, json_str(&d.package), json_str(&format!("{:?}", d.state)), d.arena_in_use, d.arena_committed, d.static_committed, d.threads,
+        out.line(&format!("{{\"domain\":{},\"package\":{},\"state\":{},\"arena_in_use_bytes\":{},\"arena_committed_bytes\":{},\"arena_touched_small_bytes\":{},\"arena_live_slot_bytes\":{},\"arena_large_bytes\":{},\"static_committed_bytes\":{},\"threads\":{},\"thread_names\":[{}]}}",
+            d.id, json_str(&d.package), json_str(&format!("{:?}", d.state)), d.arena_in_use, d.arena_committed, d.arena_detail.0, d.arena_detail.1, d.arena_detail.2, d.static_committed, d.threads,
             d.thread_names.iter().map(|s| json_str(s)).collect::<Vec<_>>().join(",")));
     }
+    // chunk states with resident bytes (MB): attached / listed / released / full, then large, then sparse
+    let st = |a: &[usize; 28]| {
+        let mb = |b: usize| format!("{:.1}", b as f64 / 1048576.0);
+        let row = |r: usize| format!("{{\"chunks\":{},\"touched_mb\":{},\"live_slots_mb\":{},\"resident_mb\":{}}}", a[r * 4], mb(a[r * 4 + 1]), mb(a[r * 4 + 2]), mb(a[r * 4 + 3]));
+        format!("\"attached\":{},\"listed\":{},\"released\":{},\"full\":{},\"large\":{{\"runs\":{},\"committed_mb\":{},\"resident_mb\":{}}},\"sparse\":{{\"chunks\":{},\"resident_mb\":{}}},\"old\":{{\"chunks\":{},\"live_slots_mb\":{},\"resident_mb\":{}}},\"free_granules\":{{\"attached_mb\":{},\"listed_mb\":{}}},\"attached_use\":{{\"requested_mb\":{},\"remote_pending_mb\":{}}}",
+            row(0), row(1), row(2), row(3), a[16], mb(a[17]), mb(a[18]), a[19], mb(a[20]), a[21], mb(a[22]), mb(a[23]), mb(a[24]), mb(a[25]), mb(a[26]), mb(a[27]))
+    };
+    for (id, a) in crate::domain::heap_states() {
+        out.line(&format!("{{\"arena_states\":\"domain {id:?}\",{}}}", st(&a)));
+    }
+    let (cs, bs) = crate::zone_alloc::arena_states();
+    out.line(&format!("{{\"arena_states\":\"compiler\",{}}}", st(&cs)));
+    out.line(&format!("{{\"arena_states\":\"burst\",{}}}", st(&bs)));
     let compiler = req.get("compiler") == Some("1");
     let n = req.num("n", 24) as usize;
     let mut partial = Vec::new();
@@ -404,9 +472,11 @@ pub fn cmd_memory(req: &Req, out: &mut Out) {
     total.push('}');
     out.line(&total);
     let ev = crate::zone_alloc::compiler_events();
+    let jobs = crate::zone_alloc::job_stats();
     // the three heaps apart (zone_alloc.rs): the program's malloc, the compiler's own arena, the JIT's mappings
+    out.line(&format!("{{\"trims\":{},\"last_trim_ms\":{}}}", crate::memstat::TRIMS.load(std::sync::atomic::Ordering::Relaxed), crate::memstat::LAST_TRIM_MS.load(std::sync::atomic::Ordering::Relaxed)));
     out.line(&format!(
-        "{{\"split\":{{\"routing\":{},\"program_heap_in_use_mb\":{},\"program_heap_held_free_mb\":{},\"compiler_arena_committed_mb\":{},\"compiler_arena_live_mb\":{},\"jit_code_mb\":{},\"jit_ro_data_mb\":{},\"program_statics_mb\":{},\"burst_arena_committed_mb\":{},\"compiler_arena_touched_mb\":{},\"compiler_arena_live_slots_mb\":{},\"compiler_arena_large_mb\":{},\"compiler_arena_chunks_listed\":{},\"compiler_arena_events\":{{\"contended_chunk\":{},\"contended_pool\":{},\"contended_warm\":{},\"contended_partial\":{},\"yields\":{},\"commits\":{},\"decommits\":{},\"pushes\":{},\"pops\":{},\"tombstone_frees\":{},\"generation\":{},\"tombstones\":{}}}{}}}}}",
+        "{{\"split\":{{\"routing\":{},\"program_heap_in_use_mb\":{},\"program_heap_held_free_mb\":{},\"compiler_arena_committed_mb\":{},\"compiler_arena_live_mb\":{},\"jit_code_mb\":{},\"jit_ro_data_mb\":{},\"program_statics_mb\":{},\"burst_arena_committed_mb\":{},\"compiler_arena_touched_mb\":{},\"compiler_arena_live_slots_mb\":{},\"compiler_arena_large_mb\":{},\"compiler_arena_chunks_listed\":{},\"compiler_arena_events\":{{\"contended_chunk\":{},\"contended_pool\":{},\"contended_warm\":{},\"contended_partial\":{},\"yields\":{},\"commits\":{},\"decommits\":{},\"pushes\":{},\"pops\":{}}},\"job_arena\":{{\"jobs\":{},\"survivor_jobs\":{},\"survivor_bytes\":{}}}}}}}",
         json_str(if crate::zone_alloc::compiler_arena_enabled() { "compiler arena" } else { "off (MAKEPAD_RUN_COMPILER_ARENA=0)" }),
         mb(inuse),
         mb(free),
@@ -421,9 +491,15 @@ pub fn cmd_memory(req: &Req, out: &mut Out) {
         mb(snap.get("makepad-run/compiler arena/large blocks")),
         snap.get("makepad-run/compiler arena/chunks listed for reuse"),
         ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7], ev[8],
-        crate::zone_alloc::compiler_tombstone_frees(), crate::zone_alloc::compiler_generation(), crate::zone_alloc::compiler_tombstones(),
-        match crate::jit::zone_scan::last_total() { Some(n) => format!(",\"kept_in_compiler\":{n}"), None => String::new() },
+        jobs.0, jobs.1, jobs.2,
     ));
+    // the arenas' census: committed bytes by small chunk / large run, and how much of the small
+    // chunks' touched pages a few surviving blocks pin
+    let (cc, bc) = crate::zone_alloc::arena_census();
+    for (name, c) in [("compiler", cc), ("burst", bc)] {
+        out.line(&format!("{{\"arena\":{},\"small_chunks\":{},\"small_touched_mb\":{},\"small_live_blocks\":{},\"small_live_slots_mb\":{},\"pinned_by_le4_blocks_mb\":{},\"large_runs\":{},\"large_mb\":{},\"largest_mb\":[{},{},{},{}]}}",
+            json_str(name), c[0], mb(c[1] as u64), c[2], mb(c[3] as u64), mb(c[4] as u64), c[5], mb(c[6] as u64), mb(c[7] as u64), mb(c[8] as u64), mb(c[9] as u64), mb(c[10] as u64)));
+    }
     // the tree: every node, ranked within its parent, top `n`
     let mut rows: Vec<&(String, u64)> = snap.nodes.iter().filter(|x| x.0.contains('/') && x.1 >= 1 << 20).collect();
     rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
@@ -446,7 +522,7 @@ pub fn cmd_memory(req: &Req, out: &mut Out) {
         let mut growth: Vec<(i64, &String)> = snap.nodes.iter().map(|(k, v)| (*v as i64 - p.iter().find(|x| &x.0 == k).map_or(0, |x| x.1 as i64), k)).filter(|x| x.0 >= 16 << 20 && x.1.contains('/')).collect();
         growth.sort_by(|a, b| b.0.cmp(&a.0));
         for (d, k) in growth.iter().take(3) {
-            f.push((*d as u64, format!("{} grew {} MB since the last `memory`", k, smb(*d))));
+            f.push((*d as u64, format!("{} grew +{} MB since the last `memory`", k, smb(*d))));
         }
     }
     let tracked = snap.get("malloc/in use/program (tracked stacks, est.)");
@@ -464,6 +540,18 @@ pub fn cmd_memory(req: &Req, out: &mut Out) {
 /// `mem snap <name>` / `mem timeline [step_ms=]` / `mem marks`.
 pub fn cmd_mem(req: &Req, out: &mut Out) {
     match req.pos.first().map(String::as_str) {
+        Some("trim") => {
+            // what a trim gives back now (the monitor trims after 1 s without compiles and at
+            // every 256 MB of growth)
+            let r0 = crate::memstat::resident();
+            let b0 = crate::zone_alloc::arena_census();
+            let t = std::time::Instant::now();
+            crate::memstat::trim();
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            let r1 = crate::memstat::resident();
+            out.line(&format!("{{\"trim\":\"done\",\"rss_before_mb\":{},\"rss_after_mb\":{},\"ms\":{:.1},\"burst_small_chunks\":{},\"compiler_small_chunks\":{}}}",
+                mb(r0), mb(r1), ms, b0.1[0], b0.0[0]));
+        }
         Some("snap") => {
             let name = req.pos.get(1).cloned().unwrap_or_else(|| format!("s{}", now_ms()));
             let mut partial = Vec::new();

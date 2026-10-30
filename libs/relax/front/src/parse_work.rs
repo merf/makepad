@@ -9,13 +9,16 @@ pub struct Reuse {
     expansions: crate::fxhash::HashMap<Vec<u8>, std::sync::Arc<crate::builtins::Expansion>>,
     rules: crate::fxhash::HashMap<Vec<u8>, std::sync::Arc<Rules>>,
 }
-pub type Rules = (String, Vec<(u32, u32, u32)>, Vec<(u32, u32, u32)>);
+/// transcription text, fragment-token origins, definition-body-token origins, opaque fragment
+/// groups (text offsets of the first token's start and the last token's end)
+/// a macro_rules expansion: its text, the tokens over it, token origins, body positions, token-tree groups
+pub type Rules = (String, Vec<crate::lexer::Tok>, Vec<(u32, u32, u32)>, Vec<(u32, u32, u32)>, Vec<(u32, u32)>);
 struct Reusing {
     previous: std::sync::Arc<Reuse>,
     next: Reuse,
     hits: usize,
 }
-crate::gen_local! {
+crate::memo_local! {
     static REUSE: RefCell<Option<Reusing>>;
 }
 pub struct Session;
@@ -174,8 +177,8 @@ pub fn put_rules(key: Option<Vec<u8>>, x: &Rules) {
 pub const SLOTS: usize = 10;
 #[derive(Default, Clone, Copy, Debug)]
 pub struct Times(pub [f64; SLOTS]);
-crate::gen_local! {
-    static STATE: RefCell<Option<(Times, [bool; SLOTS])>>;
+thread_local! {
+    static STATE: RefCell<Option<(Times, [bool; SLOTS])>> = Default::default();
 }
 pub fn begin() { STATE.with(|s| *s.borrow_mut() = Some((Times::default(), [false; SLOTS]))); }
 pub fn finish() -> Times { STATE.with(|s| s.borrow_mut().take().map(|s| s.0).unwrap_or_default()) }

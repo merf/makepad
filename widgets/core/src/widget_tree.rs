@@ -1,17 +1,10 @@
 use {
-    crate::button::Button,
-    crate::check_box::CheckBox,
-    crate::drop_down::DropDown,
     crate::makepad_draw::{cx_2d::Cx2d, cx_3d::Cx3d, *},
-    crate::makepad_platform::studio::WidgetSnapshot,
-    crate::radio_button::RadioButton,
-    crate::text_input::TextInput,
-    crate::widget::{SnapshotPart, WidgetRef, WidgetRegistry, WidgetUid, WidgetWeakRef},
+    crate::widget::{WidgetRef, WidgetRegistry, WidgetUid, WidgetWeakRef},
     crate::widget_async::update_global_ui_handle,
     crate::window::Window,
     std::cell::RefCell,
     std::collections::{HashMap, HashSet},
-    std::fmt::Write,
 };
 use crate::widget_hooks::WidgetHooks;
 
@@ -70,100 +63,6 @@ pub fn widget_type_names(cx: &Cx) -> HashMap<ScriptTypeId, LiveId> {
     widget_type_names
 }
 
-/// The rows a widget's drawn parts add to the snapshot, in the window of the
-/// widget that drew them. A part is only as visible as the widget it belongs
-/// to: a hidden bar's items must not look pressable to a test. Parts with no
-/// size are left out, as a dock header with no size is.
-fn snapshot_part_rows(
-    parts: Vec<SnapshotPart>,
-    node_visible: bool,
-    window_id: &str,
-    window_index: usize,
-    offset: (i64, i64),
-) -> Vec<WidgetSnapshot> {
-    parts
-        .into_iter()
-        .filter_map(|part| {
-            let width = part.rect.size.x.round() as i64;
-            let height = part.rect.size.y.round() as i64;
-            if width <= 0 || height <= 0 {
-                return None;
-            }
-            Some(WidgetSnapshot {
-                id: live_id_token(part.id),
-                widget_type: part.widget_type.to_string(),
-                window_id: window_id.to_string(),
-                window_index,
-                visible: node_visible,
-                enabled: part.enabled,
-                x: part.rect.pos.x.round() as i64 + offset.0,
-                y: part.rect.pos.y.round() as i64 + offset.1,
-                width,
-                height,
-                selected: part.selected.then(|| part.text.clone()),
-                checked: Some(part.selected),
-                text: Some(part.text),
-                value: None,
-                path: None,
-            })
-        })
-        .collect()
-}
-
-/// What a widget reported about itself through the `Widget` snapshot hooks.
-#[derive(Default)]
-struct SnapshotHooks {
-    checked: Option<bool>,
-    value: Option<String>,
-    selected: Option<String>,
-}
-
-/// What the tree can still read from the five widget types it knew before
-/// the hooks existed, plus the widget's plain text.
-#[derive(Default)]
-struct SnapshotFallback {
-    checked: Option<bool>,
-    selected: Option<String>,
-    is_button: bool,
-    is_text_input: bool,
-    text: String,
-}
-
-struct SnapshotState {
-    text: Option<String>,
-    value: Option<String>,
-    checked: Option<bool>,
-    selected: Option<String>,
-}
-
-/// The rules the snapshot has always followed, with the hooks in front:
-/// a text input reports its contents as `value` and no `text`; buttons and
-/// anything with a checked state always report `text`, even empty; any
-/// other widget reports `text` only when it has some; a selection also
-/// becomes the row's `text`.
-fn merge_snapshot_state(hooks: SnapshotHooks, fallback: SnapshotFallback) -> SnapshotState {
-    let checked = hooks.checked.or(fallback.checked);
-    let selected = hooks.selected.or(fallback.selected);
-    let mut value = hooks.value;
-    let mut text = None;
-    if fallback.is_text_input {
-        if value.is_none() {
-            value = Some(fallback.text);
-        }
-    } else if fallback.is_button || checked.is_some() || !fallback.text.is_empty() {
-        text = Some(fallback.text);
-    }
-    if let Some(selected) = &selected {
-        text = Some(selected.clone());
-    }
-    SnapshotState {
-        text,
-        value,
-        checked,
-        selected,
-    }
-}
-
 /// The screen rect a viewer actually sees for `area`, or `None` when the area
 /// is stale or clipped away entirely.
 ///
@@ -177,6 +76,7 @@ fn merge_snapshot_state(hooks: SnapshotHooks, fallback: SnapshotFallback) -> Sna
 /// reported rect into a click (the `--remote` `/snap` + `/click` loop, a
 /// `makepad_test` locator, an accessibility reader) aims at the wrong widget.
 /// Event hit-testing uses `Area::clipped_rect`; the tree must agree with it.
+#[cfg(test)]
 fn widget_screen_rect(area: &Area, cx: &Cx) -> Option<Rect> {
     if !area.is_valid(cx) {
         return None;
@@ -191,41 +91,8 @@ fn widget_screen_rect(area: &Area, cx: &Cx) -> Option<Rect> {
 /// Snapshot coordinates follow the rendered 2D draw-list transform. Areas
 /// intentionally retain local coordinates for canvas hosts' inverse-mapped
 /// input, so this conversion must not change `Area` or ordinary hit-testing.
-fn widget_snapshot_rect(area: &Area, cx: &Cx) -> Option<Rect> {
-    let rect = widget_screen_rect(area, cx)?;
-    let draw_list = &cx.draw_lists[area.draw_list_id()?];
-    // This is the final uniform consumed by the shader. Parent transforms are
-    // already assigned to children by set_view_transform, not composed here.
-    let matrix = draw_list.draw_list_uniforms.view_transform;
-    if matrix.v == Mat4f::identity().v {
-        return Some(rect);
-    }
-    if !matrix.v.iter().all(|value| value.is_finite()) {
-        return None;
-    }
-    // Preserve the existing reporting for 3D/perspective lists: projecting
-    // those correctly also needs the pass camera and the widget's draw depth.
-    if matrix.v[3] != 0.0 || matrix.v[7] != 0.0 || matrix.v[11] != 0.0
-        || matrix.v[15] != 1.0 || matrix.v[8] != 0.0 || matrix.v[9] != 0.0
-    {
-        return Some(rect);
-    }
-    let mut min = dvec2(f64::INFINITY, f64::INFINITY);
-    let mut max = dvec2(f64::NEG_INFINITY, f64::NEG_INFINITY);
-    for corner in [rect.pos, rect.pos + dvec2(rect.size.x, 0.0),
-        rect.pos + dvec2(0.0, rect.size.y), rect.pos + rect.size]
-    {
-        let point = dvec2(
-            corner.x * matrix.v[0] as f64 + corner.y * matrix.v[4] as f64 + matrix.v[12] as f64,
-            corner.x * matrix.v[1] as f64 + corner.y * matrix.v[5] as f64 + matrix.v[13] as f64,
-        );
-        if !point.x.is_finite() || !point.y.is_finite() { return None; }
-        min.x = min.x.min(point.x); min.y = min.y.min(point.y);
-        max.x = max.x.max(point.x); max.y = max.y.max(point.y);
-    }
-    let rect = Rect { pos: min, size: max - min };
-    (rect.size.x > 0.0 && rect.size.y > 0.0).then_some(rect)
-}
+#[cfg(test)]
+use makepad_platform::a11y::snapshot_rect as widget_snapshot_rect;
 
 // ============================================================================
 // WidgetTree: persistent graph + dense query index
@@ -298,7 +165,6 @@ struct WidgetTreeInner {
 }
 
 struct WidgetTreeNode {
-    #[allow(unused)]
     uid: WidgetUid,
     widget: WidgetWeakRef,
     parent: u32,
@@ -1905,16 +1771,22 @@ impl WidgetTree {
         let mut stored_before = Vec::with_capacity(results.len() + 1);
         for widget in &results {
             stored_before.push(matches.len());
-            let Some(uid) = widget.try_widget_uid() else {
-                continue;
-            };
-            if uid == WidgetUid(0) {
-                continue;
+            // A match whose uid cannot be read right now (its widget is mutably borrowed: a
+            // lookup from inside that widget's own draw, e.g. a PortalList comparing itself
+            // with `self.portal_list(..)` while the step holds it) is still a match. Leaving
+            // it out would store a MISS (or a short list) that outlives the borrow: every
+            // later lookup answers from it until an unrelated invalidation (SBXPLAY's dead
+            // JOIN row). The answer is right, it just cannot be cached: store nothing.
+            match widget.try_widget_uid() {
+                Some(uid) if uid != WidgetUid(0) => matches.push(PathCacheMatch {
+                    uid,
+                    widget: widget.downgrade(),
+                }),
+                _ => {
+                    inner.stats.stores_skipped += 1;
+                    return (results, hits);
+                }
             }
-            matches.push(PathCacheMatch {
-                uid,
-                widget: widget.downgrade(),
-            });
         }
         stored_before.push(matches.len());
         let stored_hits = hits
@@ -2829,471 +2701,60 @@ impl WidgetTree {
         self.inner.borrow().root_uid
     }
 
-    pub fn query_rects(&self, cx: &Cx, query: &str) -> Vec<String> {
+
+
+    /// Named ancestor path without borrowing widgets that are currently drawing.
+    pub(crate) fn semantic_path(&self, uid: WidgetUid, window: WidgetUid) -> String {
+        let inner = self.inner.borrow();
+        let mut names = Vec::new();
+        let mut current = Some(uid);
+        while let Some(id) = current {
+            if id == window { break; }
+            let Some(node) = inner.graph.get(&id) else { break };
+            if node.name != LiveId(0) { names.push(node.name); }
+            current = node.parent;
+        }
+        names.into_iter().rev().map(live_id_token).collect::<Vec<_>>().join(".")
+    }
+
+
+
+    /// The window-relative id path (named widgets only) and
+    /// the type of each widget in `uids` (frame capture attribution).
+    pub fn uid_paths(&self, cx: &Cx, uids: &[u64]) -> Vec<(u64, String, String)> {
+        if uids.is_empty() {
+            return Vec::new();
+        }
         self.sync_dirty();
         let inner = self.inner.borrow();
-
-        let query = query.trim();
-        let (mode, needle) = if let Some(v) = query.strip_prefix("id:") {
-            ("id", v.trim())
-        } else if let Some(v) = query.strip_prefix("type:") {
-            ("type", v.trim())
-        } else {
-            ("any", query)
-        };
-
-        fn matches_query(mode: &str, needle: &str, id: &str, ty: &str) -> bool {
-            match mode {
-                "id" => id == needle,
-                "type" => ty == needle,
-                _ => needle.is_empty() || id.contains(needle) || ty.contains(needle),
-            }
-        }
-
-        fn live_id_token(id: LiveId) -> String {
-            if id == LiveId(0) {
-                return "-".to_string();
-            }
-            id.as_string(|name| {
-                if let Some(name) = name {
-                    name.to_string()
-                } else {
-                    format!("{:x}", id.0)
-                }
-            })
-        }
-
-        let mut widget_type_names: HashMap<ScriptTypeId, LiveId> = HashMap::new();
-        {
-            let widget_registry = cx.components.get::<WidgetRegistry>();
-            for (type_id, (info, _)) in widget_registry.map.iter() {
-                widget_type_names.insert(*type_id, info.name);
-            }
-        }
-
-        let mut rects = Vec::new();
-        let mut dump_index = 0usize;
+        let registry = cx.components.get::<WidgetRegistry>();
+        let mut paths: Vec<String> = Vec::with_capacity(inner.nodes.len());
+        let mut out = Vec::new();
         for (index, node) in inner.nodes.iter().enumerate() {
-            let Some(widget) = node.widget.upgrade() else {
-                continue;
+            let parent = if node.parent == NONE { String::new() } else { paths[node.parent as usize].clone() };
+            let widget = node.widget.upgrade();
+            let name = inner.names[index];
+            let path = if widget.as_ref().is_some_and(|w| w.borrow::<Window>().is_some()) {
+                String::new()
+            } else if name != LiveId(0) {
+                if parent.is_empty() { live_id_token(name) } else { format!("{parent}.{}", live_id_token(name)) }
+            } else {
+                parent
             };
-            let id = inner.names[index];
-            let ty = widget
-                .widget_type_id()
-                .and_then(|type_id| widget_type_names.get(&type_id).copied())
-                .unwrap_or(LiveId(0));
-
-            let id_token = live_id_token(id);
-            let ty_token = live_id_token(ty);
-            let area = widget.area();
-            if area.is_valid(cx) {
-                if let Some(rect) = widget_screen_rect(&area, cx) {
-                    let x = rect.pos.x.round() as i64;
-                    let y = rect.pos.y.round() as i64;
-                    let w = rect.size.x.round() as i64;
-                    let h = rect.size.y.round() as i64;
-                    if w > 0 && h > 0 && matches_query(mode, needle, &id_token, &ty_token) {
-                        rects.push(format!(
-                            "{} {} {} {} {} {} {}",
-                            dump_index, id_token, ty_token, x, y, w, h
-                        ));
-                        if rects.len() >= 256 {
-                            break;
-                        }
-                    }
-                }
-                dump_index += 1;
-
-                // The parts a widget draws for itself, in the shape of the
-                // dock's lines below, so a query can find an item no widget
-                // node holds. Only for a widget drawn this frame, as its own
-                // line is: parts cached from an earlier draw would give a
-                // test coordinates for something no longer on screen.
-                for part in widget.snapshot_parts(cx) {
-                    let x = part.rect.pos.x.round() as i64;
-                    let y = part.rect.pos.y.round() as i64;
-                    let w = part.rect.size.x.round() as i64;
-                    let h = part.rect.size.y.round() as i64;
-                    if w <= 0 || h <= 0 {
-                        continue;
-                    }
-                    let id_token = live_id_token(part.id);
-                    if matches_query(mode, needle, &id_token, part.widget_type) {
-                        rects.push(format!(
-                            "PP {} {} {} {} {} {}",
-                            id_token, part.widget_type, x, y, w, h
-                        ));
-                        if rects.len() >= 256 {
-                            break;
-                        }
-                    }
-                }
+            if uids.contains(&node.uid.0) {
+                let kind = widget
+                    .as_ref()
+                    .and_then(|w| w.widget_type_id())
+                    .and_then(|t| registry.map.get(&t).map(|(info, _)| live_id_token(info.name)))
+                    .unwrap_or_else(|| "-".into());
+                out.push((node.uid.0, path.clone(), kind));
             }
-            if rects.len() >= 256 {
-                break;
-            }
-
-            let dock_dump = WidgetHooks::dock_dump(cx, &widget);
-            if let Some(dock_dump) = dock_dump {
-                for tabs in dock_dump.tabs {
-                    let x = tabs.rect.pos.x.round() as i64;
-                    let y = tabs.rect.pos.y.round() as i64;
-                    let w = tabs.rect.size.x.round() as i64;
-                    let h = tabs.rect.size.y.round() as i64;
-                    if w <= 0 || h <= 0 {
-                        continue;
-                    }
-                    let id_token = live_id_token(tabs.tabs_id);
-                    let ty_token = "DockTabs";
-                    if matches_query(mode, needle, &id_token, ty_token) {
-                        rects.push(format!(
-                            "DB {} {} {} {} {} {}",
-                            id_token, ty_token, x, y, w, h
-                        ));
-                        if rects.len() >= 256 {
-                            break;
-                        }
-                    }
-                }
-                if rects.len() >= 256 {
-                    break;
-                }
-                for tab in dock_dump.tab_headers {
-                    let x = tab.rect.pos.x.round() as i64;
-                    let y = tab.rect.pos.y.round() as i64;
-                    let w = tab.rect.size.x.round() as i64;
-                    let h = tab.rect.size.y.round() as i64;
-                    if w <= 0 || h <= 0 {
-                        continue;
-                    }
-                    let id_token = live_id_token(tab.tab_id);
-                    let ty_token = "DockTab";
-                    if matches_query(mode, needle, &id_token, ty_token) {
-                        rects.push(format!(
-                            "DT {} {} {} {} {} {}",
-                            id_token, ty_token, x, y, w, h
-                        ));
-                        if rects.len() >= 256 {
-                            break;
-                        }
-                    }
-                }
-                if rects.len() >= 256 {
-                    break;
-                }
-            }
+            paths.push(path);
         }
-        rects
+        out
     }
 
-    pub fn snapshot(&self, cx: &Cx) -> Vec<WidgetSnapshot> {
-        self.snapshot_with_paths(cx)
-            .into_iter()
-            .map(|(widget, _)| widget)
-            .collect()
-    }
 
-    /// [`Self::snapshot`] with each row's dotted id path from its window
-    /// root: the names of the widget and its ancestors below the `Window`,
-    /// unnamed ones left out (`main.new_note`). A part or dock row extends
-    /// its widget's path with its own id. The remote bridge's `/snap` path
-    /// addressing reads this through `Cx::widget_paths_callback`.
-    pub fn snapshot_with_paths(&self, cx: &Cx) -> Vec<(WidgetSnapshot, String)> {
-        self.sync_dirty();
-        let inner = self.inner.borrow();
-        let widget_type_names = widget_type_names(cx);
-
-        #[derive(Clone)]
-        struct WindowContext {
-            id: String,
-            index: usize,
-            position: Vec2d,
-        }
-
-        let mut window_contexts = HashMap::<usize, WindowContext>::new();
-        for (index, node) in inner.nodes.iter().enumerate() {
-            let Some(widget) = node.widget.upgrade() else {
-                continue;
-            };
-            let Some(context) = widget.borrow::<Window>().map(|window| WindowContext {
-                id: live_id_token(inner.names[index]),
-                index: window.window_index(),
-                position: window.position(cx),
-            }) else {
-                continue;
-            };
-            window_contexts.insert(index, context);
-        }
-
-        let resolve_window_context = |node_index: usize| -> Option<WindowContext> {
-            let mut current = Some(node_index as u32);
-            while let Some(index) = current {
-                if let Some(context) = window_contexts.get(&(index as usize)) {
-                    return Some(context.clone());
-                }
-                let parent = inner.nodes[index as usize].parent;
-                current = if parent == NONE { None } else { Some(parent) };
-            }
-            None
-        };
-
-        // A widget's own visible flag isn't enough: if any ancestor is hidden, the
-        // widget is effectively hidden even though its own flag stays true. Precompute
-        // each node's own visibility, then fold in ancestors so the reported `visible`
-        // reflects what a viewer would actually see.
-        let own_visible: Vec<bool> = inner
-            .nodes
-            .iter()
-            .map(|node| node.widget.upgrade().is_some_and(|w| w.visible()))
-            .collect();
-        let effective_visible = |mut index: usize| -> bool {
-            loop {
-                if !own_visible[index] {
-                    return false;
-                }
-                let parent = inner.nodes[index].parent;
-                if parent == NONE {
-                    return true;
-                }
-                index = parent as usize;
-            }
-        };
-
-        let node_path = |index: usize| -> String {
-            let mut names = Vec::new();
-            let mut current = index;
-            // The window itself and everything above it are not in the path.
-            while !window_contexts.contains_key(&current) {
-                let name = inner.names[current];
-                if name != LiveId(0) {
-                    names.push(live_id_token(name));
-                }
-                let parent = inner.nodes[current].parent;
-                if parent == NONE || parent as usize >= inner.nodes.len() {
-                    break;
-                }
-                current = parent as usize;
-            }
-            names.reverse();
-            names.join(".")
-        };
-
-        let mut widgets = Vec::new();
-        let mut paths: Vec<String> = Vec::new();
-        for (index, node) in inner.nodes.iter().enumerate() {
-            let Some(widget) = node.widget.upgrade() else {
-                continue;
-            };
-            let path = node_path(index);
-            let first_row = widgets.len();
-            let id = live_id_token(inner.names[index]);
-            let widget_type = widget
-                .widget_type_id()
-                .and_then(|type_id| widget_type_names.get(&type_id).copied())
-                .map(live_id_token)
-                .unwrap_or_else(|| "-".to_string());
-            let window_context = resolve_window_context(index);
-            let (mut x, mut y, width, height) = {
-                // Clipped geometry only — a row a `PortalList` drew past its
-                // viewport edge reports nothing rather than a full-size rect
-                // sitting on top of whatever really is drawn there.
-                match widget_snapshot_rect(&widget.area(), cx) {
-                    Some(rect) => (
-                        rect.pos.x.round() as i64,
-                        rect.pos.y.round() as i64,
-                        rect.size.x.round() as i64,
-                        rect.size.y.round() as i64,
-                    ),
-                    None => (0, 0, 0, 0),
-                }
-            };
-            if let Some(context) = &window_context {
-                x += context.position.x.round() as i64;
-                y += context.position.y.round() as i64;
-            }
-            // Viewer semantics: a widget with no on-screen rect is not
-            // visible, whatever its own flag says. A recycled PortalList row
-            // whose area went stale kept reporting visible=true at
-            // [0,0,0,0] — one big wheel left 100 of those in the snapshot.
-            let node_visible = effective_visible(index) && width > 0 && height > 0;
-
-            // Each downcast in its own statement: `borrow::<T>()` hands back
-            // a `Ref` guard, and a guard born inside a longer expression
-            // lives to the end of that expression, where `widget.text()`
-            // would find the cell already borrowed.
-            let is_button = widget.borrow::<Button>().is_some();
-            let button_enabled = widget.borrow::<Button>().map(|button| button.enabled());
-            let check_box_active = widget
-                .borrow::<CheckBox>()
-                .map(|check_box| check_box.active(cx));
-            let radio_active = widget
-                .borrow::<RadioButton>()
-                .map(|radio_button| radio_button.active(cx));
-            let dropdown_selected = widget
-                .borrow::<DropDown>()
-                .map(|drop_down| drop_down.selected_item_label());
-            let is_text_input = widget.borrow::<TextInput>().is_some();
-            let widget_text = widget.text();
-
-            // What the widget says about itself comes first; the downcasts
-            // above only answer for the five original types when it says
-            // nothing, so a widget the tree has never heard of can still be
-            // waited on by `wait_checked`/`wait_value`.
-            let hooks = SnapshotHooks {
-                checked: widget.snapshot_checked(cx),
-                value: widget.snapshot_value(cx),
-                selected: widget.snapshot_selected(cx),
-            };
-            let fallback = SnapshotFallback {
-                checked: check_box_active.or(radio_active),
-                selected: dropdown_selected,
-                is_button,
-                is_text_input,
-                text: widget_text,
-            };
-            let state = merge_snapshot_state(hooks, fallback);
-
-            widgets.push(WidgetSnapshot {
-                id,
-                widget_type,
-                window_id: window_context
-                    .as_ref()
-                    .map(|context| context.id.clone())
-                    .unwrap_or_default(),
-                window_index: window_context
-                    .as_ref()
-                    .map(|context| context.index)
-                    .unwrap_or_default(),
-                visible: node_visible,
-                enabled: button_enabled.unwrap_or_else(|| !widget.disabled(cx)),
-                x,
-                y,
-                width,
-                height,
-                text: state.text,
-                value: state.value,
-                checked: state.checked,
-                selected: state.selected,
-                path: None,
-            });
-
-            let window_offset = window_context
-                .as_ref()
-                .map(|context| {
-                    (
-                        context.position.x.round() as i64,
-                        context.position.y.round() as i64,
-                    )
-                })
-                .unwrap_or_default();
-            widgets.extend(snapshot_part_rows(
-                widget.snapshot_parts(cx),
-                node_visible,
-                &window_context
-                    .as_ref()
-                    .map(|context| context.id.clone())
-                    .unwrap_or_default(),
-                window_context
-                    .as_ref()
-                    .map(|context| context.index)
-                    .unwrap_or_default(),
-                window_offset,
-            ));
-
-            let dock_dump = WidgetHooks::dock_dump(cx, &widget);
-            if let Some(dock_dump) = dock_dump {
-                let window_id = window_context
-                    .as_ref()
-                    .map(|context| context.id.clone())
-                    .unwrap_or_default();
-                let window_index = window_context
-                    .as_ref()
-                    .map(|context| context.index)
-                    .unwrap_or_default();
-                let offset_x = window_context
-                    .as_ref()
-                    .map(|context| context.position.x.round() as i64)
-                    .unwrap_or_default();
-                let offset_y = window_context
-                    .as_ref()
-                    .map(|context| context.position.y.round() as i64)
-                    .unwrap_or_default();
-
-                for tabs in dock_dump.tabs {
-                    let width = tabs.rect.size.x.round() as i64;
-                    let height = tabs.rect.size.y.round() as i64;
-                    if width <= 0 || height <= 0 {
-                        continue;
-                    }
-                    widgets.push(WidgetSnapshot {
-                        id: live_id_token(tabs.tabs_id),
-                        widget_type: "DockTabs".to_string(),
-                        window_id: window_id.clone(),
-                        window_index,
-                        visible: true,
-                        enabled: true,
-                        x: tabs.rect.pos.x.round() as i64 + offset_x,
-                        y: tabs.rect.pos.y.round() as i64 + offset_y,
-                        width,
-                        height,
-                        text: None,
-                        value: None,
-                        checked: None,
-                        selected: Some(
-                            tabs.selected_tab_id
-                                .map(live_id_token)
-                                .unwrap_or_else(|| "-".to_string()),
-                        ),
-                        path: None,
-                    });
-                }
-
-                for tab in dock_dump.tab_headers {
-                    let width = tab.rect.size.x.round() as i64;
-                    let height = tab.rect.size.y.round() as i64;
-                    if width <= 0 || height <= 0 {
-                        continue;
-                    }
-                    widgets.push(WidgetSnapshot {
-                        id: live_id_token(tab.tab_id),
-                        widget_type: "DockTab".to_string(),
-                        window_id: window_id.clone(),
-                        window_index,
-                        visible: true,
-                        enabled: true,
-                        x: tab.rect.pos.x.round() as i64 + offset_x,
-                        y: tab.rect.pos.y.round() as i64 + offset_y,
-                        width,
-                        height,
-                        text: Some(tab.title.clone()),
-                        value: None,
-                        checked: Some(tab.is_active),
-                        selected: if tab.is_active { Some(tab.title) } else { None },
-                        path: None,
-                    });
-                }
-            }
-            // The widget's own row, then its parts and dock rows under it.
-            for row in first_row..widgets.len() {
-                paths.push(if row == first_row {
-                    path.clone()
-                } else if path.is_empty() {
-                    widgets[row].id.clone()
-                } else {
-                    format!("{path}.{}", widgets[row].id)
-                });
-            }
-        }
-
-        widgets
-            .into_iter()
-            .zip(paths)
-            .map(|(mut widget, path)| {
-                widget.path = Some(path.clone()).filter(|p| !p.is_empty());
-                (widget, path)
-            })
-            .collect()
-    }
 
     /// The live widget hierarchy flattened depth-first for the tweaker's
     /// tree tab: (uid, name, type, depth). Every alive node appears; depth
@@ -3342,234 +2803,7 @@ impl WidgetTree {
         out
     }
 
-    pub fn compact_dump(&self, cx: &Cx) -> String {
-        self.sync_dirty();
-        let inner = self.inner.borrow();
 
-        let mut widget_type_names: HashMap<ScriptTypeId, LiveId> = HashMap::new();
-        {
-            let widget_registry = cx.components.get::<WidgetRegistry>();
-            for (type_id, (info, _)) in widget_registry.map.iter() {
-                widget_type_names.insert(*type_id, info.name);
-            }
-        }
-
-        fn live_id_token(id: LiveId) -> String {
-            if id == LiveId(0) {
-                return "-".to_string();
-            }
-            id.as_string(|name| {
-                if let Some(name) = name {
-                    name.to_string()
-                } else {
-                    format!("{:x}", id.0)
-                }
-            })
-        }
-
-        fn compact_text_token(input: &str) -> String {
-            let trimmed = input.trim();
-            if trimmed.is_empty() {
-                return "-".to_string();
-            }
-            let mut out = String::with_capacity(trimmed.len());
-            for ch in trimmed.chars() {
-                if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.') {
-                    out.push(ch);
-                } else if ch.is_whitespace() {
-                    out.push('_');
-                }
-            }
-            if out.is_empty() {
-                "-".to_string()
-            } else {
-                if out.len() > 48 {
-                    out.truncate(48);
-                }
-                out
-            }
-        }
-
-        #[derive(Clone)]
-        struct DumpNode {
-            index: usize,
-            parent: u32,
-            id: String,
-            ty: String,
-            x: i64,
-            y: i64,
-            w: i64,
-            h: i64,
-        }
-
-        #[derive(Clone)]
-        struct DockTabsRow {
-            dock_id: String,
-            tabs_id: String,
-            selected_tab_id: String,
-            tab_count: usize,
-            x: i64,
-            y: i64,
-            w: i64,
-            h: i64,
-        }
-
-        #[derive(Clone)]
-        struct DockTabRow {
-            dock_id: String,
-            tabs_id: String,
-            tab_id: String,
-            active: u8,
-            title: String,
-            x: i64,
-            y: i64,
-            w: i64,
-            h: i64,
-        }
-
-        let mut dump_nodes = Vec::new();
-        let mut dock_tabs_rows = Vec::<DockTabsRow>::new();
-        let mut dock_tab_rows = Vec::<DockTabRow>::new();
-        for (index, node) in inner.nodes.iter().enumerate() {
-            let Some(widget) = node.widget.upgrade() else {
-                continue;
-            };
-            let id = inner.names[index];
-            let ty = widget
-                .widget_type_id()
-                .and_then(|type_id| widget_type_names.get(&type_id).copied())
-                .unwrap_or(LiveId(0));
-            if let Some(rect) = widget_screen_rect(&widget.area(), cx) {
-                let x = rect.pos.x.round() as i64;
-                let y = rect.pos.y.round() as i64;
-                let w = rect.size.x.round() as i64;
-                let h = rect.size.y.round() as i64;
-                if w > 0 && h > 0 {
-                    let id_token = live_id_token(id);
-                    let ty_token = live_id_token(ty);
-                    dump_nodes.push(DumpNode {
-                        index,
-                        parent: node.parent,
-                        id: id_token,
-                        ty: ty_token,
-                        x,
-                        y,
-                        w,
-                        h,
-                    });
-                }
-            }
-
-            let dock_dump = WidgetHooks::dock_dump(cx, &widget);
-            if let Some(dock_dump) = dock_dump {
-                let dock_id = live_id_token(id);
-                for tabs in dock_dump.tabs {
-                    let x = tabs.rect.pos.x.round() as i64;
-                    let y = tabs.rect.pos.y.round() as i64;
-                    let w = tabs.rect.size.x.round() as i64;
-                    let h = tabs.rect.size.y.round() as i64;
-                    if w <= 0 || h <= 0 {
-                        continue;
-                    }
-                    dock_tabs_rows.push(DockTabsRow {
-                        dock_id: dock_id.clone(),
-                        tabs_id: live_id_token(tabs.tabs_id),
-                        selected_tab_id: tabs
-                            .selected_tab_id
-                            .map(live_id_token)
-                            .unwrap_or_else(|| "-".to_string()),
-                        tab_count: tabs.tab_count,
-                        x,
-                        y,
-                        w,
-                        h,
-                    });
-                }
-                for tab in dock_dump.tab_headers {
-                    let x = tab.rect.pos.x.round() as i64;
-                    let y = tab.rect.pos.y.round() as i64;
-                    let w = tab.rect.size.x.round() as i64;
-                    let h = tab.rect.size.y.round() as i64;
-                    if w <= 0 || h <= 0 {
-                        continue;
-                    }
-                    dock_tab_rows.push(DockTabRow {
-                        dock_id: dock_id.clone(),
-                        tabs_id: live_id_token(tab.tabs_id),
-                        tab_id: live_id_token(tab.tab_id),
-                        active: tab.is_active as u8,
-                        title: compact_text_token(&tab.title),
-                        x,
-                        y,
-                        w,
-                        h,
-                    });
-                }
-            }
-        }
-
-        let mut old_to_new = HashMap::<usize, usize>::new();
-        for (new_index, node) in dump_nodes.iter().enumerate() {
-            old_to_new.insert(node.index, new_index);
-        }
-
-        let mut out = String::new();
-        let _ = writeln!(&mut out, "W3 {}", dump_nodes.len());
-        for (new_index, node) in dump_nodes.iter().enumerate() {
-            let mut parent = node.parent;
-            let mut parent_index = -1i64;
-            while parent != NONE {
-                if let Some(new_parent) = old_to_new.get(&(parent as usize)) {
-                    parent_index = *new_parent as i64;
-                    break;
-                }
-                parent = inner.nodes[parent as usize].parent;
-            }
-            let _ = writeln!(
-                &mut out,
-                "{} {} {} {} {} {} {} {}",
-                new_index, parent_index, node.id, node.ty, node.x, node.y, node.w, node.h
-            );
-        }
-        if !dock_tabs_rows.is_empty() || !dock_tab_rows.is_empty() {
-            let _ = writeln!(
-                &mut out,
-                "D3 {} {}",
-                dock_tabs_rows.len(),
-                dock_tab_rows.len()
-            );
-        }
-        for row in dock_tabs_rows {
-            let _ = writeln!(
-                &mut out,
-                "DB {} {} DockTabs {} {} {} {} {} {}",
-                row.dock_id,
-                row.tabs_id,
-                row.x,
-                row.y,
-                row.w,
-                row.h,
-                row.selected_tab_id,
-                row.tab_count
-            );
-        }
-        for row in dock_tab_rows {
-            let _ = writeln!(
-                &mut out,
-                "DT {} {} DockTab {} {} {} {} {} {} {}",
-                row.dock_id,
-                row.tab_id,
-                row.x,
-                row.y,
-                row.w,
-                row.h,
-                row.tabs_id,
-                row.active,
-                row.title
-            );
-        }
-        out
-    }
 }
 
 // ============================================================================
@@ -3620,20 +2854,8 @@ fn get_or_init_state(cx: &mut Cx) -> &mut WidgetTreeState {
     WidgetTreeState::get_or_init(cx)
 }
 
-fn compact_widget_tree_dump_callback(cx: &Cx) -> String {
-    cx.widget_tree().compact_dump(cx)
-}
-
-fn widget_query_callback(cx: &Cx, query: &str) -> Vec<String> {
-    cx.widget_tree().query_rects(cx, query)
-}
-
-fn widget_snapshot_callback(cx: &Cx) -> Vec<WidgetSnapshot> {
-    cx.widget_tree().snapshot(cx)
-}
-
-fn widget_paths_callback(cx: &Cx) -> Vec<(WidgetSnapshot, String)> {
-    cx.widget_tree().snapshot_with_paths(cx)
+fn widget_uid_paths_callback(cx: &Cx, uids: &[u64]) -> Vec<(u64, String, String)> {
+    cx.widget_tree().uid_paths(cx, uids)
 }
 
 /// One row of the flattened widget hierarchy (`WidgetTree::flat_tree`).
@@ -3672,10 +2894,7 @@ pub fn set_ui_root(cx: &mut Cx, ui: &WidgetRef) {
     state.tree.set_root_widget(ui.clone());
     *cx.global::<UiRoot>() = UiRoot { widget: ui.downgrade(), ..Default::default() };
     cx.cancel_scope_resolver = Some(cancel_scope_resolver);
-    cx.widget_tree_dump_callback = Some(compact_widget_tree_dump_callback);
-    cx.widget_query_callback = Some(widget_query_callback);
-    cx.widget_snapshot_callback = Some(widget_snapshot_callback);
-    cx.widget_paths_callback = Some(widget_paths_callback);
+    cx.widget_uid_paths_callback = Some(widget_uid_paths_callback);
     if let Some(tweaker) = WidgetHooks::tweaker(cx) {
         cx.tweak_callback = Some(tweaker.tweak_callback);
     }
@@ -4061,6 +3280,35 @@ mod tests {
         assert!(!found.is_empty());
         assert_eq!(found.widget_uid(), uid);
         assert!(tree.find_within(root_uid, &[name("root")]).is_empty());
+    }
+
+    /// A lookup made while its match is mutably borrowed (a list's draw step asking for
+    /// itself by name: `self.portal_list(cx, ids!(rooms))` under `item.borrow_mut::<PortalList>()`)
+    /// finds the widget but cannot read its uid. It must not leave a cached MISS behind:
+    /// SBXPLAY's JOIN row never fired because every later `portal_list(rooms)` answered empty.
+    #[test]
+    fn test_lookup_of_a_borrowed_widget_caches_no_miss() {
+        for scope in [true, false] {
+            let tree = WidgetTree::default();
+            let root_uid = WidgetUid::new();
+            let box_uid = WidgetUid::new();
+            let list_uid = WidgetUid::new();
+            let list = if scope { make_widget_skip(list_uid, vec![]) } else { make_widget(list_uid, vec![]) };
+            let boxed = make_widget(box_uid, vec![(name("rooms"), list.clone())]);
+            let root = make_widget(root_uid, vec![(name("rooms_box"), boxed.clone())]);
+            tree.observe_node(root_uid, name("root"), root.clone(), None);
+            tree.observe_node(box_uid, name("rooms_box"), boxed.clone(), Some(root_uid));
+            tree.observe_node(list_uid, name("rooms"), list.clone(), Some(box_uid));
+            stabilize_graph_cache(&tree);
+            {
+                let _drawing = list.borrow_mut::<TestWidget>().expect("the list is a TestWidget");
+                let found = tree.find_within(root_uid, &[name("rooms")]);
+                assert!(!found.is_empty(), "found while borrowed (scope {scope})");
+            }
+            let found = tree.find_within(root_uid, &[name("rooms")]);
+            assert_eq!(found.widget_uid(), list_uid, "found after the borrow ends (scope {scope})");
+            assert_eq!(tree.find_all_within(root_uid, &[name("rooms")]).len(), 1);
+        }
     }
 
     #[test]
@@ -6019,219 +5267,164 @@ mod tests {
         );
     }
 
-    /// A widget that draws its own targets, the way a bar of items drawn
-    /// in Rust does, and reports them through the parts hook.
-    struct PartsTestWidget {
-        uid: WidgetUid,
-        area: Area,
-        parts: Vec<SnapshotPart>,
+    // The former snapshot tests now exercise the one semantic tree and its parts.
+    fn semantic_parts(count: usize, hidden: bool) -> a11y_tree::mirror::Tree {
+        use a11y_tree::{Node, Role, States};
+        let mut builder = makepad_platform::a11y::CxA11y::default();
+        builder.set_consumers(a11y_tree::consumer::TEST);
+        builder.begin_frame();
+        let token = builder.begin_node(1, None);
+        builder.begin_window(WindowId(0, 1));
+        for i in 0..count {
+            builder.set_part(token, i as u64, None, Node { role: Role::MenuItem, name: format!("Item {i}"), value: i.to_string(), states: if i % 2 == 0 { States::SELECTED } else { States::empty() }, bounds: a11y_tree::Rect { x: i as f32, y: 20.0, w: 60.0, h: 24.0 }, ..Default::default() }, || WidgetUid::new().0);
+        }
+        builder.end_node(token, Node { role: Role::Window, states: if hidden { States::HIDDEN } else { States::empty() }, ..Default::default() }, Area::Empty);
+        builder.end_window();
+        let mut tree = a11y_tree::mirror::Tree::default();
+        builder.finish_frame(Area::Empty, |_| None, |_| None, |_, bytes| { tree.apply(a11y_tree::wire::decode_update(&bytes).unwrap()); });
+        tree
     }
 
-    impl ScriptApply for PartsTestWidget {
-        fn script_apply(
-            &mut self,
-            _vm: &mut ScriptVm,
-            _apply: &Apply,
-            _scope: &mut Scope,
-            _value: ScriptValue,
-        ) {
-        }
-    }
-
-    impl WidgetNode for PartsTestWidget {
-        fn widget_uid(&self) -> WidgetUid {
-            self.uid
-        }
-        fn children(&self, _visit: &mut dyn FnMut(LiveId, WidgetRef)) {}
-        fn walk(&mut self, _cx: &mut Cx) -> Walk {
-            Walk::default()
-        }
-        fn area(&self) -> Area {
-            self.area
-        }
-        fn redraw(&mut self, _cx: &mut Cx) {}
-    }
-
-    impl Widget for PartsTestWidget {
-        fn draw_walk(&mut self, _cx: &mut Cx2d, _scope: &mut Scope, _walk: Walk) -> DrawStep {
-            DrawStep::done()
-        }
-        fn snapshot_parts(&self, _cx: &Cx) -> Vec<SnapshotPart> {
-            self.parts.clone()
-        }
-    }
-
-    fn part(id: &str, rect: Rect, text: &str, selected: bool, enabled: bool) -> SnapshotPart {
-        SnapshotPart {
-            // Through the lookup table, so the tree can spell the id back.
-            id: LiveId::from_str_with_lut(id).unwrap(),
-            widget_type: "PillNavItem",
-            rect,
-            text: text.to_string(),
-            selected,
-            enabled,
-        }
-    }
-
-    /// Items a widget draws for itself show in the test tree as rows after
-    /// the widget's own, with their type, words and state, and a query
-    /// finds them by type or id; an item with no size is left out.
     #[test]
-    fn snapshot_reports_the_parts_a_widget_draws() {
-        let mut cx = Cx::new(Box::new(|_, _| {}));
-        drop(cx.components.get_or_create::<WidgetRegistry>());
-        let (_list, area) = snapshot_area(&mut cx);
-        let parts = vec![
-            part("home", Rect { pos: dvec2(10.0, 20.0), size: dvec2(60.4, 24.6) }, "Home", true, true),
-            part("docs", Rect { pos: dvec2(72.0, 20.0), size: dvec2(50.0, 24.0) }, "Docs", false, false),
-            part("gone", Rect { pos: dvec2(130.0, 20.0), size: dvec2(0.0, 24.0) }, "Gone", false, true),
-        ];
-        let uid = WidgetUid::new();
-        let bar = WidgetRef::new_with_inner(Box::new(PartsTestWidget { uid, area, parts }));
-        let tree = WidgetTree::default();
-        tree.observe_node(uid, LiveId::from_str_with_lut("bar").unwrap(), bar.clone(), None);
-
-        let rows = tree.snapshot(&cx);
-        assert_eq!(rows.len(), 3, "the widget and its two parts with a size");
-        assert_eq!(rows[0].id, "bar");
-        let home = &rows[1];
-        assert_eq!((home.id.as_str(), home.widget_type.as_str()), ("home", "PillNavItem"));
-        assert_eq!((home.x, home.y, home.width, home.height), (10, 20, 60, 25));
-        assert_eq!(home.text.as_deref(), Some("Home"));
-        assert_eq!(home.checked, Some(true));
-        assert_eq!(home.selected.as_deref(), Some("Home"));
-        assert_eq!(home.value, None);
-        assert!(home.visible && home.enabled);
-        let docs = &rows[2];
-        assert_eq!((docs.id.as_str(), docs.text.as_deref()), ("docs", Some("Docs")));
-        assert_eq!((docs.checked, docs.selected.as_deref()), (Some(false), None));
-        assert!(docs.visible && !docs.enabled);
-
-        assert_eq!(
-            tree.query_rects(&cx, "type:PillNavItem"),
-            vec!["PP home PillNavItem 10 20 60 25", "PP docs PillNavItem 72 20 50 24"]
-        );
-        assert_eq!(tree.query_rects(&cx, "id:docs"), vec!["PP docs PillNavItem 72 20 50 24"]);
-        drop(bar);
-    }
-
-    /// A widget not drawn this frame has no line in a query, and its parts
-    /// none either: rects cached from an earlier draw would send a test to
-    /// press something no longer on screen.
-    #[test]
-    fn a_widget_not_drawn_this_frame_reports_no_parts() {
-        let cx = Cx::new(Box::new(|_, _| {}));
-        drop(cx.components.get_or_create::<WidgetRegistry>());
-        let parts = vec![part("stale", Rect { pos: dvec2(10.0, 20.0), size: dvec2(60.0, 24.0) }, "Stale", false, true)];
-        let uid = WidgetUid::new();
-        let bar = WidgetRef::new_with_inner(Box::new(PartsTestWidget { uid, area: Area::Empty, parts }));
-        let tree = WidgetTree::default();
-        tree.observe_node(uid, LiveId::from_str_with_lut("bar").unwrap(), bar.clone(), None);
-        assert!(tree.query_rects(&cx, "type:PillNavItem").is_empty());
-        assert!(tree.query_rects(&cx, "id:stale").is_empty());
-        drop(bar);
-    }
-
-    /// A part sits in its widget's window: the window's offset is added as
-    /// it is to the widget's own row, and a hidden widget's parts are hidden.
-    #[test]
-    fn snapshot_parts_take_their_window_and_visibility_from_the_widget() {
-        let parts = vec![part("home", Rect { pos: dvec2(10.0, 20.0), size: dvec2(60.0, 24.0) }, "Home", false, true)];
-        let rows = snapshot_part_rows(parts.clone(), true, "main_window", 2, (100, 50));
-        assert_eq!(rows.len(), 1);
-        assert_eq!((rows[0].x, rows[0].y), (110, 70));
-        assert_eq!((rows[0].window_id.as_str(), rows[0].window_index), ("main_window", 2));
-        assert!(rows[0].visible);
-        let hidden = snapshot_part_rows(parts, false, "main_window", 2, (100, 50));
-        assert!(!hidden[0].visible, "a hidden widget's items are not pressable");
-    }
-
-    fn plain_fallback(text: &str) -> SnapshotFallback {
-        SnapshotFallback {
-            text: text.to_string(),
-            ..Default::default()
+    fn semantics_reports_the_parts_a_widget_draws() {
+        let tree = semantic_parts(3, false);
+        assert_eq!(tree.nodes.len(), 4);
+        for i in 0..3 {
+            let node = &tree.nodes[&a11y_tree::NodeId::part(1, i + 1)];
+            assert_eq!(node.name, format!("Item {i}"));
+            assert_eq!(node.value, i.to_string());
+            assert_eq!(node.states.contains(a11y_tree::States::SELECTED), i % 2 == 0);
+            assert_eq!((node.bounds.x, node.bounds.w), (i as f32, 60.0));
         }
     }
 
     #[test]
-    fn snapshot_hooks_come_before_the_downcasts() {
-        let state = merge_snapshot_state(
-            SnapshotHooks {
-                checked: Some(false),
-                value: Some("7".into()),
-                selected: Some("B".into()),
-            },
-            SnapshotFallback {
-                checked: Some(true),
-                selected: Some("A".into()),
-                ..plain_fallback("x")
-            },
-        );
-        assert_eq!(state.checked, Some(false));
-        assert_eq!(state.value.as_deref(), Some("7"));
-        assert_eq!(state.selected.as_deref(), Some("B"));
-        assert_eq!(state.text.as_deref(), Some("B"));
+    fn a_widget_not_drawn_this_frame_reports_no_parts() {
+        assert_eq!(semantic_parts(0, false).nodes.len(), 1);
     }
 
     #[test]
-    fn snapshot_downcasts_still_answer_when_the_hooks_are_silent() {
-        let state = merge_snapshot_state(
-            SnapshotHooks::default(),
-            SnapshotFallback {
-                checked: Some(true),
-                ..plain_fallback("")
-            },
-        );
-        assert_eq!(state.checked, Some(true));
-        assert_eq!(state.text.as_deref(), Some(""));
-        assert_eq!(state.value, None);
-        assert_eq!(state.selected, None);
+    fn semantic_parts_take_their_window_and_visibility_from_the_widget() {
+        assert!(semantic_parts(3, true).nodes.is_empty());
+        let tree = semantic_parts(3, false);
+        assert_eq!(tree.nodes[&tree.root].children.len(), 3);
     }
 
     #[test]
-    fn snapshot_text_input_reports_a_value_and_no_text() {
-        let state = merge_snapshot_state(
-            SnapshotHooks::default(),
-            SnapshotFallback {
-                is_text_input: true,
-                ..plain_fallback("typed")
-            },
-        );
-        assert_eq!(state.value.as_deref(), Some("typed"));
-        assert_eq!(state.text, None);
-        let hooked = merge_snapshot_state(
-            SnapshotHooks {
-                value: Some("hooked".into()),
-                ..Default::default()
-            },
-            SnapshotFallback {
-                is_text_input: true,
-                ..plain_fallback("typed")
-            },
-        );
-        assert_eq!(hooked.value.as_deref(), Some("hooked"));
-        assert_eq!(hooked.text, None);
+    fn semantics_has_one_state_description_without_downcasts() {
+        let mut cx = crate::test_cx::checkout_test_cx(crate::script_mod);
+        cx.with_vm(|vm| {
+            let checkbox = crate::check_box::CheckBox::script_new(vm);
+            let mut node = a11y_tree::Node::default();
+            checkbox.semantics(vm.cx_mut(), &mut node);
+            assert_eq!(node.role, a11y_tree::Role::CheckBox);
+            assert_eq!(node.toggle, a11y_tree::Toggle::Off);
+            assert!(node.actions.contains(a11y_tree::Actions::TOGGLE));
+        });
     }
 
     #[test]
-    fn snapshot_plain_widgets_report_text_only_when_they_have_some() {
-        assert_eq!(
-            merge_snapshot_state(SnapshotHooks::default(), plain_fallback("")).text,
-            None
-        );
-        assert_eq!(
-            merge_snapshot_state(SnapshotHooks::default(), plain_fallback("hi"))
-                .text
-                .as_deref(),
-            Some("hi")
-        );
-        let button = merge_snapshot_state(
-            SnapshotHooks::default(),
-            SnapshotFallback {
-                is_button: true,
-                ..plain_fallback("")
-            },
-        );
-        assert_eq!(button.text.as_deref(), Some(""));
+    fn every_control_describes_itself_without_tree_fallbacks() {
+        let mut cx = crate::test_cx::checkout_test_cx(crate::script_mod);
+        cx.with_vm(|vm| {
+            let button = crate::button::Button::script_new(vm);
+            let radio = crate::radio_button::RadioButton::script_new(vm);
+            for (widget, role) in [(&button as &dyn crate::widget::Widget, a11y_tree::Role::Button), (&radio, a11y_tree::Role::Radio)] {
+                let mut node = a11y_tree::Node::default();
+                widget.semantics(vm.cx_mut(), &mut node);
+                assert_eq!(node.role, role);
+                assert!(node.states.contains(a11y_tree::States::FOCUSABLE));
+            }
+        });
     }
+
+    #[test]
+    fn semantics_text_input_reports_a_value_and_text_info() {
+        let mut cx = crate::test_cx::checkout_test_cx(crate::script_mod);
+        cx.with_vm(|vm| {
+            let mut input = crate::text_input::TextInput::script_new(vm);
+            input.set_text(vm.cx_mut(), "é🦀");
+            let mut node = a11y_tree::Node::default();
+            input.semantics(vm.cx_mut(), &mut node);
+            assert_eq!(node.value, "é🦀");
+            assert_eq!(node.text.unwrap().content, "é🦀");
+        });
+    }
+
+    #[test]
+    fn semantics_plain_widgets_report_text_only_when_they_have_some() {
+        let mut cx = crate::test_cx::checkout_test_cx(crate::script_mod);
+        cx.with_vm(|vm| {
+            let mut label = crate::label::Label::script_new(vm);
+            let mut node = a11y_tree::Node::default();
+            label.semantics(vm.cx_mut(), &mut node);
+            assert!(node.name.is_empty());
+            label.set_text(vm.cx_mut(), "hi");
+            label.semantics(vm.cx_mut(), &mut node);
+            assert_eq!(node.name, "hi");
+        });
+    }
+
+    #[test]
+    fn semantic_wide_tree_matches_each_declared_part() {
+        let tree = semantic_parts(1000, false);
+        assert_eq!(tree.nodes.len(), 1001);
+        for i in 0..1000 {
+            let node = &tree.nodes[&a11y_tree::NodeId::part(1, i + 1)];
+            assert_eq!(node.value, i.to_string());
+        }
+    }
+
+    #[test]
+    fn semantic_large_tree_keeps_all_parts() {
+        use a11y_tree::{Node, NodeId, Role, States};
+        let tree = semantic_parts(20_000, false);
+        assert_eq!(tree.nodes.len(), 20_001);
+        assert_eq!(tree.nodes[&tree.root].children.len(), 20_000);
+        // Several windows, deep nesting, hidden subtrees and recycled rows over redraws.
+        // Compare complete records against independently constructed expectations each time.
+        let mut builder = makepad_platform::a11y::CxA11y::default();
+        builder.set_consumers(a11y_tree::consumer::TEST);
+        let mut mirrors = HashMap::<usize, a11y_tree::mirror::Tree>::new();
+        for frame in 0..4 {
+            builder.begin_frame();
+            let mut expected = HashMap::<usize, HashMap<NodeId, Node>>::new();
+            for window in 0..3 {
+                let uid = 100_000 + window as u64 * 100_000;
+                let root = builder.begin_node(uid, None);
+                builder.begin_window(WindowId(window, 1));
+                let mut nodes = HashMap::new();
+                let mut parents = Vec::new();
+                for depth in 1..=8 {
+                    parents.push(builder.begin_node(uid + depth, None));
+                }
+                let mut children = Vec::new();
+                for row in 0..1000 {
+                    let row_id = NodeId::widget(uid + 100 + frame * 1000 + row);
+                    let token = builder.begin_node(row_id.uid(), None);
+                    let node = Node { id: row_id, role: Role::ListItem, name: format!("row {row}"), value: format!("frame {frame}"), pos_in_set: row as u32 + 1, set_size: 1000, ..Default::default() };
+                    builder.end_node(token, node.clone(), Area::Empty);
+                    children.push(row_id);
+                    if frame != 2 { nodes.insert(row_id, node); }
+                }
+                for depth in (1..=8).rev() {
+                    let hidden = frame == 2 && depth == 8;
+                    let node = Node { id: NodeId::widget(uid + depth), role: Role::Group, states: if hidden { States::HIDDEN } else { States::empty() }, children: children.clone(), ..Default::default() };
+                    builder.end_node(parents.pop().unwrap(), node.clone(), Area::Empty);
+                    children = if hidden { Vec::new() } else { vec![node.id] };
+                    if !hidden { nodes.insert(node.id, node); }
+                }
+                let node = Node { id: NodeId::widget(uid), role: Role::Window, children, ..Default::default() };
+                builder.end_node(root, node.clone(), Area::Empty);
+                builder.end_window();
+                nodes.insert(node.id, node);
+                expected.insert(window, nodes);
+            }
+            builder.finish_frame(Area::Empty, |_| None, |_| None, |window, bytes| {
+                mirrors.entry(window.0).or_default().apply(a11y_tree::wire::decode_update(&bytes).unwrap());
+            });
+            for (window, nodes) in expected { assert_eq!(mirrors[&window].nodes, nodes, "window {window}, frame {frame}"); }
+        }
+    }
+
 }

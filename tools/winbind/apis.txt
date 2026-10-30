@@ -351,6 +351,18 @@ Windows.Win32.Media.MediaFoundation.MFVideoFormat_MJPG
 Windows.Win32.Media.MediaFoundation.MFVideoFormat_NV12
 Windows.Win32.Media.MediaFoundation.MFVideoFormat_RGB24
 Windows.Win32.Media.MediaFoundation.MFVideoFormat_YUY2
+Windows.Win32.Media.MediaFoundation.MFVideoPrimaries_BT709
+Windows.Win32.Media.MediaFoundation.MFVideoPrimaries_BT470_2_SysM
+Windows.Win32.Media.MediaFoundation.MFVideoPrimaries_BT470_2_SysBG
+Windows.Win32.Media.MediaFoundation.MFVideoPrimaries_SMPTE170M
+Windows.Win32.Media.MediaFoundation.MFVideoPrimaries_SMPTE240M
+Windows.Win32.Media.MediaFoundation.MFVideoPrimaries_BT2020
+Windows.Win32.Media.MediaFoundation.MFVideoTransFunc_709
+Windows.Win32.Media.MediaFoundation.MFVideoTransFunc_240M
+Windows.Win32.Media.MediaFoundation.MFVideoTransFunc_sRGB
+Windows.Win32.Media.MediaFoundation.MFVideoTransFunc_2020
+Windows.Win32.Media.MediaFoundation.MFVideoTransFunc_2084
+Windows.Win32.Media.MediaFoundation.MFVideoTransFunc_HLG
 Windows.Win32.Media.MediaFoundation.MFVideoTransferMatrix_BT2020_10
 Windows.Win32.Media.MediaFoundation.MFVideoTransferMatrix_BT2020_12
 Windows.Win32.Media.MediaFoundation.MFVideoTransferMatrix_BT601
@@ -378,7 +390,9 @@ Windows.Win32.Media.MediaFoundation.MF_MT_INTERLACE_MODE
 Windows.Win32.Media.MediaFoundation.MF_MT_MAJOR_TYPE
 Windows.Win32.Media.MediaFoundation.MF_MT_PIXEL_ASPECT_RATIO
 Windows.Win32.Media.MediaFoundation.MF_MT_SUBTYPE
+Windows.Win32.Media.MediaFoundation.MF_MT_TRANSFER_FUNCTION
 Windows.Win32.Media.MediaFoundation.MF_MT_VIDEO_NOMINAL_RANGE
+Windows.Win32.Media.MediaFoundation.MF_MT_VIDEO_PRIMARIES
 Windows.Win32.Media.MediaFoundation.MF_MT_YUV_MATRIX
 Windows.Win32.Media.MediaFoundation.MF_PD_DURATION
 Windows.Win32.Media.MediaFoundation.MF_READWRITE_DISABLE_CONVERTERS
@@ -1279,6 +1293,19 @@ Windows.Win32.UI.Shell.SHCreateItemFromParsingName
 Windows.Win32.System.Registry.RegGetValueW
 Windows.Win32.System.Registry.HKEY_CURRENT_USER
 Windows.Win32.System.Registry.RRF_RT_REG_DWORD
+
+# Native composition layers (generated additively with apis-composition.txt).
+Windows.Win32.Graphics.DirectComposition.DCompositionCreateDevice2
+Windows.Win32.Graphics.DirectComposition.DCompositionCreateDevice3
+Windows.Win32.Graphics.DirectComposition.IDCompositionDesktopDevice
+Windows.Win32.Graphics.DirectComposition.IDCompositionDevice2
+Windows.Win32.Graphics.DirectComposition.IDCompositionDevice3
+Windows.Win32.Graphics.DirectComposition.IDCompositionTarget
+Windows.Win32.Graphics.DirectComposition.IDCompositionVisual2
+Windows.Win32.Graphics.DirectComposition.IDCompositionVisual3
+Windows.Win32.Graphics.DirectComposition.IDCompositionRectangleClip
+Windows.Win32.Graphics.DirectComposition.IDCompositionEffectGroup
+Windows.Win32.Graphics.DirectComposition.IDCompositionSurface
 Windows.Win32.UI.Input.MOUSE_MOVE_ABSOLUTE
 Windows.Win32.System.Ole.DROPEFFECT_NONE
 Windows.Win32.System.SystemServices.MK_RBUTTON
@@ -1326,3 +1353,266 @@ Windows.Win32.System.JobObjects.SetInformationJobObject
 Windows.Win32.System.JobObjects.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 Windows.Win32.System.JobObjects.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
 Windows.Win32.System.JobObjects.JobObjectExtendedLimitInformation
+Windows.Win32.Storage.EnhancedStorage.PKEY_AppUserModel_ID
+Windows.Win32.Storage.EnhancedStorage.PKEY_AppUserModel_RelaunchCommand
+Windows.Win32.Storage.EnhancedStorage.PKEY_AppUserModel_RelaunchDisplayNameResource
+Windows.Win32.Storage.EnhancedStorage.PKEY_AppUserModel_RelaunchIconResource
+Windows.Win32.System.Variant.VT_LPWSTR
+Windows.Win32.UI.Shell.PropertiesSystem.IPropertyStore
+Windows.Win32.UI.Shell.PropertiesSystem.SHGetPropertyStoreForWindow
+Windows.Win32.UI.Shell.SetCurrentProcessExplicitAppUserModelID
+# Desk Link: the hardware H.264 encoder MFT fed DXGI surfaces (platform/video windows_stream_encoder.rs)
+Windows.Win32.Media.MediaFoundation.MFTEnumEx
+Windows.Win32.Media.MediaFoundation.MFT_ENUM_FLAG_HARDWARE
+Windows.Win32.Media.MediaFoundation.MFT_ENUM_FLAG_SORTANDFILTER
+Windows.Win32.Media.MediaFoundation.MFT_REGISTER_TYPE_INFO
+Windows.Win32.Media.MediaFoundation.MFT_CATEGORY_VIDEO_ENCODER
+Windows.Win32.Media.MediaFoundation.MF_TRANSFORM_ASYNC
+Windows.Win32.Media.MediaFoundation.MF_TRANSFORM_ASYNC_UNLOCK
+Windows.Win32.Media.MediaFoundation.MF_SA_D3D11_AWARE
+Windows.Win32.Media.MediaFoundation.MFT_MESSAGE_SET_D3D_MANAGER
+Windows.Win32.Media.MediaFoundation.METransformNeedInput
+Windows.Win32.Media.MediaFoundation.METransformHaveOutput
+Windows.Win32.Media.MediaFoundation.MF_EVENT_FLAG_NO_WAIT
+Windows.Win32.Media.MediaFoundation.CODECAPI_AVEncVideoForceKeyFrame
+Windows.Win32.Media.MediaFoundation.CODECAPI_AVLowLatencyMode
+Windows.Win32.Media.MediaFoundation.CODECAPI_AVEncCommonRateControlMode
+Windows.Win32.Media.MediaFoundation.CODECAPI_AVEncCommonMeanBitRate
+Windows.Win32.Media.MediaFoundation.CODECAPI_AVEncMPVGOPSize
+Windows.Win32.Media.MediaFoundation.CODECAPI_AVEncMPVDefaultBPictureCount
+Windows.Win32.Media.MediaFoundation.eAVEncCommonRateControlMode_LowDelayVBR
+# Desk Host: the logged-in session's screen (DXGI output duplication) and input (SendInput)
+Windows.Win32.Graphics.Dxgi.IDXGIOutput1
+Windows.Win32.Graphics.Dxgi.IDXGIOutputDuplication
+Windows.Win32.Graphics.Dxgi.DXGI_OUTDUPL_FRAME_INFO
+Windows.Win32.Graphics.Dxgi.DXGI_OUTDUPL_POINTER_SHAPE_INFO
+Windows.Win32.Graphics.Dxgi.DXGI_OUTPUT_DESC
+Windows.Win32.Graphics.Dxgi.DXGI_ERROR_WAIT_TIMEOUT
+Windows.Win32.Graphics.Dxgi.DXGI_ERROR_ACCESS_LOST
+Windows.Win32.Graphics.Dxgi.IDXGIAdapter1
+Windows.Win32.Graphics.Dxgi.IDXGIFactory1
+Windows.Win32.Graphics.Dxgi.CreateDXGIFactory1
+Windows.Win32.UI.Input.KeyboardAndMouse.SendInput
+Windows.Win32.UI.Input.KeyboardAndMouse.INPUT
+Windows.Win32.UI.Input.KeyboardAndMouse.INPUT_MOUSE
+Windows.Win32.UI.Input.KeyboardAndMouse.INPUT_KEYBOARD
+Windows.Win32.UI.Input.KeyboardAndMouse.MOUSEINPUT
+Windows.Win32.UI.Input.KeyboardAndMouse.KEYBDINPUT
+Windows.Win32.UI.Input.KeyboardAndMouse.MOUSEEVENTF_MOVE
+Windows.Win32.UI.Input.KeyboardAndMouse.MOUSEEVENTF_ABSOLUTE
+Windows.Win32.UI.Input.KeyboardAndMouse.MOUSEEVENTF_VIRTUALDESK
+Windows.Win32.UI.Input.KeyboardAndMouse.MOUSEEVENTF_LEFTDOWN
+Windows.Win32.UI.Input.KeyboardAndMouse.MOUSEEVENTF_LEFTUP
+Windows.Win32.UI.Input.KeyboardAndMouse.MOUSEEVENTF_RIGHTDOWN
+Windows.Win32.UI.Input.KeyboardAndMouse.MOUSEEVENTF_RIGHTUP
+Windows.Win32.UI.Input.KeyboardAndMouse.MOUSEEVENTF_MIDDLEDOWN
+Windows.Win32.UI.Input.KeyboardAndMouse.MOUSEEVENTF_MIDDLEUP
+Windows.Win32.UI.Input.KeyboardAndMouse.MOUSEEVENTF_XDOWN
+Windows.Win32.UI.Input.KeyboardAndMouse.MOUSEEVENTF_XUP
+Windows.Win32.UI.Input.KeyboardAndMouse.MOUSEEVENTF_WHEEL
+Windows.Win32.UI.Input.KeyboardAndMouse.MOUSEEVENTF_HWHEEL
+Windows.Win32.UI.Input.KeyboardAndMouse.KEYEVENTF_KEYUP
+Windows.Win32.UI.Input.KeyboardAndMouse.KEYEVENTF_SCANCODE
+Windows.Win32.UI.Input.KeyboardAndMouse.KEYEVENTF_EXTENDEDKEY
+Windows.Win32.UI.WindowsAndMessaging.GetCursorInfo
+Windows.Win32.UI.WindowsAndMessaging.CURSORINFO
+Windows.Win32.UI.WindowsAndMessaging.IDC_IBEAM
+Windows.Win32.UI.WindowsAndMessaging.IDC_HAND
+Windows.Win32.UI.WindowsAndMessaging.IDC_CROSS
+Windows.Win32.UI.WindowsAndMessaging.IDC_SIZEWE
+Windows.Win32.UI.WindowsAndMessaging.IDC_SIZENS
+Windows.Win32.UI.WindowsAndMessaging.IDC_SIZENWSE
+Windows.Win32.UI.WindowsAndMessaging.IDC_SIZENESW
+Windows.Win32.UI.WindowsAndMessaging.IDC_SIZEALL
+Windows.Win32.UI.WindowsAndMessaging.IDC_NO
+Windows.Win32.UI.WindowsAndMessaging.IDC_WAIT
+Windows.Win32.UI.WindowsAndMessaging.IDC_ARROW
+Windows.Win32.UI.WindowsAndMessaging.GetSystemMetrics
+Windows.Win32.UI.WindowsAndMessaging.SM_XVIRTUALSCREEN
+Windows.Win32.UI.WindowsAndMessaging.SM_YVIRTUALSCREEN
+Windows.Win32.UI.WindowsAndMessaging.SM_CXVIRTUALSCREEN
+Windows.Win32.UI.WindowsAndMessaging.SM_CYVIRTUALSCREEN
+Windows.Win32.Media.MediaFoundation.MFT_FRIENDLY_NAME_Attribute
+Windows.Win32.UI.Shell.Shell_NotifyIconW
+Windows.Win32.UI.Shell.NOTIFYICONDATAW
+Windows.Win32.UI.Shell.NIM_ADD
+Windows.Win32.UI.Shell.NIM_MODIFY
+Windows.Win32.UI.Shell.NIM_DELETE
+Windows.Win32.UI.Shell.NIM_SETVERSION
+Windows.Win32.UI.Shell.NIF_MESSAGE
+Windows.Win32.UI.Shell.NIF_ICON
+Windows.Win32.UI.Shell.NIF_TIP
+Windows.Win32.UI.Shell.NIF_SHOWTIP
+Windows.Win32.UI.Shell.NOTIFYICON_VERSION_4
+Windows.Win32.UI.Shell.NIN_SELECT
+Windows.Win32.UI.Shell.NINF_KEY
+Windows.Win32.UI.WindowsAndMessaging.RegisterWindowMessageW
+Windows.Win32.UI.WindowsAndMessaging.WM_CONTEXTMENU
+Windows.Win32.UI.WindowsAndMessaging.WM_NULL
+Windows.Win32.UI.WindowsAndMessaging.TPM_NONOTIFY
+Windows.Win32.UI.WindowsAndMessaging.TPM_BOTTOMALIGN
+# tray dropdowns: the icon's rect and its monitor
+Windows.Win32.UI.Shell.Shell_NotifyIconGetRect
+Windows.Win32.UI.Shell.NOTIFYICONIDENTIFIER
+Windows.Win32.Graphics.Gdi.MonitorFromRect
+Windows.Win32.UI.WindowsAndMessaging.SWP_SHOWWINDOW
+Windows.Win32.System.JobObjects.TerminateJobObject
+Windows.Win32.System.JobObjects.QueryInformationJobObject
+Windows.Win32.System.JobObjects.JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
+Windows.Win32.System.JobObjects.JobObjectBasicAccountingInformation
+Windows.Win32.System.JobObjects.JOBOBJECT_BASIC_PROCESS_ID_LIST
+Windows.Win32.System.JobObjects.JobObjectBasicProcessIdList
+Windows.Win32.System.Diagnostics.ToolHelp.Thread32First
+Windows.Win32.System.Diagnostics.ToolHelp.Thread32Next
+Windows.Win32.System.Diagnostics.ToolHelp.THREADENTRY32
+Windows.Win32.System.Diagnostics.ToolHelp.TH32CS_SNAPTHREAD
+Windows.Win32.System.Diagnostics.ToolHelp.TH32CS_SNAPPROCESS
+Windows.Win32.System.Threading.OpenThread
+Windows.Win32.System.Threading.ResumeThread
+Windows.Win32.System.Threading.THREAD_SUSPEND_RESUME
+Windows.Win32.System.Threading.GetSystemTimes
+Windows.Win32.System.Threading.CREATE_SUSPENDED
+Windows.Win32.System.Threading.CREATE_NEW_PROCESS_GROUP
+Windows.Win32.System.Threading.CREATE_NO_WINDOW
+Windows.Win32.System.Threading.BELOW_NORMAL_PRIORITY_CLASS
+Windows.Win32.System.Threading.PROCESS_TERMINATE
+Windows.Win32.System.Threading.PROCESS_SET_QUOTA
+Windows.Win32.System.Threading.PROCESS_QUERY_INFORMATION
+Windows.Win32.System.Threading.PROCESS_VM_READ
+Windows.Win32.System.ProcessStatus.K32GetProcessMemoryInfo
+Windows.Win32.System.ProcessStatus.PROCESS_MEMORY_COUNTERS
+Windows.Win32.System.SystemInformation.GetNativeSystemInfo
+Windows.Win32.System.SystemInformation.SYSTEM_INFO
+Windows.Win32.System.SystemInformation.GetTickCount64
+Windows.Win32.System.Power.GetSystemPowerStatus
+Windows.Win32.System.Power.SYSTEM_POWER_STATUS
+
+# UI Automation providers are called concurrently, including destruction.
+# Explicit bounds preserve apartment-local implementations of other interfaces.
+implement Windows.Win32.UI.Accessibility.IRawElementProviderSimple: Send + Sync
+implement Windows.Win32.UI.Accessibility.IRawElementProviderFragment: Send + Sync
+implement Windows.Win32.UI.Accessibility.IRawElementProviderFragmentRoot: Send + Sync
+implement Windows.Win32.UI.Accessibility.IInvokeProvider: Send + Sync
+implement Windows.Win32.UI.Accessibility.IToggleProvider: Send + Sync
+implement Windows.Win32.UI.Accessibility.IValueProvider: Send + Sync
+implement Windows.Win32.UI.Accessibility.IRangeValueProvider: Send + Sync
+implement Windows.Win32.UI.Accessibility.ISelectionProvider: Send + Sync
+implement Windows.Win32.UI.Accessibility.ISelectionItemProvider: Send + Sync
+implement Windows.Win32.UI.Accessibility.IExpandCollapseProvider: Send + Sync
+implement Windows.Win32.UI.Accessibility.IScrollProvider: Send + Sync
+implement Windows.Win32.UI.Accessibility.IScrollItemProvider: Send + Sync
+implement Windows.Win32.UI.Accessibility.ITextProvider: Send + Sync
+implement Windows.Win32.UI.Accessibility.ITextProvider2: Send + Sync
+implement Windows.Win32.UI.Accessibility.ITextRangeProvider: Send + Sync
+implement Windows.Win32.UI.Accessibility.IGridProvider: Send + Sync
+implement Windows.Win32.UI.Accessibility.IGridItemProvider: Send + Sync
+implement Windows.Win32.UI.Accessibility.ITableProvider: Send + Sync
+implement Windows.Win32.UI.Accessibility.ITableItemProvider: Send + Sync
+Windows.Win32.UI.Accessibility.UiaReturnRawElementProvider
+Windows.Win32.UI.Accessibility.UiaHostProviderFromHwnd
+Windows.Win32.UI.Accessibility.UiaRaiseAutomationEvent
+Windows.Win32.UI.Accessibility.UiaRaiseAutomationPropertyChangedEvent
+Windows.Win32.UI.Accessibility.UiaRaiseStructureChangedEvent
+Windows.Win32.UI.Accessibility.UiaRaiseNotificationEvent
+Windows.Win32.UI.Accessibility.UiaClientsAreListening
+Windows.Win32.UI.Accessibility.UiaDisconnectProvider
+Windows.Win32.UI.Accessibility.UiaDisconnectAllProviders
+Windows.Win32.UI.Accessibility.UiaRootObjectId
+Windows.Win32.UI.Accessibility.UiaAppendRuntimeId
+Windows.Win32.UI.WindowsAndMessaging.WM_GETOBJECT
+constants Windows.Win32.UI.Accessibility.UIA_*PropertyId
+constants Windows.Win32.UI.Accessibility.UIA_*ControlTypeId
+constants Windows.Win32.UI.Accessibility.UIA_*PatternId
+constants Windows.Win32.UI.Accessibility.UIA_*EventId
+constants Windows.Win32.UI.Accessibility.UIA_E_*
+Windows.Win32.UI.Accessibility.ProviderOptions
+constants Windows.Win32.UI.Accessibility.ProviderOptions_*
+Windows.Win32.UI.Accessibility.NavigateDirection
+constants Windows.Win32.UI.Accessibility.NavigateDirection_*
+Windows.Win32.UI.Accessibility.StructureChangeType
+constants Windows.Win32.UI.Accessibility.StructureChangeType_*
+Windows.Win32.UI.Accessibility.ToggleState
+constants Windows.Win32.UI.Accessibility.ToggleState_*
+Windows.Win32.UI.Accessibility.ExpandCollapseState
+constants Windows.Win32.UI.Accessibility.ExpandCollapseState_*
+Windows.Win32.UI.Accessibility.RowOrColumnMajor
+constants Windows.Win32.UI.Accessibility.RowOrColumnMajor_*
+Windows.Win32.UI.Accessibility.ScrollAmount
+constants Windows.Win32.UI.Accessibility.ScrollAmount_*
+Windows.Win32.UI.Accessibility.SupportedTextSelection
+constants Windows.Win32.UI.Accessibility.SupportedTextSelection_*
+Windows.Win32.UI.Accessibility.TextPatternRangeEndpoint
+constants Windows.Win32.UI.Accessibility.TextPatternRangeEndpoint_*
+Windows.Win32.UI.Accessibility.TextUnit
+constants Windows.Win32.UI.Accessibility.TextUnit_*
+Windows.Win32.UI.Accessibility.NotificationKind
+constants Windows.Win32.UI.Accessibility.NotificationKind_*
+Windows.Win32.UI.Accessibility.NotificationProcessing
+constants Windows.Win32.UI.Accessibility.NotificationProcessing_*
+Windows.Win32.UI.Accessibility.OrientationType
+constants Windows.Win32.UI.Accessibility.OrientationType_*
+Windows.Win32.UI.Accessibility.LiveSetting
+constants Windows.Win32.UI.Accessibility.LiveSetting_*
+Windows.Win32.UI.Accessibility.UiaRect
+Windows.Win32.System.Variant.VariantClear
+constants Windows.Win32.System.Variant.VT_*
+Windows.Win32.System.Ole.SafeArrayCreateVector
+Windows.Win32.System.Ole.SafeArrayPutElement
+Windows.Win32.System.Ole.SafeArrayAccessData
+Windows.Win32.System.Ole.SafeArrayUnaccessData
+Windows.Win32.System.Ole.SafeArrayDestroy
+
+# In-process client for comparing the provider tree with the mirror.
+Windows.Win32.UI.Accessibility.IUIAutomation
+Windows.Win32.UI.Accessibility.CUIAutomation
+Windows.Win32.UI.Accessibility.IUIAutomationElement
+Windows.Win32.UI.Accessibility.IUIAutomationElementArray
+Windows.Win32.UI.Accessibility.IUIAutomationTreeWalker
+Windows.Win32.UI.Accessibility.IUIAutomationCondition
+Windows.Win32.UI.Accessibility.IUIAutomationInvokePattern
+Windows.Win32.UI.Accessibility.IUIAutomationValuePattern
+Windows.Win32.UI.Accessibility.IUIAutomationTogglePattern
+
+# Successful null interface results denote missing patterns, matches or neighbours.
+nullable Windows.Win32.UI.Accessibility.IRawElementProviderSimple.GetPatternProvider.pRetVal
+nullable Windows.Win32.UI.Accessibility.IRawElementProviderSimple.get_HostRawElementProvider.pRetVal
+nullable Windows.Win32.UI.Accessibility.IRawElementProviderFragment.Navigate.pRetVal
+nullable Windows.Win32.UI.Accessibility.IRawElementProviderFragmentRoot.ElementProviderFromPoint.pRetVal
+nullable Windows.Win32.UI.Accessibility.IRawElementProviderFragmentRoot.GetFocus.pRetVal
+nullable Windows.Win32.UI.Accessibility.ITextRangeProvider.FindAttribute.pRetVal
+nullable Windows.Win32.UI.Accessibility.ITextRangeProvider.FindText.pRetVal
+nullable Windows.Win32.UI.Accessibility.IUIAutomationTreeWalker.GetParentElement.parent
+nullable Windows.Win32.UI.Accessibility.IUIAutomationTreeWalker.GetFirstChildElement.first
+nullable Windows.Win32.UI.Accessibility.IUIAutomationTreeWalker.GetLastChildElement.last
+nullable Windows.Win32.UI.Accessibility.IUIAutomationTreeWalker.GetNextSiblingElement.next
+nullable Windows.Win32.UI.Accessibility.IUIAutomationTreeWalker.GetPreviousSiblingElement.previous
+nullable Windows.Win32.UI.Accessibility.IUIAutomationTreeWalker.NormalizeElement.normalized
+nullable Windows.Win32.UI.Accessibility.IUIAutomationTreeWalker.GetParentElementBuildCache.parent
+nullable Windows.Win32.UI.Accessibility.IUIAutomationTreeWalker.GetFirstChildElementBuildCache.first
+nullable Windows.Win32.UI.Accessibility.IUIAutomationTreeWalker.GetLastChildElementBuildCache.last
+nullable Windows.Win32.UI.Accessibility.IUIAutomationTreeWalker.GetNextSiblingElementBuildCache.next
+nullable Windows.Win32.UI.Accessibility.IUIAutomationTreeWalker.GetPreviousSiblingElementBuildCache.previous
+nullable Windows.Win32.UI.Accessibility.IUIAutomationTreeWalker.NormalizeElementBuildCache.normalized
+
+# Text-provider attributes and UTF-16 strings used by the Win32 semantic adapter.
+Windows.Win32.UI.Accessibility.UiaGetReservedNotSupportedValue
+Windows.Win32.UI.Accessibility.UIA_TextPattern2Id
+constants Windows.Win32.UI.Accessibility.UIA_*AttributeId
+Windows.Win32.Foundation.SysStringLen
+# Additive desktop session, computer name and Task Scheduler bindings.
+Windows.Win32.System.RemoteDesktop.ProcessIdToSessionId
+Windows.Win32.System.RemoteDesktop.WTSGetActiveConsoleSessionId
+Windows.Win32.System.RemoteDesktop.WTSQuerySessionInformationW
+Windows.Win32.System.RemoteDesktop.WTSFreeMemory
+Windows.Win32.System.RemoteDesktop.WTSConnectState
+Windows.Win32.System.RemoteDesktop.WTSActive
+Windows.Win32.System.RemoteDesktop.WTSDisconnected
+Windows.Win32.System.SystemInformation.GetComputerNameExW
+Windows.Win32.System.SystemInformation.ComputerNameDnsHostname
+Windows.Win32.System.TaskScheduler.TaskScheduler
+Windows.Win32.System.TaskScheduler.ITaskService
+Windows.Win32.System.Threading.DETACHED_PROCESS
+Windows.Win32.System.Threading.CREATE_BREAKAWAY_FROM_JOB
+Windows.Win32.Foundation.ERROR_FILE_NOT_FOUND
+Windows.Win32.Foundation.ERROR_PATH_NOT_FOUND
+Windows.Win32.Foundation.RPC_E_CHANGED_MODE

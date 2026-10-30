@@ -9,6 +9,7 @@
 //! Every spawn site of the window manager, of the apps it hosts and of their tools (Code's runs,
 //! the terminal's shell) calls [`scrub`], so the rule holds down the whole process tree.
 
+use std::ffi::OsString;
 use std::process::Command;
 
 /// Read only by the direct-display shell and the WM's display settings.
@@ -28,6 +29,29 @@ pub const DIRECT_SHELL_ENV: &[&str] = &[
 /// What makes a process one particular hosted client of its host.
 pub const HOSTED_IDENTITY_ENV: &[&str] = &["STUDIO", "STUDIO_HOST", "STUDIO_BUILD", "STUDIO_CRATE", "MAKEPAD_STDIN_LOOP", "MAKEPAD_HIDE_WINDOWS"];
 
+/// A test instance's marks: a lane's run is badged and kept off the local network
+/// (`MAKEPAD_TEST_LANE`, `MAKEPAD_LAN`), a hidden one muted (`SANDBOX_MUTE`), and its builds and
+/// JIT state go to the lane's own dirs. A registry launch (the dock's app) never inherits them.
+pub const LANE_ENV: &[&str] = &["MAKEPAD_TEST_LANE", "MAKEPAD_LAN", "SANDBOX_MUTE", "CARGO_TARGET_DIR"];
+
+/// The `makepad run` settings a launcher may carry (`MAKEPAD_RUN_HOME`, `_TARGET_DIR`, `_STD`,
+/// `_REPORT_TO`, ...): a registry launch starts with none of them; a machine sets its own in
+/// jit.env ([`crate::machine`]).
+pub const LANE_ENV_PREFIX: &str = "MAKEPAD_RUN_";
+
+/// Clears [`LANE_ENV`] and every `MAKEPAD_RUN_*` of this process from `command`: what a registry
+/// launch starts is the same app with the same settings however its launcher was started.
+pub fn scrub_lane(command: &mut Command) {
+    for key in LANE_ENV {
+        command.env_remove(key);
+    }
+    for (key, _) in std::env::vars_os() {
+        if key.to_str().is_some_and(|key| key.starts_with(LANE_ENV_PREFIX)) {
+            command.env_remove(key);
+        }
+    }
+}
+
 /// `MAKEPAD`'s tokens without the window-backend ones (`linux_direct`, `direct`, `wayland`,
 /// `x11`); None when nothing is left.
 pub fn child_makepad_env(value: &str) -> Option<String> {
@@ -36,6 +60,30 @@ pub fn child_makepad_env(value: &str) -> Option<String> {
         .filter(|t| !t.is_empty() && !matches!(*t, "linux_direct" | "direct" | "wayland" | "x11"))
         .collect();
     (!kept.is_empty()).then(|| kept.join("+"))
+}
+
+/// This process's environment as [`scrub`] leaves it for a child, for a spawn site that hands
+/// the child a whole environment block (the terminal's Windows PTY). Names compare as the OS
+/// does: ignoring case on Windows.
+pub fn scrubbed_vars() -> Vec<(OsString, OsString)> {
+    let same = |a: &str, b: &str| if cfg!(windows) { a.eq_ignore_ascii_case(b) } else { a == b };
+    let mut vars = Vec::new();
+    for (key, value) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if DIRECT_SHELL_ENV.iter().chain(HOSTED_IDENTITY_ENV).any(|d| same(&name, d)) {
+            continue;
+        }
+        if same(&name, "MAKEPAD") {
+            match value.to_str().map(child_makepad_env) {
+                Some(Some(kept)) => vars.push((key, kept.into())),
+                Some(None) => {}
+                None => vars.push((key, value)),
+            }
+            continue;
+        }
+        vars.push((key, value));
+    }
+    vars
 }
 
 /// Clears the variables above from `command`'s environment (a host sets its child's own

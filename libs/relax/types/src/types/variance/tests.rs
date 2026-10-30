@@ -169,6 +169,40 @@ fn relax_core_declarations() {
 }
 
 #[test]
+fn added_declarations_infer_against_the_converged_program() {
+    // JITSTALL: a loaded module's ADTs are inferred alone against the program's values, and
+    // reach the same fixpoint the whole-program inference does (cycles among the added included)
+    let (p, t) = collect(r#"
+        struct Old<T>(fn(T));
+        struct OldCo<'a, T>(&'a T);
+        struct NewA<T, U>(Old<T>, *const NewB<U>);
+        struct NewB<U>(fn(NewA<U, U>), OldCo<'static, U>);
+        struct NewC<'a, T>(OldCo<'a, Old<T>>, NewC2<T>);
+        struct NewC2<T>(T);
+        struct Tup<T>(*mut T);
+    "#);
+    let full = infer(&t);
+    let added: Vec<DefId> = ["NewA", "NewB", "NewC", "NewC2", "Tup"].iter().map(|n| named(&p, n)).collect();
+    let mut values = full.clone();
+    for d in &added { values.remove(d); }
+    infer_added(&t, &mut values, &added);
+    assert_eq!(values, full);
+}
+
+#[test]
+fn removed_impls_keep_the_inferred_variances() {
+    // JITSTALL: impls are no input of variance; their removal (an inspect probe's module going,
+    // a refused reload) keeps the program's inference instead of redoing it on the next query
+    let (p, mut t) = collect("struct A<T>(T); impl<T> A<T> { fn f(&self) {} }");
+    check(&p, &t, "A", &[V::Co]);
+    let imp = (0..p.defs.len()).map(|i| DefId(i as u32)).find(|&d| p.def(d).kind == crate::program::DefKind::Impl).unwrap();
+    let before = t.variances.get().map(|m| m as *const _);
+    t.uncollect_impls(&[imp]);
+    assert!(before.is_some() && t.variances.get().map(|m| m as *const _).is_some());
+    check(&p, &t, "A", &[V::Co]);
+}
+
+#[test]
 fn publication_invalidates_dependents() {
     let (p, mut t) = collect("struct A<T>(T); struct B<T>(A<T>);");
     check(&p, &t, "B", &[V::Co]);
@@ -229,15 +263,15 @@ fn lazy_signature_diagnostics_survive_first_reader_and_reload() {
     let bad = named(&p, "bad");
     assert_eq!(t.signature_count(), 0);
     t.fn_sig(&p, bad).unwrap();
-    assert!(t.signature_errors(&p, bad).iter().any(|e| e.contains("unsupported function ABI")));
+    assert!(t.signature_errors(&p, bad).iter().any(|e| e.contains("E0703: invalid ABI")));
     let state = crate::tcx::EvalState::new();
     let cx = crate::tcx::EvalCx::new(&p, &t, crate::tcx::TypingEnv::fully_monomorphized(&p), &state);
     let body = crate::typeck::instantiate_body(&cx, &p, &t, bad, &[]);
-    assert!(body.errors.iter().any(|e| e.contains("unsupported function ABI")));
+    assert!(body.errors.iter().any(|e| e.contains("E0703: invalid ABI")));
     assert_eq!(t.signature_count(), 1);
     t.collect_added(&p, &[bad], false);
     assert_eq!(t.signature_count(), 0);
-    assert!(t.signature_errors(&p, bad).iter().any(|e| e.contains("unsupported function ABI")));
+    assert!(t.signature_errors(&p, bad).iter().any(|e| e.contains("E0703: invalid ABI")));
 }
 
 #[test]
@@ -252,7 +286,7 @@ fn lazy_foreign_signature_errors_reach_every_caller() {
     let cx = crate::tcx::EvalCx::new(&p, &t, crate::tcx::TypingEnv::fully_monomorphized(&p), &state);
     for name in ["first", "second"] {
         let body = crate::typeck::instantiate_body(&cx, &p, &t, named(&p, name), &[]);
-        assert!(body.errors.iter().any(|e| e.contains("unsupported function ABI")), "{:?}", body.errors);
+        assert!(body.errors.iter().any(|e| e.contains("E0703: invalid ABI")), "{:?}", body.errors);
     }
     assert_eq!(t.signature_count(), 3);
 }

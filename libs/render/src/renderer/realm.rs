@@ -15,6 +15,9 @@ impl Renderer {
     /// adaptive-quality history owned by this device.
     pub fn enter_realm(&mut self) {
         self.custom_draws.clear();
+        // The stock IBL program went with them: a build of it that failed
+        // may be made again (renderer/stock_ibl.rs).
+        self.stock_ibl_forget_failure();
         self.static_chunks.clear();
         self.chunk_visible.clear();
         self.slab_key = None;
@@ -104,6 +107,23 @@ impl Renderer {
 
     pub fn set_stage(&mut self, stage: Stage) {
         self.stage = stage;
+    }
+
+    /// The room box an `MrBox` stage clips the world to (other stages ignore it).
+    pub fn set_clip_box(&mut self, clip_box: Option<crate::stage::ClipBox>) {
+        self.clip_box = clip_box;
+    }
+
+    /// The stage the scene draw list carries as its view transform: the stage itself, or
+    /// identity on an `MrBox` stage (the XR eye views carry it, `Cx::xr_set_scene_to_room`).
+    pub(crate) fn draw_stage_matrix(&self) -> Mat4f {
+        if self.stage.mode == StageMode::MrBox { Mat4f::identity() } else { self.stage.matrix() }
+    }
+
+    /// An `MrBox` stage's box, world -> the unit box.
+    pub(crate) fn clip_box_from_world(&self) -> Option<Mat4f> {
+        let b = self.clip_box.filter(|_| self.stage.mode == StageMode::MrBox)?;
+        Some(Mat4f::mul(&b.unit_from_room(), &self.stage.matrix()))
     }
 
     /// How many casters may use the projected-silhouette tier. Lower it on
@@ -501,6 +521,10 @@ impl Renderer {
     /// Independent camera/lighting caches for an on-demand scene review.
     /// Meshes, textures and immutable metadata share resident handles; the
     /// live renderer's GI, camera and simulation state remain untouched.
+    /// The environment is the live renderer's (I4): the fork is born
+    /// mirroring it ([`Self::mirror_environment_from`]) and never prepares
+    /// one of its own, so a `game.environment` world draws with its map in
+    /// every view; a fork kept across frames mirrors it again each frame.
     pub fn fork_scene_for_review(&self) -> Self {
         let mut review = Self::default();
         review.static_models = self.static_models.clone();
@@ -521,6 +545,7 @@ impl Renderer {
         review.set_gpu_lightmap_mode(crate::GpuLightmapMode::Realtime);
         review.set_clustered_lighting(true);
         review.set_gi_mode(crate::GiMode::Off);
+        review.mirror_environment_from(self);
         review
     }
 
@@ -582,8 +607,13 @@ impl Renderer {
         self.custom_draws.get(name).map(|m| &**m)
     }
 
+    /// Keep only the installed materials `names` lists (a host's reload:
+    /// the ones it still declares). The stock IBL program goes with the
+    /// rest and the next frame under an environment builds it again, also
+    /// when its last build failed (renderer/stock_ibl.rs).
     pub fn retain_custom_materials(&mut self, names: &[String]) {
         self.custom_draws.retain(|name, _| names.contains(name));
+        self.stock_ibl_forget_failure();
     }
 
     pub fn custom_material_shader(&self, name: &str) -> Option<DrawShaderId> {
@@ -603,6 +633,32 @@ impl Renderer {
         let Some(mut draw) = self.foliage_draw.take() else { return };
         self.draw_models_inner(cx, ModelDraw::Foliage(&mut draw), eye, instances, lane, fog, sun, frustum, stats);
         self.foliage_draw = Some(draw);
+    }
+
+    /// The terrain paint pass (shaders/splat.rs): the same instance list,
+    /// taking only the models with a painted layer. Until its pipeline
+    /// exists they stay on the PBR lane (their main layer).
+    pub(super) fn draw_splat_models(
+        &mut self, cx: &mut Cx3d, eye: Vec3f, instances: &[ModelInstance],
+        lane: WorldModelLane, fog: (Vec3f, f32), sun: &SunLight,
+        frustum: Option<&Frustum>, stats: &mut RenderStats,
+    ) {
+        if !self.splat_ready { return; }
+        let Some(mut draw) = self.splat_draw.take() else { return };
+        self.draw_models_inner(cx, ModelDraw::Splat(&mut draw), eye, instances, lane, fog, sun, frustum, stats);
+        self.splat_draw = Some(draw);
+    }
+
+    /// Decide once per frame, before any model pass, whether painted
+    /// terrain takes its own lane this frame.
+    pub(super) fn prepare_splat_lane(&mut self, cx: &mut Cx) {
+        if self.splat_draw.is_none() {
+            self.splat_draw = cx.try_with_vm(|vm| Box::new(crate::shaders::DrawSceneSplat::script_new_with_default(vm)));
+        }
+        let hdr = self.hdr_output;
+        let stock = self.splat_draw.as_ref().and_then(|d| d.pbr.skinned.draw_vars.draw_shader_id);
+        let shader = if stock.is_some() { self.lane_shaders(cx, super::variants::ModelLane::Splat, stock).0 } else { None };
+        self.splat_ready = self.pbr_materials_enabled && shader.is_some_and(|id| cx.draw_shader_ready(id, hdr));
     }
 
     /// Decide once per frame, before any model pass, whether foliage takes
@@ -625,11 +681,28 @@ impl Renderer {
         lane: WorldModelLane, fog: (Vec3f, f32), sun: &SunLight,
         frustum: Option<&Frustum>, stats: &mut RenderStats,
     ) {
+        // The stock IBL program draws when the frame routes through it and
+        // a shiny stock model is in the list, whether or not an instance
+        // names it (renderer/stock_ibl.rs). The list check is the name scan
+        // of draw_pbr_models' early-out without its fast path (the diffuse
+        // lane's model_orders): while the frame routes, each call hashes
+        // the resident shiny models' names and scans the list, and a list
+        // with no shiny stock model draws nothing through the program.
+        // While the frame does not route (no environment) nothing is
+        // scanned.
+        let stock_ibl_on = self.stock_ibl_active() && self.lists_a_stock_ibl_model(instances);
         // Blended programs after every opaque one (they neither write depth
         // nor hide what is behind them), each group in name order.
         let mut names: Vec<(bool, String)> = self.custom_draws.iter().filter(|(name, _)| {
-            instances.iter().any(|i| i.custom_material.as_ref().is_some_and(|m| &m.name == *name))
-        }).map(|(name, m)| (m.draw.draw_vars.options.alpha_blend, name.clone())).collect();
+            (stock_ibl_on && name.as_str() == stock_ibl::STOCK_IBL_MATERIAL)
+                || instances.iter().any(|i| i.custom_material.as_ref().is_some_and(|m| &m.name == *name))
+        }).map(|(name, m)| {
+            // The stock IBL program stands in for the PBR lane: opaque models, their blended
+            // layers drawn inside it, before every blended program. set_material leaves the
+            // last layer's blend state on its draw, so that state must not sort it.
+            let blended = m.draw.draw_vars.options.alpha_blend && name.as_str() != stock_ibl::STOCK_IBL_MATERIAL;
+            (blended, name.clone())
+        }).collect();
         names.sort();
         let names = names.into_iter().map(|(_, name)| name);
         for name in names {

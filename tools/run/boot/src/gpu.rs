@@ -321,6 +321,9 @@ impl Pipeline {
                 instance_binding: info.instance_binding().unwrap_or(u32::MAX),
                 pick_binding: info.pick_binding().unwrap_or(u32::MAX),
                 pick_texture_base: info.pick_texture_base().unwrap_or(u32::MAX),
+                // the boot screen never draws into a multiview pass
+                xr_vertex: Vec::new(),
+                xr_fragment: Vec::new(),
                 // the boot document samples at most one 2D texture (checked above)
                 textures: vec![0; textures],
                 samplers: desc
@@ -397,6 +400,26 @@ impl Pipeline {
 
     pub fn create(&self, writer: &mut CmdWriter, dialect: u32) {
         writer.pipeline_create(self.id, dialect, Attr::default(), &self.blob);
+    }
+
+    /// One draw of `count` instances of the retained instance buffer `buffer`.
+    pub fn draw_buffer(&self, writer: &mut CmdWriter, buffer: Id, count: u32, uniforms: &[f32], scissor: [f32; 4]) {
+        if count == 0 {
+            return;
+        }
+        writer.draw(Draw {
+            pipeline: self.id,
+            vb: VERTICES,
+            ib: INDICES,
+            index: [0, 6],
+            inst: Inst::buffer(buffer, 0, count),
+            uniforms: [Slice::EMPTY, Slice::EMPTY, Slice::of(uniforms), Slice::of(&self.scope)],
+            tex: Default::default(),
+            scissor,
+            bounds: [f32::NAN; 4],
+            flags: Draw::BLEND | Draw::INDEX_U32,
+            ..Default::default()
+        });
     }
 
     pub fn draw(

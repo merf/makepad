@@ -15,6 +15,20 @@ use std::{
     time::Duration,
 };
 
+// Prefer the active checkout when the packaging tool was built on a build node or in
+// another worktree. Its Java, resources and signing assets must match the app's sources.
+fn android_tool_sources() -> PathBuf {
+    if let Ok(cwd) = std::env::current_dir() {
+        for root in cwd.ancestors() {
+            let tool = root.join("tools/cargo_makepad");
+            if tool.join("src/android/java/dev/makepad/android/MakepadActivity.java").is_file() {
+                return tool;
+            }
+        }
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
 fn aapt_path(sdk_dir: &Path, urls: &AndroidSDKUrls) -> PathBuf {
     sdk_dir
         .join(BUILD_TOOLS_DIR)
@@ -1107,7 +1121,7 @@ fn prepare_build(opts: &PrepareBuildOpts<'_>) -> Result<BuildPaths, String> {
     mkdir(&out_dir)?;
     mkdir(&java_out_dir)?;
 
-    let cargo_manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let cargo_manifest_dir = android_tool_sources();
     cp_all(&cargo_manifest_dir.join("src/android/res"), &res_dir, false)?;
 
     let build_crate_dir = get_crate_dir(opts.build_crate)?;
@@ -1234,7 +1248,7 @@ fn compile_java(
     extra_sources: &[PathBuf],
 ) -> Result<(), String> {
     let makepad_package_path = "dev/makepad/android";
-    let cargo_manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let cargo_manifest_dir = android_tool_sources();
     let java_home = sdk_dir.join("openjdk");
     let cwd = std::env::current_dir().unwrap();
     let javac_stamp = build_paths.java_out_dir.join("javac.inputs");
@@ -1249,7 +1263,9 @@ fn compile_java(
     let java_sources = vec![
         r_class_path.clone(),
         makepad_java_classes_dir.join("MakepadNative.java"),
+        makepad_java_classes_dir.join("MakepadA11yProvider.java"),
         makepad_java_classes_dir.join("MakepadActivity.java"),
+        makepad_java_classes_dir.join("NativeLayerContainer.java"),
         makepad_java_classes_dir.join("MakepadInputConnection.java"),
         makepad_java_classes_dir.join("MakepadNetwork.java"),
         makepad_java_classes_dir.join("MakepadSpeech.java"),
@@ -1261,6 +1277,8 @@ fn compile_java(
         makepad_java_classes_dir.join("VideoPlayerRunnable.java"),
         makepad_java_classes_dir.join("OesDecodeSurface.java"),
         makepad_java_classes_dir.join("H264Encoder.java"),
+        // makepad-network's P-256 and TLS server (fleet identity) over Java security, for every app
+        makepad_java_classes_dir.join("FleetTls.java"),
         build_paths.java_file.clone(),
         build_paths.xr_file.clone(),
     ];
@@ -1757,7 +1775,6 @@ fn add_rust_library(
     variant: &AndroidVariant,
     urls: &AndroidSDKUrls,
 ) -> Result<PathBuf, String> {
-    let _ = variant;
     let cwd = std::env::current_dir().unwrap();
     let target_dir = cargo_target_dir(&cwd);
     let profile = get_profile_from_args(args);
@@ -1841,8 +1858,20 @@ fn add_rust_library(
             }
         }
     }
+    // a Quest build carries the Khronos OpenXR loader: the HAL finds it and runs immersive
+    if let AndroidVariant::Quest = variant {
+        let binary_path = "lib/arm64-v8a/libopenxr_loader.so";
+        cp(&quest_openxr_loader(), &build_paths.out_dir.join(binary_path), false)?;
+        shell_env_cap(&[], &build_paths.out_dir, aapt_path(sdk_dir, urls).to_str().unwrap(),
+            &["add", build_paths.dst_unaligned_apk.to_str().unwrap(), binary_path])?;
+    }
 
     Ok(build_dir.unwrap())
+}
+
+/// The Khronos OpenXR loader for Android arm64, kept in-tree (`tools/cargo_makepad/quest`).
+fn quest_openxr_loader() -> PathBuf {
+    android_tool_sources().join("quest/libopenxr_loader.so")
 }
 
 fn add_resources(
@@ -2081,7 +2110,7 @@ fn sign_apk(sdk_dir: &Path, build_paths: &BuildPaths, urls: &AndroidSDKUrls) -> 
 /// Sign `apk` in place with the bundled debug keystore (apksigner).
 pub fn sign_apk_debug(sdk_dir: &Path, urls: &AndroidSDKUrls, apk: &Path) -> Result<(), String> {
     let cwd = std::env::current_dir().unwrap();
-    let cargo_manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let cargo_manifest_dir = android_tool_sources();
     let java_home = sdk_dir.join("openjdk");
 
     shell_env_cap(
@@ -2371,7 +2400,6 @@ fn stage_aab_native_libs(
     variant: &AndroidVariant,
     urls: &AndroidSDKUrls,
 ) -> Result<PathBuf, String> {
-    let _ = variant;
     let cwd = std::env::current_dir().unwrap();
     let target_dir = cargo_target_dir(&cwd);
     let profile = get_profile_from_args(args);
@@ -2411,6 +2439,9 @@ fn stage_aab_native_libs(
             libs_root,
             &current_build_dir,
         )?;
+    }
+    if let AndroidVariant::Quest = variant {
+        cp(&quest_openxr_loader(), &libs_root.join("arm64-v8a/libopenxr_loader.so"), false)?;
     }
     Ok(build_dir.unwrap())
 }
@@ -2813,7 +2844,7 @@ pub fn build_aab(
 
     println!("AAB Build completed: {}", aab_paths.dst_aab.display());
     if let Some(opts) = &signing {
-        let cargo_manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let cargo_manifest_dir = android_tool_sources();
         if opts.keystore == cargo_manifest_dir.join("debug.keystore") {
             println!(
                 "NOTE: signed with the bundled debug keystore. The Play Store will reject this AAB. Pass --keystore=<path> --keystore-pass=<pw> --keystore-key-alias=<alias> --keystore-key-pass=<pw> to sign with a release keystore."
@@ -2971,6 +3002,34 @@ pub struct HostOpts {
     pub privileged: bool,
     /// font files beyond the set that the packed apps declare in their `app_main!` (`--font-asset=`)
     pub font_assets: Vec<String>,
+    /// the embedded devhub node's machine name (`--devhub-name=`; default: the device's LAN octet)
+    pub devhub_name: Option<String>,
+    /// a debuggable APK (`--debuggable`: `adb shell run-as` reads the app's files, e.g. session logs)
+    pub debuggable: bool,
+    /// the host's Desk Link endpoint starts switched on (`--desk-link=on|off`; on in a debuggable
+    /// APK): the host conf's `desk_link=`, switched later by devhub or `files/deskhost.conf`
+    pub desk_link: bool,
+}
+
+/// `rev=<repo> <sha>` for the host conf: each repo's HEAD, the base the device's devhub store
+/// starts from (the master pushes the files changed since). A dirty tree packs files that differ
+/// from that commit: said, not refused.
+fn host_store_revs(cwd: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for (repo, dir) in [("makepad", cwd.to_path_buf()), ("commercial", cwd.join("apps/commercial"))] {
+        let head = std::process::Command::new("git").current_dir(&dir).args(["rev-parse", "HEAD"]).output();
+        let Ok(head) = head else { continue };
+        let sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        if !head.status.success() || sha.len() != 40 {
+            continue;
+        }
+        let dirty = std::process::Command::new("git").current_dir(&dir).args(["status", "--porcelain", "-uno"]).output().map(|o| !o.stdout.is_empty()).unwrap_or(false);
+        if dirty {
+            println!("  note: {repo} has uncommitted changes; the device's devhub store starts from {} all the same", &sha[..10]);
+        }
+        out.push(format!("rev={repo} {sha}\n"));
+    }
+    out
 }
 
 /// The name of the packed source archive in the APK's assets (jni.rs ARCHIVE_ASSET).
@@ -3094,13 +3153,31 @@ pub fn build_host(
     if custom_template.is_file() {
         return Err(format!("{} has its own AndroidManifest template; the host APK needs RunActivity in it", build_crate));
     }
-    let extra_activities = r#"<activity
+    // Quest: MakepadApp is the Activity that shows, so it is the immersive one (Horizon OS reads
+    // the VR category off the Activity it starts; without it MakepadApp opened as a 2D panel
+    // app whose XR session never rendered: a black view)
+    let extra_activities = if *variant == AndroidVariant::Quest {
+        r#"<activity
                     android:name=".MakepadApp"
                     android:configChanges="orientation|screenSize|keyboardHidden|uiMode"
                     android:exported="false"
                     android:launchMode="singleTask"
                     android:windowSoftInputMode="adjustNothing|stateUnchanged"
-                    android:theme="@style/MakepadLaunchTheme" />"#;
+                    android:theme="@style/MakepadLaunchTheme">
+                    <intent-filter>
+                        <action android:name="android.intent.action.MAIN" />
+                        <category android:name="com.oculus.intent.category.VR" />
+                    </intent-filter>
+                    </activity>"#
+    } else {
+        r#"<activity
+                    android:name=".MakepadApp"
+                    android:configChanges="orientation|screenSize|keyboardHidden|uiMode"
+                    android:exported="false"
+                    android:launchMode="singleTask"
+                    android:windowSoftInputMode="adjustNothing|stateUnchanged"
+                    android:theme="@style/MakepadLaunchTheme" />"#
+    };
     let prep_opts = PrepareBuildOpts {
         build_crate,
         res_crate: "makepad-run-android",
@@ -3110,8 +3187,8 @@ pub fn build_host(
         urls,
         version_code: resolved.version_code,
         version_name: &resolved.version_name,
-        // a release APK: the phone's JIT needs nothing a debuggable one adds
-        debuggable: false,
+        // a release APK unless asked: the phone's JIT needs nothing a debuggable one adds
+        debuggable: host.debuggable,
         launcher_class: "RunActivity",
         extra_activities,
     };
@@ -3121,7 +3198,7 @@ pub fn build_host(
         resolved.java_url, resolved.app_label, resolved.version_code, resolved.version_name, build_crate
     );
     build_r_class(sdk_dir, &build_paths, urls)?;
-    let run_java = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/android/java/dev/makepad/run/RunActivity.java");
+    let run_java = android_tool_sources().join("src/android/java/dev/makepad/run/RunActivity.java");
     compile_java(sdk_dir, &build_paths, urls, &[run_java])?;
     build_dex(sdk_dir, &build_paths, urls)?;
     build_unaligned_apk(sdk_dir, &build_paths, urls)?;
@@ -3147,6 +3224,13 @@ pub fn build_host(
     }
     if host.privileged {
         conf.push_str("privileged=1\n");
+    }
+    if let Some(name) = &host.devhub_name {
+        conf.push_str(&format!("devhub_name={name}\n"));
+    }
+    conf.push_str(if host.desk_link { "desk_link=on\n" } else { "desk_link=off\n" });
+    for rev in host_store_revs(&cwd) {
+        conf.push_str(&rev);
     }
     let with_payload = build_paths.dst_unaligned_apk.with_extension("host.apk");
     add_host_payload(&build_paths.dst_unaligned_apk, &with_payload, &archive, &conf)?;

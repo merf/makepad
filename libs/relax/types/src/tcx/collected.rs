@@ -5,7 +5,7 @@ use crate::crate_image::{Codec, Decode};
 use crate::collected::ImageMap;
 
 crate::collected_fields!(FnSigT, region_contract, generic_indices, bound_regions, params, ret,
-    self_kind, n_generics, n_parent_generics, is_const, rustc_promotable, header,
+    self_kind, n_generics, n_parent_generics, is_const, rustc_promotable, rustc_intrinsic, header,
     track_caller, target_features, safe_target_features);
 crate::collected_fields!(FieldT, name, ty, is_pub, vis_mod);
 crate::collected_fields!(VariantT, def, name, shape, fields, discr);
@@ -35,14 +35,14 @@ crate::collected_fields!(crate::types::variance::GenericIndices, lifetimes, type
 crate::collected_enum!(crate::types::variance::V; 0 => Bi, 1 => Co, 2 => Contra, 3 => Inv);
 crate::collected_enum!(outlives::OutlivesPredicate; 0 => Region(a,b), 1 => Type(t,r));
 crate::collected_enum!(TyKey; 0 => Prim(p), 1 => Adt(d), 2 => Slice, 3 => Array,
-    4 => Str, 5 => Ref, 6 => Ptr, 7 => Tuple, 8 => FnPtr, 9 => Dyn(d), 10 => Other);
+    4 => Str, 5 => Ref, 6 => Ptr, 7 => Tuple, 8 => FnPtr, 9 => Dyn(d), 10 => Other, 11 => Error);
 impl crate::collected::ImageKey for TyKey {
     fn image_key(&self) -> u128 {
         let (tag, payload) = match *self {
             TyKey::Prim(p) => (0u128, p as u128), TyKey::Adt(d) => (1, d.0 as u128),
             TyKey::Slice => (2, 0), TyKey::Array => (3, 0), TyKey::Str => (4, 0), TyKey::Ref => (5, 0),
             TyKey::Ptr => (6, 0), TyKey::Tuple => (7, 0), TyKey::FnPtr => (8, 0),
-            TyKey::Dyn(d) => (9, d.0 as u128), TyKey::Other => (10, 0),
+            TyKey::Dyn(d) => (9, d.0 as u128), TyKey::Other => (10, 0), TyKey::Error => (11, 0),
         };
         tag << 32 | payload
     }
@@ -68,17 +68,22 @@ impl Tcx {
     pub fn retain_collected_prefix(&mut self, first: usize) {
         self.declarations.retain_prefix(first);
         let keep = |d: &DefId| (d.0 as usize) < first;
-        let impls: Vec<_> = self.impl_self.keys().filter(|d| !keep(d)).copied().collect();
+        // the definitions from `first` on: a table keyed by DefId drops them without decoding the
+        // retained rows of its image (ImageMap::keys_from / remove_from)
+        let lo = first as u128;
+        let impls: Vec<_> = self.impl_self.keys_from(lo).into_iter().copied().collect();
         self.uncollect_impls(&impls);
+        // (a list only the dropped impls had goes, as a build without them never made it)
         self.inherent.retain(|_, v| !v.is_empty()); self.trait_impls.retain(|_, v| !v.is_empty());
-        let mut gone: Vec<_> = self.sigs.keys().chain(self.adts.keys())
-            .chain(self.impl_self.keys()).chain(self.trait_closure.keys()).filter(|d| !keep(d)).copied().collect();
-        gone.extend(self.const_tys.keys().filter(|d| !keep(d)));
+        self.trait_impls_of.retain(|_, v| !v.is_empty()); self.impls_by_key.retain(|_, v| !v.is_empty());
+        let mut gone: Vec<DefId> = self.sigs.keys_from(lo).into_iter().chain(self.adts.keys_from(lo))
+            .chain(self.impl_self.keys_from(lo)).chain(self.trait_closure.keys_from(lo)).copied().collect();
+        gone.extend(self.const_tys.keys_from(lo));
         self.invalidate_check(&gone);
-        self.impl_trait_args.retain(|d, _| keep(d)); self.impl_trait_regions.retain(|d, _| keep(d));
-        self.impl_trait_bounds.retain(|d, _| keep(d));
-        self.nominal_region_contracts.retain(|d, _| keep(d)); self.contracts_waiting.retain(|d| keep(d));
-        self.ctor_sigs.retain(|d, _| keep(d)); self.opaques.retain(|d, _| keep(d));
+        self.impl_trait_args.remove_from(lo); self.impl_trait_regions.remove_from(lo);
+        self.impl_trait_bounds.remove_from(lo);
+        self.nominal_region_contracts.remove_from(lo); self.contracts_waiting.remove_from(lo);
+        self.ctor_sigs.remove_from(lo); self.opaques.retain(|d, _| keep(d));
         self.adt_destructors.retain(|d, v| keep(d) && keep(&v.did));
         self.destructor_impls.retain(|d, v| keep(d) && keep(v));
         self.async_fns = self.async_fns.snapshot().into_iter().filter(|(d, _)| keep(d))
@@ -221,12 +226,21 @@ impl Tcx {
         let mut image = crate::image::Writer::default();
         image.add_bytes(0, w);
         if stop() { return None; }
-        image.add_image(1, std::sync::Arc::new(self.tys.collected_writer()?));
         let mut id = 2;
-        macro_rules! table { ($($f:ident),+) => { $(if stop() { return None; } self.$f.write_image(&mut image, &mut id);)+ }; }
+        let tr = std::env::var_os("MAKEPAD_RUN_COLLECTED_TRACE").is_some();
+        let mut t = std::time::Instant::now();
+        let mut lap = |what: &str| if tr { eprintln!("tcx-writer: {what} {:.1} ms", t.elapsed().as_secs_f64() * 1e3); t = std::time::Instant::now(); };
+        macro_rules! table { ($($f:ident),+) => { $(self.$f.write_image_with(&mut image, &mut id, stop)?; lap(stringify!($f));)+ }; }
         tables!(table);
         self.const_tys.write_image(&mut image, &mut id);
         self.contracts_waiting.write_image(&mut image, &mut id);
+        lap("const_tys+contracts");
+        // The interner last (its section stays the second): other threads may intern while this
+        // runs (a mid-run encode), and every type, region, list and constant the tables
+        // above name was interned before its count is read, so the image is consistent.
+        if stop() { return None; }
+        image.insert_image(1, 1, std::sync::Arc::new(self.tys.collected_writer_with(stop)?));
+        lap("interner");
         Some(image)
     }
 
@@ -370,11 +384,16 @@ impl ConstTypes {
         }).collect();
         out.extend(self.added.snapshot()); out
     }
-    fn keys(&self) -> impl Iterator<Item = DefId> + '_ {
-        self.image.keys().copied().chain(self.added.snapshot().into_keys())
+    /// The keys from definition `lo` on (ImageMap::keys_from).
+    fn keys_from(&self, lo: u128) -> Vec<DefId> {
+        let mut out: Vec<DefId> = self.image.keys_from(lo).into_iter().copied().collect();
+        out.extend(self.added.snapshot().into_keys().filter(|d| d.0 as u128 >= lo));
+        out
     }
-    pub(super) fn retain(&mut self, mut keep: impl FnMut(&DefId) -> bool) {
-        self.image.retain(|d, _| keep(d)); self.added.retain(|d, _| keep(d));
+    /// Drops `gone`'s entries (a removal per key: the image's other rows stay undecoded).
+    pub(super) fn remove_all(&mut self, gone: &crate::fxhash::HashSet<DefId>) {
+        for d in gone { self.image.remove(d); }
+        self.added.retain(|d, _| !gone.contains(d));
     }
     pub(super) fn reset_declarations_with_misses(&mut self) {
         // Include persisted misses in entries not yet decoded in this process.

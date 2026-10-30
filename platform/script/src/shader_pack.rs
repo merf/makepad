@@ -5,7 +5,8 @@
 //! path builds the shader's mapping from), serialised into versioned bytes
 //! and keyed by a hash of the shader's source.
 //!
-//! - Recording (native): [`ShaderPacks::record_enabled`] makes every draw shader
+//! - Recording (any build with the compiler: native, or the web build a
+//!   trace host runs): [`ShaderPacks::record_enabled`] makes every draw shader
 //!   that is applied also run the web build's GLSL compile and keep the
 //!   result; [`ShaderPacks::take_recording`] serialises it.
 //! - Use: [`ShaderPacks::install`]. The web build's draw-shader compile
@@ -54,7 +55,7 @@ use makepad_live_id::*;
 use std::collections::{HashMap, HashSet};
 /// Bumped whenever the key's recipe or the pack's layout changes; a pack of
 /// another version is refused.
-const SHADER_PACK_VERSION: u32 = 2;
+const SHADER_PACK_VERSION: u32 = 3;
 const SHADER_PACK_MAGIC: &[u8; 4] = b"MPSP";
 
 /// One draw shader of a pack: its GLSL ES 3.0 code and reflection.
@@ -109,6 +110,8 @@ pub enum PackIoKind {
     Uniform,
     DynInstance,
     ScopeUniform,
+    /// The fragment depth output and its conservative mode (`FRAG_DEPTH_*`).
+    FragmentDepth(u8),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -516,6 +519,7 @@ fn shader_key_walk<'a>(bx: &'a ScriptVmBase, io_self: ScriptObject, const_table:
         w.h.id(key);
         w.h.id(heap.value(io_self, key.into(), NoTrap).as_id().unwrap_or(LiveId(0)));
     }
+    w.h.u8((heap.value(io_self, id!(precise_math).into(), NoTrap).as_bool() == Some(true)) as u8);
     let mut cur = Some(io_self);
     while let Some(obj) = cur {
         w.h.u8(K_PROTO);
@@ -580,6 +584,7 @@ impl ShaderPackEntry {
                     PackIoKind::Uniform => ShaderIoKind::uniform(),
                     PackIoKind::DynInstance => ShaderIoKind::dyn_instance(),
                     PackIoKind::ScopeUniform => ShaderIoKind::scope_uniform(),
+                    PackIoKind::FragmentDepth(m) => ShaderIoKind::FragmentDepth(m),
                 };
                 // A custom uniform buffer keeps the heap's pod type: the one
                 // its marker on the shader object names.
@@ -739,7 +744,7 @@ fn pod_structure(name: Option<LiveId>, ty: &ScriptPodTy) -> Option<(Vec<PackPodT
 
 /// A compile's reflection as a pack entry: scope uniform sources become
 /// paths from the shader object.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(all(target_arch = "wasm32", makepad_precompiled_shaders)))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn pack_entry_from_desc(
     vm: &ScriptVm,
@@ -771,6 +776,7 @@ pub(crate) fn pack_entry_from_desc(
             crate::shader_output::ShaderIoKindTag::Uniform => PackIoKind::Uniform,
             crate::shader_output::ShaderIoKindTag::DynInstance => PackIoKind::DynInstance,
             crate::shader_output::ShaderIoKindTag::ScopeUniform => PackIoKind::ScopeUniform,
+            crate::shader_output::ShaderIoKindTag::FragmentDepth => PackIoKind::FragmentDepth(d.kind.fragment_depth().unwrap()),
             crate::shader_output::ShaderIoKindTag::Workgroup => return Err(format!("io `{}` is a compute kernel's workgroup array; draw packs have none", d.name)),
         };
         io.push(PackIo {
@@ -830,7 +836,7 @@ pub(crate) fn pack_entry_from_desc(
 /// Paths of names from a shader object to the objects its scope uniforms
 /// are read from: a breadth-first search over scope lookups of the names
 /// its functions use.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(all(target_arch = "wasm32", makepad_precompiled_shaders)))]
 struct ScopePaths<'a> {
     heap: &'a ScriptHeap,
     names: Vec<LiveId>,
@@ -841,7 +847,7 @@ struct ScopePaths<'a> {
     expanded: usize,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(all(target_arch = "wasm32", makepad_precompiled_shaders)))]
 impl<'a> ScopePaths<'a> {
     /// Paths at most this many names long.
     const MAX_DEPTH: usize = 8;
@@ -1085,6 +1091,10 @@ impl PackWriter {
                 PackIoKind::Uniform => self.u8(9),
                 PackIoKind::DynInstance => self.u8(10),
                 PackIoKind::ScopeUniform => self.u8(11),
+                PackIoKind::FragmentDepth(m) => {
+                    self.u8(12);
+                    self.u8(m);
+                }
             }
             self.u64(io.name);
             self.u32(io.ty);
@@ -1289,6 +1299,7 @@ impl<'a> PackReader<'a> {
                 9 => PackIoKind::Uniform,
                 10 => PackIoKind::DynInstance,
                 11 => PackIoKind::ScopeUniform,
+                12 => PackIoKind::FragmentDepth(self.u8()?),
                 _ => return Err("a shader pack holds an unknown io kind".into()),
             };
             io.push(PackIo {
@@ -1421,7 +1432,7 @@ pub struct ShaderPacks {
     index: HashMap<u64, (usize, usize)>,
     error: String,
     installed_count: usize,
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(all(target_arch = "wasm32", makepad_precompiled_shaders)))]
     recorder: Option<ShaderPackRecorder>,
 }
 /// What ShaderPacks::view answers.
@@ -1443,9 +1454,9 @@ impl ShaderPacks {
     pub fn is_empty(&self) -> bool { self.index.is_empty() }
     #[relax_api]
     pub fn view(&self) -> ShaderPacksView<'_> {
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(all(target_arch = "wasm32", makepad_precompiled_shaders)))]
         let recording = self.recorder.is_some();
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", makepad_precompiled_shaders))]
         let recording = false;
         ShaderPacksView { error: &self.error, installed_count: self.installed_count, recording }
     }
@@ -1453,12 +1464,12 @@ impl ShaderPacks {
     pub fn error(&self) -> &str { self.view().error }
     #[inline]
     pub fn installed_count(&self) -> usize { self.view().installed_count }
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(all(target_arch = "wasm32", makepad_precompiled_shaders)))]
     #[inline]
     pub fn is_recording(&self) -> bool { self.view().recording }
     #[inline]
     pub fn install(&mut self, bytes: &[u8]) -> bool { self.control(SHADER_PACKS_INSTALL, bytes, false) }
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(all(target_arch = "wasm32", makepad_precompiled_shaders)))]
     #[inline]
     pub fn record_enabled(&mut self, on: bool) { self.control(SHADER_PACKS_RECORD_ENABLED, &[], on); }
     /// Changes the packs by `mode`: SHADER_PACKS_INSTALL adds the pack `bytes` (false: it does not
@@ -1466,13 +1477,13 @@ impl ShaderPacks {
     #[relax_api]
     pub fn control(&mut self, mode: u32, bytes: &[u8], on: bool) -> bool {
         if mode == SHADER_PACKS_RECORD_ENABLED {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(not(all(target_arch = "wasm32", makepad_precompiled_shaders)))]
             match (on, self.recorder.is_some()) {
                 (true, false) => self.recorder = Some(ShaderPackRecorder::default()),
                 (false, true) => self.recorder = None,
                 _ => {}
             }
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(all(target_arch = "wasm32", makepad_precompiled_shaders))]
             let _ = on;
             return true;
         }
@@ -1497,7 +1508,7 @@ impl ShaderPacks {
         })();
         ShaderPackLookup(entry)
     }
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(all(target_arch = "wasm32", makepad_precompiled_shaders)))]
     #[relax_api]
     pub fn take_recording(&mut self) -> ShaderPackBytes {
         let entries = match &mut self.recorder {
@@ -1506,7 +1517,7 @@ impl ShaderPacks {
         };
         ShaderPackBytes(write_shader_pack(&entries))
     }
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(all(target_arch = "wasm32", makepad_precompiled_shaders)))]
     #[relax_api]
     pub fn record(&mut self, vm: &mut ScriptVm, shader: ScriptObject) {
         self.error.clear();
@@ -1525,7 +1536,7 @@ impl ShaderPacks {
         }
     }
 }
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(all(target_arch = "wasm32", makepad_precompiled_shaders)))]
 #[derive(Default)]
 struct ShaderPackRecorder {
     entries: Vec<ShaderPackEntry>, keys: HashSet<u64>, objects: HashSet<(usize, ScriptObject)>, epoch: u64,
@@ -1563,14 +1574,14 @@ impl ShaderPackRecord {
         ShaderPackBytes(match self.0.as_ref().ok() { Some(entry) => write_shader_pack(std::slice::from_ref(entry)), None => Vec::new() })
     }
 }
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(all(target_arch = "wasm32", makepad_precompiled_shaders)))]
 #[relax_api]
 pub fn record_shader(vm: &mut ScriptVm, shader: ScriptObject) -> ShaderPackRecord {
     let walk = shader_key_walk(&vm.bx, shader, false);
     let key = walk.h.0;
     record_shader_with_key(vm, shader, key, walk.fns)
 }
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(all(target_arch = "wasm32", makepad_precompiled_shaders)))]
 fn record_shader_with_key(vm: &mut ScriptVm, shader: ScriptObject, key: u64, mut fns: Vec<ScriptObject>) -> ShaderPackRecord {
     use crate::shader_compile::{compile_shader, ShaderCompileOptions};
     let opts = ShaderCompileOptions::new(crate::shader_backend::ShaderBackend::Glsl, false, false, true, false);
@@ -1640,7 +1651,7 @@ impl ShaderPackContents {
 #[relax_api]
 pub fn inspect_shader_pack(bytes: &[u8]) -> ShaderPackContents { ShaderPackContents(read_shader_pack(bytes)) }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(all(target_arch = "wasm32", makepad_precompiled_shaders)))]
 fn write_value_to_f32_slots(
         heap: &ScriptHeap,
         value: ScriptValue,
@@ -1875,7 +1886,7 @@ fn write_value_to_f32_slots(
             output[offset + i] = 0.0;
         }
     }
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(all(target_arch = "wasm32", makepad_precompiled_shaders)))]
 fn write_pack_value(heap: &ScriptHeap, value: ScriptValue, output: &mut [f32]) { write_value_to_f32_slots(heap, value, output, 0, output.len()); }
 
 /// Compare reflected POD layouts without exporting the pack serialization model.

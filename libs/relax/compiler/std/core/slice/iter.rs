@@ -183,6 +183,7 @@ impl<'a, T> DoubleEndedIterator for Iter<'a, T> {
 }
 
 impl<'a, T> ExactSizeIterator for Iter<'a, T> {}
+unsafe impl<'a, T> crate::iter::TrustedLen for Iter<'a, T> {}
 impl<'a, T> FusedIterator for Iter<'a, T> {}
 
 pub struct IterMut<'a, T> {
@@ -294,6 +295,7 @@ impl<'a, T> DoubleEndedIterator for IterMut<'a, T> {
 }
 
 impl<'a, T> ExactSizeIterator for IterMut<'a, T> {}
+unsafe impl<'a, T> crate::iter::TrustedLen for IterMut<'a, T> {}
 impl<'a, T> FusedIterator for IterMut<'a, T> {}
 
 // ---------------------------------------------------------------- Windows
@@ -1064,7 +1066,7 @@ pub fn rchunks_exact<T>(v: &[T], chunk_size: usize) -> RChunksExact<'_, T> {
     }
 }
 impl<'a, T> RChunksExact<'a, T> {
-    pub fn remainder(&self) -> &'a [T] {
+    pub const fn remainder(&self) -> &'a [T] {
         self.rem
     }
 }
@@ -1178,7 +1180,7 @@ pub fn rchunks_exact_mut<T>(v: &mut [T], chunk_size: usize) -> RChunksExactMut<'
     }
 }
 impl<'a, T> RChunksExactMut<'a, T> {
-    pub fn into_remainder(self) -> &'a mut [T] {
+    pub const fn into_remainder(self) -> &'a mut [T] {
         self.rem
     }
 }

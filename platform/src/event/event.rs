@@ -45,6 +45,8 @@ pub enum Event {
     ///
     /// [`onCreate`]: https://developer.android.com/reference/android/app/Activity#onCreate(android.os.Bundle)
     Startup,
+    /// A semantic request addressed to one widget uid.
+    A11yAction(makepad_a11y::ActionRequest),
     /// The application is being shut down is about to close and be destroyed.
     ///
     /// * This event may not be sent at all, so you should not rely on it.
@@ -273,6 +275,7 @@ pub enum Event {
     AudioDevices(AudioDevicesEvent),
     MidiPorts(MidiPortsEvent),
     VideoInputs(VideoInputsEvent),
+    NativeLayer(crate::native_layer::NativeLayerEvent),
     NetworkResponses(NetworkResponsesEvent),
     /// Results of asynchronous operations submitted through [`Cx::storage`].
     Storage(StorageResponsesEvent),
@@ -329,6 +332,10 @@ pub enum Event {
     /// The GPU is short of memory (see [`GpuPressureEvent`]); the session that owns the
     /// desktop frees what other GPU users hold for the UI. HAL client only.
     GpuPressure(GpuPressureEvent),
+    /// An item of one of the app's tray menus was chosen (see [`crate::tray`]).
+    TrayMenu(crate::tray::TrayMenuEvent),
+    /// A primary click on one of the app's tray icons (Windows; macOS opens the menu).
+    TrayClick(crate::tray::TrayClickEvent),
 
     #[cfg(target_arch = "wasm32")]
     ToWasmMsg(ToWasmMsgEvent),
@@ -355,6 +362,7 @@ impl Event {
 
     pub fn name_from_u32(v: u32) -> &'static str {
         match v {
+            94 => "A11yAction",
             1 => "Startup",
             2 => "Shutdown",
             67 => "QuitRequested",
@@ -456,12 +464,16 @@ impl Event {
             88 => "ChildWindowAction",
             89 => "ChildMessage",
             90 => "GpuPressure",
+            91 => "TrayMenu",
+            92 => "TrayClick",
+            93 => "NativeLayer",
             _ => panic!(),
         }
     }
 
     pub fn to_u32(&self) -> u32 {
         match self {
+            Self::A11yAction(_) => 94,
             Self::Startup => 1,
             Self::Shutdown => 2,
             Self::QuitRequested(_) => 67,
@@ -557,6 +569,9 @@ impl Event {
             Self::ChildWindowAction(_) => 88,
             Self::ChildMessage { .. } => 89,
             Self::GpuPressure(_) => 90,
+            Self::TrayMenu(_) => 91,
+            Self::TrayClick(_) => 92,
+            Self::NativeLayer(_) => 93,
 
             #[cfg(target_arch = "wasm32")]
             Self::ToWasmMsg(_) => 55,

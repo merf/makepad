@@ -243,7 +243,7 @@ impl App {
                     client
                 };
                 if let Some(slot) = self.state_mut().clients.get_mut(&client) {
-                    slot.title = e.title.clone();
+                    slot.set_title(&e.title);
                     slot.ready = true;
                 }
                 self.with_domain_view(cx, client, |cx, v| v.child_window(cx, e));
@@ -251,7 +251,7 @@ impl App {
                 if first_window {
                     let theme_splash = theme::theme_splash_path(&self.state_mut().theme_name).to_string_lossy().into_owned();
                     self.send_wm_event(client, WmEvent::Hosted { theme_splash });
-                    self.send_desktop_style(client);
+                    self.send_desktop_style(cx, client);
                     self.resend_screens_event(client);
                     if self.ai_bus.is_pane(client) { self.replay_bus_to_pane(); }
                 }

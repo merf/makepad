@@ -34,8 +34,8 @@ impl DeferredRegionLiveness {
         let ty = body.local_decls[local.0 as usize].ty;
         // #160670: variance comes from the entire local type, including for drops.
         if !use_live.is_empty() || !drop_live.is_empty() { record_live_region_variance(tcx, prog, variances, universals, ty); }
-        for r in regions_in(tcx, universals, ty) { for p in use_live.iter() { liveness.add_point(r, p); } }
-        for r in drop_regions { for p in drop_live.iter() { liveness.add_point(r, p); } }
+        for r in regions_in(tcx, universals, ty) { liveness.mark_deferred(r); for p in use_live.iter() { liveness.add_point(r, p); } }
+        for r in drop_regions { liveness.mark_deferred(r); for p in drop_live.iter() { liveness.add_point(r, p); } }
     }
 }
 
@@ -48,7 +48,7 @@ pub(super) struct DeferredLivenessSource<'a> {
 }
 pub(super) struct RegionLiveness<'a> {
     pub direction: super::ConstraintDirection,
-    points: Option<&'a crate::mir::dataflow::BitSet>,
+    points: Option<&'a crate::mir::dataflow::IntervalSet>,
 }
 impl RegionLiveness<'_> {
     pub fn is_live_at(&self, point: usize) -> bool { self.points.is_some_and(|row| row.contains(point)) }

@@ -20,7 +20,7 @@ use crate::link::{Client, Error, Target};
 use crate::stream::{write_varint, TAG_DROP};
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -53,7 +53,7 @@ struct HostLink {
 }
 
 impl HostLink {
-    fn new(host: Host) -> HostLink {
+    fn new(host: Host, fleet: Option<&FleetDialer>) -> HostLink {
         let client = match &host.via {
             Via::Ssh { ssh, relax, env } => {
                 // the remote shell splits the command: every env pair is one single-quoted word
@@ -65,6 +65,10 @@ impl HostLink {
                 Some(Client::new(Target::Command(argv), "hub"))
             }
             Via::Dial { .. } => None,
+            Via::Fleet { addr } => fleet.map(|f| {
+                let (f, addr) = (f.clone(), addr.clone());
+                Client::new(Target::Dialer(Arc::new(move || f(&addr))), "hub")
+            }),
         };
         HostLink { host, client, dialed: Mutex::new(None) }
     }
@@ -78,6 +82,15 @@ impl HostLink {
 
     /// The live connection to the relay, dialling (ssh) or waiting for the device (dial).
     fn conn(&self, wait: Duration) -> Result<Conn, Error> {
+        if let (Via::Fleet { addr }, None) = (&self.host.via, &self.client) {
+            return Err(Error::LinkLost(format!("host `{}` ({addr}) is a fleet hub and this hub has no fleet dialer", self.host.name)));
+        }
+        if let (Via::Fleet { addr }, Some(c)) = (&self.host.via, &self.client) {
+            return c.conn().map_err(|e| match e {
+                Error::LinkLost(w) => Error::LinkLost(format!("cannot reach fleet hub `{}` at {addr}: {w}", self.host.name)),
+                e => e,
+            });
+        }
         if let Some(c) = &self.client {
             return c.conn().map_err(|e| match e {
                 Error::LinkLost(w) => Error::LinkLost(format!("cannot reach host `{}` over ssh (BatchMode, 5 s connect timeout; needs a key that works without a prompt; see {}): {w}", self.host.name, log_path().display())),
@@ -107,9 +120,16 @@ struct Inner {
     clients: Mutex<Vec<Conn>>,
     /// where the registry is re-read from when a request names a host the hub does not know yet
     source: Mutex<Option<Source>>,
+    /// how `via = "fleet"` hosts are dialled (the owner's transport and authentication)
+    fleet: Mutex<Option<FleetDialer>>,
+    /// live client -> upstream threads of routes (one per open route)
+    routes_in: Arc<AtomicUsize>,
 }
 
 pub type Source = Arc<dyn Fn() -> Hosts + Send + Sync>;
+
+/// Dials a `via = "fleet"` host's address: an authenticated carrier.
+pub type FleetDialer = Arc<dyn Fn(&str) -> io::Result<crate::carrier::Carrier> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct Hub(Arc<Inner>);
@@ -124,7 +144,7 @@ pub fn parse_target(t: &str) -> (&str, Option<String>) {
 
 impl Hub {
     pub fn new(hosts: &Hosts) -> Hub {
-        let hub = Hub(Arc::new(Inner { links: Mutex::new(Vec::new()), clients: Mutex::new(Vec::new()), source: Mutex::new(None) }));
+        let hub = Hub(Arc::new(Inner { links: Mutex::new(Vec::new()), clients: Mutex::new(Vec::new()), source: Mutex::new(None), fleet: Mutex::new(None), routes_in: Arc::new(AtomicUsize::new(0)) }));
         hub.sync(hosts);
         hub
     }
@@ -147,14 +167,40 @@ impl Hub {
         self.0.links.lock().unwrap().clone()
     }
 
+    /// Sets how `via = "fleet"` hosts are dialled (before they are added): `addr` -> carrier.
+    pub fn set_fleet(&self, dial: FleetDialer) {
+        *self.0.fleet.lock().unwrap() = Some(dial);
+    }
+
     /// Adds the registry's hosts that have no link yet (hosts paired while the hub runs).
     pub fn sync(&self, hosts: &Hosts) {
+        let fleet = self.0.fleet.lock().unwrap().clone();
         let mut links = self.0.links.lock().unwrap();
         for h in &hosts.hosts {
             if !links.iter().any(|l| l.host.name == h.name) {
-                links.push(Arc::new(HostLink::new(h.clone())));
+                links.push(Arc::new(HostLink::new(h.clone(), fleet.as_ref())));
             }
         }
+    }
+
+    /// Drops the links whose host name `keep` refuses (a host that turned out to be another
+    /// name of a machine the hub already links to).
+    pub fn retain(&self, keep: &dyn Fn(&str) -> bool) {
+        self.0.links.lock().unwrap().retain(|l| {
+            let kept = keep(&l.host.name);
+            if !kept {
+                // a dropped client does not end its connection on its own
+                if let Some(c) = &l.client {
+                    c.close();
+                }
+            }
+            kept
+        });
+    }
+
+    /// Routes whose client -> upstream thread still runs.
+    pub fn routes(&self) -> usize {
+        self.0.routes_in.load(Relaxed)
     }
 
     /// Clients currently connected to the hub's socket.
@@ -218,6 +264,7 @@ impl Hub {
     /// Test seam: serves a carrier a relay named `name` dialled over and binds it (the TCP path
     /// binds by proved key instead).
     #[cfg(test)]
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn accept_dialed(&self, car: crate::carrier::Carrier) -> Result<Conn, crate::hello::HandshakeError> {
         let conn = Endpoint::new("makepad-run-hub").serve(car.reader, car.writer, car.shutdown)?;
         self.bind_link(&conn.peer().name.clone(), &conn);
@@ -230,11 +277,11 @@ impl Hub {
             .into_iter()
             .map(|l| {
                 std::thread::spawn(move || {
-                    let target = match &l.host.via {
-                        Via::Ssh { ssh, .. } => format!(",\"ssh\":{}", json_str(ssh)),
-                        Via::Dial { .. } => String::new(),
+                    let (via, target) = match &l.host.via {
+                        Via::Ssh { ssh, .. } => ("ssh", format!(",\"ssh\":{}", json_str(ssh))),
+                        Via::Dial { .. } => ("dial", String::new()),
+                        Via::Fleet { addr } => ("fleet", format!(",\"addr\":{}", json_str(addr))),
                     };
-                    let via = if l.client.is_some() { "ssh" } else { "dial" };
                     let head = format!("{{\"host\":{},\"via\":\"{via}\"{target}", json_str(&l.host.name));
                     match l.conn(Duration::ZERO) {
                         Ok(c) => {
@@ -289,9 +336,10 @@ fn route_factory(hub: Hub) -> Factory {
         };
         let service = service.to_string();
         let channel = open.channel;
+        let live = hub.0.routes_in.clone();
         std::thread::Builder::new()
             .name("makepad-remote-route".into())
-            .spawn(move || route(link, channel, spec, service, args))
+            .spawn(move || route(link, channel, spec, service, args, live))
             .map(|_| ())
             .map_err(|e| (CLOSE_REFUSED, format!("cannot start the route thread: {e}")))
     })
@@ -330,20 +378,33 @@ impl Slot {
         self.tx.lock().unwrap().take()
     }
 
-    /// The sender, waiting while there is none and the route is still alive.
+    /// The sender, waiting while there is none and the route is still alive (`done` is set
+    /// before the `set` that wakes this, under the same lock: no wake-up is lost, no polling).
     fn wait(&self, done: &AtomicBool) -> Option<ChannelTx> {
         let mut g = self.tx.lock().unwrap();
         while g.is_none() {
             if done.load(Relaxed) {
                 return None;
             }
-            g = self.set.wait_timeout(g, Duration::from_millis(200)).unwrap().0;
+            g = self.set.wait(g).unwrap();
         }
         g.clone()
     }
 }
 
-fn route(link: Arc<HostLink>, client: Channel, spec: Option<String>, service: String, args: String) {
+/// Ends a route however its upstream loop returns: the client -> upstream thread stops waiting
+/// for an upstream that will never come. (Without it every request to a host that could not be
+/// reached left that thread polling forever: 20 threads a minute with two hosts down.)
+struct RouteEnd(Arc<Slot>, Arc<AtomicBool>);
+
+impl Drop for RouteEnd {
+    fn drop(&mut self) {
+        self.1.store(true, Relaxed);
+        self.0.set(None);
+    }
+}
+
+fn route(link: Arc<HostLink>, client: Channel, spec: Option<String>, service: String, args: String, live: Arc<AtomicUsize>) {
     let feed = service == "watch" || service == "stream";
     let ctx = client.tx();
     let up_slot: Arc<Slot> = Arc::new(Slot::default());
@@ -351,13 +412,19 @@ fn route(link: Arc<HostLink>, client: Channel, spec: Option<String>, service: St
     {
         // client -> upstream, for as long as the client channel lives
         let (slot, done) = (up_slot.clone(), done.clone());
-        let _ = std::thread::Builder::new().name("makepad-remote-route-in".into()).spawn(move || {
+        live.fetch_add(1, Relaxed);
+        let gone = live.clone();
+        let started = std::thread::Builder::new().name("makepad-remote-route-in".into()).spawn(move || {
             loop {
                 match client.recv() {
                     Some(Event::Data(d)) => {
                         // the upstream channel may still be opening (or reopening)
-                        if let Some(tx) = slot.wait(&done) {
-                            let _ = tx.send(d);
+                        match slot.wait(&done) {
+                            Some(tx) => {
+                                let _ = tx.send(d);
+                            }
+                            // the route ended: nothing forwards any more
+                            None => break,
                         }
                     }
                     Some(Event::Opened(_)) => {}
@@ -368,8 +435,13 @@ fn route(link: Arc<HostLink>, client: Channel, spec: Option<String>, service: St
             if let Some(tx) = slot.take() {
                 tx.close(CLOSE_NORMAL, "");
             }
+            live.fetch_sub(1, Relaxed);
         });
+        if started.is_err() {
+            gone.fetch_sub(1, Relaxed);
+        }
     }
+    let _end = RouteEnd(up_slot.clone(), done.clone());
     let (mut last, mut have_seq, mut attempt, mut ever) = (0u64, false, 0u32, false);
     'link: loop {
         if done.load(Relaxed) {
@@ -464,7 +536,6 @@ fn lock_pid() -> io::Result<bool> {
 /// Runs the hub in this process until it has been idle for [`IDLE_EXIT`] (never, with a TCP
 /// listener). Returns `Ok(false)` at once when another hub already runs. `listen`: `host:port`
 /// for paired devices to dial; the hub's TLS identity is created on first use.
-#[cfg(unix)]
 pub fn serve(hosts: Hosts, listen: Option<&str>) -> io::Result<bool> {
     if !lock_pid()? {
         return Ok(false);
@@ -475,7 +546,6 @@ pub fn serve(hosts: Hosts, listen: Option<&str>) -> io::Result<bool> {
     result.map(|_| true)
 }
 
-#[cfg(unix)]
 fn serve_locked(hosts: Hosts, listen: Option<&str>) -> io::Result<()> {
     let hub = Hub::new(&hosts);
     hub.set_source(Arc::new(|| Hosts::load(&crate::hosts::registry_path()).unwrap_or_default()));
@@ -508,9 +578,7 @@ fn serve_locked(hosts: Hosts, listen: Option<&str>) -> io::Result<()> {
 
 /// A client of the hub: dials its socket, starting `<exe> hub` first (detached, logging to
 /// [`log_path`]) when none is running and `start` names the executable.
-#[cfg(unix)]
 pub fn connect(start: Option<&std::path::Path>) -> Result<Client, String> {
-    use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     let client = Client::new(Target::Unix(socket_path()), "client");
     if client.conn().is_ok() {
@@ -519,7 +587,10 @@ pub fn connect(start: Option<&std::path::Path>) -> Result<Client, String> {
     let exe = start.ok_or_else(|| "no makepad hub is running".to_string())?;
     let log = std::fs::File::create(log_path()).map_err(|e| format!("cannot write {}: {e}", log_path().display()))?;
     let log2 = log.try_clone().map_err(|e| e.to_string())?;
-    Command::new(exe).arg("hub").stdin(Stdio::null()).stdout(log).stderr(log2).process_group(0).spawn().map_err(|e| format!("cannot start `{} hub`: {e}", exe.display()))?;
+    let mut cmd = Command::new(exe);
+    cmd.arg("hub").stdin(Stdio::null()).stdout(log).stderr(log2);
+    crate::group::detach(&mut cmd);
+    cmd.spawn().map_err(|e| format!("cannot start `{} hub`: {e}", exe.display()))?;
     let end = Instant::now() + Duration::from_secs(5);
     while Instant::now() < end {
         std::thread::sleep(Duration::from_millis(50));

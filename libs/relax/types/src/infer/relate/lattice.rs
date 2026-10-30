@@ -56,8 +56,10 @@ impl<'tcx> TypeRelation<'tcx> for LatticeOp<'_, 'tcx> {
                 self.relate_bound(v, a, b)?;
                 Ok(v)
             }
+            // combine.rs super_combine_tys (next solver): an alias against anything is an
+            // alias-relate goal, not a structural relation
             (TyKind::Alias(crate::consts::IsRigid::No, _), _) |
-            (_, TyKind::Alias(crate::consts::IsRigid::No, _)) => panic!("unnormalized alias in lattice relation"),
+            (_, TyKind::Alias(crate::consts::IsRigid::No, _)) |
             (TyKind::IntVar(_) | TyKind::FloatVar(_) | TyKind::Error, _) |
             (_, TyKind::IntVar(_) | TyKind::FloatVar(_) | TyKind::Error) => {
                 let mut eq = self.invariant();
@@ -72,10 +74,12 @@ impl<'tcx> TypeRelation<'tcx> for LatticeOp<'_, 'tcx> {
         let mut inner = self.infcx.inner.borrow_mut();
         let mut regions = inner.unwrap_region_constraints();
         let tys = &self.infcx.tcx.tys;
+        // lattice.rs regions: SubregionOrigin::Subtype(trace)
+        let origin = crate::infer::region_constraints::SubregionOrigin::Subtype(self.infcx.origin_span.get());
         Ok(match self.variance {
-            V::Co => regions.glb_regions(tys, a, b),
-            V::Contra => regions.lub_regions(tys, a, b),
-            V::Inv => { regions.make_eqregion(tys, a, b, true); a }
+            V::Co => regions.glb_regions(tys, origin, a, b),
+            V::Contra => regions.lub_regions(tys, origin, a, b),
+            V::Inv => { regions.make_eqregion(tys, origin, a, b, true); a }
             V::Bi => a,
         })
     }

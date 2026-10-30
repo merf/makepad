@@ -6,6 +6,8 @@ pub use makepad_alloc_epoch as alloc_epoch;
 pub mod archive_cache;
 pub mod folder_access;
 pub mod os;
+#[cfg(all(not(target_arch = "wasm32"), feature = "web-protocol"))]
+pub mod web_protocol;
 
 #[cfg(any(
     test,
@@ -29,6 +31,8 @@ mod cx_api;
 mod shared_bytes;
 
 pub mod action;
+pub mod a11y;
+pub use makepad_a11y as a11y_tree;
 pub mod game_input;
 pub mod frame_trace;
 pub mod frame_sources;
@@ -41,6 +45,8 @@ pub mod script;
 pub mod thread;
 pub mod storage;
 pub mod video;
+pub mod native_layer;
+pub use native_layer::{NativeContent, NativeLayer, NativeLayerId, NativeLayerStyle, NativeLayerMode, NativeLayerHandle, NativeLayerEvent, NativeLayerEventKind};
 pub mod gpu_texture;
 #[cfg(target_os = "linux")]
 pub mod foreign_dmabuf;
@@ -55,6 +61,7 @@ pub mod video_encode;
 pub mod video_file;
 
 mod draw_list;
+pub mod draw_owners;
 pub mod retained_instances;
 pub mod recording_buffer;
 pub mod shared_instances;
@@ -71,6 +78,8 @@ pub use frame_build::{hlsl_kernel_pipeline_blob, metal_kernel_pipeline_blob};
 pub mod shader_pack;
 pub mod collect;
 pub mod splash_blank;
+/// The Splash use record (a web trace host's, or `MAKEPAD_SPLASH_TRACE=<file>` natively).
+pub mod splash_trace;
 
 // Native Linux services are owned by the HAL.
 #[cfg(target_os = "linux")]
@@ -98,9 +107,11 @@ mod id_pool;
 pub mod ime;
 pub mod live_reload;
 mod macos_menu;
+pub mod tray;
 mod performance_stats;
 pub mod memory_watchdog;
 pub mod perf_monitor;
+pub mod thread_counters;
 pub mod gpu_frame_timer;
 pub mod gpu_admission;
 pub mod sploded;
@@ -111,7 +122,8 @@ mod texture;
 mod uniform_buffer;
 mod storage_buffer;
 mod window;
-mod xr_tsdf;
+/// The XR room field (surfaces as a signed distance field): `makepad_tsdf`, its process-wide store.
+pub mod xr_tsdf;
 
 pub mod web_socket;
 
@@ -135,6 +147,12 @@ pub mod font_policy;
 mod app_main;
 pub mod remote;
 pub mod remote_schema;
+// the profiler stream of a native build (a `makepad run` app serves it from relax inspect)
+#[cfg(all(not(relax), any(target_os = "macos", target_os = "linux")))]
+pub mod prof_native;
+// `prof` / `why-slow` of a native build (inspect's sampler and buckets; a `makepad run` app gets them from relax inspect)
+#[cfg(all(not(relax), target_os = "macos"))]
+pub mod prof_sampler;
 pub mod devtools;
 pub mod pixel_probe;
 pub mod screen_capture;
@@ -180,7 +198,7 @@ pub fn host_dark() -> Option<bool> {
 #[cfg(all(target_os = "android", not(relax)))]
 pub use crate::app_main::android_on_load;
 pub use crate::app_main::{
-    admitted_by_window_manager, attach_parent_console, discover_window_manager, is_window_manager, launched_by_host,
+    admitted_by_window_manager, attach_parent_console, discover_window_manager, hosted_by_window_manager, is_window_manager, launched_by_host, set_menu_bar_app, set_outlives_window_manager,
     new_cx_with_font_set, resolve_studio_http, run_app, set_window_manager, should_run_stdin_loop_from_env, WmAdmission,
 };
 // Working-tree startup instrumentation (`MAKEPAD_TRACE=startup`).
@@ -188,12 +206,14 @@ pub use crate::cx::{
     first_present_seen, launched_hidden_until_first_present,startup_trace_first_present,
     startup_acc, startup_since_exec_ms, startup_trace, startup_trace_enabled, startup_trace_flush,
 };
-pub use crate::cx_api::{can_play_type, CxSystemBrowser, SystemBrowserId};
+pub use crate::cx_api::can_play_type;
 pub use crate::xr_tsdf::{
     XrDepthAlignHeightMap, XrTsdfCooperativeStepResult, XrTsdfCooperativeStepStats,
 };
 
 #[cfg(target_arch = "wasm32")]
+pub use makepad_wasm_bridge;
+#[cfg(all(not(target_arch = "wasm32"), feature = "web-protocol"))]
 pub use makepad_wasm_bridge;
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
@@ -204,6 +224,14 @@ pub use ::windows;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use makepad_hal;
+
+/// The window-controls table of a desktop family: the HAL's, compiled in directly on the web
+/// (no HAL there), so widgets' caption code has one table on every target.
+#[cfg(not(target_arch = "wasm32"))]
+pub use makepad_hal::window_controls;
+#[cfg(target_arch = "wasm32")]
+#[path = "../hal/src/window_controls.rs"]
+pub mod window_controls;
 
 pub use makepad_futures;
 pub use makepad_script_std::makepad_network;
@@ -224,16 +252,16 @@ pub use {
         component::{ComponentInfo, ComponentRegistries, ComponentRegistry},
         cursor::MouseCursor,
         cx::{Cx, CxMemoryReport, CxRef, GpuBackend, LinuxWindowParams, OsType},
-        cx_api::{AccessibilityUpdatePayload, CxOsApi, CxOsOp, CxThreadPriority, HapticFeedback, OpenUrlInPlace, ScreenEdges},
+        cx_api::{ CxOsApi, CxOsOp, CxThreadPriority, HapticFeedback, OpenUrlInPlace, ScreenEdges},
         display_context::{DisplayContext, ScreenOrientation, SystemBarAppearance},
         font_policy::{
             extend_font_asset_manifest, font_asset_manifest_len, FontAsset, FontChain, FontPolicy,
             FontRole, FontSet, LazyFontAsset, LazyFontFamily, FONT_ASSET_MANIFEST_SECTION, LAZY_FONT_FACES, LAZY_FONT_FALLBACKS,
             INTERNATIONAL_FONT_ASSET_MANIFEST, LATIN_FONT_ASSET_MANIFEST,
-            LATIN_FONT_ASSET_PACKAGE_MANIFEST, MATH_VIEW_FONT_ASSET, INTER_FONT_ASSET,
+            LATIN_FONT_ASSET_PACKAGE_MANIFEST, SYSTEM_FONT_ASSET_MANIFEST, MATH_VIEW_FONT_ASSET, INTER_FONT_ASSET,
             ROBOTO_FLEX_FONT_ASSET, UI_SYMBOL_FALLBACK,
         },
-        draw_list::{CxDrawCall, CxDrawItem, CxDrawListPool, CxRectArea, DrawList, DrawListId, DrawListRecordingStorage},
+        draw_list::{CxDrawCall, CxDrawKind, CxDrawItem, CxDrawListPool, CxRectArea, DrawList, DrawListId, DrawListRecordingStorage},
         shared_instances::{
             upload_pacing, FrameLease, FrameLeases, PublicationAccounting, PublicationIds, Publications,
             PublishBackpressure, PublishError, PublishHints, PublishReceipt, ReceiptPhase, SharedInstances,
@@ -244,7 +272,7 @@ pub use {
             CxDrawPassParent, CxDrawPassRect, DrawPass, DrawPassClearColor, DrawPassClearDepth,
             DrawPassId, ScriptDrawPass, union_rects,
         },
-        draw_vars::{DrawVars, DRAW_CALL_MAX_UNIFORM_FLOATS},
+        draw_vars::{DrawVars, DRAW_CALL_MAX_UNIFORM_FLOATS, DRAW_CALL_TEXTURE_SLOTS},
         sploded::{SplodedParams, SplodedView},
         event::{
             AppOpenEvent,
@@ -260,8 +288,13 @@ pub use {
             DragEvent,
             DragHit,
             DragHitEvent,
+            DragImage,
             DragItem,
+            DragOut,
+            DragOutFile,
+            DragOutItem,
             DragResponse,
+            FilePromise,
             DragState,
             DrawEvent,
             DropEvent,
@@ -352,6 +385,7 @@ pub use {
             TextInputConfig,
         },
         macos_menu::MacosMenu,
+        tray::{TrayClickEvent, TrayIcon, TrayImage, TrayMenuEvent, TrayMenuItem},
         media_api::CxMediaApi,
         media_host::{MediaControlBridge, MediaEventBridge, MediaTextureBridge, MediaTextureInfo},
         media_plugin::{
@@ -395,7 +429,7 @@ pub use {
         window::{
             CxWindowPool, MacosWindowChrome, MacosWindowConfig, MacosWindowKind, MacosWindowLevel,
             ScriptWindowHandle, WaylandDecorationPreference, WindowBackdrop, WindowHandle,
-            WindowIcon, WindowIconBuffer, WindowId, WindowVisuals,
+            WindowIcon, WindowIconBuffer, WindowId, WindowVisuals, badge_window_title, test_lane,
         },
         window_snapshot::WindowSnapshotState,
         xr_tsdf::{
@@ -433,6 +467,7 @@ pub use crate::draw_shader::DrawShaderId;
 pub use crate::compute::{ComputeDispatch, ComputeKernel, ComputeKernelId, DispatchSize, KernelParam};
 pub use crate::storage_buffer::{StorageBuffer, StorageBufferId};
 pub use crate::texture::StorageFormat;
+pub use crate::draw_owners::DrawLabel;
 pub use crate::pick::{PickError, PickImage, PickTicket};
 /// Edit mode's literal-site map (`Cx::set_live_literals`,
 /// `set_literal_source`, `patch_literal`).
@@ -440,3 +475,4 @@ pub use makepad_script_std::makepad_script::literal::{LiteralOrigin, LiteralReac
 pub use crate::collect::{ScanEvent, Scanner};
 
 pub mod restart;
+pub mod engine_request;

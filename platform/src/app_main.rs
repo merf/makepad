@@ -67,11 +67,17 @@ pub unsafe fn android_on_load(vm: *mut std::ffi::c_void, app: fn()) -> i32 {
 }
 
 /// `app` is the whole of the app's main: it creates its `Cx` itself.
-/// Under Relax the host has done the same around the program's `main` (it gave the process's main
-/// thread to the HAL and called `main` on a thread of its own), so the app just runs.
+/// Under `makepad run` the host has done the same around the program's `main` (it gave the
+/// process's main thread to the HAL and called `main` on a thread of its own), so the app just
+/// runs. Under the bare `relax` runner nothing hosts: the HAL is the program's own, as in a
+/// rustc build.
 pub fn run_app(app: fn()) {
-    #[cfg(all(any(target_vendor = "apple", target_os = "linux", target_os = "windows"), not(relax)))]
-    {
+    #[cfg(relax)]
+    let hosted = std::relax::main_hosted();
+    #[cfg(not(relax))]
+    let hosted = false;
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "windows"))]
+    if !hosted {
         /// Ends the main loop when the app thread is done, however it is done.
         struct Done;
         impl Drop for Done {
@@ -106,15 +112,20 @@ pub fn run_app(app: fn()) {
         if std::env::var_os("MAKEPAD_HAL_LOG").is_some() {
             eprintln!("[hal-linux] main loop returned; joining app thread");
         }
-        if thread.join().is_err() {
+        let panicked = thread.join().is_err();
+        // the process exits next (main returns): the HAL's driver threads stop and are joined
+        // before exit() runs the driver's exit handlers, which fault a thread still inside it
+        makepad_hal::Hal::global().before_exit();
+        if panicked {
             std::process::exit(101);
         }
         #[cfg(target_os = "linux")]
         if std::env::var_os("MAKEPAD_HAL_LOG").is_some() {
-            eprintln!("[hal-linux] app thread joined; run_app returning");
+            eprintln!("[hal-linux] app thread joined, HAL stopped; run_app returning");
         }
+        return;
     }
-    #[cfg(not(all(any(target_vendor = "apple", target_os = "linux", target_os = "windows"), not(relax))))]
+    let _ = hosted;
     app();
 }
 
@@ -143,9 +154,46 @@ pub fn set_window_manager(window_manager: bool) {
     WINDOW_MANAGER.store(window_manager, std::sync::atomic::Ordering::Release);
 }
 
+static OUTLIVES_WINDOW_MANAGER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `app_main!` records [`AppMain::outlives_window_manager`] here before anything opens.
+pub fn set_outlives_window_manager(on: bool) {
+    OUTLIVES_WINDOW_MANAGER.store(on, std::sync::atomic::Ordering::Release);
+}
+
+/// `app_main!` records [`AppMain::menu_bar_app`] here before anything opens: the window system
+/// starts it without a Dock icon (macOS, a rustc build; under `makepad run` the host's window
+/// system is already up and the app turns its Dock icon off with `Cx::show_in_dock`).
+pub fn set_menu_bar_app(on: bool) {
+    #[cfg(all(target_os = "macos", not(relax)))]
+    makepad_hal::set_menu_bar_app(on);
+    #[cfg(not(all(target_os = "macos", not(relax))))]
+    let _ = on;
+}
+
 /// This process is a window manager: it never becomes a client of another one.
 pub fn is_window_manager() -> bool {
     WINDOW_MANAGER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+static HAL_WINDOW_MANAGER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(not(target_arch = "wasm32"))]
+/// The HAL session says its shell is a makepad window manager's client (`info_flags::WM_HOSTED`:
+/// `makepad run` on the WM, whose HAL shell is the WM tile this app draws into).
+pub(crate) fn set_hal_window_manager(on: bool) {
+    HAL_WINDOW_MANAGER.store(on, std::sync::atomic::Ordering::Release);
+}
+
+/// A makepad window manager hosts this app's windows, however it got there: the WM launched it
+/// (`MAKEPAD_WM_CAPTION_CONTENT=1`), it adopted the process at startup (native Linux), or the HAL
+/// shell the app runs on is the WM's client (`makepad run`). Its windows then draw their own caption
+/// with the WM's window controls.
+pub fn hosted_by_window_manager() -> bool {
+    static LAUNCHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LAUNCHED.get_or_init(|| std::env::var("MAKEPAD_WM_CAPTION_CONTENT").is_ok_and(|value| value == "1"))
+        || admitted_by_window_manager().is_some()
+        || HAL_WINDOW_MANAGER.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Where a running makepad window manager admitted this process (Linux, native builds).
@@ -173,10 +221,17 @@ pub fn admitted_by_window_manager() -> Option<WmAdmission> {
 /// hosted path as the apps the WM launches. Otherwise the HAL picks Wayland, then X11.
 /// Under Relax the HAL shell does this for the whole `makepad run` process.
 pub fn discover_window_manager(crate_name: &'static str) {
+    // The name this process gives a WM that hosts it (also the HAL's own WM shell and its
+    // reattach to the next WM): its package, which the WM finds the app's label and icon by.
+    // Never the executable's file name: a rebuild replaces the binary under a running app and
+    // Linux then reads it as "<path> (deleted)".
+    #[cfg(all(target_os = "linux", not(relax)))]
+    makepad_hal::wm_socket::set_client_name(crate_name);
     #[cfg(all(target_os = "linux", not(relax)))]
     ADMITTED.get_or_init(|| {
         use makepad_hal::wm_socket::{self, Backend};
-        if launched_by_host() || is_window_manager() || resolve_studio_host_from_env().is_some()
+        if launched_by_host() || is_window_manager() || OUTLIVES_WINDOW_MANAGER.load(std::sync::atomic::Ordering::Acquire)
+            || resolve_studio_host_from_env().is_some()
             || std::env::var_os("MAKEPAD_HIDE_WINDOWS").is_some()
             || std::env::var("MAKEPAD_HAL_BACKEND").is_ok_and(|b| !b.is_empty())
         {
@@ -436,6 +491,29 @@ pub trait AppMain {
         false
     }
 
+    /// Whether the app lives in the menu bar (macOS): no Dock icon from the first moment, as for a
+    /// bundle whose Info.plist says `LSUIElement`, also when the binary is not such a bundle (Desk
+    /// Host, started by its launcher bundle). Windows it shows later may turn the Dock icon on
+    /// (`Cx::show_in_dock`).
+    fn menu_bar_app() -> bool
+    where
+        Self: Sized,
+    {
+        false
+    }
+
+    /// Whether the app is a service that keeps running when the makepad window manager hosting it
+    /// restarts (a tray app: the AI Hub). Such an app is hosted by the HAL's own WM shell, which
+    /// detaches from a window manager that went away and attaches to the next one (its windows
+    /// and trays come back), instead of being adopted over the hosted `--stdin-loop` wire, whose
+    /// children end with their host.
+    fn outlives_window_manager() -> bool
+    where
+        Self: Sized,
+    {
+        false
+    }
+
     /// Whether the app is a window manager: it hosts other apps' windows, so it never looks for
     /// a makepad window manager to host its own (Linux backend discovery).
     fn window_manager() -> bool
@@ -600,6 +678,12 @@ pub fn new_cx_with_font_set(
 ) -> Cx {
     let mut cx = Cx::new(event_handler);
     cx.init_collect_from_env();
+    // The Splash use record (`wasm_record_splash`, `MAKEPAD_SPLASH_TRACE`):
+    // the module census from before the first script module.
+    if crate::splash_trace::requested() {
+        cx.record_module_census();
+        cx.with_vm(|vm| makepad_script_census::touch_record(vm));
+    }
     #[cfg(not(target_arch = "wasm32"))]
     cx.init_splash_blank_from_env();
     let font_set = if cx.is_collecting() { web_font_set } else { font_set };
@@ -689,6 +773,23 @@ macro_rules! app_main {
     ( $app:ident, font_set: International, configure: $configure:expr ) => {
         $crate::app_main!(@impl $app, $crate::FontSet::International, $crate::FontSet::International, $crate::INTERNATIONAL_FONT_ASSET_MANIFEST, [], $configure);
     };
+    // The OS draws CJK, emoji and every script the Latin faces miss; the web
+    // build, which has no OS fonts to read, is `Latin`.
+    ( $app:ident, font_set: System ) => {
+        $crate::app_main!($app, font_set: System, configure: |_cx: &mut Cx| {});
+    };
+    ( $app:ident, font_set: System, configure: $configure:expr ) => {
+        $crate::app_main!($app, font_set: System, font_assets: [], configure: $configure);
+    };
+    ( $app:ident, font_set: System, font_assets: [$($asset:expr),* $(,)?] ) => {
+        $crate::app_main!($app, font_set: System, font_assets: [$($asset),*], configure: |_cx: &mut Cx| {});
+    };
+    ( $app:ident, font_set: System, font_assets: [$($asset:expr),* $(,)?], configure: $configure:expr ) => {
+        #[cfg(target_arch = "wasm32")]
+        $crate::app_main!(@impl $app, $crate::FontSet::Latin, $crate::FontSet::Latin, $crate::LATIN_FONT_ASSET_PACKAGE_MANIFEST, [$($asset),*], $configure);
+        #[cfg(not(target_arch = "wasm32"))]
+        $crate::app_main!(@impl $app, $crate::FontSet::System, $crate::FontSet::Latin, $crate::SYSTEM_FONT_ASSET_MANIFEST, [$($asset),*], $configure);
+    };
     ( $app:ident, font_set: Latin, font_assets: [$($asset:expr),* $(,)?] ) => {
         $crate::app_main!($app, font_set: Latin, font_assets: [$($asset),*], configure: |_cx: &mut Cx| {});
     };
@@ -749,6 +850,8 @@ macro_rules! app_main {
         pub fn app_main() {
             $crate::attach_parent_console();
             Cx::init_log();
+            // MAKEPAD_NET_AUDIT=1: log every socket from the first instruction on
+            $crate::makepad_network::socket_audit::start_if_enabled();
             $crate::startup_trace("main-entered (dyld done)");
             // A later launch of a single-instance app hands its command line
             // to the running instance and ends here, before the VM or a window.
@@ -765,6 +868,8 @@ macro_rules! app_main {
                 return;
             }
             $crate::set_window_manager(<$app as AppMain>::window_manager());
+            $crate::set_outlives_window_manager(<$app as AppMain>::outlives_window_manager());
+            $crate::set_menu_bar_app(<$app as AppMain>::menu_bar_app());
             $crate::discover_window_manager(env!("CARGO_PKG_NAME"));
             $crate::startup_trace("pre_start (objc classes)");
 
@@ -880,7 +985,7 @@ mod font_set_macro_compile_test {
 
     #[test]
     fn every_entry_point_uses_a_pre_frozen_font_selection() {
-        for set in [FontSet::Latin, FontSet::International] {
+        for set in [FontSet::Latin, FontSet::International, FontSet::System] {
             let cx = new_cx_with_font_set(Box::new(|_, _| {}), set, set);
             assert_eq!(cx.font_set(), set);
             assert!(cx.is_font_set_frozen());

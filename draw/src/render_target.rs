@@ -19,6 +19,10 @@ pub enum RenderTargetFormat {
     Bgra8,
     /// Half-float RGBA (a linear, HDR picture).
     Rgba16f,
+    /// 8-bit BGRA another GPU user reads by its platform handle
+    /// (`Cx::shared_texture_handle`: an encoder taking the picture as it
+    /// lies in GPU memory). Kept, never transient.
+    SharedBgra8,
 }
 
 /// One offscreen pass, its draw list and its colour target.
@@ -67,11 +71,18 @@ impl RenderTarget {
             return false;
         }
         let fixed = TextureSize::Fixed { width: size.0.max(1) as usize, height: size.1.max(1) as usize };
-        self.texture = Texture::new_with_format(cx, match format {
-            RenderTargetFormat::Bgra8 => TextureFormat::RenderBGRAu8 { size: fixed, initial: true },
-            RenderTargetFormat::Rgba16f => TextureFormat::RenderRGBAf16 { size: fixed, initial: true },
-        }).label(cx, self.name);
-        self.texture.set_transient(cx, true);
+        self.texture = match format {
+            RenderTargetFormat::Bgra8 => Texture::new_with_format(cx, TextureFormat::RenderBGRAu8 { size: fixed, initial: true }),
+            RenderTargetFormat::Rgba16f => Texture::new_with_format(cx, TextureFormat::RenderRGBAf16 { size: fixed, initial: true }),
+            #[cfg(not(target_arch = "wasm32"))]
+            RenderTargetFormat::SharedBgra8 => cx.create_shared_texture(size.0.max(1) as usize, size.1.max(1) as usize),
+            // the browser shares no textures with another renderer: a plain target
+            #[cfg(target_arch = "wasm32")]
+            RenderTargetFormat::SharedBgra8 => Texture::new_with_format(cx, TextureFormat::RenderBGRAu8 { size: fixed, initial: true }),
+        }.label(cx, self.name);
+        if format != RenderTargetFormat::SharedBgra8 {
+            self.texture.set_transient(cx, true);
+        }
         self.depth = None;
         self.size = size;
         self.format = format;
@@ -152,6 +163,88 @@ impl RenderTarget {
         cx.begin_pass(&self.pass, Some(1.0));
         self.list.begin_always(cx);
         size
+    }
+}
+
+/// An NV12 picture drawn on the GPU into its two planes (a shared texture an encoder takes as
+/// it lies: `Cx::create_shared_nv12_texture`): a luma pass at the picture's size and a chroma
+/// pass at half of it, each its own draw list. Draw one sample per pixel into each (the NV12
+/// pack shaders' `lanes: 1`).
+pub struct Nv12Target {
+    pub texture: Texture,
+    pub luma: DrawPass,
+    pub chroma: DrawPass,
+    luma_list: DrawList2d,
+    chroma_list: DrawList2d,
+    size: (u32, u32),
+}
+
+impl Nv12Target {
+    pub fn new(cx: &mut Cx, name: &'static str) -> Self {
+        Self {
+            texture: unsized_texture(cx),
+            luma: DrawPass::new_with_name(cx, name),
+            chroma: DrawPass::new_with_name(cx, name),
+            luma_list: DrawList2d::new(cx),
+            chroma_list: DrawList2d::new(cx),
+            size: (0, 0),
+        }
+    }
+
+    /// Size it (even): a new texture only when the size changed. Returns whether it did.
+    pub fn ensure(&mut self, cx: &mut Cx, size: (u32, u32)) -> bool {
+        let size = (size.0.max(2) & !1, size.1.max(2) & !1);
+        if self.size == size {
+            return false;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.texture = cx.create_shared_nv12_texture(size.0 as usize, size.1 as usize);
+        }
+        // the browser shares no textures with an encoder: a plain target
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.texture = Texture::new_with_format(cx, TextureFormat::RenderBGRAu8 { size: TextureSize::Fixed { width: size.0 as usize, height: size.1 as usize }, initial: true });
+        }
+        self.size = size;
+        true
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        self.size
+    }
+
+    /// Begin the luma plane (its pixel size, dpi 1), cleared to `clear` (its first channel).
+    pub fn begin_luma(&mut self, cx: &mut Cx2d, clear: f32) {
+        let size = dvec2(self.size.0 as f64, self.size.1 as f64);
+        Self::begin_plane(cx, &self.luma, &mut self.luma_list, &self.texture, 0, size, vec4(clear, 0.0, 0.0, 0.0));
+    }
+
+    /// Begin the chroma plane (half the size), cleared to `clear` (U, V).
+    pub fn begin_chroma(&mut self, cx: &mut Cx2d, clear: Vec2f) {
+        let size = dvec2((self.size.0 / 2) as f64, (self.size.1 / 2) as f64);
+        Self::begin_plane(cx, &self.chroma, &mut self.chroma_list, &self.texture, 1, size, vec4(clear.x, clear.y, 0.0, 0.0));
+    }
+
+    pub fn end_luma(&mut self, cx: &mut Cx2d) {
+        cx.end_pass_sized_turtle();
+        self.luma_list.end(cx);
+        cx.end_pass(&self.luma);
+    }
+
+    pub fn end_chroma(&mut self, cx: &mut Cx2d) {
+        cx.end_pass_sized_turtle();
+        self.chroma_list.end(cx);
+        cx.end_pass(&self.chroma);
+    }
+
+    fn begin_plane(cx: &mut Cx2d, pass: &DrawPass, list: &mut DrawList2d, texture: &Texture, plane: u32, size: Vec2d, clear: Vec4f) {
+        pass.set_size(cx, size);
+        pass.set_color_texture_face(cx, texture, plane, DrawPassClearColor::ClearWith(clear));
+        cx.make_child_pass(pass);
+        cx.begin_pass(pass, Some(1.0));
+        list.begin_always(cx);
+        cx.begin_root_turtle(size, Layout::flow_overlay());
     }
 }
 
@@ -270,5 +363,43 @@ mod tests {
         // A new size allocates anew: still kept.
         assert!(kept.ensure_kept(&mut cx, (16, 8), RenderTargetFormat::Bgra8));
         assert!(!kept.texture.is_transient(&cx));
+    }
+
+    /// A window's content drawn into a pass nested under a pixel-addressed target keeps the
+    /// window's density. Desk Link draws the desktop (C) inside its dpi-1 picture target; C took
+    /// the picture's dpi, so at display scale 2.0 it was half the screen's pixels and the window
+    /// showed it magnified: every pixel of the panel and of the stream blurred (WMSHARP, 166).
+    #[test]
+    fn a_pass_under_a_pixel_target_draws_at_its_windows_dpi() {
+        use crate::cx_draw::CxDraw;
+        for dpi in [1.0, 1.3, 2.0, 2.07, 3.0] {
+            let mut cx = Cx::new(Box::new(|_, _| {}));
+            let window = WindowHandle::new(&mut cx);
+            let window_id = window.window_id();
+            cx.windows[window_id].is_created = true;
+            cx.windows[window_id].window_geom.inner_size = dvec2(1920.0, 1080.0);
+            cx.windows[window_id].window_geom.dpi_factor = dpi;
+            let root_pass = DrawPass::new(&mut cx);
+            window.set_pass(&mut cx, &root_pass);
+            let mut picture = RenderTarget::new(&mut cx, "picture");
+            picture.ensure(&mut cx, (960, 6480), RenderTargetFormat::SharedBgra8);
+            let event = DrawEvent::default();
+            let mut draw = CxDraw::new(&mut cx, &event);
+            draw.begin_pass(&root_pass, Some(dpi));
+            {
+                let mut cx = Cx2d::new(&mut draw);
+                cx.begin_root_turtle(dvec2(1920.0, 1080.0), Layout::default());
+                assert_eq!(cx.owning_window_dpi_factor(), dpi);
+                picture.begin(&mut cx, vec4(0.0, 0.0, 0.0, 0.0));
+                assert_eq!(cx.current_dpi_factor(), 1.0, "the picture is pixel-addressed");
+                assert_eq!(cx.owning_window_dpi_factor(), dpi, "content of the window under the picture: the window's dpi");
+                assert_eq!(cx.owning_window_or_root_pass_size(), dvec2(1920.0, 1080.0));
+                picture.end(&mut cx);
+                while !cx.turtles.is_empty() {
+                    cx.end_turtle();
+                }
+            }
+            draw.end_pass(&root_pass);
+        }
     }
 }

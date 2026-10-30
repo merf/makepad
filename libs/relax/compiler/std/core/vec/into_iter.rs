@@ -5,6 +5,7 @@ use crate::fmt;
 use crate::heap;
 use crate::intrinsics_mem as im;
 
+#[rustc_insignificant_dtor]
 pub struct IntoIter<T> {
     buf: crate::ptr::NonNull<T>,
     cap: usize,
@@ -12,6 +13,7 @@ pub struct IntoIter<T> {
     start: usize,
     /// one past the next back index
     end: usize,
+    _marker: crate::marker::PhantomData<T>,
 }
 
 unsafe impl<T: Send> Send for IntoIter<T> {}
@@ -19,7 +21,7 @@ unsafe impl<T: Sync> Sync for IntoIter<T> {}
 
 pub(super) fn new<T>(v: Vec<T>) -> IntoIter<T> {
     let me = crate::mem::ManuallyDrop::new(v);
-    IntoIter { buf: me.ptr, cap: me.cap.get(), start: 0, end: me.len }
+    IntoIter { buf: me.ptr, cap: me.cap.get(), start: 0, end: me.len, _marker: crate::marker::PhantomData }
 }
 
 impl<T> IntoIter<T> {
@@ -74,6 +76,7 @@ impl<T> DoubleEndedIterator for IntoIter<T> {
 }
 
 impl<T> ExactSizeIterator for IntoIter<T> {}
+unsafe impl<T> crate::iter::TrustedLen for IntoIter<T> {}
 impl<T> crate::iter::FusedIterator for IntoIter<T> {}
 
 impl<T: Clone> Clone for IntoIter<T> {
@@ -94,14 +97,14 @@ impl<T> Default for IntoIter<T> {
     }
 }
 
-impl<T> Drop for IntoIter<T> {
+unsafe impl<#[may_dangle] T> Drop for IntoIter<T> {
     fn drop(&mut self) {
         while self.start < self.end {
             unsafe { im::drop_in_place(im::ptr_add_mut(self.buf.as_ptr(), self.start)) };
             self.start += 1;
         }
         if crate::mem::size_of::<T>() != 0 && self.cap != 0 {
-            heap::free(self.buf.as_ptr() as *mut u8, Vec::<T>::layout_for(self.cap));
+            heap::free(self.buf.as_ptr() as *mut u8, Vec::<T>::current_layout(self.cap));
         }
     }
 }

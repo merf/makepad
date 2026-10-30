@@ -452,6 +452,7 @@ pub mod portable {
     }
 
     extern "C" {
+        fn __relax_on_program_stack(f: extern "C" fn(*mut u8), arg: *mut u8);
         fn __relax_domain_base() -> u64;
         fn __relax_domain_enter(base: u64, token: u64);
         fn __relax_domain_reserve(base: u64) -> u64;
@@ -461,9 +462,14 @@ pub mod portable {
     extern "system" fn windows_thread_start(p: *mut c_void) -> DWORD {
         // first, before anything that may name a static
         unsafe { __relax_domain_enter((*(p as *const StartArg)).domain, (*(p as *const StartArg)).token) };
+        // the thread's body runs on a program stack (relax_base::stack::on_program_stack)
+        unsafe { __relax_on_program_stack(start_body, p as *mut u8) };
+        0
+    }
+
+    extern "C" fn start_body(p: *mut u8) {
         let a = unsafe { alloc::boxed::Box::from_raw(p as *mut StartArg) };
         (a.f)(a.arg);
-        0
     }
 
     /// CreateThread with `stack_size` reserved (STACK_SIZE_PARAM_IS_A_RESERVATION, as real std).
@@ -499,12 +505,12 @@ pub mod portable {
     /// Runtime-owned TLS: domain teardown waits until these destructors have completed.
     pub type Key = u32;
     extern "C" {
-        fn __relax_key_create(dtor: extern "C" fn(*mut c_void)) -> u32;
+        fn __relax_key_create(dtor: extern "C" fn(*mut c_void), late: u32) -> u32;
         fn __relax_key_delete(key: u32);
         fn __relax_key_get(key: u32) -> *mut c_void;
         fn __relax_key_set(key: u32, value: *const c_void);
     }
-    pub fn key_create(dtor: extern "C" fn(*mut c_void)) -> Option<Key> { Some(unsafe { __relax_key_create(dtor) }) }
+    pub fn key_create(dtor: extern "C" fn(*mut c_void), late: bool) -> Option<Key> { Some(unsafe { __relax_key_create(dtor, late as u32) }) }
     pub fn key_delete(key: Key) { unsafe { __relax_key_delete(key); } }
     pub fn key_get(key: Key) -> *mut c_void { unsafe { __relax_key_get(key) } }
     pub fn key_set(key: Key, value: *const c_void) { unsafe { __relax_key_set(key, value); } }

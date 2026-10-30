@@ -61,6 +61,11 @@ pub struct UnitInfo {
     pub features: Vec<String>,
     pub deps: Vec<(usize, String)>,
     pub proc_macro: bool,
+    /// a registry/git package (CrateUnit::registry): third-party, sandboxed under a strict
+    /// proc-macro policy (pmhost::Policy)
+    pub registry: bool,
+    pub cfgs: Vec<String>,
+    pub env: Vec<(String, String)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -87,6 +92,78 @@ pub struct Reg {
     pub macros: Vec<(String, Entry)>,
     /// derive name -> its helper attributes (`attributes(..)` of proc_macro_derive)
     pub helpers: Vec<(String, Vec<String>)>,
+    /// crate name -> the units its unit(s) reach through `deps` (transitively; memoised)
+    pub reach: std::collections::HashMap<String, Vec<bool>>,
+}
+
+/// The units in the dependency closure of the unit(s) named `krate`, themselves included. A
+/// name no unit has (core, alloc, std, proc_macro: never cargo units) reaches nothing.
+fn reach<'a>(reg: &'a mut Reg, krate: &str) -> &'a [bool] {
+    if !reg.reach.contains_key(krate) {
+        let mut seen = vec![false; reg.units.len()];
+        let mut stack: Vec<usize> = (0..reg.units.len()).filter(|&i| reg.units[i].name == krate).collect();
+        while let Some(i) = stack.pop() {
+            if std::mem::replace(&mut seen[i], true) {
+                continue;
+            }
+            stack.extend(reg.units[i].deps.iter().map(|d| d.0));
+        }
+        reg.reach.insert(krate.to_string(), seen);
+    }
+    &reg.reach[krate]
+}
+
+/// Resolves proc-macro `name` of `kind` as crate `krate` sees it:
+/// Tier 1: direct proc-macro dependency of `krate`
+/// Tier 2: 1-hop library wrapper dependency of `krate` (`krate -> wrapper -> proc_macro`)
+/// Tier 3: transitive dependency closure of `krate`
+fn resolve_entry(reg: &mut Reg, krate: &str, name: &str, kind: Kind) -> Option<Entry> {
+    let hits: Vec<Entry> = match kind {
+        Kind::Derive => reg.derives.iter().filter(|(n, _)| n == name).map(|x| x.1.clone()).collect(),
+        _ => reg.macros.iter().filter(|(n, e)| n == name && e.kind == kind).map(|x| x.1.clone()).collect(),
+    };
+    if hits.is_empty() {
+        return None;
+    }
+    let u_idxs: Vec<usize> = if krate.is_empty() {
+        Vec::new()
+    } else {
+        (0..reg.units.len()).filter(|&i| reg.units[i].name == krate).collect()
+    };
+    if u_idxs.is_empty() {
+        return if kind == Kind::Attr { None } else { hits.into_iter().next() };
+    }
+    if let Some(e) = hits.iter().find(|e| u_idxs.contains(&e.unit) || u_idxs.iter().any(|&u| reg.units[u].deps.iter().any(|&(d, _)| d == e.unit))) {
+        return Some(e.clone());
+    }
+    if let Some(e) = hits.iter().find(|e| u_idxs.iter().any(|&u| reg.units[u].deps.iter().any(|&(d, _)| reg.units[d].deps.iter().any(|&(dd, _)| dd == e.unit)))) {
+        return Some(e.clone());
+    }
+    let rc = reach(reg, krate);
+    hits.into_iter().find(|e| rc[e.unit])
+}
+
+/// Attribute macro `name` as crate `krate` sees it: an entry of a proc-macro crate in `krate`'s
+/// dependency closure (rustc: the macro has to be nameable in the invoking crate). A crate
+/// whose closure holds no proc-macro crate, such as std's own crates, has no attribute macros
+/// at all: core's inert `#[unstable]` stays an attribute when the graph holds the
+/// `instability` crate, which exports an attribute macro of that name.
+pub(crate) fn attr_entry_for(krate: &str, name: &str) -> Option<Entry> {
+    if in_world() { return None; }
+    REG.with(|r| {
+        let mut b = r.borrow_mut();
+        resolve_entry(b.as_mut()?, krate, name, Kind::Attr)
+    })
+}
+
+/// An attribute exported by this crate itself, not by one of its dependencies.
+pub(crate) fn exported_attr(krate: &str, name: &str) -> Option<Entry> {
+    if in_world() { return None; }
+    REG.with(|r| {
+        let r = r.borrow();
+        let r = r.as_ref()?;
+        r.macros.iter().find(|(n, e)| n == name && e.kind == Kind::Attr && r.units[e.unit].name == krate).map(|(_, e)| e.clone())
+    })
 }
 
 /// Boot cost of the host (for the measurements in builtins-lane.md).
@@ -177,6 +254,60 @@ thread_local! {
     /// this thread builds the world, or parses its crates (the builder's parse pool): a hosted
     /// macro met there is left alone (it would wait for the world being built)
     static IN_WORLD: Cell<bool> = const { Cell::new(false) };
+    /// this thread works for the macro world's build (the builder, or a parse worker on one of
+    /// the world's crates): a macro the boot world lacks must not wait for that build (pmhost)
+    static WORLD_BUILDER: Cell<bool> = const { Cell::new(false) };
+    /// the invoking crate name during a proc-macro expansion (`run_derive_in`, `run_attr`, `run_bang_in`)
+    static CALL_KRATE: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+pub struct CallKrateGuard(String);
+
+impl Drop for CallKrateGuard {
+    fn drop(&mut self) {
+        CALL_KRATE.with(|c| *c.borrow_mut() = std::mem::take(&mut self.0));
+    }
+}
+
+pub fn with_call_krate(krate: &str) -> CallKrateGuard {
+    let prev = CALL_KRATE.with(|c| std::mem::replace(&mut *c.borrow_mut(), krate.to_string()));
+    CallKrateGuard(prev)
+}
+
+pub fn current_call_krate() -> String {
+    CALL_KRATE.with(|c| c.borrow().clone())
+}
+
+pub fn call_krate_env(key: &str) -> Option<String> {
+    let krate = current_call_krate();
+    if krate.is_empty() {
+        return None;
+    }
+    if let Some(v) = crate::crates::crate_env_registered(&krate, key) {
+        return Some(v);
+    }
+    REG.with(|r| {
+        let b = r.borrow();
+        let reg = b.as_ref()?;
+        let u = reg.units.iter().find(|u| u.name == krate)?;
+        if let Some((_, v)) = u.env.iter().find(|(k, _)| k == key) {
+            return Some(v.clone());
+        }
+        match key {
+            "CARGO_MANIFEST_DIR" => {
+                let p = std::path::Path::new(&u.src_path);
+                for dir in p.ancestors().skip(1) {
+                    if crate::vfs::exists(dir.join("Cargo.toml")) {
+                        return Some(dir.to_string_lossy().into_owned());
+                    }
+                }
+                p.parent().map(|d| d.to_string_lossy().into_owned())
+            }
+            "CARGO_CRATE_NAME" => Some(crate::crates::base_crate_name(&krate).to_string()),
+            "CARGO_PKG_NAME" => Some(crate::crates::base_crate_name(&krate).replace('_', "-")),
+            _ => None,
+        }
+    })
 }
 
 /// The registry and the stats are process-wide: files parse on worker threads too.
@@ -189,38 +320,6 @@ impl<T> Shared<T> {
 }
 
 pub static REG: Shared<Reg> = Shared(relax_session::sync::Mutex::new(RefCell::new(None)));
-
-pub(crate) struct ZoneTaken(Option<Reg>);
-
-pub(crate) fn zone_take() -> ZoneTaken {
-    // The warm path must call register_and_strip again before expanding macros;
-    // registry lookups do not load a missing graph themselves.
-    let mut reg = REG.0.lock().unwrap_or_else(|e| e.into_inner());
-    let taken = ZoneTaken(std::mem::take(reg.get_mut()));
-    #[cfg(test)]
-    assert!(reg.get_mut().is_none());
-    taken
-}
-
-pub(crate) fn zone_put_back(taken: ZoneTaken) {
-    let mut reg = REG.0.lock().unwrap_or_else(|e| e.into_inner());
-    std::mem::forget(std::mem::replace(reg.get_mut(), taken.0));
-}
-
-/// The next compiler generation registers the running program's proc-macro graph again: a
-/// copy of the taken registry, made in the caller's (new) generation, and the runner's
-/// `registered` (the native macro graph is rebuilt there). A live edit after the swap expands
-/// the same derives and macro calls as before it; with the registry left empty its file
-/// reparsed without them (every derive's items "removed", every item macro "added": a
-/// restart for any edit).
-pub(crate) fn zone_reinstall(sess: &std::sync::Arc<crate::Session>, taken: &ZoneTaken) -> Result<(), String> {
-    let Some(reg) = taken.0.clone() else { return Ok(()) };
-    REG.with(|r| *r.borrow_mut() = Some(reg));
-    match RUNNER.get() {
-        Some(r) => r.registered(sess),
-        None => Ok(()),
-    }
-}
 
 static STATS_CELL: Shared<HostStats> = Shared(relax_session::sync::Mutex::new(RefCell::new(None)));
 
@@ -249,9 +348,33 @@ pub fn set_in_world(v: bool) {
     IN_WORLD.with(|w| w.set(v));
 }
 
+pub fn world_builder() -> bool {
+    WORLD_BUILDER.with(|w| w.get())
+}
+
+pub fn set_world_builder(v: bool) {
+    WORLD_BUILDER.with(|w| w.set(v));
+}
+
 /// Index of function-like proc macro `name` of the registered graph (builtins' HOSTED ids).
 pub fn bang_index(name: &str) -> Option<usize> {
+    if in_world() {
+        return None;
+    }
     REG.with(|r| r.borrow().as_ref().and_then(|r| r.macros.iter().position(|(n, e)| n == name && e.kind == Kind::Bang)))
+}
+
+/// Index of function-like proc macro `name` as crate `krate` sees it (`resolve_entry`).
+pub fn bang_index_for(krate: &str, name: &str) -> Option<usize> {
+    if in_world() {
+        return None;
+    }
+    REG.with(|r| {
+        let mut b = r.borrow_mut();
+        let reg = b.as_mut()?;
+        let e = resolve_entry(reg, krate, name, Kind::Bang)?;
+        reg.macros.iter().position(|(n, ex)| n == name && ex.unit == e.unit && ex.fname == e.fname && ex.kind == Kind::Bang)
+    })
 }
 
 pub fn bang_name(i: usize) -> Option<String> {
@@ -275,24 +398,29 @@ pub fn reusable_derive(name: &str) -> bool {
     pure || entry.as_ref().is_some_and(|e| RUNNER.get().is_some_and(|r| r.reusable(e)))
 }
 
-/// Is attribute macro `name` (as run_attr finds it) a pure token transform (derive rule)?
-pub fn reusable_attr(name: &str) -> bool {
-    let (entry, pure) = REG.with(|r| r.borrow().as_ref().and_then(|r| r.macros.iter().find(|(n, e)| n == name && e.kind == Kind::Attr)
-        .map(|(_, e)| (Some(e.clone()), PURE_DERIVE_UNITS.contains(&r.units[e.unit].name.as_str())))).unwrap_or((None, false)));
-    pure || entry.as_ref().is_some_and(|e| RUNNER.get().is_some_and(|r| r.reusable(e)))
+/// Is the resolved attribute a pure token transform (derive rule)?
+pub fn reusable_attr(entry: &Entry) -> bool {
+    let pure = REG.with(|r| r.borrow().as_ref().is_some_and(|r| PURE_DERIVE_UNITS.contains(&r.units[entry.unit].name.as_str())));
+    pure || RUNNER.get().is_some_and(|r| r.reusable(entry))
 }
 
-/// Runs function-like proc macro `i` (bang_index) on `input`.
-pub fn run_bang(sess: &std::sync::Arc<crate::Session>, i: usize, input: TokenStream, call_span: Span) -> Result<TokenStream, String> {
+/// Runs function-like proc macro `i` (bang_index) on `input` in crate `krate`.
+pub fn run_bang_in(sess: &std::sync::Arc<crate::Session>, krate: &str, i: usize, input: TokenStream, call_span: Span) -> Result<TokenStream, String> {
     let e = REG.with(|r| r.borrow().as_ref().and_then(|r| r.macros.get(i).map(|x| x.1.clone()))).ok_or("unknown proc macro")?;
     if in_world() {
         return Err("a proc macro used while the macro world itself is being built".to_string());
     }
+    let _krate = with_call_krate(krate);
     match RUNNER.get() {
         Some(r) if declaring() => r.declare(sess, &e, None, &input, call_span),
         Some(r) => r.call(sess, &e, &input, call_span),
         None => Err(no_runner(&e)),
     }
+}
+
+/// Runs function-like proc macro `i` (bang_index) on `input`.
+pub fn run_bang(sess: &std::sync::Arc<crate::Session>, i: usize, input: TokenStream, call_span: Span) -> Result<TokenStream, String> {
+    run_bang_in(sess, "", i, input, call_span)
 }
 pub fn trace() -> bool {
     crate::preload::relax_trace().map_or(false, |t| t.split(',').any(|x| x == "pmhost"))
@@ -311,29 +439,33 @@ pub fn stats() -> HostStats {
 fn register(sess: &std::sync::Arc<crate::Session>, units: &[CrateUnit], std_dir: &str, additive: bool) -> Result<(), String> {
     let mut reg = if additive { REG.with(|r| r.borrow().clone()).unwrap_or_default() } else { Reg::default() };
     reg.std_dir = std_dir.to_string();
+    // the dependency closures are computed again for the new units
+    reg.reach.clear();
     // unit index of the graph -> unit index in the registry
     let mut map = vec![usize::MAX; units.len()];
     let mut fresh = Vec::new();
     for (i, u) in units.iter().enumerate() {
+        let features = u.host.as_ref().map_or(&u.features, |h| &h.features);
         let same = if additive {
-            reg.units.iter().position(|r| r.name == u.name && r.src_path == u.src_path && r.edition == u.edition && r.features == u.features && r.proc_macro == u.proc_macro)
+            reg.units.iter().position(|r| r.name == u.name && r.src_path == u.src_path && r.edition == u.edition && &r.features == features && r.proc_macro == u.proc_macro && r.registry == u.registry)
         } else {
             None
         };
         map[i] = same.unwrap_or_else(|| {
-            reg.units.push(UnitInfo { name: String::new(), src_path: String::new(), edition: 0, features: Vec::new(), deps: Vec::new(), proc_macro: false });
+            reg.units.push(UnitInfo { name: String::new(), src_path: String::new(), edition: 0, features: Vec::new(), deps: Vec::new(), proc_macro: false, registry: false, cfgs: Vec::new(), env: Vec::new() });
             fresh.push(i);
             reg.units.len() - 1
         });
     }
     for &i in &fresh {
         let u = &units[i];
-        reg.units[map[i]] = UnitInfo { name: u.name.clone(), src_path: u.src_path.clone(), edition: u.edition, features: u.features.clone(), deps: u.deps.iter().map(|(d, n)| (map[*d], n.clone())).collect(), proc_macro: u.proc_macro };
+        let (features, deps) = u.host.as_ref().map_or((&u.features, &u.deps), |h| (&h.features, &h.deps));
+        reg.units[map[i]] = UnitInfo { name: u.name.clone(), src_path: u.src_path.clone(), edition: u.edition, features: features.clone(), deps: deps.iter().map(|(d, n)| (map[*d], n.clone())).collect(), proc_macro: u.proc_macro, registry: u.registry, cfgs: Vec::new(), env: Vec::new() };
     }
     for &i in &fresh {
         let u = reg.units[map[i]].clone();
         if u.proc_macro {
-            scan_entries(&mut reg, map[i], &u.src_path, u.edition);
+            scan_entries(sess, &mut reg, map[i], &u.src_path, u.edition);
         }
     }
     if trace() {
@@ -354,6 +486,119 @@ fn register(sess: &std::sync::Arc<crate::Session>, units: &[CrateUnit], std_dir:
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn merged_host_units_keep_features_and_dependencies() {
+    use crate::resolve::{GraphUnit, Units};
+    let root = std::env::temp_dir().join(format!("relax-host-units-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("proc_macro")).unwrap();
+    std::fs::write(root.join("proc_macro/empty.rs"), "").unwrap();
+    let dir = root.display().to_string();
+    let unit = |name: &str, kind: &str, host, features: &[&str], deps: &[(usize, &str)]| GraphUnit {
+        pkg_id: format!("path+file://{dir}/{name}#0.1.0"),
+        name: name.to_string(), kind: vec![kind.to_string()],
+        src_path: format!("{dir}/{name}/src/lib.rs"), edition: "2021".to_string(),
+        host, mode: "build".to_string(), features: features.iter().map(|s| s.to_string()).collect(),
+        deps: deps.iter().map(|(d, n)| (*d, n.to_string())).collect(),
+    };
+    let units = Units { units: vec![
+        unit("app", "bin", false, &[], &[(1, "shared"), (2, "macros")]),
+        unit("shared", "lib", false, &["target"], &[(3, "target_helper")]),
+        unit("macros", "proc-macro", true, &[], &[(4, "shared")]),
+        unit("target_helper", "lib", false, &[], &[]),
+        unit("shared", "lib", true, &["full", "visit"], &[(5, "host_helper")]),
+        unit("host_helper", "lib", true, &["walk"], &[]),
+    ], roots: vec![0], bins: Vec::new() };
+    let mut g = crate::unitgraph::load(&units, false).unwrap();
+    let sess = &std::sync::Arc::new(crate::Session::default());
+    let saved = REG.with(|r| r.borrow_mut().take());
+    register_and_strip(sess, &mut g.crates, &dir, false).unwrap();
+    let shared = g.crates.iter().find(|u| u.name == "shared").unwrap();
+    assert_eq!(shared.features, ["target"]);
+    assert_eq!(shared.deps.len(), 1);
+    assert_eq!(g.crates[shared.deps[0].0].name, "target_helper");
+    let helper = g.crates.iter().find(|u| u.name == "host_helper").unwrap();
+    assert_eq!(helper.src_path, format!("{dir}/proc_macro/empty.rs"));
+    // Re-registering the original graph matches the host feature set, not the app's.
+    let again = crate::unitgraph::load(&units, false).unwrap();
+    register(sess, &again.crates, &dir, true).unwrap();
+    REG.with(|r| {
+        let r = r.borrow();
+        let reg = r.as_ref().unwrap();
+        assert_eq!(reg.units.len(), 5);
+        let shared = reg.units.iter().find(|u| u.name == "shared").unwrap();
+        assert_eq!(shared.features, ["full", "visit"]);
+        assert_eq!(shared.deps.len(), 1);
+        let helper = &reg.units[shared.deps[0].0];
+        assert_eq!(helper.name, "host_helper");
+        assert_eq!(helper.features, ["walk"]);
+        assert_eq!(helper.src_path, format!("{dir}/host_helper/src/lib.rs"));
+        let pm = reg.units.iter().find(|u| u.name == "macros").unwrap();
+        assert_eq!(reg.units[pm.deps[0].0].features, shared.features);
+    });
+    REG.with(|r| *r.borrow_mut() = saved);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Updates registered units with build-script `cfgs` and `env` outputs (`run.rs` after
+/// `run_build_scripts`), and re-scans proc-macro units whose `cfgs` changed.
+pub fn set_build_outputs(sess: &std::sync::Arc<crate::Session>, units: &[CrateUnit], cfgs: &[Vec<String>], env: &[Vec<(String, String)>]) {
+    REG.with(|r| {
+        let mut b = r.borrow_mut();
+        let Some(reg) = b.as_mut() else { return };
+        let mut rescan = Vec::new();
+        for (ci, c) in units.iter().enumerate() {
+            if c.bin {
+                continue;
+            }
+            for (ui, u) in reg.units.iter_mut().enumerate() {
+                if u.name == c.name {
+                    if let Some(cs) = cfgs.get(ci) {
+                        if u.cfgs != *cs {
+                            u.cfgs = cs.clone();
+                            if u.proc_macro {
+                                rescan.push((ui, u.src_path.clone(), u.edition));
+                            }
+                        }
+                    }
+                    if let Some(ev) = env.get(ci) {
+                        u.env = ev.clone();
+                    }
+                }
+            }
+        }
+        for (ui, src_path, edition) in rescan {
+            reg.derives.retain(|(_, e)| e.unit != ui);
+            reg.macros.retain(|(_, e)| e.unit != ui);
+            scan_entries(sess, reg, ui, &src_path, edition);
+        }
+    });
+}
+
+/// Whether a proc-macro crate of the registered graph depends (directly or not) on a crate named
+/// in `names`: the macro world built before those crates' build outputs are known would lack them.
+pub fn macro_closure_reaches(names: &[&str]) -> bool {
+    macro_closure_names().iter().any(|n| names.contains(&n.as_str()))
+}
+
+/// The registered graph's proc-macro crates and everything they depend on (the crates a macro
+/// world loads), by name.
+pub fn macro_closure_names() -> Vec<String> {
+    REG.with(|r| {
+        let b = r.borrow();
+        let Some(reg) = b.as_ref() else { return Vec::new() };
+        let mut seen = vec![false; reg.units.len()];
+        let mut stack: Vec<usize> = (0..reg.units.len()).filter(|&i| reg.units[i].proc_macro).collect();
+        let mut out = Vec::new();
+        while let Some(i) = stack.pop() {
+            if std::mem::replace(&mut seen[i], true) { continue; }
+            out.push(reg.units[i].name.clone());
+            stack.extend(reg.units[i].deps.iter().map(|(d, _)| *d));
+        }
+        out
+    })
 }
 
 /// The boot driver's load will expand macros (it is not a warm restore of the whole program):
@@ -386,7 +631,7 @@ pub fn register_and_strip(sess: &std::sync::Arc<crate::Session>, units: &mut [Cr
     // proc-macro crate
     let mut is_dep = vec![false; n];
     for u in units.iter() {
-        for (d, _) in &u.deps {
+        for (d, _) in u.deps.iter().chain(u.host.iter().flat_map(|h| &h.deps)) {
             is_dep[*d] = true;
         }
     }
@@ -405,6 +650,7 @@ pub fn register_and_strip(sess: &std::sync::Arc<crate::Session>, units: &mut [Cr
             units[i].src_path = empty.clone();
             units[i].deps.clear();
             units[i].features.clear();
+            units[i].host = None;
         }
     }
     Ok(())
@@ -426,7 +672,11 @@ pub fn outline_native(name: &str, kind: Kind) -> bool {
     let entry = REG.with(|r| r.borrow().as_ref().and_then(|r| {
         r.derives.iter().chain(&r.macros).find(|(n, e)| n == name && e.kind == kind).map(|(_, e)| e.clone())
     }));
-    entry.as_ref().is_some_and(|e| RUNNER.get().is_some_and(|r| if declaring() { r.declaration_surface(e) } else { r.native(e) }))
+    entry.as_ref().is_some_and(outline_native_entry)
+}
+
+pub(crate) fn outline_native_entry(entry: &Entry) -> bool {
+    RUNNER.get().is_some_and(|r| if declaring() { r.declaration_surface(entry) } else { r.native(entry) })
 }
 
 /// The outline can run only source-matched native entries. A source edit can
@@ -455,16 +705,17 @@ pub fn is_derive_helper(name: &str, derives: &[String]) -> bool {
     REG.with(|r| r.borrow().as_ref().map_or(false, |r| r.helpers.iter().any(|(d, hs)| derives.contains(d) && hs.iter().any(|h| h == name))))
 }
 
-/// Runs attribute macro `name` on its arguments and item (any thread but the world's).
-pub fn run_attr(sess: &std::sync::Arc<crate::Session>, name: &str, attr: &TokenStream, item: &TokenStream, call_span: Span) -> Result<TokenStream, String> {
+/// Runs the resolved attribute macro, with `krate` as the calling crate, on its arguments
+/// and item (any thread but the world's).
+pub fn run_attr(sess: &std::sync::Arc<crate::Session>, krate: &str, e: &Entry, attr: &TokenStream, item: &TokenStream, call_span: Span) -> Result<TokenStream, String> {
     if in_world() {
         return Err("an attribute macro used while the macro world itself is being built".to_string());
     }
-    let e = REG.with(|r| r.borrow().as_ref().and_then(|r| r.macros.iter().find(|(n, e)| n == name && e.kind == Kind::Attr).map(|x| x.1.clone()))).ok_or("unknown attribute macro")?;
+    let _krate = with_call_krate(krate);
     match RUNNER.get() {
-        Some(r) if declaring() => r.declare(sess, &e, Some(attr), item, call_span),
-        Some(r) => r.call_attr(sess, &e, attr, item, call_span),
-        None => Err(no_runner(&e)),
+        Some(r) if declaring() => r.declare(sess, e, Some(attr), item, call_span),
+        Some(r) => r.call_attr(sess, e, attr, item, call_span),
+        None => Err(no_runner(e)),
     }
 }
 
@@ -473,11 +724,71 @@ pub fn has_derive(name: &str) -> bool {
     REG.with(|r| r.borrow().as_ref().map_or(false, |r| r.derives.iter().any(|(n, _)| n == name)))
 }
 
-/// `#[proc_macro_derive(Name, ..)]` / `#[proc_macro]` / `#[proc_macro_attribute]` fns of a
-/// proc-macro crate (token scan of its files, following `mod x;`).
-fn scan_entries(reg: &mut Reg, unit: usize, root: &str, edition: u16) {
+/// Collects `macro_rules!` definitions from a crate's root file for proc-macro entry discovery.
+fn collect_macro_rules_defs(root: &str, krate: &str, edition: u16) -> Vec<crate::macros::MacroDef> {
     use crate::lexer::T;
+    let Ok(src) = crate::vfs::read(root) else { return Vec::new() };
+    let mut toks = Vec::new();
+    if crate::lexer::lex(&src, edition, &mut toks).is_err() {
+        return Vec::new();
+    }
+    let text = |i: usize| -> &[u8] { &src[toks[i].lo as usize..toks[i].hi as usize] };
+    let mut defs = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        if toks[i].kind == T::Ident && text(i) == b"macro_rules" && i + 3 < toks.len() && toks[i + 1].kind == T::Not {
+            let name = String::from_utf8_lossy(text(i + 2)).trim_start_matches("r#").to_string();
+            let open = i + 3;
+            let mut d = 0i32;
+            let mut close = open;
+            while close < toks.len() {
+                match toks[close].kind {
+                    T::OpenParen | T::OpenBracket | T::OpenBrace => d += 1,
+                    T::CloseParen | T::CloseBracket | T::CloseBrace => {
+                        d -= 1;
+                        if d == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                close += 1;
+            }
+            if close > open {
+                let mt = crate::macros::definition_tokens(&toks[open + 1..close.min(toks.len())],
+                    |lo, hi| &src[lo as usize..hi as usize]);
+                if let Ok(def) = crate::macros::parse_def(&name, krate, edition, &mt) {
+                    defs.push(def);
+                }
+            }
+            i = close + 1;
+            continue;
+        }
+        i += 1;
+    }
+    defs
+}
+
+/// `#[proc_macro_derive(Name, ..)]` / `#[proc_macro]` / `#[proc_macro_attribute]` fns of a
+/// proc-macro crate (token scan of its files, following `mod x;` and expanding top-level
+/// `macro_rules!` invocations that generate proc-macro entry points).
+fn scan_entries(sess: &std::sync::Arc<crate::Session>, reg: &mut Reg, unit: usize, root: &str, edition: u16) {
     crate::why::edge(root, crate::why::Cause::new(root, 1, "proc-macro-index", "scan_entries"));
+    let u = &reg.units[unit];
+    let mut cfg = crate::cfg::CfgSet::machine(sess, &u.features);
+    cfg.set.push("relax".to_string());
+    for c in &u.cfgs {
+        cfg.set.push(c.replace('"', ""));
+    }
+    let mut local_defs = collect_macro_rules_defs(root, &u.name, edition);
+    let deps: Vec<(usize, String)> = u.deps.clone();
+    for (dep_idx, _) in deps {
+        if let Some(dep_u) = reg.units.get(dep_idx) {
+            if !dep_u.proc_macro {
+                local_defs.extend(collect_macro_rules_defs(&dep_u.src_path, &dep_u.name, dep_u.edition));
+            }
+        }
+    }
     let mut stack = vec![root.to_string()];
     let mut seen = Vec::new();
     while let Some(path) = stack.pop() {
@@ -493,105 +804,200 @@ fn scan_entries(reg: &mut Reg, unit: usize, root: &str, edition: u16) {
         if crate::lexer::lex(&src, edition, &mut toks).is_err() {
             continue;
         }
-        let text = |i: usize| -> &[u8] { &src[toks[i].lo as usize..toks[i].hi as usize] };
         let is_root = path == root;
-        let dir = crate::program::dir_of(&path).to_string();
-        let mut i = 0;
-        while i < toks.len() {
-            match toks[i].kind {
-                T::KwMod if i + 2 < toks.len() && toks[i + 2].kind == T::Semi => {
-                    let name = String::from_utf8_lossy(text(i + 1)).into_owned();
-                    let base = if is_root || path.ends_with("/mod.rs") { dir.clone() } else { format!("{}/{}", dir, crate::program::stem_of(&path)) };
-                    for c in [format!("{}/{}.rs", base, name), format!("{}/{}/mod.rs", base, name)] {
-                        if crate::vfs::exists(&c) {
-                            if crate::why::enabled() { crate::why::edge(&c, crate::why::Cause::new(&path, crate::lexer::line_col(&src, toks[i].lo).0, "proc-macro-module", &name)); }
-                            stack.push(c);
-                            break;
-                        }
-                    }
-                }
-                T::Pound if i + 2 < toks.len() && toks[i + 1].kind == T::OpenBracket => {
-                    let a = text(i + 2);
-                    let kind = match a {
-                        b"proc_macro_derive" => Some(Kind::Derive),
-                        b"proc_macro" => Some(Kind::Bang),
-                        b"proc_macro_attribute" => Some(Kind::Attr),
-                        _ => None,
-                    };
-                    if let Some(kind) = kind {
-                        // derive name: first ident inside `(..)`
-                        let mut name = String::new();
-                        let mut helpers: Vec<String> = Vec::new();
-                        let mut j = i + 3;
-                        if kind == Kind::Derive && j < toks.len() && toks[j].kind == T::OpenParen && j + 1 < toks.len() {
-                            name = String::from_utf8_lossy(text(j + 1)).into_owned();
-                            // `attributes(a, b)`: the derive's helper attributes
-                            let mut k = j + 2;
-                            while k + 1 < toks.len() && toks[k].kind != T::CloseBracket {
-                                if text(k) == b"attributes" && toks[k + 1].kind == T::OpenParen {
-                                    let mut m = k + 2;
-                                    while m < toks.len() && toks[m].kind != T::CloseParen {
-                                        if matches!(toks[m].kind, T::Ident | T::RawIdent) {
-                                            helpers.push(String::from_utf8_lossy(text(m)).trim_start_matches("r#").to_string());
-                                        }
-                                        m += 1;
-                                    }
-                                    break;
-                                }
-                                k += 1;
-                            }
-                        }
-                        // skip to the end of the attribute, then to `fn name`
-                        let mut d = 0i32;
-                        j = i + 1;
-                        while j < toks.len() {
-                            match toks[j].kind {
-                                T::OpenBracket | T::OpenParen | T::OpenBrace => d += 1,
-                                T::CloseBracket | T::CloseParen | T::CloseBrace => {
-                                    d -= 1;
-                                    if d == 0 {
-                                        break;
-                                    }
-                                }
-                                _ => {}
-                            }
-                            j += 1;
-                        }
-                        while j < toks.len() && toks[j].kind != T::KwFn {
-                            j += 1;
-                        }
-                        if j + 1 < toks.len() {
-                            let fname = String::from_utf8_lossy(text(j + 1)).into_owned();
-                            let e = Entry { unit, fname: fname.clone(), kind };
-                            match kind {
-                                Kind::Derive => {
-                                    if !helpers.is_empty() {
-                                        reg.helpers.push((name.clone(), helpers));
-                                    }
-                                    reg.derives.push((name, e))
-                                }
-                                _ => reg.macros.push((fname, e)),
-                            }
-                        }
-                        i = j;
-                    }
-                }
-                _ => {}
-            }
-            i += 1;
-        }
+        scan_tokens_for_entries(sess, reg, unit, &src, &toks, edition, &cfg, &path, is_root, &local_defs, &mut stack, 0);
     }
 }
 
-/// Runs derive `name` on `item` (any thread). `None`: not a registered derive, or this thread
-/// builds the macro world (a derive inside the macro crates themselves is left alone).
-pub fn run_derive(sess: &std::sync::Arc<crate::Session>, name: &str, item: &TokenStream, call_span: Span) -> Option<Result<TokenStream, String>> {
+fn scan_tokens_for_entries(
+    sess: &std::sync::Arc<crate::Session>,
+    reg: &mut Reg,
+    unit: usize,
+    src: &[u8],
+    toks: &[crate::lexer::Tok],
+    edition: u16,
+    cfg: &crate::cfg::CfgSet,
+    path: &str,
+    is_root: bool,
+    local_defs: &[crate::macros::MacroDef],
+    stack: &mut Vec<String>,
+    depth: u32,
+) {
+    use crate::lexer::T;
+    let text = |i: usize| -> &[u8] { &src[toks[i].lo as usize..toks[i].hi as usize] };
+    let dir = if path.is_empty() { String::new() } else { crate::program::dir_of(path).to_string() };
+    let p_src = crate::cfg::Src { src, plain: toks, ext: &[], parts: None };
+    let mut brace_depth = 0i32;
+    let mut i = 0;
+    while i < toks.len() {
+        match toks[i].kind {
+            T::OpenBrace => brace_depth += 1,
+            T::CloseBrace => brace_depth = (brace_depth - 1).max(0),
+            T::Ident if text(i) == b"macro_rules" && i + 3 < toks.len() && toks[i + 1].kind == T::Not => {
+                // Skip `macro_rules!` definition body so metavariables like `$trait` inside
+                // `#[proc_macro_derive($trait)]` are never mistaken for real derive names.
+                let mut d = 0i32;
+                let mut close = i + 3;
+                while close < toks.len() {
+                    match toks[close].kind {
+                        T::OpenParen | T::OpenBracket | T::OpenBrace => d += 1,
+                        T::CloseParen | T::CloseBracket | T::CloseBrace => {
+                            d -= 1;
+                            if d == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    close += 1;
+                }
+                i = close;
+            }
+            T::KwMod if !path.is_empty() && i + 2 < toks.len() && toks[i + 2].kind == T::Semi => {
+                let name = String::from_utf8_lossy(text(i + 1)).into_owned();
+                let base = if is_root || path.ends_with("/mod.rs") { dir.clone() } else { format!("{}/{}", dir, crate::program::stem_of(path)) };
+                for c in [format!("{}/{}.rs", base, name), format!("{}/{}/mod.rs", base, name)] {
+                    if crate::vfs::exists(&c) {
+                        if crate::why::enabled() { crate::why::edge(&c, crate::why::Cause::new(path, crate::lexer::line_col(src, toks[i].lo).0, "proc-macro-module", &name)); }
+                        stack.push(c);
+                        break;
+                    }
+                }
+            }
+            T::Pound if i + 2 < toks.len() && toks[i + 1].kind == T::OpenBracket => {
+                let a = text(i + 2);
+                let kind = match a {
+                    b"proc_macro_derive" => Some(Kind::Derive),
+                    b"proc_macro" => Some(Kind::Bang),
+                    b"proc_macro_attribute" => Some(Kind::Attr),
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    // derive name: first ident inside `(..)`
+                    let mut name = String::new();
+                    let mut helpers: Vec<String> = Vec::new();
+                    let mut j = i + 3;
+                    if kind == Kind::Derive && j < toks.len() && toks[j].kind == T::OpenParen && j + 1 < toks.len() && matches!(toks[j + 1].kind, T::Ident | T::RawIdent) {
+                        name = String::from_utf8_lossy(text(j + 1)).trim_start_matches("r#").to_string();
+                        // `attributes(a, b)`: the derive's helper attributes
+                        let mut k = j + 2;
+                        while k + 1 < toks.len() && toks[k].kind != T::CloseBracket {
+                            if text(k) == b"attributes" && toks[k + 1].kind == T::OpenParen {
+                                let mut m = k + 2;
+                                while m < toks.len() && toks[m].kind != T::CloseParen {
+                                    if matches!(toks[m].kind, T::Ident | T::RawIdent) {
+                                        helpers.push(String::from_utf8_lossy(text(m)).trim_start_matches("r#").to_string());
+                                    }
+                                    m += 1;
+                                }
+                                break;
+                            }
+                            k += 1;
+                        }
+                    }
+                    // skip to the end of the attribute, then to `fn name`
+                    let mut d = 0i32;
+                    j = i + 1;
+                    while j < toks.len() {
+                        match toks[j].kind {
+                            T::OpenBracket | T::OpenParen | T::OpenBrace => d += 1,
+                            T::CloseBracket | T::CloseParen | T::CloseBrace => {
+                                d -= 1;
+                                if d == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    while j < toks.len() && toks[j].kind != T::KwFn {
+                        j += 1;
+                    }
+                    if j + 1 < toks.len() && (kind != Kind::Derive || !name.is_empty()) {
+                        let item_attrs = crate::cfg::attrs_before(p_src, j, cfg);
+                        if crate::cfg::active(p_src, &item_attrs, cfg) {
+                            let fname = String::from_utf8_lossy(text(j + 1)).trim_start_matches("r#").to_string();
+                            let e = Entry { unit, fname: fname.clone(), kind };
+                            match kind {
+                                Kind::Derive => {
+                                    if !helpers.is_empty() && !reg.helpers.iter().any(|(n, hs)| n == &name && hs == &helpers) {
+                                        reg.helpers.push((name.clone(), helpers));
+                                    }
+                                    if !reg.derives.iter().any(|(n, ex)| n == &name && ex.unit == unit && ex.fname == e.fname) {
+                                        reg.derives.push((name, e));
+                                    }
+                                }
+                                _ => {
+                                    if !reg.macros.iter().any(|(n, ex)| n == &fname && ex.unit == unit && ex.kind == kind) {
+                                        reg.macros.push((fname, e));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    i = j;
+                }
+            }
+            T::Ident if brace_depth == 0 && depth < 8 && !local_defs.is_empty() => {
+                // Top-level macro call `m!(...)` or `path::m!(...)` in a proc-macro crate
+                let start = i;
+                let mut k = i;
+                while k + 2 < toks.len() && toks[k + 1].kind == T::PathSep && matches!(toks[k + 2].kind, T::Ident | T::RawIdent) {
+                    k += 2;
+                }
+                if k + 2 < toks.len() && toks[k + 1].kind == T::Not && matches!(toks[k + 2].kind, T::OpenParen | T::OpenBracket | T::OpenBrace) {
+                    let mname = String::from_utf8_lossy(text(k)).trim_start_matches("r#").to_string();
+                    let open = k + 2;
+                    let mut d = 0i32;
+                    let mut close = open;
+                    while close < toks.len() {
+                        match toks[close].kind {
+                            T::OpenParen | T::OpenBracket | T::OpenBrace => d += 1,
+                            T::CloseParen | T::CloseBracket | T::CloseBrace => {
+                                d -= 1;
+                                if d == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        close += 1;
+                    }
+                    if close < toks.len() {
+                        let call_attrs = crate::cfg::attrs_before(p_src, start, cfg);
+                        if crate::cfg::active(p_src, &call_attrs, cfg) {
+                            if let Some(def) = local_defs.iter().rev().find(|d| d.name == mname) {
+                                let mut p = crate::parser::Parser::new(sess, src, toks.to_vec(), edition);
+                                if let Ok((exp_text, exp_toks, _, _, _)) = p.expand_rules(def, open + 1, close) {
+                                    scan_tokens_for_entries(sess, reg, unit, exp_text.as_bytes(), &exp_toks, edition, cfg, "", false, local_defs, stack, depth + 1);
+                                }
+                            }
+                        }
+                        i = close;
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+/// Runs derive `name` as crate `krate` sees it on `item` (any thread). `None`: not a registered
+/// derive, or this thread builds the macro world (a derive inside the macro crates themselves is
+/// left alone).
+pub fn run_derive_in(sess: &std::sync::Arc<crate::Session>, krate: &str, name: &str, item: &TokenStream, call_span: Span) -> Option<Result<TokenStream, String>> {
     if in_world() {
         return None;
     }
-    let e = REG.with(|r| r.borrow().as_ref().and_then(|r| r.derives.iter().find(|(n, _)| n == name).map(|x| x.1.clone())))?;
+    let e = REG.with(|r| {
+        let mut b = r.borrow_mut();
+        resolve_entry(b.as_mut()?, krate, name, Kind::Derive)
+    })?;
     let native = RUNNER.get().map_or(false, |r| r.native(&e));
     let _profile = crate::load_profile::span(sess.runtime.profile, if native { "derive-native" } else { "derive-jit" }, name);
+    let _krate = with_call_krate(krate);
     Some(match RUNNER.get() {
         Some(r) if declaring() => r.declare(sess, &e, None, item, call_span),
         Some(r) => r.call(sess, &e, item, call_span),
@@ -599,44 +1005,7 @@ pub fn run_derive(sess: &std::sync::Arc<crate::Session>, name: &str, item: &Toke
     })
 }
 
-#[cfg(test)]
-mod zone_tests {
-    use super::*;
-
-    /// The compiler-generation swap takes the registry with the other compiler statics; the new
-    /// generation registers the same proc-macro graph again (zone_reinstall), so a live edit
-    /// after the swap still expands the file's derives and macro calls. Without it the registry
-    /// stayed empty and every edit of a file with a derive classified as items removed (a restart).
-    #[test]
-    fn a_swapped_generation_registers_the_proc_macro_graph_again() {
-        const CHILD: &str = "RELAX_FRONT_MACRO_REG_ZONE_TEST_CHILD";
-        if std::env::var_os(CHILD).is_some() {
-            let unit = UnitInfo { name: "derive_crate".into(), src_path: "/d/lib.rs".into(), edition: 2021, features: Vec::new(), deps: Vec::new(), proc_macro: true };
-            let reg = Reg {
-                units: vec![unit],
-                std_dir: "/std".into(),
-                derives: vec![("Script".into(), Entry { unit: 0, fname: "derive_script".into(), kind: Kind::Derive })],
-                macros: vec![("script_mod".into(), Entry { unit: 0, fname: "script_mod".into(), kind: Kind::Bang })],
-                helpers: Vec::new(),
-            };
-            REG.with(|r| *r.borrow_mut() = Some(reg));
-            assert!(has_macro("Script") && has_macro("script_mod"));
-            let taken = zone_take();
-            assert!(!has_macro("Script"), "the swap takes the registry");
-            let sess = std::sync::Arc::new(crate::Session::default());
-            zone_reinstall(&sess, &taken).unwrap();
-            assert!(has_macro("Script") && has_macro("script_mod"), "the new generation has the program's macros");
-            assert_eq!(bang_index("script_mod"), Some(0));
-            // the taken registry stays intact for a rollback
-            zone_put_back(taken);
-            assert!(has_macro("Script"));
-            return;
-        }
-        // REG is process-wide: isolate the take/reinstall in a child of this test binary
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "macro_reg::zone_tests::a_swapped_generation_registers_the_proc_macro_graph_again"])
-            .env(CHILD, "1")
-            .status().unwrap();
-        assert!(status.success());
-    }
+/// Runs derive `name` on `item` (any thread).
+pub fn run_derive(sess: &std::sync::Arc<crate::Session>, name: &str, item: &TokenStream, call_span: Span) -> Option<Result<TokenStream, String>> {
+    run_derive_in(sess, "", name, item, call_span)
 }

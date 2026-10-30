@@ -14,6 +14,13 @@
 //! release being run; when the release changed the file too, the edit moves to
 //! `.makepad-run-conflicts/<commit>/<path>` (beside it `<path>.base`) and the run reports it -- an edit
 //! is never dropped silently. Without MAKEPAD_RUN_EDITS virtual files stay read-only.
+//!
+//! SEED (MAKEPAD_RUN_EDITS_SEED=<folder>[,<folder>...], relative to the outermost mount): at a run's
+//! start the store's files under those folders are written into the edits folder where it has none
+//! (`seed_edits`), so a tool outside the run (a coding agent) finds an app's whole source on disk and
+//! edits it in place. `.makepad-run-seeded` records each written file's blob: a seeded file whose
+//! bytes still are that blob is not an edit; `reconcile_edits` brings it to the release being run.
+//! One whose bytes changed becomes an edit (recorded in `.makepad-run-edits` from that blob).
 use crate::gitstore::{self as store, Entry, Oid, Store};
 use std::collections::BTreeMap;
 use std::io;
@@ -42,7 +49,7 @@ static RECORDED: relax_session::sync::Mutex<Option<(std::collections::HashSet<(u
 
 /// Starts the read log from MAKEPAD_RUN_READ_LOG (the loader calls this at start, next to MAKEPAD_RUN_VFS).
 pub fn record_from_env() -> Result<(), String> {
-    // process state: built in the kept heap (the settle swap destroys the compiler zone)
+    // process state: built in the kept heap
     let _k = crate::zone_alloc::kept();
     let Some(p) = std::env::var_os("MAKEPAD_RUN_READ_LOG").filter(|p| !p.is_empty()) else { return Ok(()) };
     let f = std::fs::OpenOptions::new().create(true).append(true).open(&p).map_err(|e| format!("MAKEPAD_RUN_READ_LOG {}: {e}", p.to_string_lossy()))?;
@@ -75,7 +82,7 @@ static FROZEN: RwLock<Vec<String>> = RwLock::new(Vec::new());
 /// Verify a complete subtree directly from the store (no disk/edits reads), then protect it
 /// from the app's edit overlay. Paths and bytes use the same digest as the compiler build.
 pub fn verify_std(path: &str, expected: &str) -> Result<(), String> {
-    // process state: built in the kept heap (the settle swap destroys the compiler zone)
+    // process state: built in the kept heap
     let _k = crate::zone_alloc::kept();
     let (m, rel) = find(path).ok_or("no makepad run std mount")?;
     let prefix = if rel.is_empty() { String::new() } else { format!("{rel}/") };
@@ -108,7 +115,7 @@ pub fn verify_std(path: &str, expected: &str) -> Result<(), String> {
 
 /// Serves `root` (a folder that does not exist on disk) from `store` at `commit`.
 pub fn mount(root: &str, store: Arc<Store>, commit: &Oid) -> Result<(), String> {
-    // process state: built in the kept heap (the settle swap destroys the compiler zone)
+    // process state: built in the kept heap
     let _k = crate::zone_alloc::kept();
     let files: Arc<[Entry]> = store.index.table(commit).ok_or_else(|| format!("{}: commit {} is not kept", store.path.display(), store::hex(commit)))?.to_vec().into();
     let root = normalize_path(root);
@@ -253,9 +260,14 @@ fn edited_file(path: &str) -> Option<std::path::PathBuf> {
     p.is_file().then_some(p)
 }
 
+/// Whether virtual files are writable (an edits folder is set).
+pub fn edits_enabled() -> bool {
+    EDITS.read().unwrap().is_some()
+}
+
 /// The edits folder from MAKEPAD_RUN_EDITS (the runner sets it per licensed app).
 pub fn set_edits(dir: Option<std::path::PathBuf>) {
-    // process state: built in the kept heap (the settle swap destroys the compiler zone)
+    // process state: built in the kept heap
     let _k = crate::zone_alloc::kept();
     *EDITS.write().unwrap() = dir;
 }
@@ -280,11 +292,10 @@ fn not_found(path: &str) -> io::Error {
 // Read bindings: a load binds its read snapshot to the thread it runs on for the extent of a
 // `ReadScope` on that thread's stack. The binding lives in the thread's own table and owns its
 // snapshot (a strong reference, dropped with the scope): there is no process registry, no weak
-// pointer and no entry another thread or a later compiler generation can reach. A scope is
-// !Send, so no shared state (a preload pool, a Program the settle swap forgets) can keep a
-// thread's binding alive past its load.
+// pointer and no entry another thread can reach. A scope is !Send, so no shared state (a preload
+// pool, a Program) can keep a thread's binding alive past its load.
 thread_local! {
-    static BOUND: std::cell::RefCell<Vec<(u64, Arc<ReadSnapshot>)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static BOUND: std::cell::RefCell<Vec<(u64, Arc<ReadSnapshot>)>> = Default::default();
 }
 static BIND_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -769,7 +780,7 @@ pub fn mounts_text() -> String {
 
 /// Mounts what `mounts_text` wrote (MAKEPAD_RUN_VFS).
 pub fn mount_text(text: &str) -> Result<(), String> {
-    // process state: built in the kept heap (the settle swap destroys the compiler zone)
+    // process state: built in the kept heap
     let _k = crate::zone_alloc::kept();
     for line in text.lines().filter(|l| !l.is_empty()) {
         let mut it = line.split('\t');
@@ -795,7 +806,7 @@ pub fn parse_range(s: &str) -> Option<(u64, u64)> {
 
 /// MAKEPAD_RUN_VFS from the environment, mounted once (the loader calls this at start).
 pub fn mount_from_env() -> Result<(), String> {
-    // process state: built in the kept heap (the settle swap destroys the compiler zone)
+    // process state: built in the kept heap
     let _k = crate::zone_alloc::kept();
     record_from_env()?;
     if let Some(d) = std::env::var_os("MAKEPAD_RUN_EDITS").filter(|d| !d.is_empty()) {
@@ -917,6 +928,81 @@ fn save_records(dir: &std::path::Path, r: &BTreeMap<String, Option<Oid>>) -> io:
 
 static EDIT_LOCK: relax_session::sync::Mutex<()> = relax_session::sync::Mutex::new(());
 
+/// The files `seed_edits` wrote: path -> the store blob written.
+fn load_seeded(dir: &std::path::Path) -> BTreeMap<String, Oid> {
+    let mut out = BTreeMap::new();
+    if let Ok(t) = std::fs::read_to_string(dir.join(".makepad-run-seeded")) {
+        for line in t.lines() {
+            if let Some((rel, oid)) = line.split_once('\t').and_then(|(r, o)| Some((r, store::from_hex(o)?))) {
+                out.insert(rel.to_string(), oid);
+            }
+        }
+    }
+    out
+}
+
+fn save_seeded(dir: &std::path::Path, s: &BTreeMap<String, Oid>) -> io::Result<()> {
+    let text: String = s.iter().map(|(rel, oid)| format!("{}\t{}\n", rel, store::hex(oid))).collect();
+    let tmp = dir.join(".makepad-run-seeded.tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, dir.join(".makepad-run-seeded"))
+}
+
+/// git's blob id of `data`.
+fn blob_oid(data: &[u8]) -> Oid {
+    let mut bytes = format!("blob {}\0", data.len()).into_bytes();
+    bytes.extend_from_slice(data);
+    store::sha1(&bytes)
+}
+
+/// Seeding writes the store's source files under these folders (relative to the outermost mount)
+/// into the edits folder where it has none; returns how many it wrote. Left out: `resources/`
+/// folders and files over 1 MB (assets: read from the store as before), submodules, symlinks.
+pub fn seed_edits(folders: &[String]) -> io::Result<usize> {
+    let Some(dir) = EDITS.read().unwrap().clone() else { return Ok(0) };
+    let Some(outer) = MOUNTS.read().unwrap().iter().map(|x| x.root.clone()).min_by_key(|r| r.len()) else { return Ok(0) };
+    let _g = EDIT_LOCK.lock().unwrap();
+    let mut seeded = load_seeded(&dir);
+    let records = load_records(&dir);
+    let mut wrote = 0;
+    for folder in folders {
+        let folder = folder.trim_matches('/');
+        if folder.is_empty() || folder.split('/').any(|c| c == ".." || c == ".") || folder.starts_with(".makepad-run-") {
+            continue;
+        }
+        let vdir = format!("{outer}/{folder}");
+        let Some((m, mrel)) = find(&vdir) else { continue };
+        let prefix = if mrel.is_empty() { String::new() } else { format!("{mrel}/") };
+        // the mount's own folder relative to the outermost mount
+        let mount_rel = relative(&m.root, &outer).unwrap_or("").to_string();
+        for e in m.files.iter().filter(|e| e.path.starts_with(&prefix) && (e.mode == 0o100644 || e.mode == 0o100755)) {
+            let rel = if mount_rel.is_empty() { e.path.clone() } else { format!("{mount_rel}/{}", e.path) };
+            if e.path.split('/').any(|c| c == "resources") || m.store.object_size(&e.oid)?.is_none_or(|n| n > 1 << 20) {
+                continue;
+            }
+            let disk = dir.join(&rel);
+            if disk.exists() || records.contains_key(&rel) {
+                continue;
+            }
+            // a file of a nested mount inside this folder is that mount's, not this one's
+            if find(&format!("{outer}/{rel}")).is_none_or(|(n, _)| !Arc::ptr_eq(&n, &m)) {
+                continue;
+            }
+            let Some((_, data)) = m.store.object(&e.oid)? else { continue };
+            if let Some(p) = disk.parent() {
+                std::fs::create_dir_all(p)?;
+            }
+            std::fs::write(&disk, &data)?;
+            seeded.insert(rel, e.oid);
+            wrote += 1;
+        }
+    }
+    if wrote > 0 {
+        save_seeded(&dir, &seeded)?;
+    }
+    Ok(wrote)
+}
+
 /// What a write into a virtual path needs: the disk path to write (in the edits folder), its
 /// folder made, and on the first edit of a store file its record and base copy. `keep`: the
 /// write keeps the content (append, read-write): the store's bytes are copied first. Err when
@@ -983,6 +1069,7 @@ pub fn prepare_edit_dir(path: &str) -> io::Result<std::path::PathBuf> {
 /// Returns one line per conflict (for the run's report); nothing when there are no edits.
 pub fn reconcile_edits() -> Vec<String> {
     let Some(dir) = EDITS.read().unwrap().clone() else { return Vec::new() };
+    reconcile_seeded(&dir);
     if !dir.join(".makepad-run-edits").is_file() {
         return Vec::new();
     }
@@ -1047,6 +1134,51 @@ pub fn reconcile_edits() -> Vec<String> {
     out
 }
 
+/// The seeded files against the release being run: one still holding its seeded blob is brought
+/// to the release's file (removed when the release has none); one whose bytes changed becomes an
+/// edit from its seeded blob (then reconciled as every edit); one removed is forgotten.
+fn reconcile_seeded(dir: &std::path::Path) {
+    let mut seeded = load_seeded(dir);
+    if seeded.is_empty() {
+        return;
+    }
+    let Some(outer) = MOUNTS.read().unwrap().iter().map(|x| x.root.clone()).min_by_key(|r| r.len()) else { return };
+    let _g = EDIT_LOCK.lock().unwrap();
+    let mut records = load_records(dir);
+    let mut records_changed = false;
+    for (rel, oid) in seeded.clone() {
+        let disk = dir.join(&rel);
+        let Ok(mine) = std::fs::read(&disk) else {
+            seeded.remove(&rel);
+            continue;
+        };
+        if blob_oid(&mine) != oid {
+            seeded.remove(&rel);
+            records.entry(rel).or_insert(Some(oid));
+            records_changed = true;
+            continue;
+        }
+        let now = find(&format!("{outer}/{rel}")).and_then(|(m, mrel)| m.file(&mrel).filter(|e| e.mode != 0o160000).map(|e| (m.clone(), e.oid)));
+        match now {
+            Some((_, n)) if n == oid => {}
+            Some((m, n)) => match m.store.object(&n) {
+                Ok(Some((_, data))) if std::fs::write(&disk, &data).is_ok() => {
+                    seeded.insert(rel, n);
+                }
+                _ => {}
+            },
+            None => {
+                let _ = std::fs::remove_file(&disk);
+                seeded.remove(&rel);
+            }
+        }
+    }
+    let _ = save_seeded(dir, &seeded);
+    if records_changed {
+        let _ = save_records(dir, &records);
+    }
+}
+
 /// std's write into a virtual path (fs_vfs.rs): mode 0 the edited file or folder if any, 1 a
 /// write keeping the content, 2 a write replacing it, 3 a folder. The disk path, held until
 /// `relax_vfs_release`; 0 when the path cannot be written.
@@ -1071,6 +1203,49 @@ mod test_store;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The mounts' outermost root and the edits folder are process state: the tests that set
+    /// them run one at a time.
+    static EDITS_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn seeded_files_follow_the_release_until_edited() {
+        let _one = EDITS_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let v1 = test_store::Fixture::new(&[("app/a.rs", b"a1"), ("app/b.rs", b"b1"), ("app/gone.rs", b"g1"), ("app/src/c.rs", b"c1"), ("other/x.rs", b"x1")]);
+        let v2 = test_store::Fixture::new(&[("app/a.rs", b"a2"), ("app/b.rs", b"b2"), ("app/src/c.rs", b"c1"), ("app/new.rs", b"n2"), ("other/x.rs", b"x2")]);
+        let root = "/seed-test/vfs/m";
+        let edits = v1.store.path.with_extension("seed-edits");
+        mount(root, v1.store.clone(), &v1.commit).unwrap();
+        set_edits(Some(edits.clone()));
+        assert_eq!(reconcile_edits(), Vec::<String>::new());
+        assert_eq!(seed_edits(&["app".to_string()]).unwrap(), 4);
+        // again: nothing to write
+        assert_eq!(seed_edits(&["app".to_string()]).unwrap(), 0);
+        assert_eq!(std::fs::read(edits.join("app/src/c.rs")).unwrap(), b"c1");
+        assert!(!edits.join("other/x.rs").exists());
+        assert!(load_records(&edits).is_empty(), "a seeded file is not an edit");
+        // a tool edits b.rs in place
+        std::fs::write(edits.join("app/b.rs"), b"b-mine").unwrap();
+        // the next release
+        mount(root, v2.store.clone(), &v2.commit).unwrap();
+        let conflicts = reconcile_edits();
+        // new.rs, and b.rs again (its edit is kept aside below)
+        assert_eq!(seed_edits(&["app".to_string()]).unwrap(), 2);
+        assert_eq!(std::fs::read(edits.join("app/b.rs")).unwrap(), b"b2");
+        // untouched seeded files follow the release; one the release dropped goes
+        assert_eq!(std::fs::read(edits.join("app/a.rs")).unwrap(), b"a2");
+        assert!(!edits.join("app/gone.rs").exists());
+        assert_eq!(std::fs::read(edits.join("app/new.rs")).unwrap(), b"n2");
+        assert_eq!(read(format!("{root}/app/a.rs")).unwrap(), b"a2");
+        // the edited one became an edit from its seeded blob: the release changed it too, so it
+        // is kept aside and reported
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+        assert!(conflicts[0].starts_with("app/b.rs"));
+        assert_eq!(load_seeded(&edits).len(), 4);
+        set_edits(None);
+        MOUNTS.write().unwrap().retain(|m| m.root != normalize_path(root));
+        let _ = std::fs::remove_dir_all(&edits);
+    }
 
     #[test]
     fn disk_paths_are_untouched_and_mounts_resolve() {
@@ -1115,6 +1290,7 @@ mod tests {
 
     #[test]
     fn windows_spellings_share_mounts_and_edits() {
+        let _one = EDITS_TEST.lock().unwrap_or_else(|e| e.into_inner());
         let file = "examples/counter/src/counter.rs";
         let bytes = b"pub fn value() -> u32 { 7 }\n";
         let fixture = test_store::Fixture::new(&[(file, bytes)]);

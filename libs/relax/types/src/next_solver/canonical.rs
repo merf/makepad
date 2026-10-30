@@ -16,6 +16,7 @@ use crate::types::fold::{TypeFolder, super_fold_ty};
 use std::collections::HashMap;
 pub mod response;
 pub mod method_response;
+pub mod user_type;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CanonicalVarKind {
@@ -57,9 +58,18 @@ pub struct QueryInput { pub goal: Goal, pub predefined_opaques_in_body: Vec<(Opa
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 // Program contains several crates; coherence_crate identifies the local crate
 // that rustc_next_trait_solver/src/coherence.rs obtains from its single-crate Tcx.
-pub struct CanonicalQueryInput { pub canonical: Canonical<QueryInput>, pub typing_mode: TypingModeEqWrapper, pub coherence_crate: Option<u32> }
+// impl_view: the crate whose impl set applies (InferCtxt::impl_view). Only a goal with type or
+// const inference variables keeps it: with concrete or placeholder heads at most one impl of the
+// whole program can match (orphan rules), so those answers stay shared by every crate.
+pub struct CanonicalQueryInput { pub canonical: Canonical<QueryInput>, pub typing_mode: TypingModeEqWrapper, pub coherence_crate: Option<u32>, pub impl_view: Option<u32> }
 #[derive(Clone, Copy)]
-pub enum CanonicalizeMode { Input { in_param_env: bool }, Response { max_input_universe: UniverseIndex } }
+pub enum CanonicalizeMode {
+    Input { in_param_env: bool },
+    Response { max_input_universe: UniverseIndex },
+    /// rustc_infer canonicalizer.rs:217-248 (CanonicalizeUserTypeAnnotation): written lifetimes
+    /// stay rigid, every region variable becomes a root-universe variable; universes are not kept.
+    UserType,
+}
 
 #[derive(Default)]
 pub struct CanonicalizerState {
@@ -128,10 +138,10 @@ impl<'a, 'tcx> Canonicalizer<'a, 'tcx> {
         BoundVar(index as u32)
     }
     fn universe(&self, ui: UniverseIndex) -> UniverseIndex {
-        match self.mode { CanonicalizeMode::Input { .. } => UniverseIndex::ROOT, CanonicalizeMode::Response { .. } => ui }
+        match self.mode { CanonicalizeMode::Input { .. } | CanonicalizeMode::UserType => UniverseIndex::ROOT, CanonicalizeMode::Response { .. } => ui }
     }
     fn placeholder_index(&self, original: BoundVar) -> BoundVar {
-        match self.mode { CanonicalizeMode::Input { .. } => BoundVar(self.state.variables.len() as u32), CanonicalizeMode::Response { .. } => original }
+        match self.mode { CanonicalizeMode::Input { .. } => BoundVar(self.state.variables.len() as u32), CanonicalizeMode::Response { .. } | CanonicalizeMode::UserType => original }
     }
     fn finalize(mut self) -> (UniverseIndex, Vec<GenericArg>, Vec<CanonicalVarKind>) {
         let mut max = UniverseIndex::ROOT;
@@ -215,6 +225,19 @@ impl TypeFolder for Canonicalizer<'_, '_> {
         result
     }
     fn fold_region(&mut self, tys: &Types, mut region: RegionId, depth: DebruijnIndex) -> RegionId {
+        if matches!(self.mode, CanonicalizeMode::UserType) {
+            // canonicalizer.rs:231-246: no opportunistic resolution, so distinct written holes stay
+            // independent variables even if type checking has already related their regions.
+            return match tys.region_kind(region) {
+                RegionKind::ReBound(..) => region,
+                RegionKind::ReVar(_) => {
+                    let var = self.get_or_insert_bound_var(GenericArg::Lifetime(region), CanonicalVarKind::Region(UniverseIndex::ROOT));
+                    tys.intern_region(RegionKind::ReBound(depth, var))
+                }
+                RegionKind::RePlaceholder { .. } => panic!("placeholder region in a user type annotation"),
+                _ => region,
+            };
+        }
         if let RegionKind::ReVar(vid) = tys.region_kind(region) {
             region = self.delegate.inner.borrow_mut().unwrap_region_constraints().shallow_resolve_region_var(tys, vid);
         }
@@ -234,6 +257,7 @@ impl TypeFolder for Canonicalizer<'_, '_> {
             }
             (RegionKind::ReVar(_), CanonicalizeMode::Response { .. }) => CanonicalVarKind::Region(self.delegate.inner.borrow_mut().unwrap_region_constraints().universe(tys, region)),
             (RegionKind::ReEarlyParam(_) | RegionKind::ReLateParam(..), CanonicalizeMode::Response { .. }) => panic!("param region in response"),
+            (_, CanonicalizeMode::UserType) => unreachable!(),
         };
         let var = self.get_or_insert_bound_var(GenericArg::Lifetime(region), kind);
         tys.intern_region(RegionKind::ReBound(depth, var))
@@ -292,9 +316,10 @@ pub fn canonicalize_goal(infcx: &InferCtxt<'_>, goal: &Goal, opaque_types: &[(Op
         for &arg in &*key.args { args.push(super::fold::fold_arg(tys, arg, &mut c, 0)); }
         predefined_opaques_in_body.push((OpaqueTypeKey { def_id: key.def_id, args: args.into() }, c.fold_ty(tys, *ty, 0)));
     }
+    let impl_view = infcx.impl_view.filter(|_| goal.predicate.flags(tys) & TypeFlags::HAS_NON_REGION_INFER.bits() != 0);
     let value = QueryInput { goal: Goal { param_env, predicate }, predefined_opaques_in_body };
     let (max_universe, originals, var_kinds) = c.finalize();
-    (originals, CanonicalQueryInput { canonical: Canonical { value, max_universe, var_kinds }, typing_mode: TypingModeEqWrapper(typing_mode), coherence_crate: infcx.coherence_crate })
+    (originals, CanonicalQueryInput { canonical: Canonical { value, max_universe, var_kinds }, typing_mode: TypingModeEqWrapper(typing_mode), coherence_crate: infcx.coherence_crate, impl_view })
 }
 
 #[cfg(test)]

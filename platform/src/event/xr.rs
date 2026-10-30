@@ -570,6 +570,12 @@ impl XrHand {
         Some((max_bend_angle_degrees, straightness, extension_ratio))
     }
 
+    /// The index finger's (max bend in degrees, straightness, extension ratio) that
+    /// [`Self::grab_intent`] judges a grasp by (`None`: its joints are not valid).
+    pub fn index_release_metrics(&self) -> Option<(f32, f32, f32)> {
+        self.index_grab_release_metrics()
+    }
+
     pub fn grab_intent(&self) -> bool {
         if !self.grabbing() {
             return false;
@@ -971,6 +977,15 @@ pub struct XrSyncAnchor {
     pub captured_at: f64,
     pub extrema: XrSyncAnchorExtrema,
     pub anchor: XrAnchor,
+}
+
+/// A controller buzz an XR app asked for (`Cx::xr_haptic`): which hand (0 left, 1 right), how
+/// strong (0..1) and how long.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct XrHapticPulse {
+    pub hand: u8,
+    pub amplitude: f32,
+    pub seconds: f32,
 }
 
 #[derive(Clone, Debug, Default, SerBin, DeBin)]

@@ -43,7 +43,7 @@ impl SocketAddr {
             SocketAddr::V6(a) => IpAddr::V6(a.ip),
         }
     }
-    pub fn set_ip(&mut self, ip: IpAddr) {
+    pub const fn set_ip(&mut self, ip: IpAddr) {
         match (self, ip) {
             (SocketAddr::V4(a), IpAddr::V4(ip)) => a.set_ip(ip),
             (SocketAddr::V6(a), IpAddr::V6(ip)) => a.set_ip(ip),
@@ -56,7 +56,7 @@ impl SocketAddr {
             SocketAddr::V6(a) => a.port,
         }
     }
-    pub fn set_port(&mut self, port: u16) {
+    pub const fn set_port(&mut self, port: u16) {
         match self {
             SocketAddr::V4(a) => a.port = port,
             SocketAddr::V6(a) => a.port = port,
@@ -101,13 +101,13 @@ impl SocketAddrV4 {
     pub const fn ip(&self) -> &Ipv4Addr {
         &self.ip
     }
-    pub fn set_ip(&mut self, ip: Ipv4Addr) {
+    pub const fn set_ip(&mut self, ip: Ipv4Addr) {
         self.ip = ip;
     }
     pub const fn port(&self) -> u16 {
         self.port
     }
-    pub fn set_port(&mut self, port: u16) {
+    pub const fn set_port(&mut self, port: u16) {
         self.port = port;
     }
 }
@@ -119,13 +119,13 @@ impl SocketAddrV6 {
     pub const fn ip(&self) -> &Ipv6Addr {
         &self.ip
     }
-    pub fn set_ip(&mut self, ip: Ipv6Addr) {
+    pub const fn set_ip(&mut self, ip: Ipv6Addr) {
         self.ip = ip;
     }
     pub const fn port(&self) -> u16 {
         self.port
     }
-    pub fn set_port(&mut self, port: u16) {
+    pub const fn set_port(&mut self, port: u16) {
         self.port = port;
     }
     pub const fn flowinfo(&self) -> u32 {
@@ -306,7 +306,14 @@ fn host_port(host: &str, port: u16) -> io::Result<alloc::vec::IntoIter<SocketAdd
     lookup(host, port)
 }
 
+/// Host names cannot be resolved (rustc's sys/net/connection/unsupported.rs `lookup_host`).
+#[cfg(target_family = "wasm")]
+fn lookup(_host: &str, _port: u16) -> io::Result<alloc::vec::IntoIter<SocketAddr>> {
+    Err(io::Error::UNSUPPORTED_PLATFORM)
+}
+
 /// getaddrinfo(host) with SOCK_STREAM hints, ports set afterwards (as real std does).
+#[cfg(not(target_family = "wasm"))]
 fn lookup(host: &str, port: u16) -> io::Result<alloc::vec::IntoIter<SocketAddr>> {
     let c_host = match CString::new(host) {
         Ok(c) => c,

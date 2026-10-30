@@ -16,6 +16,21 @@ pub enum Poll<T> {
 
 pub use Poll::{Pending, Ready};
 
+/// `ready!(poll)` (core/src/task/ready.rs): the value of a `Poll::Ready`, or an early
+/// `return Poll::Pending`.
+#[macro_export]
+macro_rules! __relax_task_ready {
+    ($e:expr $(,)?) => {
+        match $e {
+            $crate::task::Poll::Ready(t) => t,
+            $crate::task::Poll::Pending => {
+                return $crate::task::Poll::Pending;
+            }
+        }
+    };
+}
+pub use __relax_task_ready as ready;
+
 impl<T> Poll<T> {
     pub fn map<U, F: FnOnce(T) -> U>(self, f: F) -> Poll<U> {
         match self {
@@ -102,7 +117,7 @@ unsafe impl Send for Waker {}
 unsafe impl Sync for Waker {}
 
 impl Waker {
-    pub unsafe fn from_raw(waker: RawWaker) -> Waker {
+    pub const unsafe fn from_raw(waker: RawWaker) -> Waker {
         Waker { waker }
     }
     pub unsafe fn new(data: *const (), vtable: &'static RawWakerVTable) -> Waker {
@@ -124,7 +139,7 @@ impl Waker {
     pub fn vtable(&self) -> &'static RawWakerVTable {
         self.waker.vtable
     }
-    pub fn noop() -> &'static Waker {
+    pub const fn noop() -> &'static Waker {
         &NOOP_WAKER
     }
 }

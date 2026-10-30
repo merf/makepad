@@ -5,7 +5,7 @@
 
 use super::timing::*;
 use makepad_apple_sys::*;
-use std::collections::HashMap;
+use crate::FastMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -14,7 +14,7 @@ use std::time::Instant;
 /// What a finished piece of GPU work tells the backend thread. Completion handlers run on
 /// Metal's threads: they push here and wake the pump; `Metal::step` turns them into events.
 pub(crate) enum Done {
-    Frame { sid: u32, target: crate::Id, frame: u64, gpu_ns: u64, present_ns: u64, gpu_span: [f64; 2], failed: bool, window: bool, kind: u32, incarnation: Arc<crate::font::FrameProgress> },
+    Frame { sid: u32, target: crate::Id, frame: u64, gpu_ns: u64, present_ns: u64, gpu_span: [f64; 2], failed: bool, partial: bool, window: bool, kind: u32, incarnation: Arc<crate::font::FrameProgress> },
     Readback { sid: u32, incarnation: Arc<crate::font::FrameProgress>, req: u32, status: u32, rect: [u32; 4], pixels: Vec<u8> },
     Pick { sid: u32, incarnation: Arc<crate::font::FrameProgress>, req: u32, ids: Vec<u32> },
     PipelineReady { sid: u32, incarnation: Arc<crate::font::FrameProgress>, id: crate::Id },
@@ -67,6 +67,7 @@ pub enum AllocJob {
 pub struct Submission {
     pub buffer: RcObjcId,
     pub entry: InFlightCb,
+    pub native_frames: Vec<super::super::media::layers::Frame>,
 }
 
 /// hardware: the command queue's pool, `newCommandQueueWithMaxCommandBufferCount` (the driver's
@@ -102,11 +103,15 @@ pub struct Device {
     /// a GPU fault)
     pub fallback: ObjcId,
     pub name: String,
+    /// The GPU shares memory with the CPU (Apple silicon).
+    pub unified_memory: bool,
     /// highest command buffer sequence number that COMPLETED; the one queue executes buffers in
     /// enqueue order, so completion of N implies everything below it
     pub completed: Arc<AtomicU64>,
     /// the sequence number of the newest command buffer created
     pub seq: u64,
+    /// frame completions waiting for a command buffer number (`when_completed`)
+    waiters: Arc<Mutex<Vec<(u64, crate::completion::CompletionReply)>>>,
     pub mailbox: Mailbox,
     alloc_tx: Option<SyncSender<AllocJob>>,
     alloc_thread: Option<std::thread::JoinHandle<()>>,
@@ -123,7 +128,7 @@ pub struct Device {
     pub clock: Option<Option<Arc<PassClock>>>,
     chunks: Vec<Chunk>,
     /// batch-local: where a (pointer, length) of the caller's memory already sits in the arena
-    pub dedup: HashMap<(usize, usize), Loc>,
+    pub dedup: FastMap<(usize, usize), Loc>,
     pub recommended_working_set: u64,
 }
 
@@ -138,6 +143,10 @@ impl Device {
             return None;
         }
         let name = nsstring_to_string(unsafe { msg_send![device, name] });
+        let unified_memory: bool = unsafe {
+            let available: bool = msg_send![device, respondsToSelector: sel!(hasUnifiedMemory)];
+            available && msg_send![device, hasUnifiedMemory]
+        };
         let recommended: u64 = unsafe {
             let available: bool = msg_send![device, respondsToSelector: sel!(recommendedMaxWorkingSetSize)];
             if available {
@@ -197,7 +206,9 @@ impl Device {
             queue,
             fallback,
             name,
+            unified_memory,
             completed,
+            waiters: Default::default(),
             seq: 0,
             mailbox,
             alloc_tx: Some(alloc_tx),
@@ -213,7 +224,7 @@ impl Device {
             descriptor,
             clock: None,
             chunks: Vec::new(),
-            dedup: HashMap::new(),
+            dedup: FastMap::default(),
             recommended_working_set: crate::gpu_limits::gpu_working_set_bytes(),
         };
         // the first batches' uniforms: two chunks, touched now so no draw waits for a page fault
@@ -263,9 +274,11 @@ impl Device {
         let seq = self.seq;
         let completed = self.completed.clone();
         let in_flight = self.in_flight.clone();
+        let waiters = self.waiters.clone();
         let () = unsafe {
             msg_send![buffer.as_id(), addCompletedHandler: &objc_block!(move |cb: ObjcId| {
                 completed.fetch_max(seq, Ordering::AcqRel);
+                answer_waiters(&waiters, completed.load(Ordering::Acquire));
                 let entry = {
                     let mut queue = lock_in_flight(&in_flight);
                     queue.iter().position(|e| e.seq == seq).and_then(|at| queue.remove(at))
@@ -278,8 +291,8 @@ impl Device {
 
     /// Commits a command buffer through the submit thread (`commit` never runs on the backend
     /// thread). Saturated: it stays queued, in order, for the next flush.
-    pub fn commit(&mut self, buffer: RcObjcId, entry: InFlightCb) {
-        self.submit_retry.push_back(Submission { buffer, entry });
+    pub fn commit(&mut self, buffer: RcObjcId, entry: InFlightCb, native_frames: Vec<super::super::media::layers::Frame>) {
+        self.submit_retry.push_back(Submission { buffer, entry, native_frames });
         self.flush_submissions();
     }
 
@@ -402,17 +415,56 @@ impl Device {
     }
 }
 
+impl Device {
+    /// The threads that call Metal stop and are joined: the submitter commits every buffer
+    /// encoded so far (also those the saturated queue held back), the allocator runs its
+    /// compiles and releases. Afterwards `commit` keeps buffers back, `compile` drops its job and
+    /// `retire` releases on the caller. The end of the process (`Metal::before_exit`) and `Drop`.
+    pub fn stop_workers(&mut self) {
+        if let Some(tx) = self.submit_tx.take() {
+            for submission in self.submit_retry.drain(..) {
+                if tx.send(submission).is_err() { break; }
+            }
+        }
+        self.alloc_tx = None;
+        if let Some(t) = self.submit_thread.take() {
+            if t.join().is_err() { eprintln!("[hal-metal] the submit thread panicked"); }
+        }
+        if let Some(t) = self.alloc_thread.take() {
+            if t.join().is_err() { eprintln!("[hal-metal] the allocator thread panicked"); }
+        }
+    }
+}
+
+impl Device {
+    /// Answers `reply` once every command buffer up to the newest one created has completed.
+    pub fn when_completed(&self, reply: crate::completion::CompletionReply) {
+        crate::lock(&self.waiters).push((self.seq, reply));
+        // a buffer that completed meanwhile answered nobody: answer it here
+        answer_waiters(&self.waiters, self.completed.load(Ordering::Acquire));
+    }
+}
+
+/// Answers the waiters whose command buffers completed (`done` and below).
+fn answer_waiters(waiters: &Mutex<Vec<(u64, crate::completion::CompletionReply)>>, done: u64) {
+    let ready: Vec<_> = {
+        let mut w = crate::lock(waiters);
+        if w.is_empty() {
+            return;
+        }
+        let (ready, rest) = std::mem::take(&mut *w).into_iter().partition(|(seq, _)| *seq <= done);
+        *w = rest;
+        ready
+    };
+    for (_, reply) in ready {
+        reply.send(Ok(None));
+    }
+}
+
 impl Drop for Device {
     fn drop(&mut self) {
         self.watchdog_stop.store(true, Ordering::Release);
-        self.submit_tx = None;
-        self.alloc_tx = None;
-        if let Some(t) = self.submit_thread.take() {
-            let _ = t.join();
-        }
-        if let Some(t) = self.alloc_thread.take() {
-            let _ = t.join();
-        }
+        self.stop_workers();
         if let Some(t) = self.watchdog_thread.take() {
             let _ = t.join();
         }
@@ -437,6 +489,12 @@ fn spawn_submitter(in_flight: InFlightQueue, mailbox: Mailbox) -> (SyncSender<Su
                 let buffer = submission.buffer.as_id();
                 lock_in_flight(&in_flight).push_back(submission.entry);
                 let _: () = unsafe { msg_send![buffer, commit] };
+                if !submission.native_frames.is_empty() {
+                    let _: () = unsafe { msg_send![buffer, waitUntilScheduled] };
+                    let scheduled = super::super::media::layers::trace_enabled().then(Instant::now);
+                    let status: u64 = unsafe { msg_send![buffer, status] };
+                    if status != 5 { super::layers::scheduled(submission.native_frames, scheduled); }
+                }
                 drop(submission.buffer);
                 let _: () = unsafe { msg_send![pool, release] };
             }

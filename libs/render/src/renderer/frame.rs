@@ -1,5 +1,7 @@
-//! The per-view scene pass: `draw_scene` / `draw_scene_full`.
+//! The per-view scene pass: `draw_scene` / `draw_scene_full` (and
+//! `draw_scene_aux` for a draw of the same frame that is not the scene's).
 
+use super::ibl::EnvScope;
 use super::*;
 
 /// HDR lane: the analytic dome's radiance relative to the lit world. The
@@ -16,6 +18,12 @@ const HDR_FOG_BASE: f32 = 0.0;
 const HDR_SKY_FILL_GAIN: f32 = 1.3;
 const HDR_GROUND_ALBEDO: f32 = 0.18;
 const HDR_FOG_SCALE_HEIGHT: f32 = 40.0;
+/// Aerial perspective (clustered.rs scene_fogged): how much brighter the
+/// haze grows toward the sun (x (1 + this x (lobe - 1)), the lobe 11x at
+/// the sun, 0.35x away from it), and how far the extinction spreads over
+/// wavelengths (red 0.7x, blue 1.35x the green optical depth at 1).
+const AERIAL_FORWARD: f32 = 0.12;
+const AERIAL_SPREAD: f32 = 1.0;
 
 impl Renderer {
     /// HDR lane: the fill comes from the sky that is actually drawn. Under
@@ -40,6 +48,93 @@ impl Renderer {
         hdr.ground = floor_mix(bounce, hdr.ground);
     }
 
+    /// The frame's "is it day?" switches and its lamps, first thing in the
+    /// frame (no device needed, so the tests drive it): the sun the frame's
+    /// rig starts from (`resolve_sun`, aimed by a world's own Sun, else the
+    /// environment's key) and the direction the switches read.
+    /// - N1: the switches (a streamed city's night factor with its windows
+    ///   and headlights, the lamps' photocell, the vehicle lamps'
+    ///   `lamp_level`, and later the analytic sky unless the light is the
+    ///   sun: `frame_sky`) read the daylight sun
+    ///   (`daylight_dir`): the environment's own sun when it reports one,
+    ///   never a moon key's direction.
+    /// - I1c: the lamps are railed against the rig the frame lights with, the
+    ///   environment's light folded in (`env_lamp_rig`), which in the legacy
+    ///   lane is the rig the bake snapshots.
+    pub(super) fn frame_lamps(&mut self, world: &World, camera_pos: Vec3f) -> (SunLight, Vec3f) {
+        let sun = self.frame_start_sun(world);
+        let daylight = self.daylight_dir(world);
+        self.light_eye = camera_pos;
+        self.light_daylight = daylight;
+        self.stream_lights(camera_pos, daylight.y);
+        let lamps = self.env_lamp_rig(world, sun);
+        self.build_frame_lights(&lamps);
+        let level = makepad_scene::light::lamp_level(daylight.y, world.sky.as_ref().map_or(0.0, |s| s.fog));
+        self.lamp_level = level;
+        self.frame_vehicle_lamps = crate::entity_lights::append_entity_lights_with_model_headlights(
+            world, &mut self.frame_lights, &self.model_headlight_owners, level, camera_pos, &mut self.vehicle_lamp_radius,
+        );
+        (sun, daylight)
+    }
+
+    /// The sun the frame's rig starts from: `resolve_sun`, aimed by a
+    /// world's own Sun, which steers every sun-driven system, else by the
+    /// environment's key (renderer/env_sun.rs), else the rig's own.
+    fn frame_start_sun(&self, world: &World) -> SunLight {
+        let mut sun = crate::sun::resolve_sun(&world.sun);
+        if let Some(dir) = crate::world_lights::world_sun_dir(world).or_else(|| self.env_sun_dir(world)) { sun.dir = dir; }
+        sun
+    }
+
+    /// The direction toward the light the frame draws `world` with (M7):
+    /// its final rig's, the chain the frame runs (the start sun, the lane's
+    /// rig with the environment folded in, the world's own lights last),
+    /// so a world's own Sun, else the bound environment's key (the sun's or
+    /// the moon's) or an authored `SunConfig.dir`, else the world's analytic
+    /// sun. For a host that tests against the light itself: a held view
+    /// model has no shadow map, so the host ray-tests the eye toward this.
+    /// Read before a draw it is that draw's direction, unless a preparation
+    /// lands in it (then the next draw's). Without an environment it is
+    /// `resolve_sun`'s, aimed by a world's own Sun.
+    pub fn frame_sun_dir(&self, world: &World) -> Vec3f {
+        crate::world_lights::apply_world_sun(world, self.lane_rig(world, self.frame_start_sun(world))).dir
+    }
+
+    /// The frame's rig in its lane (HDR: `to_hdr` and the analytic fill
+    /// first) with the environment's sun, fill and legacy exposure folded
+    /// in, before the world's own Sun and Sky have the last word: what the
+    /// exposure meters, and, after them, what the shaders, the GI, the
+    /// cascades and the bake take.
+    pub(super) fn lane_rig(&self, world: &World, sun: SunLight) -> SunLight {
+        let sun = if self.hdr_output {
+            let mut hdr = sun.to_hdr();
+            self.hdr_fill_from_sky(world, &mut hdr);
+            hdr
+        } else {
+            sun
+        };
+        self.env_sun_rig(world, sun)
+    }
+
+    /// The analytic sky the frame draws and fogs with (`None` where the
+    /// world keeps its painted gradient), given the frame's final rig `sun`
+    /// (the world's own Sun and Sky applied) and its daylight direction.
+    /// - When the light is the sun (a world's own Sun, or an environment
+    ///   whose key is its own sun: `env_key_is_its_sun`), the sky's sun is
+    ///   the light's direction, wherever it is aimed: an authored
+    ///   `SunConfig.dir` (a look, a host's eased clock) moves the disc and
+    ///   the gradient with the light and its shadows, not on the map's bake
+    ///   grid a preparation late.
+    /// - Otherwise day or night is the daylight switches' (N1): under a
+    ///   moonlit map, or between the sun's fade and the moon's rise, the sky
+    ///   follows the map's own sun while the moon (or nothing) lights.
+    /// Without an environment both are the rig's direction, as before.
+    pub(super) fn frame_sky(&self, world: &World, sun: &SunLight, daylight: Vec3f, shows_environment: bool) -> Option<crate::sky::SkyFrame> {
+        let light_is_the_sun = crate::world_lights::world_sun_dir(world).is_some() || self.env_key_is_its_sun(world);
+        let sky_dir = if light_is_the_sun { sun.dir } else { daylight };
+        analytic_sky_frame(world, sky_dir, shows_environment, self.hdr_output, self.sky_clock)
+    }
+
     /// Encode the whole 3D scene for one view. `draw_list` is the host's
     /// scene draw list (begun/ended here, exactly as before the move).
     pub fn draw_scene(
@@ -53,7 +148,12 @@ impl Renderer {
         self.draw_scene_full(cx, draw_list, draws, world, scene_state, None, None)
     }
 
-    /// [`draw_scene`] plus an optional skinned-character batch.
+    /// [`draw_scene`] plus an optional skinned-character batch. This is the
+    /// scene's own draw: its world's environment is the one the renderer
+    /// prepares, binds and drops (see [`Self::draw_scene_aux`] for a draw of
+    /// the same frame that is not the scene's), unless the renderer draws
+    /// another renderer's environment (a fork: [`Self::mirror_environment_from`]),
+    /// which it then draws as it was mirrored.
     pub fn draw_scene_full(
         &mut self,
         cx: &mut Cx3d,
@@ -64,10 +164,57 @@ impl Renderer {
         skinned: Option<SkinnedBatch>,
         models_draw: Option<&mut DrawSceneSkinned>,
     ) -> RenderStats {
+        self.draw_scene_scoped(cx, draw_list, draws, world, scene_state, skinned, models_draw, EnvScope::Scene)
+    }
+
+    /// A draw of the same frame that is not the scene's own: a map the scene
+    /// reads (a contact or id map drawn from another camera with its own
+    /// world), recorded between or before the scene's draws. It takes no part
+    /// in the environment: `world.environment` is not resolved, so what the
+    /// scene's draws prepared, are preparing or found unbuildable stays as it
+    /// is (a world with the default environment resolved here would drop the
+    /// scene's textures and cancel its preparation on every recording, and a
+    /// host that waits for `environment_pending` would never see it land),
+    /// and the draw shows whatever the scene's last draw bound. A world that
+    /// is the scene's own with some items taken out (a mirror, the frame
+    /// behind glass) names the scene's environment and goes through
+    /// [`Self::draw_scene_full`], so it sees what the scene sees.
+    pub fn draw_scene_aux(
+        &mut self,
+        cx: &mut Cx3d,
+        draw_list: &mut DrawList,
+        draws: &mut SceneDraws,
+        world: &World,
+        scene_state: SceneState3D,
+        models_draw: Option<&mut DrawSceneSkinned>,
+    ) -> RenderStats {
+        self.draw_scene_scoped(cx, draw_list, draws, world, scene_state, None, models_draw, EnvScope::Aux)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_scene_scoped(
+        &mut self,
+        cx: &mut Cx3d,
+        draw_list: &mut DrawList,
+        draws: &mut SceneDraws,
+        world: &World,
+        scene_state: SceneState3D,
+        skinned: Option<SkinnedBatch>,
+        models_draw: Option<&mut DrawSceneSkinned>,
+        scope: EnvScope,
+    ) -> RenderStats {
         // Image-based lighting for the materials that ask for it (before
-        // the items choose their materials), then the world's generic items
-        // ride the placed models for this frame.
-        self.resolve_ibl(cx.cx, &world.environment);
+        // the items choose their materials), then whether shiny stock
+        // models take the engine's IBL program this frame (installed here;
+        // each list's diffuse pass decides again from the program's
+        // variant for this frame's features, before any lane walks that
+        // list), then the world's generic items ride the
+        // placed models for this frame. An aux draw resolves nothing and a
+        // fork's draws resolve nothing (they draw the live renderer's,
+        // mirrored); the stock decision then reads the texture that is
+        // bound, the scene's.
+        self.resolve_ibl_for(cx.cx, &world.environment, scope);
+        self.prepare_stock_ibl(cx.cx);
         self.push_item_instances(cx.cx, world);
         let stats = self.draw_scene_inner(cx, draw_list, draws, world, scene_state, skinned, models_draw);
         self.pop_item_instances();
@@ -91,26 +238,52 @@ impl Renderer {
         self.apply_model_lod_chains();
         self.placed_blocks.refresh(&self.static_models, &self.placed_models, self.placed_scene_signature);
         let camera_pos = scene_state.camera_pos;
-        let stage_matrix = self.stage.matrix();
+        // The stage the scene draw list carries (identity on an MR box stage, whose stage
+        // rides in the XR eye views instead: shaders then see world coordinates).
+        let stage_matrix = self.draw_stage_matrix();
+        if self.stage.mode != StageMode::Flat {
+            let scene_to_room = if self.stage.mode == StageMode::MrBox { self.stage.matrix() } else { Mat4f::identity() };
+            cx.cx.xr_set_scene_to_room(scene_to_room);
+        }
         let cluster_view = (self.stage.mode == StageMode::Flat).then(|| (
             Mat4f::mul(&scene_state.view, &stage_matrix), scene_state.projection,
         ));
         // CPU frustum for per-frame instance culling AND the Realtime
         // bake's visible-region scheduling, in the same world units the
         // instance transforms use (the stage rides inside the clip matrix).
-        // Flat stage only: in XR the runtime overwrites the pass camera
-        // with its own eye matrices every frame (see stage.rs), so
-        // scene_state is not what renders there and culling from it could
-        // drop visible geometry. Only per-frame packing points consult
-        // this — cached static slabs are never culled, because they outlive
-        // the camera that built them.
-        let frustum_val = (self.stage.mode == StageMode::Flat).then(|| {
-            Frustum::from_clip_matrix(&Mat4f::mul(
+        // In XR the runtime draws with its own eye matrices (see stage.rs),
+        // not scene_state's camera: the frustum is then the union of the
+        // eyes the next XR frame draws with (what either eye sees draws).
+        // Only per-frame packing points consult this — cached static slabs
+        // are never culled, because they outlive the camera that built them.
+        // An MR box stage: what lies in the box draws (it is small; the eyes see all of it).
+        let frustum_val = if let Some(clip) = self.clip_box_from_world() {
+            Some(Frustum::from_clip_matrix(&clip))
+        } else if self.stage.mode == StageMode::Flat {
+            Some(Frustum::from_clip_matrix(&Mat4f::mul(
                 &scene_state.projection,
                 &Mat4f::mul(&scene_state.view, &stage_matrix),
+            )))
+        } else {
+            cx.cx.xr_eye_matrices().map(|[(view_l, projection_l), (view_r, projection_r)]| Frustum::from_clip_matrices(
+                &Mat4f::mul(&projection_l, &Mat4f::mul(&view_l, &stage_matrix)),
+                &Mat4f::mul(&projection_r, &Mat4f::mul(&view_r, &stage_matrix)),
             ))
-        });
+        };
         let frustum = frustum_val.as_ref();
+        // Where the eye really is in the world: the game camera, except on an MR box stage,
+        // whose eye is the headset's, through the stage (far off at a small scale). Levels of
+        // detail, impostors and grass are picked, and shading views from, there; shadows,
+        // lights and streaming stay centred on the game camera (the followed subject).
+        // (The left eye's view of the world: its view in the room times the stage.)
+        let eye_view = match (self.stage.mode, cx.cx.xr_eye_matrices()) {
+            (StageMode::MrBox, Some([(view, _), _])) => Some(Mat4f::mul(&view, &self.stage.matrix())),
+            _ => None,
+        };
+        let eye_pos = eye_view.map_or(camera_pos, |v| {
+            let w = v.invert().transform_vec4(vec4(0.0, 0.0, 0.0, 1.0));
+            vec3f(w.x, w.y, w.z) * (1.0 / w.w)
+        });
         // Which tier serves the DYNAMIC casters this frame — the ONE
         // decision point (gpu_lightmap::dynamic_shadow_tiers) both the
         // draw gates below and the mover collection consume, so the
@@ -124,45 +297,58 @@ impl Renderer {
             self.sky_clock = true;
         }
         self.sky_hour = hour;
-        let mut sun = crate::sun::resolve_sun(&world.sun);
-        if let Some(dir) = crate::world_lights::world_sun_dir(world) { sun.dir = dir; }
-        self.light_eye = camera_pos;
-        self.stream_lights(camera_pos, sun.dir.y);
-        self.build_frame_lights(&sun);
-        let lamps = makepad_scene::light::lamp_level(sun.dir.y, world.sky.as_ref().map_or(0.0, |s| s.fog));
+        // The daylight switches and the lamps (N1, I1c), and the sun the
+        // frame's rig starts from (frame_lamps also sets `lamp_level`).
+        let (sun, daylight) = self.frame_lamps(world, camera_pos);
         stats.stream_lights = self.frame_stream_lights;
-        stats.vehicle_lamps = crate::entity_lights::append_entity_lights_with_model_headlights(
-            world, &mut self.frame_lights, &self.model_headlight_owners, lamps, camera_pos, &mut self.vehicle_lamp_radius,
-        );
+        stats.vehicle_lamps = self.frame_vehicle_lamps;
         // HDR output: every light below (sun, fill, lamps, fog) switches to
         // linear scene-referred values here, once, so shaders, the cluster
         // list and the GI relight all see the same convention.
+        let env = self.env_lighting(world);
+        // The lanes that take the environment's IBL lookups carry the
+        // scale the rig's fill is made with below, and keep a fill the
+        // world authors (renderer/stock_ibl.rs).
+        self.resolve_ibl_lane(world, env.as_ref());
         let sun = if self.hdr_output {
             self.scale_frame_lights_hdr();
-            let mut hdr = sun.to_hdr();
-            self.hdr_fill_from_sky(world, &mut hdr);
-            // Exposure is metered on the UNAUTHORED rig for this sun
-            // position: a script that dims its sun or ambient (a moonlit
-            // arena) means dark, and metering its own dim light would lift
-            // it back to mid-grey. `game.sky` exposure_ev biases it.
-            self.hdr_exposure = if world.sun.color.is_some() || world.sun.ambient.is_some() {
-                let mut stock = world.sun.clone();
-                stock.color = None;
-                stock.ambient = None;
-                let mut metered = crate::sun::resolve_sun(&stock).to_hdr();
-                self.hdr_fill_from_sky(world, &mut metered);
-                metered.hdr_exposure()
-            } else {
-                hdr.hdr_exposure()
+            // The environment's sun and fill (renderer/env_sun.rs; the lane
+            // is HDR here, so nothing is exposed in the values).
+            let hdr = self.lane_rig(world, sun);
+            // Exposure. An environment meters ITSELF: the key is the map's
+            // mean luminance (its sun included) in the lane's units, so
+            // the dome, the fill and the sun it lights with land at
+            // mid-grey together, and a script's dimmed sun stays dim.
+            // Without one, exposure is metered on the UNAUTHORED rig for
+            // this sun position: a script that dims its sun or ambient (a
+            // moonlit arena) means dark, and metering its own dim light
+            // would lift it back to mid-grey. `game.sky` exposure_ev biases
+            // either.
+            self.hdr_exposure = match env.as_ref() {
+                Some(env) => crate::sun::env_exposure(env),
+                None if world.sun.color.is_some() || world.sun.ambient.is_some() => {
+                    let mut stock = world.sun.clone();
+                    stock.color = None;
+                    stock.ambient = None;
+                    let mut metered = crate::sun::resolve_sun(&stock).to_hdr();
+                    self.hdr_fill_from_sky(world, &mut metered);
+                    metered.hdr_exposure()
+                }
+                None => hdr.hdr_exposure(),
             };
             if let Some(ev) = world.sky.as_ref().map(|s| s.exposure_ev).filter(|ev| ev.is_finite() && *ev != 0.0) {
                 self.hdr_exposure *= 2.0f32.powf(ev.clamp(-8.0, 8.0));
             }
             if self.clustered_frames % 240 == 0 && std::env::var_os("MAKEPAD_HDR_STATS").is_some() {
-                log!("hdr: exposure {:.3}, sun {:?} sky {:?} ground {:?} dir.y {:.3}", self.hdr_exposure, hdr.color, hdr.sky, hdr.ground, hdr.dir.y);
+                log!("hdr: exposure {:.3}, sun {:?} sky {:?} ground {:?} dir {:?} env {}", self.hdr_exposure, hdr.color, hdr.sky, hdr.ground, hdr.dir, env.is_some());
             }
             hdr
         } else {
+            // Legacy lane: the environment's values carry its own exposure.
+            let sun = self.lane_rig(world, sun);
+            if self.clustered_frames % 240 == 0 && std::env::var_os("MAKEPAD_HDR_STATS").is_some() {
+                log!("legacy: sun {:?} sky {:?} ground {:?} dir {:?} env {}", sun.color, sun.sky, sun.ground, sun.dir, env.is_some());
+            }
             sun
         };
         // The world's own lights (documents, kits; none in a game world) are
@@ -253,8 +439,13 @@ impl Renderer {
         }
         draw_list.begin_always(cx);
         cx.begin_scene_3d(scene_state);
-        // The environment as the background, first (a world that asks).
-        self.draw_environment_background(cx, &world.environment, &scene_state.projection);
+        // The environment as the background, first (a world that asks). It
+        // replaces the dome below once its full-resolution map is up; the
+        // legacy lane meters it with the sky's exposure compensation.
+        let exposure_ev = world.sky.as_ref().map(|s| s.exposure_ev).filter(|ev| ev.is_finite()).unwrap_or(0.0);
+        let owner = cx.enter_draw_name("sky");
+        let env_dome = self.draw_environment_background(cx, &world.environment, &scene_state.projection, exposure_ev);
+        cx.exit_draw_label(owner);
         // Camera-relative rendering: world geometry shifts by the render
         // origin on the GPU (the pass view was rebuilt around it by the
         // host's `Renderer::set_pass_camera`); CPU-side culling, cascades
@@ -278,26 +469,33 @@ impl Renderer {
         cx.cx.draw_lists[draw_list.id()]
             .draw_list_uniforms
             .view_transform = scene_view_transform;
+        // An MR box stage clips the scene list to its box (the XR shader variant's depth_clip;
+        // every other stage and the window variant never test it).
+        {
+            let uniforms = &mut cx.cx.draw_lists[draw_list.id()].draw_list_uniforms;
+            match self.clip_box_from_world() {
+                Some(clip) => {
+                    uniforms.xr_clip_on = 1.0;
+                    uniforms.xr_clip = clip;
+                }
+                None => uniforms.xr_clip_on = 0.0,
+            }
+        }
         // MR puts the game on your real floor: the room supplies the
         // horizon, so the game's own environment would only paint over the
         // passthrough feed.
         let shows_environment = self.stage.shows_environment();
 
-        // One sun for every shader this frame (sun.rs). Written before any
-        // batch begins, because instance fields are snapshotted per draw and
-        // uniforms are captured when the draw item opens.
-        let sun = {
-            let mut sun = crate::sun::resolve_sun(&world.sun);
-        if let Some(dir) = crate::world_lights::world_sun_dir(world) { sun.dir = dir; }
-            let sun = if self.hdr_output {
-                let mut hdr = sun.to_hdr();
-                self.hdr_fill_from_sky(world, &mut hdr);
-                hdr
-            } else {
-                sun
-            };
-            crate::world_lights::apply_world_sun(world, sun)
-        };
+        // One sun for every shader this frame (sun.rs): the frame's rig from
+        // above (its lane, the environment's sun, fill and legacy exposure,
+        // the world's own lights last), the one the lamps, the cascades and
+        // the bake took too. Written before any batch begins, because
+        // instance fields are snapshotted per draw and uniforms are captured
+        // when the draw item opens. C8 reads these three lines (frame,
+        // shaders, bake) against each other: one sun at every site.
+        if self.clustered_frames % 240 == 0 && std::env::var_os("MAKEPAD_HDR_STATS").is_some() {
+            log!("rig: dir {:?} color {:?} sky {:?} ground {:?}", sun.dir, sun.color, sun.sky, sun.ground);
+        }
 
         // SDF-atlas sun era: the sidecars bake against one sun elevation.
         // An EXPLICIT sun change (OnChange's only kind — the day cycle
@@ -319,7 +517,9 @@ impl Renderer {
         // horizon colour stays customisable either way: it only ever tinted
         // the FOG, and in analytic mode the fog instead comes from the
         // model's own tone-mapped horizon so sky and haze agree.
-        let sky_frame = analytic_sky_frame(world, sun.dir, shows_environment, self.hdr_output, self.sky_clock);
+        // Its sun sits where the light is when the light is the sun, else
+        // where the daylight switches say (N1: `frame_sky`).
+        let sky_frame = self.frame_sky(world, &sun, daylight, shows_environment);
 
         // Fog only exists once the script asked for a sky.
         let (fog_color, fog_density) = match &world.sky {
@@ -341,8 +541,15 @@ impl Renderer {
             }
             _ => (vec3(0.75, 0.87, 0.96), 0.0),
         };
-        // The world environment's fog, when it names one.
-        let (fog_color, fog_density) = crate::world_lights::world_fog(world).unwrap_or((fog_color, fog_density));
+        // The world environment's fog, when it names one. Under `Fog::Host`
+        // a prepared environment that is the background lends its horizon
+        // band as the COLOUR (the haze, the water's horizon and the stock
+        // lanes' `sky_env` horizon then agree with the dome); the density
+        // stays the host's, and under the host's own sky so does the colour.
+        let (fog_color, fog_density) = match crate::world_lights::world_fog(world) {
+            Some(fog) => fog,
+            None => (self.env_fog_color(world, shows_environment).unwrap_or(fog_color), fog_density),
+        };
         // HDR lane: per-pixel exponential height fog (clustered.rs
         // scene_fog) with the game's density at the base height.
         // A world's linear or exp2 fog is fogged with distance as it says.
@@ -359,7 +566,13 @@ impl Renderer {
         let underwater = world.water.as_deref()
             .filter(|_| shows_environment)
             .and_then(|w| super::water::eye_under_water(w, camera_pos, world.water_time));
-        let (fog_color, fog_density) = match underwater {
+        // An MR box: the world is seen from the room, not through the air of the world (the eye
+        // stands kilometres off at a small scale): no fog.
+        let fog_density = if self.stage.mode == StageMode::MrBox { 0.0 } else { fog_density };
+        if self.stage.mode == StageMode::MrBox {
+            self.clustered.fog_ctl = [0.0; 4];
+        }
+        let (fog_color, fog_density) = match &underwater {
             Some(v) => {
                 let c = super::water::in_scatter(&v.look, &sun);
                 if self.hdr_output {
@@ -375,6 +588,14 @@ impl Renderer {
             [[0.0; 4]; 3]
         };
         self.clustered.fog_eye = [camera_pos.x, camera_pos.y, camera_pos.z, 0.0];
+        // Aerial perspective (clustered.rs scene_fogged) for the HDR lane's
+        // air; under water the water is the fog and scatters no sunlight.
+        let hue = sun.color * (1.0 / sun.color.x.max(sun.color.y).max(sun.color.z).max(1e-4));
+        (self.clustered.fog_sun, self.clustered.fog_glow) = if fog_on && underwater.is_none() {
+            ([sun.dir.x, sun.dir.y, sun.dir.z, AERIAL_FORWARD], [hue.x, hue.y, hue.z, AERIAL_SPREAD])
+        } else {
+            ([0.0; 4], [0.0; 4])
+        };
         apply_sun(cx.cx, draws, &sun, fog_color);
         // The ground light field for the cube family (statics AND dynamics —
         // a mover crossing a baked shadow should darken). Uniforms, not
@@ -482,7 +703,8 @@ impl Renderer {
         // the ANALYTIC dome (Preetham + setting sun + stars, tinted by an
         // authored palette); authored gradients under a fixed hour keep
         // DrawSceneSky.
-        if let Some(sky) = world.sky.as_ref().filter(|_| shows_environment) {
+        let owner = cx.enter_draw_name("sky dome");
+        if let Some(sky) = world.sky.as_ref().filter(|_| self.stage.shows_sky() && !env_dome) {
             let mut transform = Mat4f::identity();
             transform.v[12] = camera_pos.x;
             transform.v[13] = camera_pos.y;
@@ -564,6 +786,10 @@ impl Renderer {
             }
             stats.sky_drawn = true;
         }
+        if env_dome {
+            stats.sky_drawn = true;
+        }
+        cx.exit_draw_label(owner);
 
         // 2. The smooth terrain mesh, in CHUNK_SIZE tiles so the hills
         // behind the camera cost nothing. One draw item per visible tile —
@@ -1166,7 +1392,7 @@ impl Renderer {
                 &sun,
                 frustum,
                 &mut stats,
-                camera_pos,
+                eye_pos,
             );
         }
 
@@ -1333,10 +1559,11 @@ impl Renderer {
             }
             let instances = std::mem::take(&mut self.placed_models);
             self.prepare_foliage_lane(cx.cx);
+            self.prepare_splat_lane(cx.cx);
             self.draw_models_inner(
                 cx,
                 ModelDraw::Diffuse(draw),
-                camera_pos,
+                eye_pos,
                 &instances,
                 WorldModelLane::Placed,
                 (fog_color, fog_density),
@@ -1346,7 +1573,7 @@ impl Renderer {
             );
             self.draw_pbr_models(
                 cx,
-                camera_pos,
+                eye_pos,
                 &instances,
                 WorldModelLane::Placed,
                 (fog_color, fog_density),
@@ -1354,13 +1581,19 @@ impl Renderer {
                 frustum,
                 &mut stats,
             );
-            self.draw_foliage_models(cx, camera_pos, &instances, WorldModelLane::Placed,
+            self.draw_splat_models(cx, eye_pos, &instances, WorldModelLane::Placed,
                 (fog_color, fog_density), &sun, frustum, &mut stats);
-            self.draw_custom_models(cx, camera_pos, &instances, WorldModelLane::Placed,
+            self.draw_foliage_models(cx, eye_pos, &instances, WorldModelLane::Placed,
+                (fog_color, fog_density), &sun, frustum, &mut stats);
+            self.draw_custom_models(cx, eye_pos, &instances, WorldModelLane::Placed,
                 (fog_color, fog_density), &sun, frustum, &mut stats);
             self.placed_models = instances;
+            let owner = cx.enter_draw_name("stream");
             self.draw_stream(cx, draw, camera_pos, (fog_color, fog_density), &sun);
-            self.draw_grass(cx, camera_pos, (fog_color, fog_density), &sun, frustum, &mut stats);
+            cx.exit_draw_label(owner);
+            let owner = cx.enter_draw_name("grass");
+            self.draw_grass(cx, eye_pos, (fog_color, fog_density), &sun, frustum, &mut stats);
+            cx.exit_draw_label(owner);
 
             // Actor-attached props share the world material/depth pass, but
             // this is their ONLY renderer traversal. In particular they
@@ -1388,7 +1621,7 @@ impl Renderer {
             self.draw_models_inner(
                 cx,
                 ModelDraw::Diffuse(draw),
-                camera_pos,
+                eye_pos,
                 &attachments,
                 WorldModelLane::Attachment,
                 (fog_color, fog_density),
@@ -1398,7 +1631,7 @@ impl Renderer {
             );
             self.draw_pbr_models(
                 cx,
-                camera_pos,
+                eye_pos,
                 &attachments,
                 WorldModelLane::Attachment,
                 (fog_color, fog_density),
@@ -1406,7 +1639,7 @@ impl Renderer {
                 frustum,
                 &mut stats,
             );
-            self.draw_custom_models(cx, camera_pos, &attachments, WorldModelLane::Attachment,
+            self.draw_custom_models(cx, eye_pos, &attachments, WorldModelLane::Attachment,
                 (fog_color, fog_density), &sun, frustum, &mut stats);
             self.world_attachments = attachments;
         }
@@ -1414,9 +1647,13 @@ impl Renderer {
         // 3s. The map's own sky surfaces, after the opaque world so they are
         // depth-rejected behind it rather than shading over it. Drawn even
         // when a host lends no models_draw: the sky lane owns its shader.
-        self.draw_sky_faces(cx, camera_pos, frustum, &mut stats);
+        let owner = cx.enter_draw_name("sky faces");
+        self.draw_sky_faces(cx, eye_pos, frustum, &mut stats);
+        cx.exit_draw_label(owner);
 
-        self.draw_water(cx, draws, world, &sun, sky_frame.as_ref(), (fog_color, fog_density), frustum, shows_environment, camera_pos);
+        let owner = cx.enter_draw_name("water");
+        self.draw_water(cx, draws, world, &sun, sky_frame.as_ref(), (fog_color, fog_density), frustum, shows_environment, eye_pos);
+        cx.exit_draw_label(owner);
 
         // 4. Alpha pass, one batch per shape: static sensors from the slab,
         // then blob shadows (box batch) and dynamic sensors — drawn after all
@@ -1608,9 +1845,17 @@ impl Renderer {
             }
         }
 
-        let v = &scene_state.view.v;
-        let cam_axes = (vec3f(v[0], v[4], v[8]), vec3f(v[1], v[5], v[9]));
-        self.draw_late_layers(cx, draws, world, frustum, camera_pos, shows_environment, &mut stats, (sun, (fog_color, fog_density), cam_axes));
+        // the camera's right and up for camera-facing sprites: the headset eye's on an MR box
+        let cam_axes = match &eye_view {
+            Some(e) => (vec3f(e.v[0], e.v[4], e.v[8]).normalize(), vec3f(e.v[1], e.v[5], e.v[9]).normalize()),
+            None => {
+                let v = &scene_state.view.v;
+                (vec3f(v[0], v[4], v[8]), vec3f(v[1], v[5], v[9]))
+            }
+        };
+        let owner = cx.enter_draw_name("late layers");
+        self.draw_late_layers(cx, draws, world, frustum, eye_pos, shows_environment, &mut stats, (sun, (fog_color, fog_density), cam_axes));
+        cx.exit_draw_label(owner);
         // Particles and VFX decals, after every other transparent. Particles
         // are pure decoration and the first thing thermal pressure thins
         // (quality.particle_scale): each burst keeps a prefix, so an effect
@@ -1623,13 +1868,17 @@ impl Renderer {
             fog_density,
             lin: self.lin_ctl(),
         };
-        self.draw_vfx_layer(cx, &scene_state, stage_matrix, frustum, vfx_light, quality.particle_scale, &mut stats);
+        let owner = cx.enter_draw_name("vfx");
+        self.draw_vfx_layer(cx, &SceneState3D { camera_pos: eye_pos, ..scene_state }, stage_matrix, frustum, vfx_light, quality.particle_scale, &mut stats);
+        cx.exit_draw_label(owner);
 
         // 7. View-local held meshes, after the complete world. The dedicated
         // shader maps them into a portable near-depth band, while their queue
         // never visited any world bake/caster path above.
         if let Some(draw) = draws.view_model.as_deref_mut() {
+            let owner = cx.enter_draw_name("view model");
             self.draw_view_models_inner(cx, draw, &sun, fog_color, &mut stats);
+            cx.exit_draw_label(owner);
         }
 
         if let Some(previous_world) = previous_world {

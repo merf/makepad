@@ -73,23 +73,10 @@ script_mod! {
         }
 
         pixel: fn() {
-            // Streamed-LOD crossfade (stream.rs `Dither`), as DrawScenePbr.
-            if self.color_adjust_ctl.w > 0.5 {
-                let dsp = self.v_spos.xy / max(self.v_spos.w, 0.000001)
-                // A cell grid commensurate with no real target: two draws
-                // that must cover complementary pixels read the same cell
-                // (at 1920 cells a 2720-px target put every 17th column's
-                // centre exactly on a cell edge, where the two meshes'
-                // interpolated positions round apart: a hole in both).
-                let dpx = floor(vec2(dsp.x * 0.5 + 0.5, 0.5 - dsp.y * 0.5) * vec2(1913.37, 1071.93))
-                let dn = fract(52.9829189 * fract(dot(dpx, vec2(0.06711056, 0.00583715))))
-                let dv = self.color_adjust_ctl.w - 1.0
-                let dlo = floor(dv / 256.0)
-                let dhi = dv - dlo * 256.0
-                if dn < dlo / 255.0 || dn >= dhi / 255.0 { self.clip() }
-            }
+            self.door_window()
             var tex = self.base_texel()
-            if tex.w < 0.5 { self.clip() }
+            let cut = self.cut_coverage(tex.w, 0.5)
+            if cut <= 0.0 { self.clip() }
             let kind = self.metallic
             let night = self.city.x
             var orm = self.orm_map.sample_repeat(self.v_uv)
@@ -305,7 +292,7 @@ script_mod! {
                     lit = lit + glow * min(1.0, cap / max(glow.x, 0.0001))
                 }
             }
-            return self.csm_debug_view(self.gi_display(vec4(self.scene_fogged(self.to_display(lit), self.v_fog, pos, self.fog_density), 1.0), pos, n), pos, n)
+            return self.csm_debug_view(self.gi_display(vec4(self.scene_fogged(self.to_display(lit), self.v_fog, pos, self.fog_density), self.cut_alpha(cut)), pos, n), pos, n)
         }
 
         fragment: fn() {

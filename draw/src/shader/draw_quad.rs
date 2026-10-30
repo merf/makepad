@@ -65,6 +65,15 @@ script_mod! {
         pixel: fn(){
             #0000
         }
+
+        // The window-space depth (0..1) the rasteriser gives a world point
+        // under this pass's camera, on every backend: what a shader that
+        // declares `fragment_depth(..)` writes so its surface and raster
+        // geometry occlude each other per pixel (per eye in XR).
+        depth_of: fn(world: vec4) -> f32 {
+            let clip = self.draw_pass.camera_projection * (self.draw_pass.camera_view * world)
+            return clip.z / clip.w
+        }
     }
 
     // A quad placed by a 2D affine map per instance: `affine_m` (a b c d) and
@@ -87,6 +96,25 @@ script_mod! {
             self.pos = self.geom.pos
             self.world = self.draw_list.view_transform * vec4(w.x, w.y, self.draw_depth + self.draw_call.zbias, 1.0)
             self.vertex_pos = self.draw_pass.camera_projection * (self.draw_pass.camera_view * self.world)
+        }
+    }
+
+    // A quad's cached picture drawn back (View `cache_bg`): `image` holds the
+    // pixels the quad's own shader rendered over the same rect, at the same
+    // density, its top-left at the texture's origin. A rect that is not a
+    // whole number of pixels was rendered into the next whole pixel, so the
+    // quad samples the part it covers. One texture read per pixel.
+    mod.draw.DrawCachedQuad = mod.std.set_type_default() do #(DrawCachedQuad::script_shader(vm)){
+        ..mod.draw.DrawQuad
+        image: texture_2d(float)
+        scale: varying(vec2f)
+        vertex: fn() {
+            let dpi = self.draw_pass.dpi_factor
+            self.scale = self.rect_size / (ceil(self.rect_size * dpi - vec2(0.01, 0.01)) / dpi)
+            self.vertex_pos = self.clip_and_transform_vertex(self.rect_pos, self.rect_size)
+        }
+        pixel: fn() {
+            return self.image.sample(self.pos * self.scale)
         }
     }
 
@@ -128,6 +156,14 @@ pub struct DrawColor {
     pub draw_super: DrawQuad,
     #[live]
     pub color: Vec4f,
+}
+
+/// Draws back the texture a View's `cache_bg` rendered its background into.
+#[derive(Script, ScriptHook, Debug)]
+#[repr(C)]
+pub struct DrawCachedQuad {
+    #[deref]
+    pub draw_super: DrawQuad,
 }
 
 /// A quad of `affine_size` placed by the affine `affine_m` / `affine_t` (see

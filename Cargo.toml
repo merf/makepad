@@ -6,6 +6,9 @@ workspace.members = [
     "apps/wm",
     "apps/wm-all",
     "apps/wm-phone",
+    "apps/desklink",
+    "apps/xr_remote",
+    "apps/deskhost",
     "apps/aichat",
     "apps/code",
     "apps/code/agent",
@@ -22,13 +25,25 @@ workspace.members = [
     "apps/calendar",
     "apps/reminders",
     "apps/calculator",
+    "apps/synth",
     "libs/wayland_server",
     "libs/xkb_keymap",
+    "libs/desk_link",
+    "libs/a11y",
+    "libs/dbus_wire",
+    "libs/atspi",
+    "tools/dbus_codegen",
+    "libs/xr_core",
+    "libs/xr_nav",
+    "libs/xr_stream",
+    "libs/xr_ui",
+    "libs/desk_link_panel",
     "libs/relax_api",
     "libs/relax_api/macro",
     "libs/relax_api/macro_impl",
     "libs/civil_time",
     "libs/wm_api",
+    "libs/shell_kit",
     "libs/app_module",
     "libs/app_registry",
     "libs/app_host",
@@ -44,15 +59,28 @@ workspace.members = [
     "libs/code_language",
     "libs/search",
     "libs/lz4",
+    "libs/zstd_decode",
     "apps/route",
     "libs/flowgraph",
+    # === Flow: the generation studio and graph workbench's libraries ===
+    "libs/media_view",
+    "libs/gen",
+    "libs/gen/tools",
+    "libs/live_frame",
+    "libs/flow_ui",
+    "libs/flow_studio",
+    "apps/flow",
     "apps/ai-hub",
+    "apps/aihub",
+    "apps/devhub",
     "apps/mixer",
     "apps/storybook",
     # The tiled-RTS map generator, shared by the importer and the sandbox.
     "libs/rtsmap",
     "libs/texcomp",
+    "libs/skyline",
     "libs/ai/hub_ui",
+    "libs/ai/hub_panel",
     "libs/ai/services",
     # The AI stack: loader (disk), cuda/metal (kernel and residency stores),
     # job (the one cross-model contract), llm and models/* (per-family model
@@ -68,12 +96,17 @@ workspace.members = [
     "libs/ai/livepipe",
     # Constructive solid geometry.
     "libs/csg/csg",
+    "libs/csg/csg_cad",
+    "libs/csg/csg_graph",
     "libs/csg/csg_boolean",
     "libs/csg/csg_exact",
     "libs/csg/csg_math",
+    "libs/csg/csg_mech",
     "libs/csg/csg_mesh",
     "libs/csg/csg_primitives",
     "libs/csg/csg_sdf",
+    "libs/csg/csg_sculpt",
+    "libs/sdf_engine",
     "libs/render",
     "libs/render_kernels",
     "libs/render_kernels/tools",
@@ -89,9 +122,6 @@ workspace.members = [
     "libs/font_subset",
     "libs/kinetic_type",
     "libs/raytrace",
-    "libs/fab",
-    "libs/fab_tour",
-    "apps/fab/loaders/gltf",
     "libs/scene",
     "libs/soft_body",
     "libs/show_control",
@@ -130,8 +160,11 @@ workspace.members = [
     "examples/modal_footprint",
     "examples/vector",
     "examples/aichat",
+    "examples/tray",
     "examples/pdf",
     "examples/shader",
+    "examples/frame_probe",
+    "examples/fractal_zoom",
     "examples/material_lab",
     "examples/raytrace",
     "examples/text_input",
@@ -141,6 +174,7 @@ workspace.members = [
     "examples/counter",
     "examples/screen_span",
     "examples/browser",
+    "examples/native_app_view",
     "examples/camera",
     "examples/windows_blur",
     "examples/floating_panel",
@@ -154,9 +188,11 @@ workspace.members = [
     "examples/box3d",
     "examples/hello_world",
     "examples/render_to_texture",
+    "examples/depth_mix",
+    "examples/sdf_atlas",
+    "examples/sdf_bake",
     "examples/gl_interop",
     # === digital-fabrication product ===
-    "apps/fab",
     "apps/fabric",
     "libs/fabric/measure",
     "libs/fabric/draft",
@@ -182,6 +218,25 @@ workspace.members = [
     "libs/drumkit_phys",
     "libs/audio_synth",
     "libs/musicxml",
+    # === Synth: live-coded scores, their player and the tweak UI kit ===
+    "libs/audio_dsp",
+    "libs/score_player",
+    "libs/score_voice",
+    "libs/beat",
+    "libs/look",
+    "libs/code_values",
+    "libs/edit_values",
+    "libs/audio_engine",
+    "libs/score_live",
+    "libs/score_live/tools",
+    "libs/model_install",
+    "libs/music_iter",
+    "libs/midi_library",
+    "libs/music_corpus",
+    "libs/synth_panel",
+    "libs/value_pickers",
+    "libs/editor_panel",
+    "libs/flow",
     # === own MP3 / Ogg Vorbis decoders ===
     "libs/audio_decode",
     # === own Ogg Vorbis encoder (stem side-channels) ===
@@ -219,19 +274,26 @@ workspace.members = [
     "tools/map_tiles",
     "tools/map_bake",
     "libs/remote",
+    "libs/devhub",
+    "libs/stack",
     "tools/service_host",
     "tools/agents",
     "tools/ci",
     # === makepad run: the app-VM host (tools/run, package makepad-run, binary makepad)
     # and its host crates; Relax's Rust JIT library crates live in libs/relax ===
     "tools/run",
+    "tools/run/runner",
     "tools/run/boot",
+    "tools/run/fixture/diffpkg",
+    "tools/run/fixture/diffpkg/tables",
     "tools/run/android_host",
     "tools/run/android_exe",
     "tools/run/android_host/fixture",
     "libs/gpu_trace",
+    "libs/prof_stream",
     "libs/relax/compiler",
     "libs/relax/base",
+    "libs/relax/backend",
     "libs/relax/codegen",
     "libs/relax/front",
     "tools/run/light_http",
@@ -240,8 +302,11 @@ workspace.members = [
     "libs/relax/types",
     "tools/run/fixture",
     "libs/relax/lex",
-    "platform/codegen",
     "libs/system_speech",
+    # Relax run-time benchmark: real-world workloads (rustc --release vs makepad run)
+    "libs/relax/compiler/rwbench",
+    # Relax data-structure microbenchmarks (Vec, iterators, HashMap, BTreeMap, sort, strings, bounds loops)
+    "libs/relax/compiler/dsbench",
     # Send feedback: caption icon + panel (Amp, Scope)
     "widgets/feedback",
     # === tests ===
@@ -289,7 +354,6 @@ workspace.members = [
 ]
 
 workspace.exclude = [
-    "libs/relax/compiler/rwbench",
     # Relax's own fixtures, benches and std check crates: Relax programs and standalone
     # workspaces (their own [workspace] / Cargo.lock), not members
     "libs/relax/compiler/bench_rt",
@@ -404,6 +468,7 @@ unicode-segmentation = { path = "libs/unicode/unicode-segmentation" }
 relax-lex = { path = "libs/relax/lex", version = "0.1.0" }
 makepad-relax = { path = "libs/relax/attr", version = "1.0.0" }
 relax-base = { path = "libs/relax/base", version = "0.1.0" }
+relax-backend = { path = "libs/relax/backend", version = "0.1.0" }
 relax-codegen = { path = "libs/relax/codegen", version = "0.1.0" }
 relax-compiler = { path = "libs/relax/compiler", version = "0.1.0" }
 relax-front = { path = "libs/relax/front", version = "0.1.0" }
@@ -413,8 +478,11 @@ relax-session = { path = "libs/relax/session", version = "0.1.0" }
 relax-types = { path = "libs/relax/types", version = "0.1.0" }
 relax-provided-fixture = { path = "tools/run/fixture", version = "0.1.0" }
 makepad-live-id = { path = "libs/live_id", version = "1.0.0" }
+makepad-stack = { path = "libs/stack", version = "1.0.0" }
 makepad-remote = { path = "libs/remote", version = "0.1.0" }
+makepad-strict-json = { path = "libs/strict_json", version = "0.1.0" }
 makepad-gpu-trace = { path = "libs/gpu_trace", version = "1.0.0" }
+makepad-prof-stream = { path = "libs/prof_stream", version = "1.0.0" }
 makepad-relax-api = { path = "libs/relax_api", version = "1.0.0" }
 makepad-relax-api-macro-impl = { path = "libs/relax_api/macro_impl", version = "1.0.0" }
 makepad-live-id-macros-impl = { path = "libs/live_id/id_macros_impl", version = "1.0.0" }
@@ -429,6 +497,7 @@ ab_glyph_rasterizer = { path = "libs/ab_glyph_rasterizer", version = "0.1.8" }
 sdfer = { path = "libs/sdfer", version = "0.2.1" }
 pulldown-cmark = { path = "libs/pulldown-cmark", version = "0.12.2", default-features = false }
 makepad-fast-inflate = { path = "libs/fast_inflate", version = "0.1.0" }
+makepad-zstd-decode = { path = "libs/zstd_decode", version = "0.1.0" }
 makepad-zip-file = { path = "libs/zip_file", version = "1.0.0" }
 makepad-zune-png = { path = "libs/zune/zune-png", version = "0.5.2" }
 makepad-rust-tokenizer = { path = "libs/rust_tokenizer", version = "1.0.0" }
@@ -437,6 +506,11 @@ makepad-ai-llm = { path = "libs/ai/llm", version = "0.1.0" }
 makepad-widgets-core = { path = "widgets/core", version = "2.0.0" }
 makepad-widgets-sheets = { path = "widgets/sheets", version = "0.1.0" }
 makepad-mbtile-reader = { path = "libs/mbtile_reader", version = "1.0.0" }
+makepad-piano-model = { path = "libs/piano_model", version = "0.1.0" }
+makepad-audio-decode = { path = "libs/audio_decode", version = "0.1.0" }
+makepad-audio-synth = { path = "libs/audio_synth", version = "0.1.0" }
+makepad-script = { path = "platform/script", version = "1.0.0" }
+makepad-csg = { path = "libs/csg/csg", version = "0.1.0" }
 
 [profile.dev]
 debug = "line-tables-only"
@@ -450,6 +524,17 @@ debug = "line-tables-only"
 [profile.release]
 incremental = true
 lto = "off"
+
+# host: the `makepad` JIT binary (Relax + makepad run) built for speed on the machine that runs it.
+# Output goes to target/host/ (or target/<triple>/host/), never over target/release: release stays the
+# distributable build and the build every gate, A/B and timing series uses.
+# local/agent_state/relax-campaign/build-host.sh adds -Ctarget-cpu=native and the PGO profile.
+[profile.host]
+inherits = "release"
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+incremental = false
 
 [profile.small]
 inherits = "release"
@@ -473,12 +558,6 @@ opt-level = 1
 # math AOT overflows the stack.
 [profile.release.package.makepad-stitch]
 incremental = false
-
-# The Arcade frontend: only the app crate itself (the edit-hot 100k lines of
-# src/) compiles incrementally; the engine and gameplay crates stay whole
-# (non-incremental, thin-local LTO), which measured 25-40 % faster scene draw.
-[profile.release.package.makepad-sandbox]
-incremental = true
 
 #[profile.dev.package.makepad-live-tokenizer]
 #opt-level = 3
@@ -516,6 +595,8 @@ incremental = true
 # The makepad run host and Relax JIT build whole: incremental release splits each crate into many more
 # codegen units, which costs the JIT compiler speed.
 [profile.release.package.makepad-run]
+incremental = false
+[profile.release.package.relax-runner]
 incremental = false
 [profile.release.package.makepad-run-android]
 incremental = false

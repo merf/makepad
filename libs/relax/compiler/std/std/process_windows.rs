@@ -521,13 +521,14 @@ impl Command {
 
     /// Under `makepad run` the program's executable is Relax itself: spawning it runs this
     /// program again (Relax's command line up to `--`, then the new arguments). A spawn of the
-    /// loader whose first argument is `run` is a launcher starting another program through it
-    /// (`$MAKEPAD_RUN_LOADER run [flags] <package> ...`): that one runs as written. `program` is the
+    /// loader whose first argument is `run` or `app` is a launcher starting another program through
+    /// it (`$MAKEPAD_RUN_LOADER run [flags] <package> ...`, `... app <id>`), and one whose first argument is
+    /// `export` asks the loader for a source tree (the runner's Install natively): those run as written. `program` is the
     /// resolved executable (NUL-terminated UTF-16, with its `.exe`); the result is the argument
     /// list after argv[0] to run instead of this command's.
     fn self_exec_args(&self, program: &[u16]) -> Option<Vec<Arg>> {
         let pre = crate::env::var("MAKEPAD_RUN_SELF_EXEC").ok()?;
-        if self.args.first().is_some_and(|a| a.as_os_str().as_encoded_bytes() == b"run") {
+        if self.args.first().is_some_and(|a| matches!(a.as_os_str().as_encoded_bytes(), b"run" | b"app" | b"export")) {
             return None;
         }
         // inside a build script (MAKEPAD_RUN_AS_RUSTC): its spawns of this executable are RUSTC
@@ -812,7 +813,7 @@ fn child_pipe(ours_readable: bool) -> io::Result<(OwnedHandle, OwnedHandle)> {
 
 // ---- program resolution (real std's resolve_exe / search_paths / program_exists)
 
-fn is_sep_byte(b: u8) -> bool {
+const fn is_sep_byte(b: u8) -> bool {
     b == b'/' || b == b'\\'
 }
 

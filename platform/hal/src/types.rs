@@ -144,6 +144,8 @@ pub struct CmdBuf {
     pub draws: Slice,
     /// `[Dispatch]` of every compute pass in `frames` (element ranges, see [`Pass::dispatches`])
     pub dispatches: Slice,
+    /// `[Layer]` of every frame, addressed by `FramePacket::layers`.
+    pub layers: Slice,
 }
 
 /// One fire-and-forget command. `a` is decoded per `tag` by the generated constructors and
@@ -227,10 +229,30 @@ pub mod info_flags {
     pub const CLIENT_CHROME: u32 = 4;
     /// One full desktop target owns scanout; widgets compose the direct-display cursor.
     pub const DIRECT_DISPLAY: u32 = 32;
+    /// The backend composes session 0's window layer over a lent window (`window_overlay`
+    /// with a layer texture).
+    pub const WINDOW_LAYERS: u32 = 64;
+    /// Session 0 may put badges on its windows (`window_kind::BADGE`, `target::BADGES`): the
+    /// backend composes a window's badge layer into every frame it presents.
+    pub const WINDOW_BADGES: u32 = 128;
+    /// A makepad window manager hosts the windows (the Linux WM shell): they are its tiles,
+    /// which draw their own caption in the WM's style; the WM's messages arrive as `AppMessage`.
+    pub const WM_HOSTED: u32 = 256;
+    /// A head-mounted display runs the session: `window_kind::XR` windows show in it, and the
+    /// host window is a panel the person points at.
+    pub const XR: u32 = 512;
+    /// The backend renders multiview passes (`Pass::views` 2): an app draws a stereo view in one
+    /// pass instead of one per eye.
+    pub const MULTIVIEW: u32 = 1024;
+    /// With `XR`: the XR window has no display of its own (a remote headset: its frames go to an
+    /// encoder the app drives). XR passes render into the pass's own colour and depth textures,
+    /// both eyes side by side, and the app hands the result on; the XR window only paces them
+    /// (its `XrFrame`s and `FrameReady`s), it is never presented.
+    pub const XR_OFFSCREEN: u32 = 2048;
 
     #[test]
     fn the_flags_are_distinct_bits() {
-        let all = [PRIVILEGED, EMBEDDED, DISPLAY_CLOCK, GPU_TIMESTAMPS, CLIENT_CHROME, DIRECT_DISPLAY];
+        let all = [PRIVILEGED, EMBEDDED, DISPLAY_CLOCK, GPU_TIMESTAMPS, CLIENT_CHROME, DIRECT_DISPLAY, WINDOW_LAYERS, WINDOW_BADGES, WM_HOSTED, XR, MULTIVIEW, XR_OFFSCREEN];
         for (i, a) in all.iter().enumerate() {
             assert!(a.is_power_of_two());
             assert!(all[i + 1..].iter().all(|b| a & b == 0), "flag {a} shares a bit");
@@ -286,6 +308,14 @@ pub mod menu_kind {
     pub const DISABLED: u32 = 1 << 9;
     /// the application's Quit item: `terminate:`, not a command
     pub const QUIT: u32 = 1 << 10;
+    /// the item shows a check mark state (`CHECKED` says which)
+    pub const CHECKABLE: u32 = 1 << 11;
+    pub const CHECKED: u32 = 1 << 12;
+    /// the application's About item: the system's About panel (name, version, icon from the
+    /// bundle), not a command
+    pub const ABOUT: u32 = 1 << 13;
+    /// the item is in the Dock icon's menu too (macOS; the system lists the app's windows there)
+    pub const DOCK: u32 = 1 << 14;
 }
 
 /// `FileDialog::kind`: the dialog in the low byte, bit 8: choose several.
@@ -324,8 +354,9 @@ impl OpenReq {
             Ok("offscreen") if cfg!(target_vendor = "apple") => (backend_id::METAL, open_flags::OFFSCREEN_WINDOWS),
             Ok("offscreen") if cfg!(target_os = "linux") => (backend_id::AUTO, open_flags::OFFSCREEN_WINDOWS),
             Ok("offscreen") if cfg!(windows) => (backend_id::D3D11, open_flags::OFFSCREEN_WINDOWS),
-            Ok("d3d11") if cfg!(windows) && !hidden => (backend_id::D3D11, window_flags),
-            Ok("d3d11") if cfg!(windows) => (backend_id::D3D11, window_flags | open_flags::OFFSCREEN_WINDOWS),
+            // An explicit native backend keeps OS windows for accessibility/automation.
+            // MAKEPAD_HIDE_WINDOWS hides the Win32 HWNDs; "offscreen" creates none.
+            Ok("d3d11") if cfg!(windows) => (backend_id::D3D11, window_flags),
             Ok("offscreen") => (backend_id::HEADLESS, 0),
             Ok("metal") => (backend_id::METAL, window_flags),
             Ok("gl") if cfg!(target_os = "linux") => (backend_id::GL, window_flags | if hidden { open_flags::OFFSCREEN_WINDOWS } else { 0 }),
@@ -354,6 +385,8 @@ pub struct HalInfo {
     pub flags: u32,
     /// bit per [`format`]
     pub formats: u64,
+    /// The sample counts a pass may ask for ([`Pass::samples`]): bit n set = 2^n samples per
+    /// pixel (1: single sampling only, no MSAA).
     pub msaa: u32,
     pub dpi: f32,
     pub max_texture: u32,
@@ -362,6 +395,42 @@ pub struct HalInfo {
     pub max_buffer: u64,
     /// the memory the device works in, in bytes; 0 = unknown
     pub working_set: u64,
+    /// The GPU's PCI vendor id (0 = unknown; Apple GPUs report 0x106b).
+    pub vendor_id: u32,
+    /// [`device_kind`]: integrated, discrete, virtual or a software rasterizer.
+    pub device_kind: u32,
+    /// The device's name as the driver reports it, UTF-8, zero-padded (a fixed
+    /// array: this struct crosses the HAL pipe as plain data). An app picks its
+    /// graphics quality from it ([`HalInfo::device_name`]).
+    pub device_name: [u64; 8],
+}
+
+/// What kind of GPU a backend runs on (`HalInfo::device_kind`).
+pub mod device_kind {
+    pub const UNKNOWN: u32 = 0;
+    pub const INTEGRATED: u32 = 1;
+    pub const DISCRETE: u32 = 2;
+    pub const VIRTUAL: u32 = 3;
+    pub const SOFTWARE: u32 = 4;
+}
+
+impl HalInfo {
+    /// The device name (empty when the backend does not know it).
+    pub fn device_name(&self) -> String {
+        let bytes: Vec<u8> = self.device_name.iter().flat_map(|w| w.to_le_bytes()).take_while(|b| *b != 0).collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// Store `name`, cut at a character boundary to fit.
+    pub fn set_device_name(&mut self, name: &str) {
+        let mut end = name.len().min(63);
+        while !name.is_char_boundary(end) { end -= 1; }
+        let mut bytes = [0u8; 64];
+        bytes[..end].copy_from_slice(&name.as_bytes()[..end]);
+        for (i, w) in self.device_name.iter_mut().enumerate() {
+            *w = u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap());
+        }
+    }
 }
 
 /// Backend ids (`OpenReq::backend`, `HalInfo::backend`).
@@ -409,15 +478,26 @@ pub mod format {
     pub const BC7: u32 = 11;
     pub const BC5: u32 = 12;
     pub const ASTC4X4: u32 = 13;
-    pub const COUNT: u32 = 14;
+    /// one-channel half-float render target / data texture (filterable)
+    pub const R16F: u32 = 14;
+    pub const COUNT: u32 = 15;
+    /// RGBA8 with sRGB encoding on write (the shader outputs linear colour): a render target
+    /// of the Android XR projection chains only (`hal_xr_linear_frames`), outside the texture
+    /// formats every backend lists (`COUNT`); Vulkan alone maps it.
+    pub const RGBA8_SRGB: u32 = 32;
+    /// A two-plane 4:2:0 picture for a video encoder: luma (one byte per pixel) then chroma (U V
+    /// at half resolution both ways). A render pass draws into one plane, its layer: 0 luma (an
+    /// R8 target of the texture's size), 1 chroma (RG8, half the size). Outside `COUNT`: D3D11
+    /// alone maps it (a shared texture an encoder reads where it lies).
+    pub const NV12: u32 = 33;
 
     /// Bytes per texel; 0 for an unknown format.
     pub const fn texel_bytes(f: u32) -> u64 {
         match f {
-            RGBA8 | BGRA8 | DEPTH32F | DEPTH24_STENCIL8 | R32F | RG16F | R32UINT => 4,
-            // 16 bytes per 4x4 texels
-            R8 | BC7 | BC5 | ASTC4X4 => 1,
-            RG8 => 2,
+            RGBA8 | BGRA8 | DEPTH32F | DEPTH24_STENCIL8 | R32F | RG16F | R32UINT | RGBA8_SRGB => 4,
+            // 16 bytes per 4x4 texels; NV12: its luma plane's (the chroma adds half: `level_bytes`)
+            R8 | BC7 | BC5 | ASTC4X4 | NV12 => 1,
+            RG8 | R16F => 2,
             RGBA16F => 8,
             RGBA32F => 16,
             _ => 0,
@@ -427,6 +507,8 @@ pub mod format {
     pub const fn name(f: u32) -> &'static str {
         match f {
             RGBA8 => "Rgba8",
+            RGBA8_SRGB => "Rgba8Srgb",
+            NV12 => "Nv12",
             BGRA8 => "Bgra8",
             R8 => "R8",
             RG8 => "Rg8",
@@ -436,6 +518,7 @@ pub mod format {
             DEPTH24_STENCIL8 => "Depth24Stencil8",
             R32F => "R32F",
             RG16F => "Rg16F",
+            R16F => "R16F",
             R32UINT => "R32Uint",
             BC7 => "Bc7",
             BC5 => "Bc5",
@@ -448,6 +531,11 @@ pub mod format {
         f == DEPTH32F || f == DEPTH24_STENCIL8
     }
 
+    /// The render-target planes of `f` (a pass's layer picks one): 2 for NV12, else 1.
+    pub const fn planes(f: u32) -> u32 {
+        if f == NV12 { 2 } else { 1 }
+    }
+
     pub const fn is_block(f: u32) -> bool {
         matches!(f, BC7 | BC5 | ASTC4X4)
     }
@@ -457,6 +545,8 @@ pub mod format {
     pub fn level_bytes(f: u32, w: u32, h: u32) -> u64 {
         if is_block(f) {
             (w.max(1) as u64).div_ceil(4) * (h.max(1) as u64).div_ceil(4) * 16
+        } else if f == NV12 {
+            w.max(1) as u64 * h.max(1) as u64 * 3 / 2
         } else {
             w.max(1) as u64 * h.max(1) as u64 * texel_bytes(f)
         }
@@ -469,9 +559,12 @@ pub mod usage {
     pub const SAMPLED: u16 = 2;
     pub const SHARED: u16 = 4;
     pub const TRANSIENT: u16 = 8;
+    /// a layered texture that is a 2D array even with six square colour layers (otherwise those
+    /// are a cube: [`crate::session::TextureObj::is_cube`])
+    pub const ARRAY: u16 = 16;
     /// Written by compute dispatches (a storage image). A dispatch never samples a texture it
     /// writes, and a pass never renders into one a dispatch of the same pass writes.
-    pub const STORAGE: u16 = 16;
+    pub const STORAGE: u16 = 32;
 }
 
 /// Buffer kinds (`BufferCreate` flags).
@@ -638,6 +731,9 @@ pub mod input {
     pub mod drag_item {
         pub const FILE: u32 = 0;
         pub const STRING: u32 = 1;
+        /// A file the app is still making for a drag out (`crate::drag_promise`): the string is
+        /// `<final path>\n<mime type>`. Only in `DragStart`.
+        pub const PROMISE: u32 = 2;
     }
 }
 
@@ -650,12 +746,47 @@ pub mod window_kind {
     /// The host supplies geometry and ticks; each frame names its imported image in
     /// `Pass::color[0]`. Completion is reported against the window as usual.
     pub const HOSTED: u32 = 3;
+    /// Session 0 only (`info_flags::WINDOW_BADGES`): a badge's place over a window of session 0
+    /// (`parent`) at `geom`, in the parent's points (top left). It has no surface and no frames
+    /// (session 0 draws badges in the window's badge layer, `target::BADGES`); it is never
+    /// adopted and is the HAL's own object, not the window system's. Made with
+    /// `window_style::BADGE_HOVER`, session 0 sees the pointer move over it (copies of the moves as
+    /// events of the badge, and a `MouseLeave` of it); input itself always stays the window's.
+    pub const BADGE: u32 = 4;
+    /// A tray app's dropdown: borderless, not resizable, above other windows, no Dock / taskbar
+    /// entry of its own, made hidden. `WindowAtTray` places and shows it under its tray icon; its
+    /// focus loss answers `PopupDismissed` (the app hides it). No parent.
+    pub const DROPDOWN: u32 = 5;
+    /// A head-mounted display's stereo view (`info_flags::XR`): the shell sizes it (its geom is
+    /// both eyes side by side, the left eye in the left half) and paces it with `XrFrame` events,
+    /// each followed by the window's FrameReady. A frame must be drawn with the eyes of the
+    /// newest `XrFrame`; the shell shows it as the runtime's projection layer with those eyes.
+    pub const XR: u32 = 6;
+}
+
+/// `TraySet::flags`.
+pub mod tray_flags {
+    /// a primary click answers `TrayClick`, the menu opens on a secondary click
+    pub const DROPDOWN: u32 = 1;
 }
 
 /// `TextureImport::kind`.
 pub mod texture_handle {
     /// The backend's native shared image handle (Metal: a global IOSurface ID).
     pub const NATIVE: u32 = 0;
+    /// The luma plane of a native biplanar 4:2:0 picture (Metal: plane 0 of a `420v`/`420f`
+    /// IOSurface, by global id), as an R8 texture.
+    pub const LUMA: u32 = 1;
+    /// Its interleaved chroma plane (Metal: plane 1), as an RG8 texture of half the size.
+    pub const CHROMA: u32 = 2;
+    /// A decoder's whole picture (Vulkan on Android: a stream decoder's picture ticket, a Y'CbCr
+    /// hardware buffer) as one video texture: sampled from a `texture_video` slot it gives the
+    /// picture's raw codes (.g = Y', .b = Cb, .r = Cr, 0..1 of the 8-bit range).
+    pub const VIDEO: u32 = 3;
+    /// An XR runtime's environment depth image (Vulkan on Android: a ticket of the XR shell's,
+    /// `XrDepth::image`): both eyes' layers as a 2D array texture, sampled from a
+    /// `texture_2d_array` slot it gives the depth (0..1, the image's projection) in .r.
+    pub const XR_DEPTH: u32 = 4;
 }
 
 /// The bits above the kind byte of `WindowCreate::kind`: how a macOS window is made (Cx's
@@ -679,6 +810,8 @@ pub mod window_style {
     pub const FULLSCREEN_AUXILIARY: u32 = 1 << 18;
     /// the size is exact: not fitted to the attached displays (a capture size may exceed any)
     pub const EXACT_SIZE: u32 = 1 << 19;
+    /// a badge (`window_kind::BADGE`) that sees the pointer hover over its rect (never input)
+    pub const BADGE_HOVER: u32 = 1 << 20;
 }
 
 /// Window states (`WindowState`).
@@ -689,7 +822,9 @@ pub mod window_state {
     pub const FULLSCREEN: u32 = 3;
     pub const HIDE: u32 = 4;
     pub const SHOW: u32 = 5;
-    /// An embedded window asks its parent to close it.
+    /// The window's own close button (an app-drawn caption's): the window system answers
+    /// `CloseRequested`, as for its native close, and the app decides; an embedded window asks
+    /// its parent to close it.
     pub const CLOSE: u32 = 6;
 }
 
@@ -741,8 +876,17 @@ pub mod target {
     pub const SNAPSHOT: u32 = 0x400;
     /// Executor-set flag: a session-0 overlay frame, never a transfer of ownership.
     pub const OVERLAY: u32 = 0x800;
+    /// Or-ed into `kind` of a window frame of session 0 (`info_flags::WINDOW_BADGES`): the
+    /// window's badge layer (the JIT ring, its tooltip), in window pixels, its passes loading
+    /// what is under them. The HAL keeps it and draws it over every frame the window presents,
+    /// whoever drew that frame (a borrower's too), until the next one; it presents the window
+    /// again at once (the app may be idle). One with no draws ends the layer.
+    pub const BADGES: u32 = 0x1000;
+    /// Executor-set flag: the kept badge layer drawn again over a new frame of its window (no
+    /// `FrameDone`: session 0 heard of that frame when it sent it).
+    pub const REPLAY: u32 = 0x2000;
     /// The bits of `kind` that are flags; the rest is the target.
-    pub const FLAGS: u32 = PICK | CAPTURE | SNAPSHOT | OVERLAY;
+    pub const FLAGS: u32 = PICK | CAPTURE | SNAPSHOT | OVERLAY | BADGES | REPLAY;
 }
 
 /// Layout of `PipelineDesc::bindings` (the blob's `[u32]` binding table): the buffer slot of each
@@ -869,6 +1013,128 @@ pub struct TouchPoint {
     pub force: f32,
 }
 
+/// A tracked pose in the XR session's reference space: metres, a unit quaternion (x, y, z, w);
+/// y up, -z forward at the start of the session, the floor at y = 0 when the runtime knows it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct XrPose {
+    pub orientation: [f32; 4],
+    pub position: [f32; 3],
+}
+
+/// One eye of an `XrFrame`: where it is and its field of view (radians: left, right, up, down;
+/// left and down negative).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct XrEye {
+    pub pose: XrPose,
+    pub fov: [f32; 4],
+}
+
+/// One controller (the old Android backend's `XrController`, field for field): its grip and
+/// aim poses, the analog trigger and grip (0..1), [`xr_controller`] bits and the thumbstick
+/// (-1..1, up positive, as the runtime reports it).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct XrController {
+    pub grip_pose: XrPose,
+    pub aim_pose: XrPose,
+    pub trigger: f32,
+    pub grip: f32,
+    pub buttons: u32,
+    pub stick: [f32; 2],
+}
+
+/// `XrController::buttons` (the bits of Cx `XrController`).
+pub mod xr_controller {
+    pub const CLICK_X: u32 = 1 << 0;
+    pub const CLICK_Y: u32 = 1 << 1;
+    pub const CLICK_A: u32 = 1 << 2;
+    pub const CLICK_B: u32 = 1 << 3;
+    pub const CLICK_MENU: u32 = 1 << 4;
+    /// the controller is tracked (its poses are valid)
+    pub const ACTIVE: u32 = 1 << 5;
+    pub const CLICK_THUMBSTICK: u32 = 1 << 6;
+    pub const TOUCH_X: u32 = 1 << 7;
+    pub const TOUCH_Y: u32 = 1 << 8;
+    pub const TOUCH_A: u32 = 1 << 9;
+    pub const TOUCH_B: u32 = 1 << 10;
+    pub const TOUCH_THUMBSTICK: u32 = 1 << 11;
+    pub const TOUCH_TRIGGER: u32 = 1 << 12;
+    pub const TOUCH_THUMBREST: u32 = 1 << 13;
+}
+
+/// One tracked hand (XR_EXT_hand_tracking + XR_FB_hand_tracking_aim; the old backend's
+/// `XrHand`, field for field): the 21 joints that are not finger tips (the 26 of the
+/// extension without the tips), each tip as its distance from the joint before it, the aim
+/// pose, [`xr_hand`] flags and the pinch strengths (index, middle, ring, little; 0..255).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct XrHand {
+    pub flags: u32,
+    pub joints: [XrPose; xr_hand::JOINT_COUNT],
+    pub tips: [f32; 5],
+    /// a bit per tip (1 << tip) whose distance is valid, and [`xr_hand::GRAB_ACTIVE`]
+    pub tips_active: u32,
+    pub aim_pose: XrPose,
+    pub pinch: [u8; 4],
+}
+
+impl Default for XrHand {
+    fn default() -> Self { XrHand { flags: 0, joints: [XrPose::default(); xr_hand::JOINT_COUNT], tips: [0.; 5], tips_active: 0, aim_pose: XrPose::default(), pinch: [0; 4] } }
+}
+
+/// `XrHand` flags, joint slots and pinch slots (the values of Cx `XrHand`).
+pub mod xr_hand {
+    pub const IN_VIEW: u32 = 1 << 0;
+    pub const AIM_VALID: u32 = 1 << 1;
+    pub const PINCH_INDEX: u32 = 1 << 2;
+    pub const PINCH_MIDDLE: u32 = 1 << 3;
+    pub const PINCH_RING: u32 = 1 << 4;
+    pub const PINCH_LITTLE: u32 = 1 << 5;
+    pub const DOMINANT_HAND: u32 = 1 << 6;
+    pub const MENU_PRESSED: u32 = 1 << 7;
+    /// in `tips_active`: the grasp (hand_interaction_ext) is held, with hysteresis
+    pub const GRAB_ACTIVE: u32 = 1 << 5;
+    pub const PINCH_STRENGTH_INDEX: usize = 0;
+    pub const PINCH_STRENGTH_MIDDLE: usize = 1;
+    pub const PINCH_STRENGTH_RING: usize = 2;
+    pub const PINCH_STRENGTH_LITTLE: usize = 3;
+    pub const JOINT_COUNT: usize = 21;
+    pub const CENTER: usize = 0;
+    pub const WRIST: usize = 1;
+}
+
+/// The payload of `XrFrame`: the head, both eyes (left, right), both controllers and both hands
+/// (left, right) at the frame's predicted display time.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct XrFrame {
+    pub head: XrPose,
+    pub eyes: [XrEye; 2],
+    pub controllers: [XrController; 2],
+    pub hands: [XrHand; 2],
+}
+
+/// The header of an `XrDepth` event (`buffers::Wire`): the environment depth images of the
+/// first `layers` eyes (XR_META_environment_depth), each `width` x `height` D16 texels
+/// (row-major, little-endian u16, nonlinear: the depth of that eye's projection with
+/// `near`/`far`, `far` 0 = infinite), eye 0's first, follow it in the payload. `views` are the depth camera of each eye in the local space (y
+/// up, the floor at y = 0), at the time the depth was captured. `image`: the image itself for
+/// the GPU (`texture_handle::XR_DEPTH` ticket; 0 none). A payload without texels announces a
+/// newly acquired image (the GPU reads it from now on); the texels follow in a later event.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct XrDepth {
+    pub width: u32,
+    pub height: u32,
+    pub layers: u32,
+    pub near: f32,
+    pub far: f32,
+    pub views: [XrEye; 2],
+    pub image: u64,
+}
+
 // ------------------------------------------------------------------ frames
 
 /// One pass of a frame: a render pass (`draws`, an element range into the packet's draw array)
@@ -887,8 +1153,22 @@ pub struct Pass {
     pub clear_depth: f32,
     /// per colour attachment: the cube face / array slice it renders into
     pub layer: [u32; 4],
+    /// x, y, w, h in target pixels. Draw scissors are relative to its origin; with an origin
+    /// (an eye of a side-by-side stereo target) the pass clears and stores from the origin on.
     pub viewport: [f32; 4],
     pub dpi: f32,
+    /// 0 or 1: one view. 2 (`info_flags::MULTIVIEW` only): multiview, both views in one pass --
+    /// a window target is a two-layer image (one layer per view, each the viewport's size), the
+    /// draws run their pipelines' multiview stages once and the GPU renders every layer, the
+    /// pass uniforms' `_r` matrices being the second view's.
+    pub views: u32,
+    /// Samples per pixel: 0 or 1 single sampling; 2, 4 or 8 (a count in [`HalInfo::msaa`],
+    /// else single sampled) an MSAA pass: it renders into multisampled colour and depth images
+    /// of its attachments' formats and size the backend keeps per attachment, resolved into the
+    /// attachments at its end (colour: the samples' average; depth: sample 0). A pass that loads
+    /// continues the multisampled images (the second eye of a side-by-side target), not what
+    /// another pass wrote into the attachments.
+    pub samples: u32,
     pub uniforms: Slice,
     pub draws: Range,
     pub name: StrId,
@@ -989,7 +1269,7 @@ pub struct Draw {
     pub scissor: [f32; 4],
     pub zbias: f32,
     pub pick: u32,
-    /// [`Draw::DEPTH_WRITE`] | [`Draw::CULL`] | [`Draw::BLEND`]
+    /// [`Draw::DEPTH_WRITE`] | [`Draw::CULL`] | [`Draw::BLEND`] and the other `Draw` flag bits.
     pub flags: u32,
     pub owner: StrId,
     /// Cx draw-list id, draw-item id and the list's debug name
@@ -1006,9 +1286,74 @@ impl Draw {
     pub const BLEND: u32 = 4;
     /// the index buffer holds u32 indices (otherwise u16)
     pub const INDEX_U32: u32 = 8;
+    /// triangles drawn as their edges (frame capture's wireframe view; backends without a line
+    /// fill mode draw them filled)
+    pub const WIREFRAME: u32 = 16;
+    /// This draw never occludes input to native content below it.
+    pub const INPUT_TRANSPARENT: u32 = 32;
 }
 
 unsafe impl Plain for Draw {}
+
+/// Geometry resolved by the frame builder in window pixels. Rectangles are x, y, width,
+/// height; the transform is column-major. Radius order is top-left, top-right, bottom-right,
+/// bottom-left.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NativeLayerGeom {
+    pub rect: [f32; 4],
+    pub clip: [f32; 4],
+    pub radius: [f32; 4],
+    pub transform: [f32; 16],
+    pub opacity: f32,
+    pub flags: u32,
+}
+
+impl Default for NativeLayerGeom {
+    fn default() -> Self {
+        Self {
+            rect: [0.0; 4], clip: [0.0; 4], radius: [0.0; 4],
+            transform: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+                        0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            opacity: 1.0, flags: crate::native_layer::layer_flags::VISIBLE,
+        }
+    }
+}
+
+/// One segment of a window pass. DRAWS names elements of the batch's draw array, all from the
+/// same pass. NATIVE carries a layer's unclipped rect and clip in window pixels (x, y, width,
+/// height), corner radii, and a column-major transform. `occluders` is an ELEMENT range of
+/// `[f32; 4]` x, y, width, height rectangles in the byte arena (`buffers::read_rects`).
+#[relax_api(plain)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Layer {
+    pub kind: u32,
+    pub draws: Range,
+    pub native: Id,
+    pub rect: [f32; 4],
+    pub clip: [f32; 4],
+    pub radius: [f32; 4],
+    pub transform: [f32; 16],
+    pub opacity: f32,
+    pub flags: u32,
+    pub occluders: Range,
+}
+
+impl Layer {
+    pub const DRAWS: u32 = 0;
+    pub const NATIVE: u32 = 1;
+}
+
+impl Default for Layer {
+    fn default() -> Self {
+        let g = NativeLayerGeom::default();
+        Self { kind: Self::DRAWS, draws: Range::default(), native: Id::NONE,
+            rect: g.rect, clip: g.clip, radius: g.radius, transform: g.transform,
+            opacity: g.opacity, flags: g.flags, occluders: Range::default() }
+    }
+}
+
+unsafe impl Plain for Layer {}
 
 /// Timing Cx measured for the frame, in absolute raw monotonic ns (see [`clock_ns`]).
 #[relax_api(plain)]
@@ -1019,7 +1364,9 @@ pub struct FrameMeta {
     pub build_end_ns: u64,
     /// the causing (oldest consumed) input event
     pub input_ns: u64,
-    /// start, end per CPU phase: dispatch, draw, layout, build, submit, spare
+    /// start, end per CPU phase of the app's beat (0, 0: none): dispatch (services, timers),
+    /// next-frame callbacks, draw (the draw event walk, shader compiles), then build / submit /
+    /// spare (unused; the pass's build is `build_start_ns..build_end_ns`)
     pub phases: [[u64; 2]; 6],
 }
 
@@ -1040,6 +1387,8 @@ pub struct FramePacket {
     pub frame: u64,
     pub passes: Range,
     pub draws: Range,
+    /// Element range into `CmdBuf::layers`. Empty preserves the unsplit rendering path.
+    pub layers: Range,
     pub meta: FrameMeta,
     /// the dispatches of the packet's compute passes (element range into `CmdBuf::dispatches`)
     pub dispatches: Range,
@@ -1060,7 +1409,8 @@ pub struct PipelineDesc {
     pub vertex_layout: Range,
     pub color_formats: [u32; 4],
     pub blend: u32,
-    pub depth: u32,
+    /// `pipeline_flags` bits
+    pub flags: u32,
     /// Cx draw_shader index (stable per session; names collide), its debug name and its script
     /// source location (file:line:col)
     pub shader: u32,
@@ -1073,6 +1423,14 @@ pub struct PipelineDesc {
     pub outputs: u32,
     /// [`pipeline_kind`]
     pub kind: u32,
+}
+
+/// `PipelineDesc::flags` bits.
+pub mod pipeline_flags {
+    /// precise math (`precise_math: true`): the backend compiles the program without fast
+    /// math (no fma contraction or reassociation, IEEE division and sqrt where it can), so a
+    /// data pass can match a CPU reference bit for bit
+    pub const PRECISE: u32 = 1;
 }
 
 /// `PipelineDesc::blend` bits.

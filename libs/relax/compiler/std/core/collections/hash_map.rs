@@ -1,5 +1,5 @@
 //! HashMap over the open-addressing RawTable. Same API and semantics as real std's, except
-//! iteration order (deterministic here, see hash/fast.rs).
+//! iteration order (per process and map as in real std, but a different hash: see hash/fast.rs).
 
 use super::raw_table::{next_full, RawTable};
 use crate::borrow::Borrow;
@@ -11,6 +11,7 @@ use crate::ops::Index;
 
 pub use crate::hash::{DefaultHasher, RandomState};
 
+#[rustc_insignificant_dtor]
 pub struct HashMap<K, V, S = RandomState> {
     table: RawTable<(K, V)>,
     hash_builder: S,
@@ -486,6 +487,9 @@ impl<'a, K: fmt::Debug, V: fmt::Debug> fmt::Debug for Iter<'a, K, V> {
     }
 }
 
+// library/std/src/collections/hash/map.rs: IterMut holds `&mut` entries
+unsafe impl<K: Send, V: Send> Send for IterMut<'_, K, V> {}
+unsafe impl<K: Sync, V: Sync> Sync for IterMut<'_, K, V> {}
 pub struct IterMut<'a, K: 'a, V: 'a> {
     table: *mut RawTable<(K, V)>,
     pos: usize,

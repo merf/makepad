@@ -17,9 +17,11 @@ use super::pipeline::{Program, Shaders, KERNEL_UAV_SLOTS};
 use super::resources::{shape, Texture};
 use super::{D3d11, Tex};
 use crate::backend::exec::{self, LentState};
-use crate::buffers::{id_at, read_ids, read_pairs, CmdView};
+use super::chain::Layered;
+use super::dcomp::{self, Item, Segment};
+use crate::buffers::{id_at, read_ids, read_pairs, read_rects, CmdView};
 use crate::ledger::Kind;
-use crate::session::{LentRef, Session, TextureObj};
+use crate::session::{LentRef, Session, TextureObj, HOST};
 use crate::types::*;
 use makepad_windows_sys::Win32::Foundation::RECT;
 use makepad_windows_sys::Win32::Graphics::Direct3D::D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
@@ -147,7 +149,129 @@ struct Prepared {
     index_count: u32,
 }
 
+/// The target of an upper segment's pass: its image and the window pixel of its top left.
+#[derive(Clone)]
+pub(super) struct SegTarget {
+    pub origin: [f32; 2],
+    pub tex: Arc<Texture>,
+    /// the pass's depth format at the segment's size (D3D11 binds equal-sized targets only)
+    pub depth: Option<Arc<Texture>>,
+}
+
+/// A window pass split around its native layers: what the present places and commits, and the
+/// upper draw ranges the retained image gets once seg0 was presented.
+pub(super) struct Split {
+    pass: Pass,
+    layers: Vec<(Layer, Vec<[f32; 4]>)>,
+    uppers: Vec<(Segment, Arc<Texture>)>,
+    order: Vec<Item>,
+    retain: Vec<Range>,
+}
+
+/// The pixel bounds of a draw range in the window (`full` for a draw without finite bounds).
+fn bounds(draws: &[Draw], full: [f32; 4]) -> Option<[f32; 4]> {
+    let mut b = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
+    for d in draws {
+        let r = d.bounds;
+        if r.iter().any(|v| !v.is_finite()) { return Some(full); }
+        if r[2] <= 0.0 || r[3] <= 0.0 { continue; }
+        b[0] = b[0].min(r[0]); b[1] = b[1].min(r[1]);
+        b[2] = b[2].max(r[0] + r[2]); b[3] = b[3].max(r[1] + r[3]);
+    }
+    let x = b[0].floor().max(0.0);
+    let y = b[1].floor().max(0.0);
+    let w = b[2].ceil().min(full[2]) - x;
+    let h = b[3].ceil().min(full[3]) - y;
+    (w > 0.0 && h > 0.0).then_some([x, y, w, h])
+}
+
+fn range_draws(all: &[Draw], r: Range) -> &[Draw] {
+    slice(r, all.len()).map_or(&all[0..0], |r| &all[r])
+}
+
+/// At most this many native layers per window are composited.
+const NATIVE_BUDGET: usize = 4;
+
 impl D3d11 {
+    /// A window pass with native layers: seg0's draws into the window's retained image, each
+    /// non-empty upper segment's draws into its own image at its bounds (transparent, depth
+    /// cleared). Records past the budget are answered unsupported and drawn as nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_split(&mut self, s: &mut Session, target: Id, pass: &Pass, records: &[Layer], view: &CmdView, now: u64,
+        deps: &mut Vec<LentRef>) -> Result<(Option<Arc<Texture>>, Split), String> {
+        let sid = s.id;
+        let mut rejected = Vec::new();
+        let (natives, ranges) = dcomp::split(records, pass.draws, NATIVE_BUDGET, |id| rejected.push(id));
+        for id in rejected {
+            if self.over_budget.insert((sid, id)) {
+                eprintln!("[hal-d3d11] window {sid}:{} layer {} exceeds the four-layer compositor budget; unsupported placeholder", target.index, id.index);
+                s.events.native_layer_state(id, crate::native_layer::state::REALIZED, crate::native_layer::mode::UNSUPPORTED, 0, b"composited native layer budget (4) exceeded");
+            }
+        }
+        for g in &natives {
+            self.over_budget.remove(&(sid, g.native));
+        }
+        let image = self.encode_pass(s, target, true, false, pass, range_draws(view.draws, ranges[0]), view, now, deps)?;
+        self.give_back_shared();
+        let full = [0.0, 0.0, pass.viewport[2], pass.viewport[3]];
+        let mut uppers = Vec::new();
+        let mut order = Vec::new();
+        let mut retain = Vec::new();
+        for (gap, range) in ranges.iter().enumerate().skip(1) {
+            order.push(Item::Native((sid, natives[gap - 1].native)));
+            let draws = range_draws(view.draws, *range);
+            let Some(mut rect) = bounds(draws, full) else { continue };
+            // sizes in steps of 64 pixels: a growing popup does not remake its image every frame
+            rect[2] = ((rect[2] / 64.0).ceil() * 64.0).min(full[2] - rect[0]);
+            rect[3] = ((rect[3] / 64.0).ceil() * 64.0).min(full[3] - rect[1]);
+            let size = [rect[2] as u32, rect[3] as u32];
+            let key = (sid, target.index, gap);
+            let tex = match self.segments.get(&key).filter(|t| [t.desc.w, t.desc.h] == size) {
+                Some(t) => t.clone(),
+                None => {
+                    let t = Texture::new(self.dev.clone(), TextureObj { format: format::BGRA8, w: size[0], h: size[1], depth: 1, mips: 1,
+                        usage: usage::RENDER_TARGET | usage::SAMPLED, bytes: 0, imported: false, uploaded: 0, lent: None })?;
+                    self.segments.insert(key, t.clone());
+                    t
+                }
+            };
+            let depth = if pass.depth.is_none() {
+                None
+            } else {
+                let source = self.resolve(s, pass.depth).ok_or("missing depth texture")?;
+                match self.segment_depths.get(&key).filter(|t| [t.desc.w, t.desc.h] == size && t.desc.format == source.desc.format) {
+                    Some(t) => Some(t.clone()),
+                    None => {
+                        let t = Texture::new(self.dev.clone(), TextureObj { w: size[0], h: size[1], depth: 1, mips: 1, bytes: 0, imported: false, uploaded: 0, lent: None, ..source.desc.clone() })?;
+                        self.segment_depths.insert(key, t.clone());
+                        Some(t)
+                    }
+                }
+            };
+            let mut upper = *pass;
+            upper.load[0] = pass_load::CLEAR;
+            upper.clear[0] = [0.0; 4];
+            upper.load[4] = pass_load::CLEAR;
+            self.segment = Some(SegTarget { origin: [rect[0], rect[1]], tex: tex.clone(), depth });
+            let encoded = self.encode_pass(s, target, true, false, &upper, draws, view, now, deps);
+            self.segment = None;
+            self.give_back_shared();
+            if let Err(e) = encoded {
+                // seg0 still shows; this segment sits the frame out
+                eprintln!("[hal-d3d11] window {sid}:{} segment {gap}: {e}", target.index);
+                continue;
+            }
+            order.push(Item::Segment(gap));
+            uppers.push((Segment { gap, rect }, tex));
+            retain.push(*range);
+        }
+        let used = |k: &(u32, u32, usize)| (k.0, k.1) != (sid, target.index) || order.contains(&Item::Segment(k.2));
+        self.segments.retain(|k, _| used(k));
+        self.segment_depths.retain(|k, _| used(k));
+        let layers = natives.iter().map(|g| (*g, read_rects(view.arena, g.occluders).collect())).collect();
+        Ok((image, Split { pass: *pass, layers, uppers, order, retain }))
+    }
+
     /// Takes a cross-process image for this pass (once); true for every other texture.
     fn take_shared(&mut self, t: &Arc<Texture>) -> bool {
         let Some(sh) = &t.shared else { return true };
@@ -256,12 +380,35 @@ impl D3d11 {
         Ok(tex)
     }
 
+    /// A window with a badge layer reads as it was last presented: with the layer.
     pub(super) fn window_image(&mut self, s: &mut Session, id: Id) -> Option<Arc<Texture>> {
         if let Some(em) = s.windows.get(s.id, id).ok().and_then(|w| w.val.embedded) {
             return self.resolve(s, em.tex);
         }
         let (sid, id) = self.window_key(s.id, id);
+        if let Some(Some(composed)) = self.badged.get(&id.index).filter(|_| sid == HOST) {
+            if composed.gen == id.gen { return Some(composed.tex.clone()); }
+        }
         self.win.get(&(sid, id.index)).filter(|t| t.gen == id.gen).map(|t| t.tex.clone())
+    }
+
+    /// The image a badge layer frame of host window `key` draws into: the window's retained image
+    /// copied into the window's composed image (made at its size). `None`: nothing rendered yet.
+    fn begin_compose(&mut self, key: (u32, Id)) -> Option<Arc<Texture>> {
+        let base = self.win.get(&(key.0, key.1.index)).filter(|t| t.gen == key.1.gen)?.tex.clone();
+        let fits = |c: &Tex| c.gen == key.1.gen && [c.tex.desc.w, c.tex.desc.h] == [base.desc.w, base.desc.h];
+        let composed = match self.badged.get(&key.1.index)?.as_ref().filter(|c| fits(c)) {
+            Some(c) => c.tex.clone(),
+            None => {
+                let tex = Texture::new(self.dev.clone(), TextureObj { format: format::BGRA8, w: base.desc.w, h: base.desc.h, depth: 1, mips: 1,
+                    usage: usage::RENDER_TARGET | usage::SAMPLED, bytes: 0, imported: false, uploaded: 0, lent: None })
+                    .map_err(|e| eprintln!("[hal-d3d11] badge layer image: {e}")).ok()?;
+                self.badged.insert(key.1.index, Some(Tex { gen: key.1.gen, tex: tex.clone() }));
+                tex
+            }
+        };
+        unsafe { self.dev.ctx.CopyResource(composed.res.as_ID3D11Resource(), base.res.as_ID3D11Resource()) };
+        Some(composed)
     }
 
     /// A 1x1 texture of a shape, sampled where a draw names no texture.
@@ -313,6 +460,35 @@ impl D3d11 {
         s.stats.max_frame_ns = s.stats.max_frame_ns.max(packet.meta.build_end_ns.saturating_sub(packet.meta.build_start_ns));
         let is_window = kind & !target::FLAGS == target::WINDOW;
         let pick = kind & target::PICK != 0;
+        let replay = kind & target::REPLAY != 0;
+        let key = self.window_key(sid, target);
+        // a window with a badge layer: its frames stay in the retained image, the layer's frame
+        // (`target::BADGES`, from the executor right after) composes and presents it
+        let layered = is_window && !pick && key.0 == HOST && self.badged.contains_key(&key.1.index);
+        let badges = layered && kind & target::BADGES != 0;
+        if badges {
+            self.compose = self.begin_compose(key);
+            // an opaque panel (`target::OVERLAY`) needs nothing under it: with no frame of the
+            // window kept yet (an app parked before it drew under the layer) the window's
+            // retained image is made at the panel's size and composed over as it is
+            if self.compose.is_none() && kind & target::OVERLAY != 0 {
+                if let Some(v) = view.passes[pr.clone()].first().map(|p| p.viewport) {
+                    let size = [(v[0] + v[2]).ceil().max(1.0) as u32, (v[1] + v[3]).ceil().max(1.0) as u32];
+                    if self.window_storage(s, target, size, now).is_ok() {
+                        self.compose = self.begin_compose(key);
+                    }
+                }
+            }
+            if self.compose.is_none() {
+                // nothing rendered yet to draw the layer over
+                if !replay {
+                    let mut batch = std::mem::take(&mut self.batch);
+                    batch.tickets.push(Ticket::Frame { token: Self::token(s), target, kind, frame: packet.frame, window: false, timer: None });
+                    self.complete.submit(batch);
+                }
+                return Some(exec::SubmittedFrame { deps: Vec::new(), window: false });
+            }
+        }
         let mut deps = Vec::new();
         let mut window_image = None;
         let mut batch = std::mem::take(&mut self.batch);
@@ -320,19 +496,43 @@ impl D3d11 {
         // tools listening (PIX, RenderDoc, Nsight) see each pass as an event named after it
         let annotating = self.dev.annotating();
         // the frame's GPU span: a disjoint query around two timestamps
-        let timer = self.complete.timers.take(&self.dev);
+        let timer = if replay { None } else { self.complete.timers.take(&self.dev) };
         if let Some(t) = &timer {
             unsafe {
                 self.dev.ctx.Begin(t.disjoint.as_ID3D11Asynchronous());
                 self.dev.ctx.End(t.begin.as_ID3D11Asynchronous());
             }
         }
-        for pass in &view.passes[pr] {
+        // a window frame with native layers splits its window pass into segments (`dcomp`);
+        // offscreen, embedded, hosted, lent and badged windows draw them all into seg0
+        let records = slice(packet.layers, view.layers.len()).map_or(&[][..], |r| &view.layers[r]);
+        // a lent window (`makepad run`) composites in its host's tree with its own layers
+        let native = is_window && !pick && !replay && !layered && self.shell.is_some()
+            && s.windows.get(sid, target).is_ok_and(|w| w.val.embedded.is_none() && !w.val.is_hosted());
+        if !records.is_empty() && !native && self.native_fallback.insert((sid, target)) {
+            eprintln!("[hal-d3d11] window {sid}:{} draws its native layers' slots only (offscreen, embedded, hosted or badged)", target.index);
+        }
+        // the window pass the records split: the colour-less pass whose draws hold every record's
+        let split_pass = if native && !records.is_empty() {
+            let inside = |p: &Pass| records.iter().all(|g| g.kind != Layer::DRAWS
+                || (g.draws.off >= p.draws.off && g.draws.off as u64 + g.draws.len as u64 <= p.draws.off as u64 + p.draws.len as u64));
+            let found = view.passes[pr.clone()].iter().position(|p| p.color.iter().all(|c| c.is_none()) && inside(p));
+            if found.is_none() {
+                eprintln!("[hal-d3d11] window {sid}:{}: native layer records outside the window pass", target.index);
+                s.bad();
+            }
+            found
+        } else {
+            None
+        };
+        let mut split: Option<Split> = None;
+        for (pass_index, pass) in view.passes[pr].iter().enumerate() {
             let event = annotating && !pick && s.string(pass.name).is_some_and(|name| !name.is_empty());
             if event {
                 self.dev.begin_event(s.string(pass.name).unwrap_or(""));
             }
-            self.encode_frame_pass(s, sid, target, is_window, pick, pass, view, now, &mut deps, &mut window_image);
+            let split_here = (split_pass == Some(pass_index)).then_some(records);
+            self.encode_frame_pass(s, sid, target, is_window, pick, pass, view, now, &mut deps, &mut window_image, split_here, &mut split);
             if event {
                 self.dev.end_event();
             }
@@ -342,11 +542,35 @@ impl D3d11 {
             if let Some(image) = window_image {
                 let embedded = s.windows.get(sid, target).is_ok_and(|w| w.val.embedded.is_some());
                 let hosted = s.windows.get(sid, target).is_ok_and(|w| w.val.is_hosted());
-                if embedded {
+                if embedded || (layered && !badges) {
                     presented = true;
                 } else if !hosted {
-                    let key = self.window_key(sid, target);
-                    presented = self.present(key, &image);
+                    // a native frame without layers still retires the window's previous ones;
+                    // a badge composition (not native) keeps them as they were
+                    let layers = match &split {
+                        Some(sp) => Some(Layered { session: sid, layers: &sp.layers, uppers: &sp.uppers, order: &sp.order }),
+                        None if native => Some(Layered { session: sid, layers: &[], uppers: &[], order: &[] }),
+                        None => None,
+                    };
+                    presented = self.present(key, &image, layers);
+                    if self.chains.take_retry() {
+                        // a surface update failed short of a device loss: the app draws again
+                        // on its next frame (the window keeps its last picture meanwhile)
+                        s.events.redraw(target, false);
+                    }
+                }
+                // the retained image holds every Makepad segment (what captures and snapshots
+                // read): the upper segments' draws go over seg0 there once it was presented
+                if let Some(sp) = split.take() {
+                    for range in sp.retain {
+                        let mut pass = sp.pass;
+                        pass.load[0] = pass_load::LOAD;
+                        pass.load[4] = pass_load::CLEAR;
+                        let draws = &view.draws[slice(range, view.draws.len()).unwrap_or(0..0)];
+                        let encoded = self.encode_pass(s, target, true, false, &pass, draws, view, now, &mut deps);
+                        self.give_back_shared();
+                        if let Err(e) = encoded { eprintln!("[hal-d3d11] retained segment: {e}"); }
+                    }
                 }
                 if kind & target::CAPTURE != 0 {
                     self.capture(s, target, &image);
@@ -359,16 +583,20 @@ impl D3d11 {
                 self.dev.ctx.End(t.disjoint.as_ID3D11Asynchronous());
             }
         }
-        batch.tickets.push(Ticket::Frame { token: Self::token(s), target, kind, frame: packet.frame, window: presented, timer });
+        self.compose = None;
+        if !replay {
+            batch.tickets.push(Ticket::Frame { token: Self::token(s), target, kind, frame: packet.frame, window: presented, timer });
+        }
         self.complete.submit(batch);
         Some(exec::SubmittedFrame { deps, window: presented })
     }
 
     /// One pass of a frame: a compute pass's dispatches, or a render pass (its window image,
-    /// if it drew one, into `window_image`).
+    /// if it drew one, into `window_image`). `split_here`: the native layer records that split
+    /// this window pass into segments (`encode_split`, its segments into `split`).
     #[allow(clippy::too_many_arguments)]
     fn encode_frame_pass(&mut self, s: &mut Session, sid: u32, target: Id, is_window: bool, pick: bool, pass: &Pass, view: &CmdView, now: u64,
-        deps: &mut Vec<LentRef>, window_image: &mut Option<Arc<Texture>>) {
+        deps: &mut Vec<LentRef>, window_image: &mut Option<Arc<Texture>>, split_here: Option<&[Layer]>, split: &mut Option<Split>) {
         if pass.is_compute() {
             // a pick replay draws ids: kernels and their writes are not run again
             if !pick {
@@ -384,7 +612,13 @@ impl D3d11 {
         let before = s.stats.skipped_draws;
         let missing = pick && draws.iter().any(|d| read_ids(view.arena, d.pick_tex).any(|t| self.pick_pending.contains(&(sid, t))));
         let mut failed = false;
-        let encoded = self.encode_pass(s, target, is_window, pick, pass, draws, view, now, deps);
+        let encoded = match split_here {
+            Some(records) => self.encode_split(s, target, pass, records, view, now, deps).map(|(image, sp)| {
+                *split = Some(sp);
+                image
+            }),
+            None => self.encode_pass(s, target, is_window, pick, pass, draws, view, now, deps),
+        };
         // whatever happened, no shared image stays held past its pass
         self.give_back_shared();
         match encoded {
@@ -424,7 +658,20 @@ impl D3d11 {
         if v.iter().any(|v| !v.is_finite() || *v < 0.0) || v[2] <= 0.0 || v[3] <= 0.0 {
             return Err("invalid pass viewport".into());
         }
-        let size = [(v[0] + v[2]).ceil() as u32, (v[1] + v[3]).ceil() as u32];
+        let mut size = [(v[0] + v[2]).ceil() as u32, (v[1] + v[3]).ceil() as u32];
+        // an upper segment renders the window's draws into its own image at its rect
+        let segment = self.segment.clone().filter(|_| is_window && !pick);
+        let v = match &segment {
+            Some(seg) => {
+                size = [seg.tex.desc.w, seg.tex.desc.h];
+                [v[0] - seg.origin[0], v[1] - seg.origin[1], v[2], v[3]]
+            }
+            None => v,
+        };
+        // a badge layer is drawn over what the window has (a resize may be landing)
+        if let Some(c) = self.compose.as_ref().filter(|_| is_window) {
+            size = [size[0].min(c.desc.w), size[1].min(c.desc.h)];
+        }
         let mut colors: Vec<(usize, Arc<Texture>)> = Vec::new();
         let mut window = None;
         for (i, id) in pass.color.iter().enumerate().filter(|(_, id)| !id.is_none()) {
@@ -439,22 +686,34 @@ impl D3d11 {
         if hosted {
             window = Some(colors.iter().find(|(i, _)| *i == 0).ok_or("hosted window requires color attachment zero")?.1.clone());
         }
-        if colors.is_empty() && is_window {
+        if let Some(seg) = segment.as_ref().filter(|_| colors.is_empty()) {
+            colors.push((0, seg.tex.clone()));
+        } else if colors.is_empty() && is_window {
             let embedded = s.windows.get(s.id, target).ok().and_then(|w| w.val.embedded);
             let tex = match embedded {
                 Some(em) => self.resolve(s, em.tex).ok_or("missing embedded window storage")?,
-                None => self.window_storage(s, target, size, now)?,
+                None => match self.compose.clone() {
+                    Some(composed) => composed,
+                    None => self.window_storage(s, target, size, now)?,
+                },
             };
             window = Some(tex.clone());
             colors.push((0, tex));
         }
-        let depth = if pass.depth.is_none() { None } else { Some(self.resolve(s, pass.depth).ok_or("missing depth texture")?) };
+        let depth = if pass.depth.is_none() {
+            None
+        } else if let Some(d) = segment.as_ref().and_then(|seg| seg.depth.clone()) {
+            Some(d)
+        } else {
+            Some(self.resolve(s, pass.depth).ok_or("missing depth texture")?)
+        };
         if colors.is_empty() && depth.is_none() {
             return Err("pass has no attachments".into());
         }
         for (i, color) in &colors {
-            if color.desc.usage & usage::RENDER_TARGET == 0 || format::is_depth(color.desc.format) || pass.layer[*i] >= color.desc.depth.max(1)
-                || size[0] > color.desc.w || size[1] > color.desc.h {
+            let [w, h] = plane_size(color, pass.layer[*i]);
+            if color.desc.usage & usage::RENDER_TARGET == 0 || format::is_depth(color.desc.format) || pass.layer[*i] >= color.desc.depth.max(1).max(format::planes(color.desc.format))
+                || size[0] > w || size[1] > h {
                 return Err(format!("invalid color attachment {i}: pass {size:?} target {}x{}", color.desc.w, color.desc.h));
             }
         }
@@ -471,8 +730,8 @@ impl D3d11 {
                 return Err("a shared image is in use by the other process; the frame is retried".into());
             }
         }
-        let target_size = [colors.iter().map(|(_, c)| c.desc.w).chain(depth.iter().map(|d| d.desc.w)).min().unwrap(),
-            colors.iter().map(|(_, c)| c.desc.h).chain(depth.iter().map(|d| d.desc.h)).min().unwrap()];
+        let target_size = [colors.iter().map(|(i, c)| plane_size(c, pass.layer[*i])[0]).chain(depth.iter().map(|d| d.desc.w)).min().unwrap(),
+            colors.iter().map(|(i, c)| plane_size(c, pass.layer[*i])[1]).chain(depth.iter().map(|d| d.desc.h)).min().unwrap()];
 
         // ---- lay out the draws' transient bytes
         let mut sc = std::mem::take(&mut self.scratch);
@@ -950,7 +1209,11 @@ impl D3d11 {
         let scissor = if d.scissor.iter().any(|n| n.is_nan()) {
             RECT { left: 0, top: 0, right: target_size[0] as i32, bottom: target_size[1] as i32 }
         } else {
-            let [x, y, w, h] = d.scissor;
+            let [mut x, mut y, w, h] = d.scissor;
+            if let Some(seg) = &self.segment {
+                x -= seg.origin[0];
+                y -= seg.origin[1];
+            }
             let x0 = x.max(0.0).min(target_size[0] as f32) as i32;
             let y0 = y.max(0.0).min(target_size[1] as f32) as i32;
             let x1 = (x + w).max(x0 as f32).min(target_size[0] as f32) as i32;
@@ -983,5 +1246,15 @@ impl D3d11 {
             index_first: d.index[0],
             index_count: d.index[1],
         }))
+    }
+}
+
+/// The size of the plane a pass renders into: an NV12 texture's chroma (layer 1) is half its
+/// size both ways; any other layer is the texture's size.
+fn plane_size(t: &Texture, layer: u32) -> [u32; 2] {
+    if t.desc.format == format::NV12 && layer == 1 {
+        [t.desc.w / 2, t.desc.h / 2]
+    } else {
+        [t.desc.w, t.desc.h]
     }
 }

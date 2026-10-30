@@ -85,6 +85,26 @@ impl ScriptVm<'_> {
         req.text = message;
         self.bx.vm_errors(&mut req);
     }
+    /// A WARNING raised by host code at the current script ip: a value it coerced with a defined
+    /// meaning (`lit: true` read as 1). The log gets it once per site and `makepad inspect <app>
+    /// script errors` lists it per site with its count; it never enters the error capture, so it
+    /// never refuses an evaluation. The text says what was wrong and what to write; the script
+    /// location is added.
+    #[inline(always)]
+    pub fn push_diagnostic(&mut self, message: &str) {
+        let mut req = ScriptErrorsReq::new(ERR_PUSH_DIAGNOSTIC);
+        req.text = message;
+        self.bx.vm_errors(&mut req);
+    }
+    /// An ERROR raised by host code at the current script ip: a value it cannot read at all
+    /// (`size: [1, 2, 3]` for a vec3). Like [`Self::push_diagnostic`], and the active capture gets
+    /// it (once), so a host that refuses an evaluation on captured errors refuses this one.
+    #[inline(always)]
+    pub fn push_diagnostic_error(&mut self, message: &str) {
+        let mut req = ScriptErrorsReq::new(ERR_PUSH_DIAGNOSTIC_ERROR);
+        req.text = message;
+        self.bx.vm_errors(&mut req);
+    }
     /// Captures a message only if the active capture does not already contain it.
     #[inline(always)]
     pub fn push_captured_error_once(&mut self, message: &str) {
@@ -550,6 +570,18 @@ impl ScriptVm<'_> {
             }
             None => false,
         }
+    }
+
+    /// The whole source text of the body holding `ip` and the file line its first line is
+    /// (so `ip_to_loc(ip).line - that` is the 0-based line in the text).
+    #[inline(always)]
+    pub fn body_text(&self, ip: ScriptIp) -> Option<(u32, String)> {
+        let mut text = String::new();
+        let mut sink = ScriptQuerySink::new();
+        let mut out = ScriptTextOut::new(&mut text);
+        sink.text0(&mut out);
+        let answer = self.bx.code_ref().query(QUERY_BODY_TEXT, &mut sink, |req| req.ip = ip);
+        answer.found.then(|| (answer.at.line, text))
     }
 
     /// See [`Self::fn_text_into`] (`source` false).

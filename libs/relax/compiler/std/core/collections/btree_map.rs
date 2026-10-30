@@ -11,6 +11,7 @@ use crate::marker::PhantomData;
 
 use crate::ops::{Bound, Index, RangeBounds};
 
+#[rustc_insignificant_dtor]
 pub struct BTreeMap<K, V> {
     tree: Tree,
     _marker: PhantomData<(K, V)>,
@@ -25,11 +26,11 @@ impl<K, V> BTreeMap<K, V> {
         BTreeMap { tree: Tree::new(), _marker: PhantomData, len: 0 }
     }
 
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.len
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
 
@@ -436,7 +437,7 @@ impl<'a, K, V> Drop for DropRemaining<'a, K, V> {
     fn drop(&mut self) { self.map.drop_all(); }
 }
 
-impl<K, V> Drop for BTreeMap<K, V> {
+unsafe impl<#[may_dangle] K, #[may_dangle] V> Drop for BTreeMap<K, V> {
     fn drop(&mut self) {
         let guard = DropRemaining { map: self };
         guard.map.drop_all();
@@ -1143,3 +1144,27 @@ unsafe impl<'a, K: Send, V: Send> Send for VacantEntry<'a, K, V> {}
 unsafe impl<'a, K: Sync, V: Sync> Sync for VacantEntry<'a, K, V> {}
 unsafe impl<'a, K: Send, V: Send, F: Send> Send for ExtractIf<'a, K, V, F> {}
 unsafe impl<'a, K: Sync, V: Sync, F: Sync> Sync for ExtractIf<'a, K, V, F> {}
+
+// alloc/src/collections/btree/map.rs: the borrowing iterators print their remaining items
+// (matrix-sdk-crypto's `debug!(users = ?request.device_keys.keys())`)
+impl<K: fmt::Debug, V> fmt::Debug for Keys<'_, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.clone()).finish()
+    }
+}
+
+impl<K, V: fmt::Debug> fmt::Debug for Values<'_, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.clone()).finish()
+    }
+}
+
+impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for Range<'_, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut l = f.debug_list();
+        for (k, v) in self.clone() {
+            l.entry(&super::KvDebug(k, v));
+        }
+        l.finish()
+    }
+}

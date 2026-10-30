@@ -890,6 +890,14 @@ impl MenuBar {
         true
     }
 
+    /// The width the titles take: the pad, each pill and the gaps between
+    /// them, as [`Self::draw_titles`] lays them out.
+    fn titles_width(&self, cx: &mut Cx2d) -> f64 {
+        let pills: f64 = self.defs.iter().map(|menu| measure(&self.draw_title_text, cx, &menu.label).x + self.title_pad_x * 2.0).sum();
+        let gaps = self.title_gap * self.defs.len().saturating_sub(1) as f64;
+        self.bar_pad_x * 2.0 + pills + gaps
+    }
+
     fn draw_titles(&mut self, cx: &mut Cx2d, rect: Rect) {
         self.title_rects.clear();
         let title_height = self.title_height.min(rect.size.y);
@@ -1152,10 +1160,22 @@ impl MenuBar {
 }
 
 impl Widget for MenuBar {
+    fn semantics(&self, cx: &Cx, node: &mut a11y_tree::Node) {
+        let _ = cx;
+        node.role = a11y_tree::Role::MenuBar;
+        makepad_platform::a11y::set_string(&mut node.name, &self.text());
+    }
+
     fn draw_walk(&mut self, cx: &mut Cx2d, _scope: &mut Scope, walk: Walk) -> DrawStep {
         let mut walk = walk;
         if !matches!(walk.height, Size::Fixed(_)) {
             walk.height = Size::Fixed(self.bar_height);
+        }
+        // A leaf has no content for the turtle to fit: a `Fit` bar is as
+        // wide as its titles (else its rect, and every sibling after it in
+        // the parent's flow, would have no size).
+        if matches!(walk.width, Size::Fit { .. }) {
+            walk.width = Size::Fixed(self.titles_width(cx));
         }
         let rect = cx.walk_turtle(walk);
         self.bar_rect = rect;

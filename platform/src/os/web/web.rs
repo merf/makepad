@@ -1,3 +1,4 @@
+use makepad_relax::relax;
 use {
     self::super::{from_wasm::*, to_wasm::*, web_media::CxWebMedia},
     crate::{
@@ -258,6 +259,11 @@ impl Cx {
             match block_id {
                 live_id!(ToWasmInit) => {
                     let tw = ToWasmInit::read_to_wasm(&mut to_wasm);
+                    self.a11y.set_consumers(if tw.a11y_enabled {
+                        makepad_a11y::consumer::OS
+                    } else {
+                        0
+                    });
                     #[cfg(target_feature = "atomics")]
                     crate::web_alloc::prefill_main_thread_cache();
                     self.cpu_cores = (tw.cpu_cores as usize).max(1);
@@ -279,7 +285,9 @@ impl Cx {
                         tw.gpu_info.vendor,
                         tw.gpu_info.renderer,
                     );
-                    self.os_type = tw.browser_info.into();
+                    let mut browser_info = tw.browser_info;
+                    browser_info.search = super::web_embed::page_query(browser_info.search);
+                    self.os_type = browser_info.into();
                     self.xr_capabilities = tw.xr_capabilities.into();
                     let mut new_geom: WindowGeom = tw.window_info.into();
                     self.os.native_window_geom = new_geom.clone();
@@ -297,6 +305,36 @@ impl Cx {
                     self.redraw_all();
                 }
 
+                live_id!(ToWasmA11yState) => {
+                    let tw = ToWasmA11yState::read_to_wasm(&mut to_wasm);
+                    if self.a11y.set_consumers(if tw.enabled {
+                        makepad_a11y::consumer::OS
+                    } else {
+                        0
+                    }) {
+                        self.redraw_all();
+                    }
+                }
+                live_id!(ToWasmA11yAction) => {
+                    let tw = ToWasmA11yAction::read_to_wasm(&mut to_wasm);
+                    match makepad_a11y::wire::decode_action(tw.bytes.as_slice()) {
+                        Ok(request) => {
+                            if let Some(window) = self
+                                .windows
+                                .current_id_zero()
+                                .filter(|id| id.0 == tw.window as usize)
+                            {
+                                self.dispatch_a11y_action(window, request);
+                            } else {
+                                self.platform_ops.push_back(CxOsOp::A11yActionDone {
+                                    req: request.req,
+                                    result: makepad_a11y::ActionResult::NoSuchNode as u8,
+                                });
+                            }
+                        }
+                        Err(error) => crate::error!("web accessibility action: {error}"),
+                    }
+                }
                 live_id!(ToWasmResizeWindow) => {
                     let tw = ToWasmResizeWindow::read_to_wasm(&mut to_wasm);
                     if let Some(event) = self.windows.web_resize_window_geom(
@@ -312,6 +350,8 @@ impl Cx {
                 live_id!(ToWasmAnimationFrame) => {
                     let tw = ToWasmAnimationFrame::read_to_wasm(&mut to_wasm);
                     is_animation_frame = Some(tw.time);
+                    // A page without threads: this frame may run one deferred job.
+                    crate::thread::frame_jobs_new_frame();
                     if self.new_next_frames.len() != 0 {
                         self.call_next_frame_event(tw.time);
                     }
@@ -1027,6 +1067,13 @@ impl Cx {
             self.retire_webgl_resources();
             self.handle_repaint(time);
             self.poll_texture_lifetimes();
+            // The script heap's collection, once a frame when it is due, as
+            // the desktop loop runs it (the web loop never collected).
+            self.with_vm(|vm| {
+                if vm.heap().needs_gc() {
+                    vm.gc();
+                }
+            });
         }
 
         if network_responses.len() != 0 {
@@ -1100,6 +1147,7 @@ impl Cx {
     }
 
     fn handle_platform_ops(&mut self) {
+        self.native_layer_retire();
         while let Some(op) = self.platform_ops.pop_front() {
             match op {
                 CxOsOp::CreateWindow(window_id) => {
@@ -1200,7 +1248,21 @@ impl Cx {
                 CxOsOp::ShowSelectionHandles { .. } => {}
                 CxOsOp::UpdateSelectionHandles { .. } => {}
                 CxOsOp::HideSelectionHandles => {}
-                CxOsOp::AccessibilityUpdate(_) => {}
+                CxOsOp::A11yUpdate { window, bytes } => {
+                    if self.windows.current_id_zero() == Some(window) {
+                        self.os.from_wasm(FromWasmA11yUpdate {
+                            window: window.0 as u32,
+                            bytes: WasmDataU8::from_vec_u8(bytes),
+                        });
+                    }
+                }
+                CxOsOp::A11yActionDone { req, result } => {
+                    self.os.from_wasm(FromWasmA11yActionDone {
+                        req_lo: req as u32,
+                        req_hi: (req >> 32) as u32,
+                        result: result as u32,
+                    });
+                }
                 CxOsOp::StartDragging(items) => {
                     self.drag_drop.start_internal_drag(items);
                 }
@@ -1485,9 +1547,9 @@ impl Cx {
                     });
                 }
 
-                CxOsOp::AttachCameraNativePreview { .. }
-                | CxOsOp::UpdateCameraNativePreview { .. }
-                | CxOsOp::DetachCameraNativePreview { .. } => {}
+                CxOsOp::NativeLayerCreate { id, .. } => self.native_layer_event(id, crate::native_layer::NativeLayerEventKind::Realized(crate::native_layer::NativeLayerMode::Unsupported)),
+                CxOsOp::NativeLayerOp { .. } => {}
+                CxOsOp::NativeLayerDestroy { id } => self.native_layer_event(id, crate::native_layer::NativeLayerEventKind::Closed),
                 CxOsOp::SetVideoVolume(_, _) => {}
                 CxOsOp::SetVideoPlaybackRate(_, _) => {}
                 CxOsOp::PrepareAudioPlayback(_, _, _, _) => {}
@@ -1514,6 +1576,8 @@ impl Cx {
                     self.action(FileDialogAction::FileCancelled { id: dialog.id });
                     self.handle_actions();
                 }
+                // a page has no window chrome: the app-drawn caption's hit regions name nothing
+                CxOsOp::SetWindowCaption(..) => {}
                 e => {
                     crate::error!("Not implemented on this platform: CxOsOp::{:?}", e);
                 } /*
@@ -1555,6 +1619,8 @@ impl CxOsApi for Cx {
 
         self.os.append_to_wasm_js(&[
             ToWasmInit::to_js_code(),
+            ToWasmA11yState::to_js_code(),
+            ToWasmA11yAction::to_js_code(),
             ToWasmResizeWindow::to_js_code(),
             ToWasmAnimationFrame::to_js_code(),
             ToWasmTouchUpdate::to_js_code(),
@@ -1612,6 +1678,8 @@ impl CxOsApi for Cx {
 
         self.os.append_from_wasm_js(&[
             FromWasmStartTimer::to_js_code(),
+            FromWasmA11yUpdate::to_js_code(),
+            FromWasmA11yActionDone::to_js_code(),
             FromWasmStopTimer::to_js_code(),
             FromWasmFullScreen::to_js_code(),
             FromWasmNormalScreen::to_js_code(),
@@ -1658,6 +1726,7 @@ impl CxOsApi for Cx {
             FromWasmAllocTextureImage2D_Ru8::to_js_code(),
             FromWasmAllocTextureImage2D_RGBAf32::to_js_code(),
             FromWasmAllocTextureCube_BGRAu8_32::to_js_code(),
+            FromWasmAllocTextureArray_BGRAu8_32::to_js_code(),
             FromWasmBeginRenderTexture::to_js_code(),
             FromWasmRequestRenderTextureCapture::to_js_code(),
             FromWasmBeginRenderCanvas::to_js_code(),
@@ -1671,6 +1740,7 @@ impl CxOsApi for Cx {
             FromWasmQueryAudioDevices::to_js_code(),
             FromWasmStartAudioOutput::to_js_code(),
             FromWasmStopAudioOutput::to_js_code(),
+            FromWasmTestClock::to_js_code(),
             FromWasmQueryMidiPorts::to_js_code(),
             FromWasmPrepareVideoPlayback::to_js_code(),
             FromWasmBeginVideoPlayback::to_js_code(),
@@ -1749,6 +1819,16 @@ impl Cx {
 
     pub fn monotonic_now() -> f64 {
         unsafe { js_monotonic_now() }
+    }
+
+    /// A page opened with `?test=1` hands a test harness the app's media clock
+    /// (`FromWasmTestClock`: `globalThis.makepad_test_clock`); otherwise nothing.
+    pub fn web_test_clock(&mut self, film: f64, rendered: f64, speed: f64) {
+        let OsType::Web(params) = &self.os_type else { return };
+        if !params.search.trim_start_matches('?').split('&').any(|p| p == "test=1") {
+            return;
+        }
+        self.os.from_wasm(FromWasmTestClock { film, rendered, speed });
     }
 }
 
@@ -1854,6 +1934,9 @@ pub unsafe extern "C" fn wasm_get_js_message_bridge(cx_ptr: u32) -> u32 {
     let mut out = String::new();
 
     out.push_str("return {\n");
+    out.push_str("a11y: ");
+    out.push_str(&makepad_a11y::wire_js::javascript());
+    out.push_str(",\n");
     out.push_str("ToWasmMsg:class extends ToWasmMsg{\n");
     for to_wasm in &cx.os.to_wasm_js {
         out.push_str(to_wasm);
@@ -1886,6 +1969,7 @@ pub unsafe extern "C" fn wasm_check_signal() -> u32 {
 }
 
 #[export_name = "wasm_init_panic_hook"]
+#[relax(keep_reachable)]
 pub unsafe extern "C" fn init_panic_hook() {
     pub fn panic_hook(info: &panic::PanicHookInfo) {
         #[cfg(target_arch = "wasm32")]

@@ -21,7 +21,10 @@ use std::cell::{Cell, RefCell};
 pub struct InferCtxtInner {
     type_variable_storage: type_variable::TypeVariableStorage,
     region_constraint_storage: Option<region_constraints::RegionConstraintStorage>,
-    region_obligations: Vec<(TyId, RegionId)>,
+    region_obligations: Vec<(TyId, RegionId, u32)>,
+    /// rustc infer/mod.rs `hir_typeck_potentially_region_dependent_goals`: goals HIR typeck proved
+    /// that may depend on the identity of their regions (fulfill.rs); writeback records them.
+    hir_typeck_potentially_region_dependent_goals: Vec<crate::next_solver::fulfill::PredicateObligation>,
     opaque_type_storage: opaque_types::OpaqueTypeStorage,
     const_unification_storage: unify_key::ConstUnificationStorage,
     int_unification_storage: unify_key::IntUnificationStorage,
@@ -30,7 +33,7 @@ pub struct InferCtxtInner {
 }
 
 impl InferCtxtInner {
-    pub fn region_obligations(&self) -> &[(TyId, RegionId)] { &self.region_obligations }
+    pub fn region_obligations(&self) -> &[(TyId, RegionId, u32)] { &self.region_obligations }
     pub fn const_unification_table(&mut self) -> unify_key::ConstUnificationTable<'_> { self.const_unification_storage.with_log(&mut self.undo_log) }
     pub fn int_unification_table(&mut self) -> unify_key::IntUnificationTable<'_> { self.int_unification_storage.with_log(&mut self.undo_log) }
     pub fn float_unification_table(&mut self) -> unify_key::FloatUnificationTable<'_> { self.float_unification_storage.with_log(&mut self.undo_log) }
@@ -41,15 +44,22 @@ impl InferCtxtInner {
 
 pub struct InferCtxt<'a> {
     pub tcx: &'a Tcx,
-    pub typing_mode: TypingMode,
+    pub typing_mode: Cell<TypingMode>,
     pub recursion_limit: crate::tcx::RecursionLimit,
     pub skip_leak_check: bool,
-    pub enable_next_solver_overflow_fcw: bool,
     pub cause: crate::next_solver::fulfill::ObligationCause,
+    /// rustc `InferCtxt::in_hir_typeck`; set only for the bodies of checked crates (whose borrowck
+    /// can report from the goals it records).
+    pub in_hir_typeck: bool,
+    /// The span of the root obligation being proven (the solver's `origin_span`): the origin of the region obligations it registers.
+    pub origin_span: Cell<u32>,
     pub errors: diagnostics::DiagCtxt,
     pub(crate) diagnostic_checkpoint: diagnostics::DiagnosticCheckpoint,
     tainted: Cell<bool>,
     pub(crate) coherence_crate: Option<u32>,
+    /// The crate whose code is solved (`Program::crate_sees`): impls of crates outside its
+    /// dependency graph are not candidates. None = every crate (codegen of concrete types).
+    pub impl_view: Option<u32>,
     pub inner: RefCell<InferCtxtInner>,
     universe: Cell<UniverseIndex>,
     pub(crate) lexical_region_resolutions: RefCell<Option<lexical_region_resolve::LexicalRegionResolutions>>,
@@ -62,18 +72,36 @@ impl<'a> InferCtxt<'a> {
     pub fn tainted_by_errors(&self) -> bool { self.tainted.get() || self.errors.tainted_with_errors() }
     pub fn set_tainted_by_errors(&self) { self.tainted.set(true); }
     pub fn register_ty_outlives(&self, ty: TyId, region: RegionId) {
+        // rustc_infer outlives/obligations.rs register_type_outlives_constraint: a global type
+        // (no params, inference variables, placeholders or non-'static free regions) has no
+        // component lifetime checking cares about. Registering it anyway put a `T: 'static`
+        // into the response of every auto-trait goal of matrix-sdk's cyclic Client/Room graph,
+        // so no cycle head reached its fixpoint on the first pass (Robrix: 61k reruns, 16M goals).
+        if self.tcx.tys.is_global(ty) { return; }
         let mut inner = self.inner.borrow_mut();
-        inner.region_obligations.push((ty, region));
+        inner.region_obligations.push((ty, region, self.origin_span.get()));
         inner.undo_log.push(snapshot::undo_log::UndoLog::PushRegionObligation);
     }
+    /// rustc infer/mod.rs push_hir_typeck_potentially_region_dependent_goal.
+    pub fn push_hir_typeck_potentially_region_dependent_goal(&self, goal: crate::next_solver::fulfill::PredicateObligation) {
+        let mut inner = self.inner.borrow_mut();
+        inner.undo_log.push(snapshot::undo_log::UndoLog::PushHirTypeckPotentiallyRegionDependentGoal);
+        inner.hir_typeck_potentially_region_dependent_goals.push(goal);
+    }
+    pub fn take_hir_typeck_potentially_region_dependent_goals(&self) -> Vec<crate::next_solver::fulfill::PredicateObligation> {
+        let mut inner = self.inner.borrow_mut();
+        assert!(!inner.undo_log.in_snapshot());
+        std::mem::take(&mut inner.hir_typeck_potentially_region_dependent_goals)
+    }
     pub fn new(tcx: &'a Tcx, typing_mode: TypingMode, recursion_limit: crate::tcx::RecursionLimit) -> Self {
-        Self { tcx, typing_mode, recursion_limit, skip_leak_check: false, enable_next_solver_overflow_fcw: true, cause: Default::default(), errors: tcx.dcx.into_taintable(), diagnostic_checkpoint: tcx.dcx.checkpoint(), tainted: Cell::new(false), coherence_crate: None, inner: RefCell::new(InferCtxtInner { region_constraint_storage: Some(Default::default()), ..Default::default() }), lexical_region_resolutions: RefCell::new(None), universe: Cell::new(UniverseIndex::ROOT), canonicalizer_state: RefCell::new(Default::default()) }
+        Self { tcx, typing_mode: Cell::new(typing_mode), recursion_limit, skip_leak_check: false, cause: Default::default(), in_hir_typeck: false, origin_span: Cell::new(0), errors: tcx.dcx.into_taintable(), diagnostic_checkpoint: tcx.dcx.checkpoint(), tainted: Cell::new(false), coherence_crate: None, impl_view: None, inner: RefCell::new(InferCtxtInner { region_constraint_storage: Some(Default::default()), ..Default::default() }), lexical_region_resolutions: RefCell::new(None), universe: Cell::new(UniverseIndex::ROOT), canonicalizer_state: RefCell::new(Default::default()) }
     }
     pub fn for_item(tcx: &'a Tcx, prog: &crate::program::Program, typing_mode: TypingMode, def: crate::program::DefId) -> Self {
         let mut infcx = Self::new(tcx, typing_mode, crate::tcx::RecursionLimit::for_item(prog, def));
         if def != crate::program::NO_DEF {
             let d = prog.def(def);
             infcx.cause = crate::next_solver::fulfill::ObligationCause { span: prog.files[d.file as usize].ast.item(d.item).lo, body_id: def };
+            infcx.impl_view = Some(d.krate);
         }
         infcx
     }
@@ -165,14 +193,14 @@ impl<'a> InferCtxt<'a> {
         self.next_nll_region_var_in_universe(origin, self.universe())
     }
     pub fn next_nll_region_var_in_universe(&self, origin: crate::borrowck::region_infer::NllRegionVariableOrigin, universe: UniverseIndex) -> RegionId {
-        self.inner.borrow_mut().unwrap_region_constraints().new_region_var_with_origin(&self.tcx.tys, universe, region_constraints::RegionVariableOrigin::Nll(origin))
+        self.inner.borrow_mut().unwrap_region_constraints().new_region_var_with_origin(&self.tcx.tys, universe, region_constraints::RegionVariableOrigin::Nll(origin), self.origin_span.get())
     }
     pub fn num_region_vars(&self) -> usize { self.inner.borrow_mut().unwrap_region_constraints().num_region_vars() }
     pub fn region_var_origin(&self, vid: u32) -> region_constraints::RegionVariableOrigin { self.inner.borrow_mut().unwrap_region_constraints().var_origin(vid) }
     /// outlives/obligations.rs:201.
     pub fn take_registered_region_obligations(&self) -> Vec<(TyId, RegionId)> {
         assert!(!self.in_snapshot(), "cannot take registered region obligations in a snapshot");
-        std::mem::take(&mut self.inner.borrow_mut().region_obligations)
+        std::mem::take(&mut self.inner.borrow_mut().region_obligations).into_iter().map(|(t, r, _)| (t, r)).collect()
     }
     /// mod.rs take_and_reset_region_constraints.
     pub fn take_and_reset_region_constraints(&self) -> region_constraints::RegionConstraintData {
@@ -180,7 +208,7 @@ impl<'a> InferCtxt<'a> {
         self.inner.borrow_mut().unwrap_region_constraints().take_and_reset_data()
     }
     pub fn next_region_var_in_universe(&self, universe: UniverseIndex) -> RegionId {
-        self.inner.borrow_mut().unwrap_region_constraints().new_region_var(&self.tcx.tys, universe)
+        self.inner.borrow_mut().unwrap_region_constraints().new_region_var(&self.tcx.tys, universe, self.origin_span.get())
     }
 }
 

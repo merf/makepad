@@ -182,17 +182,22 @@ fn teardown_fixture_cycles_and_leaked_thread() {
         ..Default::default()
     })
     .is_err());
-    // Release only for test-process hygiene. A timeout's retained memory stays retained even
-    // after the thread subsequently ends; it must never be reclaimed by a delayed callback.
+    assert!(still_owned(domain).is_some_and(|why| why.contains("1 threads still alive: fixture-worker")));
+    // A timeout's retained memory stays retained even after the thread subsequently ends; it
+    // must never be reclaimed by a delayed callback. The ended run hands its id over (a
+    // relaunch): the new run gets a block of its own, the retired one stays mapped.
     flags[1].store(1, Ordering::SeqCst);
     wait(|| info(domain).unwrap().threads == 0);
+    assert!(wait_thread_done(domain, Duration::ZERO));
+    assert_eq!(still_owned(domain), None);
     assert!(blocks().contains(&base));
     assert_eq!(freed_by_teardown(), freed);
-    {
-        let mut ds = domains();
-        ds.iter_mut().find(|d| d.info.id == domain).unwrap().info.state = DomainState::Stopped;
-    }
-    teardown(domain);
+    assert_eq!(prepare(&AppSpec { id: Some(domain), ..Default::default() }), Ok(domain));
+    let fresh = info(domain).unwrap();
+    assert_eq!((fresh.base, fresh.threads), (0, 0));
+    assert!(matches!(fresh.state, DomainState::Compiling(_)));
+    assert!(blocks().contains(&base));
+    assert_eq!(freed_by_teardown(), freed);
     domains().retain(|d| d.info.id != domain);
     drop(u);
     std::fs::remove_dir_all(root).unwrap();
@@ -429,6 +434,102 @@ fn a_domain_worker_with_large_allocations_and_borrowed_field_matches() {
     stop_for(domain, Duration::from_secs(30)).unwrap();
     let dead = info(domain).unwrap();
     assert_eq!((dead.threads, dead.arena_in_use, dead.arena_committed), (0, 0, 0));
+    domains().retain(|d| d.info.id != domain);
+    drop(u);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+// Windows: the JIT's thread-local key lands past the TEB's 64 direct TlsSlots when the process
+// already used them up (a GPU driver loaded before Relax creates its key: box3d on a visible
+// window). The test uses up the direct slots before anything creates the key, then runs JIT code
+// that reads its thread-local block on the calling thread and on a new one (whose
+// TlsExpansionSlots array is still null: the slow path). Elsewhere it runs the same fixture.
+const TLS_FIXTURE: &str = r#"
+use std::cell::Cell;
+thread_local! { static N: Cell<u64> = const { Cell::new(0) }; }
+fn bump(k: u64) -> u64 {
+    N.with(|n| { n.set(n.get() + k); n.get() })
+}
+fn tls_fixture(p: *mut u64) {
+    let a = bump(3) + bump(4);
+    let b = std::thread::spawn(|| bump(5) + bump(6)).join().unwrap();
+    unsafe { *p = a * 100 + b; *p.add(1) = bump(0); }
+}
+"#;
+
+#[test]
+fn jit_tls_past_the_direct_slots() {
+    isolated_test!(jit_tls_past_the_direct_slots);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(windows)]
+    {
+        let mut last = 0;
+        while last < 64 {
+            last = unsafe { crate::os::win32::TlsAlloc() };
+            assert_ne!(last, u32::MAX, "TlsAlloc failed");
+        }
+    }
+    let (mut u, entry, root) = fixture_of(TLS_FIXTURE, "tls_fixture");
+    let out = [0u64; 2];
+    unsafe { crate::jit::call_jit(&mut *u, entry, out.as_ptr() as u64) }.unwrap_or_else(|p| panic!("{}", p.message));
+    assert_eq!(out, [10 * 100 + 16, 7]);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+// A callback the domain's code hands to native code runs on a thread native code owns (the HAL's
+// realtime audio thread): through foreign_enter it sees the domain's statics, not the default
+// domain's copy, and allocates in the domain's heap; foreign_leave puts the thread back.
+const FOREIGN_FIXTURE: &str = r#"
+use std::sync::atomic::{AtomicU64, Ordering};
+static TAPPED: AtomicU64 = AtomicU64::new(0);
+static mut LAST: Option<Box<[u8; 4096]>> = None;
+extern "C" fn tap(n: u64) {
+    unsafe { LAST = Some(Box::new([n as u8; 4096])); }
+    TAPPED.fetch_add(n, Ordering::SeqCst);
+}
+fn foreign(p: *mut u64) {
+    let a = unsafe { &*(p as *const [AtomicU64; 4]) };
+    let f: extern "C" fn(u64) = tap;
+    a[0].store(f as usize as u64, Ordering::SeqCst);
+    while TAPPED.load(Ordering::SeqCst) < 6 { std::thread::yield_now(); }
+    a[1].store(TAPPED.load(Ordering::SeqCst), Ordering::SeqCst);
+    a[2].store(unsafe { LAST.as_ref().map_or(0, |b| b[0] as u64) }, Ordering::SeqCst);
+}
+"#;
+
+#[test]
+fn foreign_thread_callback_sees_domain_statics() {
+    isolated_test!(foreign_thread_callback_sees_domain_statics);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut u, entry, root) = fixture_of(FOREIGN_FIXTURE, "foreign");
+    let flags = [const { AtomicU64::new(0) }; 4];
+    let (domain, base, main) = launch(&mut u, entry, None, &flags);
+    wait(|| flags[0].load(Ordering::SeqCst) != 0);
+    let tap: extern "C" fn(u64) = unsafe { std::mem::transmute(flags[0].load(Ordering::SeqCst) as usize) };
+    let scope = foreign_scope_of(base);
+    assert_ne!(scope, 0);
+    // a thread the program never started, as a device's callback thread
+    std::thread::spawn(move || {
+        for n in 1..=3 {
+            let saved = foreign_enter(scope);
+            assert_eq!(current(), base);
+            tap(n);
+            foreign_leave(saved);
+            assert_ne!(current(), base, "leave puts the thread back");
+            assert!(crate::zone_alloc::domain::current().is_null(), "and its heap");
+        }
+    })
+    .join()
+    .unwrap();
+    // (a callback that wrote the default domain's copy leaves the program waiting: the deadline fails it)
+    wait(|| flags[1].load(Ordering::SeqCst) != 0);
+    main.join().unwrap();
+    assert_eq!(flags[1].load(Ordering::SeqCst), 6, "the program saw every callback's write");
+    assert_eq!(flags[2].load(Ordering::SeqCst), 3);
+    wait(|| info(domain).is_some_and(|i| i.threads == 0 && i.base == 0));
+    assert!(!blocks().contains(&base));
+    // a stale scope enters nothing
+    assert_eq!(foreign_enter(scope).into_words()[2], 0);
     domains().retain(|d| d.info.id != domain);
     drop(u);
     std::fs::remove_dir_all(root).unwrap();

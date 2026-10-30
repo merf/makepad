@@ -35,6 +35,17 @@ impl WfPredicates<'_, '_> {
             let p = tcx.instantiate_predicate(self.prog, def, args, &p);
             if !predicate_has_escaping_bound_vars(&tcx.tys, &p) { self.out.push(Goal { param_env: self.env.clone(), predicate: p }); }
         }
+        // rustc `predicates_of` of an ADT includes its `inferred_outlives_of` (RFC 2093)
+        if tcx.adts.contains_key(&def) {
+            for p in crate::borrowck::implied_bounds::ImpliedBounds::inferred_outlives(tcx, self.prog, def) {
+                let kind = match p {
+                    crate::tcx::outlives::OutlivesPredicate::Region(a, b) => ClauseKind::RegionOutlives(a, b),
+                    crate::tcx::outlives::OutlivesPredicate::Type(t, r) => ClauseKind::TypeOutlives(t, r),
+                };
+                let p = tcx.instantiate_predicate(self.prog, def, args, &Predicate::dummy(PredicateKind::Clause(kind)));
+                if !predicate_has_escaping_bound_vars(&tcx.tys, &p) { self.out.push(Goal { param_env: self.env.clone(), predicate: p }); }
+            }
+        }
     }
     fn add_wf_preds_for_inherent_projection(&mut self, def: DefId, args: &[GenericArg], impl_format: bool) {
         let tcx = self.infcx.tcx;
@@ -96,6 +107,24 @@ impl TypeFolder for WfPredicates<'_, '_> {
                     } }
                 }
                 if *principal != crate::program::NO_DEF {
+                    // rustc's object type carries the projections its supertraits fix (dyn_trait.rs) and the walk of the
+                    // type visits their arguments (not the Self type): `dyn Cb<X>` with `trait Cb<T>: Fn(&Bar<T>, &T::V)` is
+                    // only well-formed if `Bar<X>` and `X::V` are. Relax derives them from the principal's supertraits.
+                    let mut implied = Vec::new();
+                    for q in tcx.supertraits(self.prog, predicates[0].clone()) {
+                        if let PredicateKind::Clause(ClauseKind::Projection(proj)) = &q.kind {
+                            if let Term::Ty(term) = proj.term { if tcx.mentions_ty(term, t) { continue; } }
+                            implied.push(proj.clone());
+                        }
+                    }
+                    for proj in implied {
+                        if let AliasTerm::Ty(alias) = proj.projection_term {
+                            if let TyKind::Alias(_, a) = tys.kind(alias) {
+                                for &x in &tys.list(a.args)[1..] { self.fold_ty(tys, x, depth); }
+                            }
+                        }
+                        match proj.term { Term::Ty(x) => { self.fold_ty(tys, x, depth); } Term::Const(c) => { self.fold_const(tys, c, depth); } }
+                    }
                     self.push(PredicateKind::DynCompatible(*principal));
                     let p = &predicates[0];
                     assert!(matches!(p.kind, PredicateKind::Clause(ClauseKind::Trait(_))));

@@ -463,9 +463,6 @@ pub struct MenuModel {
     pub warp_shelves: bool,
     /// Which shelves (left, right) auto-hide.
     pub shelf_autohide: [bool; 2],
-    /// Touchpad scrolling moves the content with the fingers (the Theme
-    /// menu's check row).
-    pub natural_scroll: bool,
     pub tap_to_click: bool,
     /// `Some(dark)` when the current style has a dark variant: the Theme
     /// menu then offers the appearance row.
@@ -488,7 +485,6 @@ impl Default for MenuModel {
             launchable: Default::default(),
             dock_rest: Vec::new(),
             dock_autohide: false,
-            natural_scroll: true,
             tap_to_click: false,
             warp_shelves: true,
             shelf_autohide: [false; 2],
@@ -578,11 +574,9 @@ impl MenuModel {
                 items.push(row);
             }
             // The direct backend reads the touchpad itself; elsewhere the OS owns the choice.
+            // (Natural scrolling lives with the devices: Display > Mouse & touchpad.)
             if cfg!(target_os = "linux") {
-                let mut row = MenuItem::new("desktop.natural-scroll", "Natural scrolling", MenuKind::Action).divided();
-                row.checked = self.natural_scroll;
-                items.push(row);
-                let mut row = MenuItem::new("desktop.tap-to-click", "Tap to click", MenuKind::Action);
+                let mut row = MenuItem::new("desktop.tap-to-click", "Tap to click", MenuKind::Action).divided();
                 row.checked = self.tap_to_click;
                 items.push(row);
             }
@@ -1682,6 +1676,44 @@ impl ShellMenu {
 }
 
 impl Widget for ShellMenu {
+    fn semantics(&self, _cx: &Cx, node: &mut a11y_tree::Node) {
+        let launcher = self.model.skin == MenuSkin::Launcher;
+        node.role = if launcher { a11y_tree::Role::ListBox } else { a11y_tree::Role::Menu };
+        node.name = if launcher { "Applications" } else { "Desktop menu" }.into();
+        node.states.set(a11y_tree::States::HIDDEN, !self.model.open || self.inert);
+    }
+    fn semantics_parts(&self, _cx: &Cx, out: &mut Vec<(u64, Option<u64>, a11y_tree::Node)>) {
+        if !self.model.open || self.inert { return; }
+        for (i, rect) in self.row_rects.iter().enumerate() {
+            let index = self.model.scroll + i;
+            let Some(row) = self.model.rows.get(index) else { continue; };
+            let mut node = a11y_tree::Node {
+                role: if self.model.skin == MenuSkin::Launcher { a11y_tree::Role::Option } else { a11y_tree::Role::MenuItem },
+                name: row.label.clone(), description: row.detail.clone(),
+                bounds: makepad_platform::a11y::semantic_rect(*rect),
+                actions: a11y_tree::Actions::PRESS | a11y_tree::Actions::SELECT,
+                pos_in_set: index as u32 + 1, set_size: self.model.rows.len() as u32,
+                ..Default::default()
+            };
+            node.states.set(a11y_tree::States::DISABLED, row.disabled);
+            node.states.insert(a11y_tree::States::SELECTABLE);
+            node.states.set(a11y_tree::States::SELECTED, self.model.sel == index);
+            out.push((LiveId::from_str(&row.target).0, None, node));
+        }
+    }
+    fn handle_action(&mut self, cx: &mut Cx, action: &a11y_tree::ActionRequest, _scope: &mut Scope) -> a11y_tree::ActionResult {
+        use a11y_tree::{ActionResult as R, Actions as A};
+        if !self.model.open || self.inert { return R::NoSuchNode; }
+        if action.action != A::PRESS && action.action != A::SELECT { return R::Unhandled; }
+        let Some(key) = cx.a11y.action_part_key(action.node) else { return R::Unhandled; };
+        let Some(index) = self.model.rows.iter().position(|row| LiveId::from_str(&row.target).0 == key) else { return R::NoSuchNode; };
+        if self.model.rows[index].disabled { return R::Disabled; }
+        self.model.sel = index;
+        if action.action == A::PRESS { self.activate_selected(cx); }
+        self.redraw(cx);
+        R::Handled
+    }
+
     fn draw_walk(&mut self, cx: &mut Cx2d, _scope: &mut Scope, walk: Walk) -> DrawStep {
         cx.begin_turtle(walk, self.layout);
         let screen = self.target.unwrap_or_else(|| cx.turtle().rect());

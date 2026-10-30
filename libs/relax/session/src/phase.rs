@@ -19,7 +19,9 @@ pub static ROUTING: AtomicU8 = AtomicU8::new(0);
 /// Whether this thread's allocations belong to the compiler arena.
 #[inline]
 pub fn in_compiler() -> bool {
-    PHASE.with(|p| p.get()) == COMPILER
+    // `try_with` of a const TLS without a destructor never fails and compiles to one
+    // thread-pointer-relative load; `with` stays a call (it carries a panic path)
+    PHASE.try_with(|p| p.get()).map_or(false, |p| p == COMPILER)
 }
 
 /// Puts the calling thread in a phase until dropped. !Send: it restores this thread's TLS.
@@ -53,4 +55,17 @@ pub fn compiler() -> PhaseGuard {
 #[inline]
 pub fn kept() -> PhaseGuard {
     enter(KEPT)
+}
+
+/// An environment variable read once into `cell`; unset or empty = None. The value lives in the
+/// kept heap: it is process state, whichever thread and phase read it first. Inlined: the runtime
+/// asks on every JIT entry (jit.rs `profile_path`), and the call across crates cost more than
+/// the initialized cell's load.
+#[inline]
+pub fn env_once(cell: &'static std::sync::OnceLock<String>, name: &str) -> Option<&'static str> {
+    let s = cell.get_or_init(|| {
+        let _k = kept();
+        std::env::var(name).unwrap_or_default()
+    });
+    (!s.is_empty()).then_some(s.as_str())
 }

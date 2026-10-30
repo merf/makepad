@@ -122,7 +122,9 @@ impl ScriptHook for DrawVars {
         DrawVars::prune_stale_object_shader_cache(vm);
 
         if !apply.is_default() && !apply.is_animate() {
-            #[cfg(not(target_arch = "wasm32"))]
+            // Pack keys include more than the shared shader functions. Record
+            // each applied key even when compilation reuses a cached program.
+            #[cfg(not(all(target_arch = "wasm32", makepad_precompiled_shaders)))]
             if vm.host.cx().draw_shaders.packs.is_recording() {
                 if let Some(io_self) = value.as_object() {
                     DrawVars::record_shader_pack_entry(vm, io_self);
@@ -553,13 +555,9 @@ impl DrawVars {
     pub fn get_uniform(&self, cx: &mut Cx, uniform: LiveId, value: &mut [f32]) {
         if let Some(draw_shader_id) = self.draw_shader_id {
             let sh = &cx.draw_shaders[draw_shader_id.index];
-            for input in &sh.mapping.dyn_uniforms.inputs {
-                let offset = input.offset;
-                let slots = input.slots;
-                if input.id == uniform {
-                    for i in 0..value.len().min(slots) {
-                        value[i] = self.dyn_uniforms.get(offset + i).copied().unwrap_or(0.0);
-                    }
+            if let Some(input) = sh.mapping.dyn_uniforms.find(uniform) {
+                for i in 0..value.len().min(input.slots) {
+                    value[i] = self.dyn_uniforms.get(input.offset + i).copied().unwrap_or(0.0);
                 }
             }
         }
@@ -569,14 +567,9 @@ impl DrawVars {
         if let Some(draw_shader_id) = self.draw_shader_id {
             let sh = &cx.draw_shaders[draw_shader_id.index];
             self.fit_dyn_uniforms(sh.mapping.dyn_uniforms.total_slots);
-            for input in &sh.mapping.dyn_uniforms.inputs {
-                let offset = input.offset;
-                let slots = input.slots;
-                if input.id == uniform {
-                    for i in 0..value.len().min(slots) {
-                        self.dyn_uniforms[offset + i] = value[i]
-                    }
-                }
+            if let Some(input) = sh.mapping.dyn_uniforms.find(uniform) {
+                let n = value.len().min(input.slots);
+                self.dyn_uniforms[input.offset..input.offset + n].copy_from_slice(&value[..n]);
             }
         }
     }
@@ -586,7 +579,7 @@ impl DrawVars {
     pub fn uniform_range(&self, cx: &Cx, uniform: LiveId) -> Option<(usize, usize)> {
         let draw_shader_id = self.draw_shader_id?;
         let sh = &cx.draw_shaders[draw_shader_id.index];
-        sh.mapping.dyn_uniforms.inputs.iter().find(|input| input.id == uniform).map(|input| (input.offset, input.slots))
+        sh.mapping.dyn_uniforms.find(uniform).map(|input| (input.offset, input.slots))
     }
 
     /// Sets a uniform value and also updates the draw call on the area if valid.
@@ -597,7 +590,7 @@ impl DrawVars {
             self.fit_dyn_uniforms(sh.mapping.dyn_uniforms.total_slots);
 
             // Find the uniform input
-            if let Some(input) = sh.mapping.dyn_uniforms.inputs.iter().find(|i| i.id == id) {
+            if let Some(input) = sh.mapping.dyn_uniforms.find(id) {
                 let slots = input.slots.min(value.len());
                 let offset = input.offset;
 
@@ -722,7 +715,7 @@ impl DrawVars {
         let Some(draw_list_id) = list.draw_list_id() else { return };
         let sh = &cx.draw_shaders[draw_shader_id.index];
         self.fit_dyn_uniforms(sh.mapping.dyn_uniforms.total_slots);
-        let Some(input) = sh.mapping.dyn_uniforms.inputs.iter().find(|i| i.id == id) else { return };
+        let Some(input) = sh.mapping.dyn_uniforms.find(id) else { return };
         let slots = input.slots.min(value.len());
         let offset = input.offset;
         for i in 0..slots {
@@ -1447,6 +1440,9 @@ impl DrawVars {
                 hash = hash.id_append(v);
             }
         }
+        if heap.value(obj, id!(precise_math).into(), NoTrap).as_bool() == Some(true) {
+            hash = hash.id_append(id!(precise_math));
+        }
         hash
     }
 
@@ -1527,7 +1523,7 @@ mod tests {
                 None,
             )
         });
-        mapping.dyn_uniforms.inputs.push(DrawShaderInput {
+        mapping.dyn_uniforms.push_placed(DrawShaderInput {
             id,
             offset: slots - 4,
             slots: 4,

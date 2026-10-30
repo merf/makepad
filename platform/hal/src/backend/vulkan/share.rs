@@ -4,7 +4,7 @@
 
 #[cfg(target_os = "linux")]
 mod dma_buf;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub(super) mod sync;
 #[cfg(target_os = "linux")]
 pub mod copy;
@@ -26,6 +26,47 @@ pub use dma_buf::DmaBuf as NativeHandle;
 pub use dma_buf::{DmaBufSupport, OpaqueMemory};
 #[cfg(target_os = "android")]
 pub use hardware_buffer::HardwareBuffer as NativeHandle;
+
+/// The process's registry on Android (the shell's sharing, the decoders' pictures).
+#[cfg(target_os = "android")]
+pub fn shared_images() -> NativeImages {
+    static IMAGES: std::sync::OnceLock<NativeImages> = std::sync::OnceLock::new();
+    IMAGES.get_or_init(NativeImages::default).clone()
+}
+
+/// A decoder's picture (`buffer`: an AHardwareBuffer it holds) registered for texture import: its
+/// ticket (`texture_handle::VIDEO` imports it as a video texture).
+#[cfg(target_os = "android")]
+pub fn picture_ticket(buffer: *mut std::ffi::c_void) -> Result<u64, String> {
+    let native = unsafe { NativeHandle::retain(buffer as *mut makepad_vulkan::vk::AHardwareBuffer) }?;
+    Ok(unsafe { shared_images().register(crate::session::HOST, native) })
+}
+
+#[cfg(target_os = "android")]
+pub fn release_picture_ticket(ticket: u64) {
+    shared_images().release(ticket);
+}
+
+/// Images an XR shell owns and lends to its sessions (`texture_handle::XR_DEPTH`), by ticket.
+#[cfg(target_os = "android")]
+fn lent_images() -> &'static Mutex<HashMap<u64, Arc<Image>>> {
+    static LENT: std::sync::OnceLock<Mutex<HashMap<u64, Arc<Image>>>> = std::sync::OnceLock::new();
+    LENT.get_or_init(Default::default)
+}
+
+/// Lends `image` to the sessions for texture import; its ticket.
+#[cfg(target_os = "android")]
+pub fn lend_image(image: Arc<Image>) -> u64 {
+    let id = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+    lock(lent_images()).insert(id, image);
+    id
+}
+
+/// Ends a lend (the images' owner goes away; imports made already keep their image).
+#[cfg(target_os = "android")]
+pub fn end_lend(ticket: u64) {
+    lock(lent_images()).remove(&ticket);
+}
 
 /// A shell may supply its own handle transport. The image lease owns the native allocation;
 /// any external producer must have completed and released ownership before import is used.
@@ -79,6 +120,16 @@ impl VkExternalImages for NativeImages {
         lock(&self.entries).insert(id, Entry { session, handle: native, image: Arc::downgrade(&image) }); Ok(id)
     }
     fn import(&mut self, dev: Arc<Device>, handle: u64, kind: u32) -> Result<Arc<Image>, String> {
+        // a decoder's picture (its hardware buffer), sampled as a video texture
+        #[cfg(target_os = "android")]
+        if kind == texture_handle::VIDEO {
+            let native = lock(&self.entries).get(&handle).map(|e| e.handle.clone()).ok_or("unknown picture ticket")?;
+            return NativeHandle::import_video(dev, native);
+        }
+        #[cfg(target_os = "android")]
+        if kind == texture_handle::XR_DEPTH {
+            return lock(lent_images()).get(&handle).cloned().ok_or_else(|| "unknown XR depth ticket".into());
+        }
         if kind != texture_handle::NATIVE { return Err("unsupported Vulkan handle kind".into()); }
         let (native, image) = {
             let entries = lock(&self.entries); let entry = entries.get(&handle).ok_or("unknown native image ticket")?;
@@ -125,15 +176,6 @@ impl crate::dmabuf::Api for super::Vulkan {
         // acquires it again, after the compositor has observed the producer's fence.
         Ok(())
     }
-    fn fence(&mut self, session: u32, notify: Arc<dyn Fn() + Send + Sync>) -> Result<crate::dmabuf::Fence, String> {
-        let semaphore = sync::Semaphore::sync_file(self.dev.clone())?;
-        self.flush();
-        let look = self.mailbox.notify.clone();
-        let (fence, reply) = crate::dmabuf::FenceReply::new(Arc::new(move || { notify(); look(session, false); }));
-        self.ensure_batch()?.release_fence = Some((semaphore, reply));
-        self.flush();
-        Ok(fence)
-    }
     fn available(&self, session: u32, id: crate::Id) -> Result<bool, String> {
         let image = self.tex.get(&(session, id.index)).filter(|t| t.gen == id.gen).ok_or("missing hosted texture")?;
         match &image.image.timeline { Some(t) if t.producer => t.available(), _ => Err("hosted image has no writer timeline".into()) }
@@ -175,6 +217,14 @@ pub(super) fn foreign_support(dev: &Device) -> Option<DmaBufSupport> { NativeHan
 /// A host compositor's shared image (a hosted window's swapchain image) as a render target of
 /// this device, with the host's timeline: [`Image::hosted_writable`], [`Image::hosted_sequence`].
 #[cfg(target_os = "linux")]
+pub(crate) fn import_foreign(dev: Arc<Device>, native: Arc<NativeHandle>) -> Result<Arc<Image>, String> {
+    let opaque = native.fourcc == u32::from_le_bytes(*b"XR24");
+    let mut image = NativeHandle::import(dev, native)?;
+    if opaque { Arc::get_mut(&mut image).unwrap().sample_alpha_one()?; }
+    Ok(image)
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn import_hosted(dev: Arc<Device>, native: Arc<NativeHandle>) -> Result<Arc<Image>, String> {
     let image = NativeHandle::import(dev, native)?;
     if image.timeline.as_ref().is_none_or(|t| !t.producer) { return Err("hosted image has no writer timeline".into()); }
@@ -186,6 +236,13 @@ impl Image {
     /// The host released this hosted image: the next frame may render into it.
     pub(crate) fn hosted_writable(&self) -> bool {
         self.timeline.as_ref().is_some_and(|t| t.producer && t.available().unwrap_or(false))
+    }
+    /// The hosted timeline's value now and the value at which the host has released the image
+    /// (it is writable from then on): what a stalled ring reports.
+    pub(crate) fn hosted_state(&self) -> Option<(u64, u64)> {
+        let t = self.timeline.as_ref().filter(|t| t.producer)?;
+        let value = unsafe { t.semaphore.dev.raw.get_semaphore_counter_value(t.semaphore.raw) }.ok()?;
+        Some((value, t.sequence() + 1))
     }
     /// The timeline value that publishes the newest frame rendered into this hosted image.
     pub(crate) fn hosted_sequence(&self) -> Option<u64> {

@@ -220,10 +220,22 @@ pub struct ScriptHeap {
     /// The module registrations, while a collect run records them
     /// (makepad-script-census; `census`).
     pub census: Option<Box<dyn crate::census::ScriptCensus>>,
+    /// The definitions a run reads, while a trace records them (touch.rs).
+    pub(crate) touch: Option<Box<crate::touch::ScriptTouch>>,
 }
 
 #[relax_api]
 impl ScriptHeap {
+    /// Declare metadata accepted by a registered component without making it a
+    /// child in the object's ordered vector. The metadata has no Rust field. An op of the
+    /// provided crate: JIT'd widget registration calls it, never reads the heap's fields.
+    #[relax_api]
+    pub fn define_type_property(&mut self, object: ScriptObject, name: LiveId, ty: ScriptTypeId) {
+        let Some(index) = self.object_type_index(object) else { return };
+        let props = &mut self.type_check[index.0 as usize].props;
+        if !props.props.contains_key(&name) { props.insert(name, ty); }
+    }
+
     /// Whether `obj` names a live object of this heap.
     pub fn object_alive(&self, obj: ScriptObject) -> bool {
         let slots = self.object_slots();
@@ -713,6 +725,7 @@ impl ScriptHeap {
             strings,
             regexes,
             heap_tag,
+            touch: crate::touch::ScriptTouch::new_if_recording(),
             ..Default::default()
         };
         // Initialize slot 0 (reserved null slot) - use get_at_mut for internal init
@@ -1087,6 +1100,9 @@ impl ScriptHeap {
     /// a use of the module that registered it (`census`).
     #[inline]
     fn census_default_used(&self, obj: Option<ScriptObject>) {
+        if let Some(obj) = obj {
+            self.touch_obj(obj);
+        }
         if let (Some(census), Some(obj)) = (&self.census, obj) {
             census.default_used(obj);
         }

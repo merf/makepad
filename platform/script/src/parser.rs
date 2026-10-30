@@ -50,6 +50,8 @@ enum State {
     ForBody {
         idents: u32,
         index: u32,
+        /// Code index where the source expression starts.
+        expr_start: u32,
     },
     ForExpr {
         code_start: u32,
@@ -231,6 +233,8 @@ enum State {
 
     EndBare,
     EndBareSquare,
+    /// Closes the list a `for` in value position collects into.
+    EndForList,
     EndProto,
     EndProtoInherit,
     EndScopeInherit,
@@ -1298,6 +1302,7 @@ impl ScriptParser {
                 | State::EndFieldInherit
                 | State::EndIndexInherit => return true,
                 State::EndBareSquare
+                | State::EndForList
                 | State::EndCall { .. }
                 | State::EndFnBlock { .. }
                 | State::EndFnExpr { .. } => return false,
@@ -1630,6 +1635,50 @@ impl ScriptParser {
         }
     }
 
+    /// A `for` source that is exactly a range literal (`for i in a..b`): its
+    /// code ends in RANGE and no branch in it can jump past that RANGE to the
+    /// `for` with another value. Mark the RANGE, so the loop knows it holds
+    /// the only reference to the range object.
+    fn mark_range_for_source(&mut self, expr_start: u32) {
+        let end = self.opcodes.len();
+        if end == 0 || (expr_start as usize) >= end || self.opcodes[end - 1] != Opcode::RANGE.into() {
+            return;
+        }
+        let branches = self.opcodes[expr_start as usize..end - 1].iter().any(|code| {
+            matches!(
+                code.as_opcode(),
+                Some((
+                    Opcode::LOGIC_AND_TEST
+                        | Opcode::LOGIC_OR_TEST
+                        | Opcode::NIL_OR_TEST
+                        | Opcode::IF_TEST
+                        | Opcode::IF_ELSE
+                        | Opcode::TRY_TEST
+                        | Opcode::TRY_ERR
+                        | Opcode::TRY_OK
+                        | Opcode::OK_TEST
+                        | Opcode::OK_END
+                        | Opcode::RETURN
+                        | Opcode::RETURN_IF_ERR
+                        | Opcode::FOR_1
+                        | Opcode::FOR_2
+                        | Opcode::FOR_3
+                        | Opcode::LOOP
+                        | Opcode::BREAKIFNOT
+                        | Opcode::FOR_END
+                        | Opcode::BREAK
+                        | Opcode::CONTINUE
+                        | Opcode::FN_BODY_DYN
+                        | Opcode::FN_BODY_TYPED,
+                    _
+                ))
+            )
+        });
+        if !branches {
+            self.set_opcode_args(end as u32 - 1, OpcodeArgs::RANGE_FOR_SOURCE);
+        }
+    }
+
     fn set_opcode_args(&mut self, index: u32, args: OpcodeArgs) {
         self.opcodes[index as usize].set_opcode_args(args);
     }
@@ -1654,7 +1703,8 @@ impl ScriptParser {
                 if id.not_empty() {
                     if id == id!(in) {
                         // alright we move on to parsing the range expr
-                        self.state.push(State::ForBody { idents, index });
+                        let expr_start = self.code_len();
+                        self.state.push(State::ForBody { idents, index, expr_start });
                         self.state.push(State::BeginExpr { required: true });
                         return 1;
                     } else if idents < 3 {
@@ -1686,9 +1736,9 @@ impl ScriptParser {
                 }
                 error!(self, tokenizer, "Unexpected state in parsing for");
             }
-            State::ForBody { idents, index } => {
+            State::ForBody { idents, index, expr_start } => {
                 // alright lets emit a for instruction
-
+                self.mark_range_for_source(expr_start);
                 let code_start = self.code_len();
                 if idents == 1 {
                     self.slot_loop_enter(true);
@@ -3631,6 +3681,11 @@ impl ScriptParser {
                 self.push_code(Opcode::CONTINUE.into(), index);
                 return 0;
             }
+            State::EndForList => {
+                self.push_code(Opcode::END_ARRAY.into(), self.index);
+                self.state.push(State::EndExpr);
+                return 0;
+            }
             State::EndBareSquare => {
                 self.push_code(Opcode::END_ARRAY.into(), self.index);
                 self.state.push(State::EndExpr);
@@ -4365,6 +4420,16 @@ impl ScriptParser {
                     return 1;
                 }
                 if id == id!(for) {
+                    // A `for` in value position (`let bolts = for i in 0..4 { .. }`) is the
+                    // list of its body's values, as `[for ..]` is.
+                    // Call arguments are statements popped into the call: a `for` that starts one
+                    // is a value too (`m.instance(post, for x in xs { .. })`).
+                    let statement = matches!(self.state.last(), Some(State::EndStmt { .. }));
+                    let call_arg = statement && matches!(self.state.iter().rev().nth(1), Some(State::EndCall { .. }));
+                    if !statement || call_arg {
+                        self.push_code(Opcode::BEGIN_ARRAY.into(), self.index);
+                        self.state.push(State::EndForList);
+                    }
                     self.state.push(State::ForIdent {
                         idents: 0,
                         index: self.index,
@@ -5254,6 +5319,15 @@ impl ScriptParser {
                 }
                 State::EmitUnary { what_op, index } => {
                     self.push_code(State::operator_to_unary(what_op), index);
+                }
+                // `use mod.x.*` as the source's last statement: the import, not a field read.
+                State::Use { index } => {
+                    if let Some((Opcode::FIELD, _)) = self.opcodes.last().and_then(|c| c.as_opcode()) {
+                        self.pop_code();
+                        self.slot_disqualify_body();
+                        self.push_code(Opcode::USE.into(), index);
+                    }
+                    let_closed = true;
                 }
                 // `a.b = v` / `a[i] = v` as the source's last statement.
                 State::EmitFieldAssign { what_op, index } => {

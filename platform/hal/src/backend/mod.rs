@@ -64,6 +64,11 @@ pub struct Pixels {
 pub trait Backend: Send {
     #[cfg(target_os = "linux")]
     fn dmabuf(&mut self) -> Option<&mut dyn crate::dmabuf::Api> { None }
+    /// The completion of everything `session` submitted so far, for a reader outside this
+    /// backend (an encoder, another process): [`crate::completion`]. `notify` when it answers.
+    fn frame_completion(&mut self, _session: u32, _notify: std::sync::Arc<dyn Fn() + Send + Sync>) -> Result<crate::completion::Completion, String> {
+        Err("this renderer has no frame completion".into())
+    }
     /// The capabilities `hal_open` answers with (session id filled in by the caller).
     fn info(&self) -> HalInfo;
     /// Executes one batch of commands. Borrowed slices in `view` are valid for this call only.
@@ -97,9 +102,11 @@ pub trait Backend: Send {
     /// after this call). Device-level state (device, queues, swapchains) and objects lent from
     /// the host stay.
     fn session_closed(&mut self, _world: &mut World, _session: u32) {}
-    /// The host is about to end the process ([`crate::Hal::before_exit`]): driver work still
-    /// running on the backend's own threads (pipeline compiles, fence waits) runs out first;
-    /// exit() unloads the driver under it.
+    /// The host ends the process next ([`crate::Hal::before_exit`]; the backend already left the
+    /// Hal): every thread of the backend's own that calls the driver (submits, presents, fence
+    /// waits, pipeline compiles) is stopped and joined before this returns -- exit() runs the
+    /// driver's exit handlers, which fault a thread still inside it. The last call a backend
+    /// gets; no wait with a time limit (a thread that is gone is the only proof).
     fn before_exit(&mut self) {}
     /// Tests and automation: the next step handles the device as lost (removed by the OS) and
     /// replaces it as a real loss does (`exec::device_reset`). Backends without a device reset

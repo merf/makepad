@@ -280,6 +280,8 @@ pub struct Renderer {
     /// vertices never change, so its per-frame cost is one instance. See
     /// model.rs.
     static_models: Vec<(String, LoadedModel)>,
+    /// The model lanes' draw names for the GPU profiler, made once each.
+    draw_names: draw_models::DrawNames,
     preview_originals: std::collections::HashMap<String, (LoadedModel, Option<String>)>,
     preview_new: std::collections::HashSet<String>,
     /// The map-sky shader, built lazily from its script type default (the
@@ -354,6 +356,8 @@ pub struct Renderer {
     /// Applied as the scene draw list's view transform, so it costs one
     /// uniform and never invalidates the static slabs. See stage.rs.
     stage: Stage,
+    /// The box an `MrBox` stage shows the world in (`set_clip_box`).
+    clip_box: Option<crate::stage::ClipBox>,
     /// How many casters get a projected silhouette before the rest fall
     /// back to blobs. A per-device dial: a Quest can afford fewer than a PC
     /// even though both cost one instance, because the projection math runs
@@ -409,9 +413,16 @@ pub struct Renderer {
     /// out of `self` for the duration of the draw so the loop can still
     /// borrow the model tables.
     pbr_draw: Option<Box<DrawScenePbr>>,
+    /// The host's per-element lookup (`elem_map` + `elem_ctl`, see
+    /// shaders/skinned.rs) for the lanes the renderer draws itself: a host
+    /// that hides or offsets elements through its static draw gets the same
+    /// on the PBR lane.
+    element_lookup: Option<(Texture, [f32; 4])>,
     custom_draws: std::collections::BTreeMap<String, Box<CustomMaterial>>,
     /// Image-based lighting for Splash materials (renderer/ibl.rs).
     ibl: ibl::IblState,
+    /// Shiny stock models under that environment (renderer/stock_ibl.rs).
+    stock_ibl: stock_ibl::StockIblState,
     /// The world's generic items on the model lanes (renderer/items.rs).
     items: items::ItemState,
     /// The streamed world's surface shader, created on first streamed draw.
@@ -424,6 +435,19 @@ pub struct Renderer {
     /// frame (else foliage stays on the PBR lane).
     foliage_draw: Option<Box<crate::shaders::DrawSceneFoliageLit>>,
     foliage_ready: bool,
+    /// The terrain paint lane's shader, and whether it can draw this frame
+    /// (else painted tiles draw their main layer on the PBR lane).
+    splat_draw: Option<Box<crate::shaders::DrawSceneSplat>>,
+    splat_ready: bool,
+    /// Multiplier on every model's stand-in distance (`makepadShading.impostor`):
+    /// the quality tier's say in where trees turn into impostors.
+    impostor_scale: f32,
+    /// The tier's grass radius multiplier and kept blade fraction.
+    grass_radius_scale: f32,
+    grass_density: f32,
+    /// The tier's reach of terrain paint blending (quality_tier.rs).
+    terrain_blend_reach: f32,
+    graphics_tier: crate::quality_tier::GraphicsTier,
     grass_rings: [Vec<(f32, f32)>; 3],
     /// The PBR pipeline can draw this frame (`draw_models_inner`).
     pbr_ready: bool,
@@ -516,13 +540,21 @@ pub struct Renderer {
     model_headlight_owners: Vec<u64>,
     /// The vehicle-lamp radius, eased between frames (`entity_lights`).
     vehicle_lamp_radius: f32,
+    /// This frame's headlight level (`light::lamp_level`: 0 in daylight, 1
+    /// at night or in fog), which the tail lamp lenses' running glow follows.
+    lamp_level: f32,
     /// Lights `stream_lights` queued this frame, and how many of them the
     /// frame budget kept.
     stream_light_count: usize,
     frame_stream_lights: usize,
+    /// The vehicle lamps `frame_lamps` lit this frame (`RenderStats::vehicle_lamps`).
+    frame_vehicle_lamps: usize,
     asset_light_error:Option<String>,
     /// This frame's eye, for ranking lights past the authored budget.
     light_eye: Vec3f,
+    /// This frame's daylight direction (renderer/env_sun.rs `daylight_dir`):
+    /// what the lamps' photocell reads, here and in the bake's lamp key.
+    light_daylight: Vec3f,
     /// See [`Renderer::set_camera_relative`].
     camera_relative: bool,
     /// Cached [`Self::harvest_lamps`] output — the harvest walks strings, so
@@ -642,11 +674,17 @@ mod gi;
 mod stream_draw;
 mod grass_draw;
 mod vfx_draw;
-mod ibl;
+pub(crate) mod ibl;
+mod env_sun;
+mod stock_ibl;
 mod items;
 mod water;
 pub use water::{eye_under_water, pack_wave_uniforms};
 pub use items::{splash_material_name, GeometryData, TransformTint, LAYOUT_TRANSFORM_TINT};
+// The names `IblSource::Procedural` indexes, for hosts that name an
+// environment as the engine does (Scene3D's `@hdri_golden_hour`).
+pub use ibl::{HDRI_PREFIX, PROCEDURAL_ENVIRONMENTS, PROCEDURAL_HDRI_WIDTH};
+pub use stock_ibl::STOCK_IBL_MATERIAL;
 
 pub use draw_items::*;
 pub use prepared::*;
@@ -677,6 +715,7 @@ impl Default for Renderer {
             skin_palette_texels: 0,
             skin_joint_bases: Vec::new(),
             static_models: Vec::new(),
+            draw_names: Default::default(),
             preview_originals: std::collections::HashMap::new(),
             preview_new: std::collections::HashSet::new(),
             sky_draw: None,
@@ -699,6 +738,7 @@ impl Default for Renderer {
             placed_scene_signature: None,
             placed_prefix: None,
             stage: Stage::default(),
+            clip_box: None,
             shadow_budget: DEFAULT_SHADOW_BUDGET,
             vfx: Default::default(),
             ao_textures: Vec::new(),
@@ -720,14 +760,23 @@ impl Default for Renderer {
             detail_fallback: None,
             orm_fallback: None,
             pbr_draw: None,
+            element_lookup: None,
             custom_draws: Default::default(),
             ibl: Default::default(),
+            stock_ibl: Default::default(),
             items: Default::default(),
             city_draw: None,
             grass: None,
             grass_draw: None,
             foliage_draw: None,
             foliage_ready: false,
+            splat_draw: None,
+            splat_ready: false,
+            impostor_scale: crate::quality_tier::GraphicsTier::High.budget().impostor_scale,
+            grass_radius_scale: 1.0,
+            grass_density: 1.0,
+            terrain_blend_reach: f32::MAX,
+            graphics_tier: crate::quality_tier::GraphicsTier::High,
             grass_rings: Default::default(),
             pbr_ready: false,
             lane_variants: Default::default(),
@@ -772,11 +821,13 @@ impl Default for Renderer {
             frame_lights: Vec::new(),
             frame_baked_count: 0,
             host_lights: Vec::new(),
-            host_asset_lights:Vec::new(),asset_light_error:None,light_eye:Vec3f::default(),camera_relative:false,
+            host_asset_lights:Vec::new(),asset_light_error:None,light_eye:Vec3f::default(),light_daylight:SunLight::default().dir,camera_relative:false,
             model_headlight_owners: Vec::new(),
             vehicle_lamp_radius: 0.0,
+            lamp_level: 0.0,
             stream_light_count: 0,
             frame_stream_lights: 0,
+            frame_vehicle_lamps: 0,
             lamp_cache: Vec::new(),
             lamp_cache_rev: None,
             light_grid: LightGrid::default(),
@@ -819,6 +870,8 @@ mod shell_bucket_tests;
 mod realm_lifecycle_tests;
 #[cfg(test)]
 mod sun_tests;
+#[cfg(test)]
+mod env_prepare_tests;
 #[cfg(test)]
 mod cull_tests;
 #[cfg(test)]

@@ -14,11 +14,14 @@ pub enum Option<T> {
 
 pub use Option::{None, Some};
 
+// library/core/src/option.rs:2290-2295 (const effects are outside this port)
+unsafe impl<T: crate::clone::TrivialClone> crate::clone::TrivialClone for Option<T> {}
+
 impl<T> Option<T> {
     pub const fn is_some(&self) -> bool {
         matches!(*self, Some(_))
     }
-    pub fn is_some_and<F: FnOnce(T) -> bool>(self, f: F) -> bool {
+    pub const fn is_some_and<F: FnOnce(T) -> bool>(self, f: F) -> bool {
         match self {
             Some(x) => f(x),
             None => false,
@@ -27,7 +30,7 @@ impl<T> Option<T> {
     pub const fn is_none(&self) -> bool {
         !self.is_some()
     }
-    pub fn is_none_or<F: FnOnce(T) -> bool>(self, f: F) -> bool {
+    pub const fn is_none_or<F: FnOnce(T) -> bool>(self, f: F) -> bool {
         match self {
             Some(x) => f(x),
             None => true,
@@ -39,51 +42,66 @@ impl<T> Option<T> {
             None => None,
         }
     }
-    pub fn as_mut(&mut self) -> Option<&mut T> {
+    pub const fn as_mut(&mut self) -> Option<&mut T> {
         match *self {
             Some(ref mut x) => Some(x),
             None => None,
         }
     }
-    pub fn as_slice(&self) -> &[T] {
+    // core/src/option.rs (stable 1.33; futures-util's ForEach::poll)
+    pub fn as_pin_ref(self: crate::pin::Pin<&Self>) -> Option<crate::pin::Pin<&T>> {
+        match crate::pin::Pin::get_ref(self).as_ref() {
+            Some(x) => unsafe { Some(crate::pin::Pin::new_unchecked(x)) },
+            None => None,
+        }
+    }
+    pub fn as_pin_mut(self: crate::pin::Pin<&mut Self>) -> Option<crate::pin::Pin<&mut T>> {
+        unsafe {
+            match crate::pin::Pin::get_unchecked_mut(self).as_mut() {
+                Some(x) => Some(crate::pin::Pin::new_unchecked(x)),
+                None => None,
+            }
+        }
+    }
+    pub const fn as_slice(&self) -> &[T] {
         match self {
             Some(x) => crate::slice::from_ref(x),
             None => &[],
         }
     }
-    pub fn as_mut_slice(&mut self) -> &mut [T] {
+    pub const fn as_mut_slice(&mut self) -> &mut [T] {
         match self {
             Some(x) => crate::slice::from_mut(x),
             None => &mut [],
         }
     }
     #[track_caller]
-    pub fn expect(self, msg: &str) -> T {
+    pub const fn expect(self, msg: &str) -> T {
         match self {
             Some(x) => x,
-            None => crate::panicking::panic_display(&msg),
+            None => expect_failed(msg),
         }
     }
     #[track_caller]
-    pub fn unwrap(self) -> T {
+    pub const fn unwrap(self) -> T {
         match self {
             Some(x) => x,
-            None => crate::panicking::panic_str("called `Option::unwrap()` on a `None` value"),
+            None => unwrap_failed(),
         }
     }
-    pub fn unwrap_or(self, default: T) -> T {
+    pub const fn unwrap_or(self, default: T) -> T {
         match self {
             Some(x) => x,
             None => default,
         }
     }
-    pub fn unwrap_or_else<F: FnOnce() -> T>(self, f: F) -> T {
+    pub const fn unwrap_or_else<F: FnOnce() -> T>(self, f: F) -> T {
         match self {
             Some(x) => x,
             None => f(),
         }
     }
-    pub fn unwrap_or_default(self) -> T
+    pub const fn unwrap_or_default(self) -> T
     where
         T: Default,
     {
@@ -93,49 +111,49 @@ impl<T> Option<T> {
         }
     }
     #[track_caller]
-    pub unsafe fn unwrap_unchecked(self) -> T {
+    pub const unsafe fn unwrap_unchecked(self) -> T {
         match self {
             Some(x) => x,
             None => crate::hint::unreachable_unchecked(),
         }
     }
-    pub fn map<U, F: FnOnce(T) -> U>(self, f: F) -> Option<U> {
+    pub const fn map<U, F: FnOnce(T) -> U>(self, f: F) -> Option<U> {
         match self {
             Some(x) => Some(f(x)),
             None => None,
         }
     }
-    pub fn inspect<F: FnOnce(&T)>(self, f: F) -> Option<T> {
+    pub const fn inspect<F: FnOnce(&T)>(self, f: F) -> Option<T> {
         if let Some(ref x) = self {
             f(x);
         }
         self
     }
-    pub fn map_or<U, F: FnOnce(T) -> U>(self, default: U, f: F) -> U {
+    pub const fn map_or<U, F: FnOnce(T) -> U>(self, default: U, f: F) -> U {
         match self {
             Some(t) => f(t),
             None => default,
         }
     }
-    pub fn map_or_else<U, D: FnOnce() -> U, F: FnOnce(T) -> U>(self, default: D, f: F) -> U {
+    pub const fn map_or_else<U, D: FnOnce() -> U, F: FnOnce(T) -> U>(self, default: D, f: F) -> U {
         match self {
             Some(t) => f(t),
             None => default(),
         }
     }
-    pub fn ok_or<E>(self, err: E) -> Result<T, E> {
+    pub const fn ok_or<E>(self, err: E) -> Result<T, E> {
         match self {
             Some(v) => Ok(v),
             None => Err(err),
         }
     }
-    pub fn ok_or_else<E, F: FnOnce() -> E>(self, err: F) -> Result<T, E> {
+    pub const fn ok_or_else<E, F: FnOnce() -> E>(self, err: F) -> Result<T, E> {
         match self {
             Some(v) => Ok(v),
             None => Err(err()),
         }
     }
-    pub fn as_deref(&self) -> Option<&T::Target>
+    pub const fn as_deref(&self) -> Option<&T::Target>
     where
         T: Deref,
     {
@@ -144,7 +162,7 @@ impl<T> Option<T> {
             None => None,
         }
     }
-    pub fn as_deref_mut(&mut self) -> Option<&mut T::Target>
+    pub const fn as_deref_mut(&mut self) -> Option<&mut T::Target>
     where
         T: DerefMut,
     {
@@ -159,19 +177,19 @@ impl<T> Option<T> {
     pub fn iter_mut(&mut self) -> IterMut<'_, T> {
         IterMut { inner: self.as_mut() }
     }
-    pub fn and<U>(self, optb: Option<U>) -> Option<U> {
+    pub const fn and<U>(self, optb: Option<U>) -> Option<U> {
         match self {
             Some(_) => optb,
             None => None,
         }
     }
-    pub fn and_then<U, F: FnOnce(T) -> Option<U>>(self, f: F) -> Option<U> {
+    pub const fn and_then<U, F: FnOnce(T) -> Option<U>>(self, f: F) -> Option<U> {
         match self {
             Some(x) => f(x),
             None => None,
         }
     }
-    pub fn filter<P: FnOnce(&T) -> bool>(self, predicate: P) -> Option<T> {
+    pub const fn filter<P: FnOnce(&T) -> bool>(self, predicate: P) -> Option<T> {
         if let Some(x) = self {
             if predicate(&x) {
                 return Some(x);
@@ -179,26 +197,26 @@ impl<T> Option<T> {
         }
         None
     }
-    pub fn or(self, optb: Option<T>) -> Option<T> {
+    pub const fn or(self, optb: Option<T>) -> Option<T> {
         match self {
             x @ Some(_) => x,
             None => optb,
         }
     }
-    pub fn or_else<F: FnOnce() -> Option<T>>(self, f: F) -> Option<T> {
+    pub const fn or_else<F: FnOnce() -> Option<T>>(self, f: F) -> Option<T> {
         match self {
             x @ Some(_) => x,
             None => f(),
         }
     }
-    pub fn xor(self, optb: Option<T>) -> Option<T> {
+    pub const fn xor(self, optb: Option<T>) -> Option<T> {
         match (self, optb) {
             (a @ Some(_), None) => a,
             (None, b @ Some(_)) => b,
             _ => None,
         }
     }
-    pub fn insert(&mut self, value: T) -> &mut T {
+    pub const fn insert(&mut self, value: T) -> &mut T {
         *self = Some(value);
         match self {
             Some(v) => v,
@@ -214,7 +232,7 @@ impl<T> Option<T> {
             None => unsafe { crate::hint::unreachable_unchecked() },
         }
     }
-    pub fn get_or_insert_default(&mut self) -> &mut T
+    pub const fn get_or_insert_default(&mut self) -> &mut T
     where
         T: Default,
     {
@@ -226,7 +244,7 @@ impl<T> Option<T> {
             None => unsafe { crate::hint::unreachable_unchecked() },
         }
     }
-    pub fn get_or_insert_with<F: FnOnce() -> T>(&mut self, f: F) -> &mut T {
+    pub const fn get_or_insert_with<F: FnOnce() -> T>(&mut self, f: F) -> &mut T {
         if let None = *self {
             *self = Some(f());
         }
@@ -235,10 +253,10 @@ impl<T> Option<T> {
             None => unsafe { crate::hint::unreachable_unchecked() },
         }
     }
-    pub fn take(&mut self) -> Option<T> {
+    pub const fn take(&mut self) -> Option<T> {
         crate::mem::replace(self, None)
     }
-    pub fn take_if<P: FnOnce(&mut T) -> bool>(&mut self, predicate: P) -> Option<T> {
+    pub const fn take_if<P: FnOnce(&mut T) -> bool>(&mut self, predicate: P) -> Option<T> {
         let hit = match self.as_mut() {
             Some(v) => predicate(v),
             None => false,
@@ -249,10 +267,10 @@ impl<T> Option<T> {
             None
         }
     }
-    pub fn replace(&mut self, value: T) -> Option<T> {
+    pub const fn replace(&mut self, value: T) -> Option<T> {
         crate::mem::replace(self, Some(value))
     }
-    pub fn zip<U>(self, other: Option<U>) -> Option<(T, U)> {
+    pub const fn zip<U>(self, other: Option<U>) -> Option<(T, U)> {
         match (self, other) {
             (Some(a), Some(b)) => Some((a, b)),
             _ => None,
@@ -270,7 +288,7 @@ impl<T, U> Option<(T, U)> {
 }
 
 impl<'a, T: Copy> Option<&'a T> {
-    pub fn copied(self) -> Option<T> {
+    pub const fn copied(self) -> Option<T> {
         match self {
             Some(&v) => Some(v),
             None => None,
@@ -288,7 +306,7 @@ impl<'a, T: Clone> Option<&'a T> {
 }
 
 impl<'a, T: Copy> Option<&'a mut T> {
-    pub fn copied(self) -> Option<T> {
+    pub const fn copied(self) -> Option<T> {
         match self {
             Some(&mut t) => Some(t),
             None => None,
@@ -306,7 +324,7 @@ impl<'a, T: Clone> Option<&'a mut T> {
 }
 
 impl<T, E> Option<Result<T, E>> {
-    pub fn transpose(self) -> Result<Option<T>, E> {
+    pub const fn transpose(self) -> Result<Option<T>, E> {
         match self {
             Some(Ok(x)) => Ok(Some(x)),
             Some(Err(e)) => Err(e),
@@ -316,7 +334,7 @@ impl<T, E> Option<Result<T, E>> {
 }
 
 impl<T> Option<Option<T>> {
-    pub fn flatten(self) -> Option<T> {
+    pub const fn flatten(self) -> Option<T> {
         match self {
             Some(inner) => inner,
             None => None,
@@ -344,6 +362,7 @@ impl<'a, T> From<&'a Option<T>> for Option<&'a T> {
 
 // ---------------------------------------------------------------- iterators
 
+#[derive(Debug)]
 pub struct Iter<'a, T> {
     inner: Option<&'a T>,
 }
@@ -380,6 +399,7 @@ impl<'a, T> Clone for Iter<'a, T> {
 impl<'a, T> ExactSizeIterator for Iter<'a, T> {}
 impl<'a, T> crate::iter::FusedIterator for Iter<'a, T> {}
 
+#[derive(Debug)]
 pub struct IterMut<'a, T> {
     pub(crate) inner: Option<&'a mut T>,
 }
@@ -404,6 +424,7 @@ impl<'a, T> DoubleEndedIterator for IterMut<'a, T> {
 impl<'a, T> ExactSizeIterator for IterMut<'a, T> {}
 impl<'a, T> crate::iter::FusedIterator for IterMut<'a, T> {}
 
+#[derive(Clone, Debug)]
 pub struct IntoIter<T> {
     inner: Option<T>,
 }
@@ -426,6 +447,7 @@ impl<T> DoubleEndedIterator for IntoIter<T> {
 }
 
 impl<T> ExactSizeIterator for IntoIter<T> {}
+unsafe impl<T> crate::iter::TrustedLen for IntoIter<T> {}
 impl<T> crate::iter::FusedIterator for IntoIter<T> {}
 
 impl<T> IntoIterator for Option<T> {
@@ -485,4 +507,20 @@ impl<'a, A, I: Iterator<Item = Option<A>>> Iterator for OptionShunt<'a, I> {
             None => None,
         }
     }
+}
+
+// real core's out-of-line failure paths (option.rs `unwrap_failed` / `expect_failed`): a call per
+// site instead of the panic's message and formatting built at each one
+#[inline(never)]
+#[cold]
+#[track_caller]
+const fn unwrap_failed() -> ! {
+    crate::panicking::panic_str("called `Option::unwrap()` on a `None` value")
+}
+
+#[inline(never)]
+#[cold]
+#[track_caller]
+const fn expect_failed(msg: &str) -> ! {
+    crate::panicking::panic_display(&msg)
 }

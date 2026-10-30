@@ -61,6 +61,11 @@ struct V<'a> {
 /// Checks one typed body owner; returns its E0133 errors (lints go to the lint sink).
 pub fn check_body(prog: &Program, tcx: &Tcx, body: &Body) -> Vec<String> {
     if !lint::enabled() { return Vec::new(); }
+    check_body_errors(prog, tcx, body)
+}
+
+/// `check_body`'s errors without the lint switch (run mode: E0133 & co, lints stay off).
+fn check_body_errors(prog: &Program, tcx: &Tcx, body: &Body) -> Vec<String> {
     let d = prog.def(body.def);
     let pf = &prog.files[body.file as usize];
     let ast = &pf.ast;
@@ -122,6 +127,39 @@ impl V<'_> {
         }
     }
 
+    /// rustc_mir_transform check_packed_ref: `&place` where the place is a field reached through a
+    /// packed ADT (after the last dereference) whose alignment exceeds the packing (E0793).
+    fn packed_ref(&mut self, pos: u32, place: ExprId) {
+        let mut pack: Option<(u32, bool)> = None;
+        let mut cur = place;
+        loop {
+            cur = self.peel(cur);
+            let base = match self.ast.expr(cur).kind {
+                ExprKind::Field(b, _) | ExprKind::TupleField(b, _) | ExprKind::Index(b, _) => b,
+                _ => break,
+            };
+            let bt = self.body.ty(base);
+            // an implicit or explicit dereference ends the place
+            if matches!(self.tcx.tys.kind(bt), TyKind::Ref(..) | TyKind::Ptr(..)) { break; }
+            if matches!(self.ast.expr(cur).kind, ExprKind::Index(..)) && !matches!(self.tcx.tys.kind(bt), TyKind::Array(..)) { break; }
+            if let TyKind::Adt(d, _, _) = self.tcx.tys.kind(bt) {
+                if let Some(a) = self.tcx.adts.get(d) {
+                    if a.repr_packed > 0 && pack.map_or(true, |(p, _)| a.repr_packed < p) { pack = Some((a.repr_packed, a.is_union)); }
+                }
+            }
+            cur = base;
+        }
+        let Some((pack, union)) = pack else { return };
+        let ty = self.body.ty(place);
+        if self.tcx.tys.flags(ty).intersects(crate::types::TypeFlags::HAS_PARAM | crate::types::TypeFlags::HAS_ALIAS) { return; }
+        let lay = crate::layout::Layouts::new();
+        let l = lay.of(&crate::layout::LayoutCx::new(self.prog), self.tcx, ty);
+        if l.align > pack {
+            let msg = format!("E0793: reference to field of packed {} is unaligned", if union { "union" } else { "struct" });
+            self.errors.push(self.prog.record_error(self.body.file, pos, "typeck", msg));
+        }
+    }
+
     fn fn_path(&self, d: DefId) -> String {
         let def = self.prog.def(d);
         let parent = self.prog.def(def.parent);
@@ -150,7 +188,14 @@ impl V<'_> {
                 lint::emit(self.prog, self.body.def, &lint::UNSAFE_OP_IN_UNSAFE_FN, self.body.file, pos, &msg);
             }
             Ctx::Safe => {
-                if self.deprecated_safe(op) { return; }
+                if self.deprecated_safe(op) {
+                    // emit_deprecated_safe_fn_call: the lint (allow by default, 2024 compatibility)
+                    if let Op::CallToUnsafeFunction(Some(d)) = op {
+                        let msg = format!("call to deprecated safe function `{}` is unsafe and requires unsafe block", self.prog.def_path(d));
+                        lint::emit(self.prog, self.body.def, &lint::DEPRECATED_SAFE_2024, self.body.file, pos, &msg);
+                    }
+                    return;
+                }
                 let tail = if self.op_in_unsafe_fn_allowed && !matches!(op, Op::CallToFunctionWith(_)) { "function or block" } else { "block" };
                 let msg = format!("E0133: {} is unsafe and requires unsafe {}", self.what(op), tail);
                 self.errors.push(self.prog.record_error(self.body.file, pos, "typeck", msg));
@@ -217,8 +262,8 @@ impl V<'_> {
         let mut t = self.body.ty(x);
         let mut known = true;
         for step in 0..n as usize {
-            if self.body.ov_derefs.contains_key(&(e.0, step)) {
-                match self.body.ov_derefs.get(&(e.0, step + 1)) {
+            if self.body.ov_deref(e.0, step).is_some() {
+                match &self.body.ov_deref(e.0, step + 1) {
                     Some((_, args)) if step + 1 < n as usize => t = self.tcx.tys.list(*args)[0],
                     _ => { known = false; break; }
                 }
@@ -324,7 +369,18 @@ impl V<'_> {
                     while let TyKind::Ref(_, p, _) = self.tcx.tys.kind(t) { t = *p; }
                     self.call_hi = self.ast.expr(e).hi;
                     match *self.tcx.tys.kind(t) {
-                        TyKind::FnDef(d, _, _) => self.call_def(lo, d),
+                        TyKind::FnDef(d, args, _) => {
+                            self.call_def(lo, d);
+                            // intrinsicck: both sides of a transmute have one size
+                            if crate::transmute::is_transmute(self.prog, d) {
+                                if let [from, to] = self.tcx.tys.list(args) {
+                                    let env = crate::tcx::TypingEnv { limit: crate::tcx::RecursionLimit::for_item(self.prog, self.body.def), param_env: self.body.param_env.unwrap_or_default(), mode: crate::tcx::TypingMode::PostAnalysis };
+                                    if let Some(msg) = crate::transmute::check_transmute(self.prog, self.tcx, env, *from, *to) {
+                                        self.errors.push(self.prog.record_error(self.body.file, lo, "typeck", msg));
+                                    }
+                                }
+                            }
+                        }
                         TyKind::FnPtr(_, _, h, _) if h.safety == Safety::Unsafe => self.requires_unsafe(lo, Op::CallToUnsafeFunction(None)),
                         _ => {}
                     }
@@ -358,6 +414,7 @@ impl V<'_> {
                     return self.expr(peeled);
                 }
                 self.static_mut_ref(lo, x, m);
+                self.packed_ref(lo, x);
                 self.expr(x);
             }
             ExprKind::Unary(UnOp::Deref, x) => {
@@ -517,6 +574,56 @@ impl V<'_> {
 }
 
 // ---------------------------------------------------------------- impls
+
+/// Run mode (`makepad run` / `test` / `live`, no lints): the unsafety errors of a type-checked body
+/// (E0133: unsafe operations outside `unsafe`). Without it a raw-pointer dereference ran from safe
+/// code. (One AST walk per built body; not memoized: a body's address does not name it across
+/// compiler generations.)
+pub fn run_body_errors(prog: &Program, tcx: &Tcx, body: &Body) -> Vec<String> {
+    check_body_errors(prog, tcx, body)
+}
+
+/// Run mode: the impl soundness errors of crate `krate`, once per crate and collect epoch -- E0197-
+/// E0200 (`unsafe impl` rules: a safe `impl Send` / `impl Sync` would let safe code race) and the
+/// well-formedness (wfcheck) of impls of unsafe or auto traits and of traits with supertraits
+/// (an impl whose supertrait bound does not hold). `makepad check` runs these as part of its
+/// item checks; `run` used to skip them.
+pub fn run_crate_impl_errors(prog: &Program, tcx: &Tcx, krate: u32) -> std::sync::Arc<Vec<String>> {
+    static MEMO: std::sync::Mutex<Option<std::collections::HashMap<(u32, u64), std::sync::Arc<Vec<String>>>>> = std::sync::Mutex::new(None);
+    let epoch = tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst);
+    if let Some(e) = MEMO.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&(krate, epoch))) {
+        return e.clone();
+    }
+    // a body type-checked while these checks run (a constant a well-formedness check evaluates)
+    // does not start them again: that would ask for the query in progress (a false E0391)
+    thread_local! { static ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+    if ACTIVE.with(|a| a.replace(true)) {
+        return std::sync::Arc::new(Vec::new());
+    }
+    struct Reset;
+    impl Drop for Reset { fn drop(&mut self) { ACTIVE.with(|a| a.set(false)); } }
+    let _reset = Reset;
+    let mut out = Vec::new();
+    for i in 0..prog.defs.len() {
+        let d = DefId(i as u32);
+        let def = prog.def(d);
+        if def.krate != krate || def.kind != DefKind::Impl { continue; }
+        out.extend(check_impl(prog, tcx, d));
+        let Some(&td) = tcx.impl_trait.get(&d) else { continue };
+        let tdef = prog.def(td);
+        let tast = &prog.files[tdef.file as usize].ast;
+        let ItemKind::Trait(tr) = tast.item(tdef.item).kind else { continue };
+        let t = tast.row(tr);
+        if t.unsafe_ || t.auto || !tast.list(t.supers).is_empty() {
+            out.extend(crate::wfcheck::obligations::check_def(prog, tcx, d));
+        }
+    }
+    // (the memo outlives compiler generations: its contents are made in the kept heap)
+    let _k = crate::zone_alloc::kept();
+    let out = std::sync::Arc::new(out.clone());
+    MEMO.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert((krate, epoch), out.clone());
+    out
+}
 
 /// rustc_hir_analysis coherence/unsafety.rs (E0199, E0200), E0197 (inherent impls) and
 /// ast_validation's E0198 (negative impls) for impl `d`.

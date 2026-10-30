@@ -4,7 +4,8 @@
 //!
 //! At the app's next event after Relax asks for a restart:
 //! 1. `AppMain::can_restart` may postpone it (unsaved work: the app says why, and the restart
-//!    waits until the app allows it);
+//!    waits until the app allows it, or until the person answers the window caption's "new
+//!    version ready: restart" with restart: [`postponed`], [`restart_anyway`]);
 //! 2. the app's own state (`AppMain::restart_state`) and the window frames are written;
 //! 3. Relax replaces the process with a fresh run of the same command line;
 //! 4. that run's `Startup` gives the app its state back (`AppMain::restore_state`) and opens
@@ -277,24 +278,31 @@ pub(crate) fn stop_workers() {
 static STOP_WAKER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Tells Relax this app restarts with its state (called once at startup).
-/// Relax only sets a flag when it wants a restart; an idle app sees no event, so a watcher
-/// thread (a 20 ms sleep loop, one atomic load each; under Relax only) sends the app an
-/// `Event::Signal` then.
 pub fn announce() {
     #[cfg(relax)]
-    {
-        std::relax::restart_supported();
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static WAKER: AtomicBool = AtomicBool::new(false);
-        if !WAKER.swap(true, Ordering::Relaxed) {
-            let _ = std::thread::Builder::new().name("restart-waker".into()).spawn(|| while !STOP_WAKER.load(Ordering::Acquire) {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                if std::relax::restart_requested() {
-                    crate::thread::SignalToUI::set_ui_signal();
-                    std::thread::sleep(std::time::Duration::from_millis(400));
-                }
-            });
+    std::relax::restart_supported();
+}
+
+/// Relax asks for a restart: it wakes the event loop (`std::relax::on_patch`, which runs this from
+/// `poll_control_channel`), and this sends the app `Event::Signal`s until the restart happens, so
+/// `after_event` asks again while it is postponed (every 420 ms, `try_restart` throttles to 1 s).
+/// The watcher thread lives only while a restart is requested: an idle app has no poller.
+#[cfg(relax)]
+pub(crate) fn poll_requested() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WAKER: AtomicBool = AtomicBool::new(false);
+    if !requested() || STOP_WAKER.load(Ordering::Acquire) || WAKER.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let spawned = std::thread::Builder::new().name("restart-waker".into()).spawn(|| {
+        while requested() && !STOP_WAKER.load(Ordering::Acquire) {
+            crate::thread::SignalToUI::set_ui_signal();
+            std::thread::sleep(std::time::Duration::from_millis(420));
         }
+        WAKER.store(false, Ordering::Release);
+    });
+    if spawned.is_err() {
+        WAKER.store(false, Ordering::Release);
     }
 }
 
@@ -322,13 +330,92 @@ pub fn restart_now(state: &RestartState) {
     let _ = state;
 }
 
+/// Why a due restart waits (the app's `can_restart` answer), while it waits: a new version (a
+/// landed change the JIT could not patch in, or a rebuilt JIT) is ready and the app has unsaved
+/// work. The window's caption offers to restart now (`restart_anyway`).
+static POSTPONED: Mutex<Option<String>> = Mutex::new(None);
+static IS_POSTPONED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The person chose to restart although the app said it has unsaved work.
+static ANYWAY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The app's reason while a ready restart waits for it (None: no restart is waiting). One
+/// atomic load when none waits.
+pub fn postponed() -> Option<String> {
+    if !IS_POSTPONED.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    POSTPONED.lock().unwrap().clone()
+}
+
+fn set_postponed(why: Option<String>) {
+    IS_POSTPONED.store(why.is_some(), std::sync::atomic::Ordering::Release);
+    *POSTPONED.lock().unwrap() = why;
+}
+
+/// Unsaved work the app registered (`set_unsaved`): what it is, by a key of the app's own (a
+/// file path). A due restart waits while any is registered, as when `can_restart` says no.
+static UNSAVED: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+/// Registers (`Some(what)`) or clears (`None`) unsaved work under `key`: an app with documents
+/// calls it when one gets edits nobody saved and when they are saved or dropped, and a restart
+/// for a new version then waits and asks the person (the caption's "new version ready").
+pub fn set_unsaved(key: &str, what: Option<&str>) {
+    let mut unsaved = UNSAVED.lock().unwrap();
+    let before = unsaved.len();
+    unsaved.retain(|(k, _)| k != key);
+    let changed = before != unsaved.len() || what.is_some();
+    if let Some(what) = what {
+        unsaved.push((key.to_string(), what.to_string()));
+    }
+    if changed {
+        publish_unsaved(&unsaved);
+    }
+}
+
+/// The process's unsaved work for the machine (Unix): `$XDG_RUNTIME_DIR/makepad-unsaved/<pid>`,
+/// one line per piece of work, gone when nothing is unsaved. What restarts a whole session
+/// (devhub's WM restart: `makepad_app_registry::machine::unsaved_work`) reads it and waits.
+fn publish_unsaved(unsaved: &[(String, String)]) {
+    #[cfg(unix)]
+    {
+        let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty()) else { return };
+        let dir = std::path::PathBuf::from(dir).join("makepad-unsaved");
+        let file = dir.join(std::process::id().to_string());
+        if unsaved.is_empty() {
+            let _ = std::fs::remove_file(&file);
+            return;
+        }
+        let text: String = unsaved.iter().map(|(_, what)| format!("{}\n", what.replace('\n', " "))).collect();
+        let tmp = dir.join(format!("{}.new", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&tmp, text)).and_then(|_| std::fs::rename(&tmp, &file));
+    }
+    #[cfg(not(unix))]
+    let _ = unsaved;
+}
+
+/// The registered unsaved work, as a reason (None: nothing unsaved).
+pub fn unsaved() -> Option<String> {
+    let unsaved = UNSAVED.lock().unwrap();
+    (!unsaved.is_empty()).then(|| format!("unsaved: {}", unsaved.iter().map(|(_, w)| w.as_str()).collect::<Vec<_>>().join(", ")))
+}
+
+/// The person answered "restart" to the new version: the waiting restart happens at the next
+/// event without asking the app again (its state is still carried over).
+pub fn restart_anyway() {
+    if IS_POSTPONED.load(std::sync::atomic::Ordering::Acquire) {
+        ANYWAY.store(true, std::sync::atomic::Ordering::Release);
+        crate::thread::SignalToUI::set_ui_signal();
+    }
+}
+
 /// At an event after a restart request: asks the app, then snapshots and restarts.
 pub fn try_restart(app: &mut dyn crate::app_main::AppMain, cx: &mut Cx) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static LAST_ASK_MS: AtomicU64 = AtomicU64::new(0);
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
     let last = LAST_ASK_MS.load(Ordering::Relaxed);
-    if last != 0 && now < last + 1000 {
+    let anyway = ANYWAY.load(Ordering::Acquire);
+    if last != 0 && now < last + 1000 && !anyway {
         return;
     }
     // the widgets write their state at the next event (they see `wants_snapshot` while they
@@ -338,16 +425,23 @@ pub fn try_restart(app: &mut dyn crate::app_main::AppMain, cx: &mut Cx) {
         return;
     }
     LAST_ASK_MS.store(now, Ordering::Relaxed);
-    match app.can_restart(cx) {
+    let asked = if anyway { Ok(()) } else { app.can_restart(cx).and_then(|()| unsaved().map_or(Ok(()), Err)) };
+    match asked {
         Err(why) => {
             SNAPSHOT.store(false, Ordering::Relaxed);
             if last == 0 {
                 crate::log!("restart postponed ({}): {}", reason(), why);
             }
+            if postponed().as_deref() != Some(why.as_str()) {
+                set_postponed(Some(why));
+                cx.redraw_all();
+            }
         }
         Ok(()) => {
             let widgets = WIDGETS_OUT.lock().unwrap().take().unwrap_or_default();
             let st = RestartState { windows: cx.restart_window_frames(), widgets, reason: reason(), app: app.restart_state(cx) };
+            set_postponed(None);
+            ANYWAY.store(false, Ordering::Release);
             restart_now(&st);
             SNAPSHOT.store(false, Ordering::Relaxed);
         }

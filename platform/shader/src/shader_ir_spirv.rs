@@ -53,6 +53,7 @@ pub fn ir_to_spirv(m: &IrModule, entry: FuncId, xr: bool) -> Result<Vec<u32>, St
         interface: Vec::new(),
         stage,
         xr,
+        precise: m.precise,
         uses_view_index: false,
         f: FnCx::default(),
     };
@@ -93,6 +94,24 @@ pub fn ir_to_spirv(m: &IrModule, entry: FuncId, xr: bool) -> Result<Vec<u32>, St
         IrStage::Fragment => {
             g.b.entry_point(EXEC_MODEL_FRAGMENT, entry_id, &name, &interface);
             g.b.execution_mode(entry_id, EXEC_MODE_ORIGIN_UPPER_LEFT);
+            // Writing FragDepth needs DepthReplacing; the conservative
+            // variants add DepthGreater / DepthLess (early tests stay on).
+            if let Some(e) = m.functions[entry as usize].entry.as_ref() {
+                for io in &e.outputs {
+                    let mode = match io.binding {
+                        IrIoBinding::Builtin(IrBuiltinIo::FragDepth) => Some(None),
+                        IrIoBinding::Builtin(IrBuiltinIo::FragDepthGreater) => Some(Some(EXEC_MODE_DEPTH_GREATER)),
+                        IrIoBinding::Builtin(IrBuiltinIo::FragDepthLess) => Some(Some(EXEC_MODE_DEPTH_LESS)),
+                        _ => None,
+                    };
+                    if let Some(extra) = mode {
+                        g.b.execution_mode(entry_id, EXEC_MODE_DEPTH_REPLACING);
+                        if let Some(x) = extra {
+                            g.b.execution_mode(entry_id, x);
+                        }
+                    }
+                }
+            }
         }
         IrStage::Compute => {
             g.b.entry_point(EXEC_MODEL_GL_COMPUTE, entry_id, &name, &interface);
@@ -138,6 +157,8 @@ struct Gen<'a> {
     interface: Vec<u32>,
     stage: IrStage,
     xr: bool,
+    /// `IrModule::precise`: float arithmetic results carry NoContraction.
+    precise: bool,
     uses_view_index: bool,
     f: FnCx,
     /// A compute kernel's push-constant block (buffer addresses, params).
@@ -215,7 +236,10 @@ impl<'a> Gen<'a> {
                 if dim == DIM_CUBE && arrayed {
                     self.b.capability(CAP_SAMPLED_CUBE_ARRAY);
                 }
-                self.b.type_image(f, dim, depth, arrayed)
+                let image = self.b.type_image(f, dim, depth, arrayed);
+                // a video texture is a combined image sampler (its sampler is the binding's own:
+                // a decoder's picture is sampled through its format's Y'CbCr conversion)
+                if matches!(tt, TextureType::TextureVideo) { self.b.type_sampled_image(image) } else { image }
             }
             IrTy::Sampler(_) => self.b.type_sampler(),
         };
@@ -314,6 +338,12 @@ impl<'a> Gen<'a> {
         words.push(id);
         words.extend_from_slice(args);
         spv_inst(&mut self.f.body, op, &words);
+        // precise math: no float op may fuse with its neighbours (a*b+c stays two roundings)
+        if self.precise && matches!(op, OP_F_NEGATE | OP_F_ADD | OP_F_SUB | OP_F_MUL | OP_F_DIV | OP_F_REM | OP_VECTOR_TIMES_SCALAR
+            | OP_MATRIX_TIMES_SCALAR | OP_VECTOR_TIMES_MATRIX | OP_MATRIX_TIMES_VECTOR | OP_MATRIX_TIMES_MATRIX | OP_OUTER_PRODUCT | OP_DOT)
+        {
+            self.b.decorate(id, DECO_NO_CONTRACTION, &[]);
+        }
         id
     }
 
@@ -689,7 +719,7 @@ impl<'a> Gen<'a> {
                         BUILTIN_VIEW_INDEX
                     }
                     IrBuiltinIo::FrontFacing => BUILTIN_FRONT_FACING,
-                    IrBuiltinIo::FragDepth => BUILTIN_FRAG_DEPTH,
+                    IrBuiltinIo::FragDepth | IrBuiltinIo::FragDepthGreater | IrBuiltinIo::FragDepthLess => BUILTIN_FRAG_DEPTH,
                 };
                 self.b.decorate(var, DECO_BUILT_IN, &[builtin]);
                 // naga back/spv/writer.rs `write_varying`: every integer
@@ -1826,7 +1856,26 @@ impl<'a> Gen<'a> {
 
     // ---- textures ----
 
+    /// Whether texture expression `tex` is a video texture (a combined image sampler).
+    fn is_video(&self, tex: ExprId) -> bool {
+        matches!(self.m.get(self.ety(tex)), IrTy::Texture(TextureType::TextureVideo))
+    }
+
+    /// The image of texture expression `tex` (a video texture's, out of its combined sampler).
+    fn image_of(&mut self, tex: ExprId) -> Result<u32, String> {
+        let v = self.value(tex)?;
+        if !self.is_video(tex) {
+            return Ok(v);
+        }
+        let f = self.b.type_f32();
+        let image = self.b.type_image(f, DIM_2D, false, false);
+        Ok(self.ins_id(OP_IMAGE, image, &[v]))
+    }
+
     fn sampled_image(&mut self, tex: ExprId, sampler: u32) -> Result<u32, String> {
+        if self.is_video(tex) {
+            return self.value(tex);
+        }
         let img = self.value(tex)?;
         let tex_ty = self.ety(tex);
         let it = self.ty(tex_ty);
@@ -1843,27 +1892,8 @@ impl<'a> Gen<'a> {
     fn sample(&mut self, s: &IrSample, ty: TyId) -> Result<u32, String> {
         let si = self.sampled_image(s.tex, s.sampler)?;
         let coord = self.value(s.coord)?;
-        let (_, _, arrayed) = image_shape(s.tex_type);
-        let coord = if arrayed {
-            // The layer is the coordinate's last lane truncated (WGSL's
-            // `i32(coord.z)`), then exact as a float.
-            let ct = self.ety(s.coord);
-            let n = self.lanes(ct);
-            let f = self.b.type_f32();
-            let i = self.b.type_i32();
-            let layer = self.ins_id(OP_COMPOSITE_EXTRACT, f, &[coord, n - 1]);
-            let li = self.ins_id(OP_CONVERT_F_TO_S, i, &[layer]);
-            let lf = self.ins_id(OP_CONVERT_S_TO_F, f, &[li]);
-            let mut args = Vec::new();
-            for k in 0..n - 1 {
-                args.push(self.ins_id(OP_COMPOSITE_EXTRACT, f, &[coord, k]));
-            }
-            args.push(lf);
-            let vt = self.vec_id(IrScalar::F32, n);
-            self.ins_id(OP_COMPOSITE_CONSTRUCT, vt, &args)
-        } else {
-            coord
-        };
+        // An arrayed image takes the layer as the coordinate's last lane, rounded to nearest by
+        // the sampler (as GLSL, HLSL and Metal take it).
         let v4 = self.vec_id(IrScalar::F32, 4);
         let f32t = self.b.type_f32();
         let r = match s.kind {
@@ -1902,7 +1932,7 @@ impl<'a> Gen<'a> {
 
     fn tex_size(&mut self, tex: ExprId, ty: TyId) -> Result<u32, String> {
         self.b.capability(CAP_IMAGE_QUERY);
-        let img = self.value(tex)?;
+        let img = self.image_of(tex)?;
         let tex_ty = self.ety(tex);
         let tt = match self.m.get(tex_ty) {
             IrTy::Texture(t) => *t,
@@ -1927,7 +1957,7 @@ impl<'a> Gen<'a> {
     }
 
     fn tex_load(&mut self, tex: ExprId, coord: ExprId, layer: ExprId, lod: ExprId, ty: TyId) -> Result<u32, String> {
-        let img = self.value(tex)?;
+        let img = self.image_of(tex)?;
         let c = self.value(coord)?;
         let c = if layer != NO_EXPR {
             let l = self.value(layer)?;

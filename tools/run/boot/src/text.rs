@@ -4,6 +4,7 @@ use makepad_font_core::{
     font_face::{FontData, FontFace},
     rustybuzz,
 };
+use makepad_script::{id, LiveId};
 use makepad_hal::{
     font::{wire, FontSource, GlyphEntry},
     CmdWriter, HalEvent, Id,
@@ -63,6 +64,10 @@ pub struct Text {
     ready: HashMap<Key, GlyphEntry>,
     pending: HashSet<Key>,
     used: HashSet<Key>,
+    /// the glyphs of what draws apart from the boot window's frames (the JIT ring's tooltip):
+    /// never released by those frames while pinned
+    pinned: HashSet<Key>,
+    pinning: bool,
     runs: HashMap<RunKey, Cached>,
 }
 
@@ -81,6 +86,8 @@ impl Text {
             ready: HashMap::new(),
             pending: HashSet::new(),
             used: HashSet::new(),
+            pinned: HashSet::new(),
+            pinning: false,
             runs: HashMap::new(),
         })
     }
@@ -143,6 +150,11 @@ impl Text {
             _ => return Ok(false),
         }
         Ok(true)
+    }
+
+    /// Where the baseline of a line of `size` sits below the line's top.
+    pub fn ascender(&self, size: f32) -> f32 {
+        self.font.ascender_in_ems() * size
     }
 
     pub fn begin_layout(&mut self) {
@@ -274,6 +286,58 @@ impl Text {
         shaped
     }
 
+    /// Appends the glyph instances of `line` (its top at `y`) clipped to `bounds`; the glyphs
+    /// the atlas lacks are asked for in `requests`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn glyph_instances(
+        &mut self,
+        program: &crate::document::Program,
+        line: &crate::TextLine,
+        y: f32,
+        bounds: [f32; 4],
+        dpi: f32,
+        requests: &mut Vec<(u32, f32)>,
+        out: &mut Vec<f32>,
+    ) {
+        for glyph in line.run.visible(
+            bounds[1] - y,
+            bounds[1] + bounds[3] - y,
+            line.style.size,
+            line.style.height,
+        ) {
+            let baseline = [
+                line.position[0]
+                    + glyph.x
+                    + (line.run.width - glyph.row_width) * line.style.align,
+                y + glyph.y,
+            ];
+            let Some(entry) = self.lookup(glyph.id, line.style.size, dpi, requests) else {
+                continue;
+            };
+            if entry.atlas_kind == wire::glyph::EMPTY {
+                continue;
+            }
+            let (rect, uv) = self.quad(entry, baseline, line.style.size);
+            let (rect, uv) = crate::crop(rect, uv, bounds);
+            if rect[2] <= 0.0 || rect[3] <= 0.0 {
+                continue;
+            }
+            program.pipes[crate::document::GLYPH].instances.write(
+                &[
+                    (id!(rect), &rect),
+                    (id!(uv), &uv),
+                    (id!(color), &line.style.color),
+                    (id!(atlas_plane), &[entry.plane as f32]),
+                    (
+                        id!(color_glyph),
+                        &[if entry.atlas_kind == wire::glyph::COLOR { 1.0 } else { 0.0 }],
+                    ),
+                ],
+                out,
+            );
+        }
+    }
+
     pub fn begin_frame(&mut self) {
         self.used.clear();
     }
@@ -287,7 +351,11 @@ impl Text {
     ) -> Option<GlyphEntry> {
         let dpxs = size * dpi;
         let key = (glyph, dpxs.to_bits());
-        self.used.insert(key);
+        if self.pinning {
+            self.pinned.insert(key);
+        } else {
+            self.used.insert(key);
+        }
         if let Some(entry) = self.ready.get(&key) {
             return Some(*entry);
         }
@@ -306,12 +374,12 @@ impl Text {
         let live: HashSet<_> = self
             .ready
             .iter()
-            .filter(|(key, _)| self.used.contains(*key))
+            .filter(|(key, _)| self.used.contains(*key) || self.pinned.contains(*key))
             .map(|(_, entry)| (entry.slot, entry.slot_gen))
             .collect();
         let mut release = HashSet::new();
         self.ready.retain(|key, entry| {
-            let keep = self.used.contains(key);
+            let keep = self.used.contains(key) || self.pinned.contains(key);
             if !keep && entry.slot != 0 && !live.contains(&(entry.slot, entry.slot_gen)) {
                 release.insert((entry.slot, entry.slot_gen));
             }
@@ -323,6 +391,27 @@ impl Text {
         self.opened
             && !self.atlas.is_none()
             && self.used.iter().all(|key| self.ready.contains_key(key))
+    }
+
+    /// A frame drawn apart from the boot window's (the JIT ring's tooltip): its glyphs are
+    /// pinned (`finish_pinned`) instead of this frame's.
+    pub fn begin_pinned(&mut self) {
+        self.pinned.clear();
+        self.pinning = true;
+    }
+
+    /// Asks for the pinned glyphs the atlas lacks; whether they are all there to draw.
+    pub fn finish_pinned(&mut self, writer: &mut CmdWriter, requests: &[(u32, f32)]) -> bool {
+        self.pinning = false;
+        if !requests.is_empty() {
+            writer.request_glyphs(FONT_ID, wire::kind::SDF, requests);
+        }
+        self.opened && !self.atlas.is_none() && self.pinned.iter().all(|key| self.ready.contains_key(key))
+    }
+
+    /// The pinned glyphs may go (the next frame of the boot window releases them).
+    pub fn unpin(&mut self) {
+        self.pinned.clear();
     }
 
     pub fn atlas(&self) -> Id {

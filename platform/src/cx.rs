@@ -35,7 +35,7 @@ use {
     makepad_network::NetworkRuntime,
     makepad_script::*,
     makepad_studio_protocol::{
-        RunViewFrameData, RunViewFrameRequest, ScreenshotRequest, WidgetSnapshot,
+        RunViewFrameData, RunViewFrameRequest, ScreenshotRequest,
     },
     std::{
         any::{Any, TypeId},
@@ -106,7 +106,11 @@ pub struct Cx {
     pub null_cube_texture: Texture,
     pub windows: CxWindowPool,
     pub passes: CxDrawPassPool,
+    pub(crate) native_layers: crate::native_layer::CxNativeLayerPool,
     pub draw_lists: CxDrawListPool,
+    pub a11y: crate::a11y::CxA11y,
+    pub(crate) a11y_host_consumers: u32,
+    pub(crate) a11y_native_consumers: u32,
     pub draw_matrices: CxDrawMatrixPool,
     pub textures: CxTexturePool,
     /// Shared-instance publications (cleanup DL-1 freeze): the registry that
@@ -129,6 +133,15 @@ pub struct Cx {
     pub signal_hooks: Vec<fn(&mut Cx)>,
 
     pub redraw_id: u64,
+    /// The drawing being recorded (`Cx::drawing_id`): one per draw event, and
+    /// one per draw context made outside a draw event.
+    pub(crate) drawing_id: u64,
+    /// `redraw_id` when that drawing began: the lists its draw contexts
+    /// recorded carry a higher one.
+    pub(crate) drawing_start: u64,
+    /// What a frame drawn again before it painted keeps of its earlier
+    /// drawings (`Cx::frame_drawn_again`).
+    pub(crate) redraw_keep: crate::os::cx_shared::RedrawKeep,
 
     /// Process-wide source of uniform block generations. A generation is
     /// issued once and never reused, so pooled draw/pass/list slots cannot
@@ -151,11 +164,21 @@ pub struct Cx {
     pub(crate) file_dialogs: FileDialogState,
 
     pub(crate) platform_ops: VecDeque<CxOsOp>,
+    /// the trays the app has (`Cx::set_tray`): while there is one the app outlives its windows
+    pub(crate) trays: Vec<LiveId>,
     pub(crate) pending_camera_playbacks: Vec<PendingCameraPlayback>,
 
     pub(crate) new_next_frames: HashSet<NextFrame>,
     /// Frame requests made so far (`Cx::frame_requests`).
     pub(crate) frame_requests: u64,
+    /// An `Event::XrUpdate` is being handled: what is redrawn now is drawn for a remote
+    /// headset's frame, and paints no window (`Cx::compute_pass_repaint_order`).
+    pub(crate) in_xr_update: bool,
+    /// Something other than a remote headset's frame redrew since the windows last painted (or
+    /// a grab waits for them): with an offscreen XR display the windows paint only then.
+    pub(crate) window_redrawn: bool,
+    /// Repaints that painted a window, since the start (`Cx::window_paints`).
+    pub(crate) window_paints: u64,
     /// A child its host says nothing shows of (`HostedVisible`: a hosted process over its
     /// socket, a HAL domain as an app message from its parent): next-frame callbacks and draws
     /// wait until it is shown again (`hosted_frames_held`).
@@ -282,8 +305,6 @@ pub struct Cx {
     pub(crate) run_view_frame_results: ToUIReceiver<Result<RunViewFrameData, String>>,
     #[allow(dead_code)]
     pub(crate) run_view_frame_encode_in_flight: bool,
-    pub(crate) widget_tree_dump_requests: Vec<u64>,
-    pub(crate) widget_snapshot_requests: Vec<u64>,
     /// Event ID that triggered a widget query cache invalidation.
     /// When Some(event_id), indicates that widgets should clear their query caches
     /// on the next event loop cycle. This ensures all views process the cache clear
@@ -295,17 +316,17 @@ pub struct Cx {
 
     /// The app's timers while `--virtual-clock` runs (see `remote::app_clock`).
     pub app_clock: crate::remote::app_clock::AppClock,
-    /// The widget snapshot with each widget's dotted id path from its window
-    /// root (named widgets only), registered by the widgets layer; the remote
-    /// bridge's `/snap` path addressing reads it.
-    pub widget_paths_callback: Option<fn(&Cx) -> Vec<(WidgetSnapshot, String)>>,
+    /// The widget path and type of each given uid, registered by the widgets layer (frame capture
+    /// attribution: `draw_owners`).
+    pub widget_uid_paths_callback: Option<fn(&Cx, &[u64]) -> Vec<(u64, String, String)>>,
+    /// Per-instance widget attribution, only while a capture asks for it (`draw_owners`).
+    pub draw_owners: Option<Box<crate::draw_owners::DrawOwners>>,
+    /// The names drawers give their instances (`Cx::draw_label`), interned once.
+    pub(crate) draw_labels: crate::draw_owners::DrawLabels,
     /// Subsystems' counts of asynchronous loads in flight, by kind (see
     /// `Cx::register_async_load_probe`).
     pub(crate) async_load_probes: Vec<(&'static str, crate::cx_api::AsyncLoadProbe)>,
     pub widget_tree_ptr: *mut (),
-    pub widget_tree_dump_callback: Option<fn(&Cx) -> String>,
-    pub widget_query_callback: Option<fn(&Cx, &str) -> Vec<String>>,
-    pub widget_snapshot_callback: Option<fn(&Cx) -> Vec<WidgetSnapshot>>,
     /// Selects a cancel scope from the currently active widget hierarchy. The lookup
     /// returns the newest matching scope for a widget UID. Called only for a new
     /// Escape/Back press; widgets install this without a platform dependency on them.
@@ -997,7 +1018,11 @@ impl Cx {
 
             windows: Default::default(),
             passes: Default::default(),
+            native_layers: Default::default(),
             draw_lists: Default::default(),
+            a11y: Default::default(),
+            a11y_host_consumers: 0,
+            a11y_native_consumers: 0,
             draw_matrices: Default::default(),
             geometries: Default::default(),
             textures,
@@ -1015,6 +1040,9 @@ impl Cx {
             new_actions: Default::default(),
 
             redraw_id: 1,
+            drawing_id: 0,
+            drawing_start: 0,
+            redraw_keep: Default::default(),
             uniform_gen: 1,
             event_id: 1,
             repaint_id: 1,
@@ -1031,10 +1059,14 @@ impl Cx {
             ime_area: Default::default(),
             keyboard_shift: 0.0,
             platform_ops: Default::default(),
+            trays: Vec::new(),
             pending_camera_playbacks: Vec::new(),
             studio_http: "".to_string(),
             new_next_frames: Default::default(),
             frame_requests: 0,
+            in_xr_update: false,
+            window_redrawn: false,
+            window_paints: 0,
             hosted_hidden: false,
 
             post_draw_hook: None,
@@ -1092,16 +1124,13 @@ impl Cx {
             pending_window_geom_changes: Default::default(),
             clear_hover_queued: false,
 
-            widget_tree_dump_requests: Default::default(),
-            widget_snapshot_requests: Default::default(),
             widget_query_invalidation_event: None,
             app_clock: Default::default(),
-            widget_paths_callback: None,
+            widget_uid_paths_callback: None,
+            draw_owners: None,
+            draw_labels: Default::default(),
             async_load_probes: Vec::new(),
             widget_tree_ptr: std::ptr::null_mut(),
-            widget_tree_dump_callback: None,
-            widget_query_callback: None,
-            widget_snapshot_callback: None,
             cancel_scope_resolver: None,
             tweak_callback: None,
             design_preview_callback: None,
@@ -1343,8 +1372,11 @@ pub fn startup_trace_first_present() {
     if FIRST.swap(false, std::sync::atomic::Ordering::Relaxed) {
         let presented_at = Cx::time_now();
         FIRST_PRESENT_SEEN.store(true, std::sync::atomic::Ordering::Release);
-        relax_first_present();
+        // The launcher is told first: the loader's hook below starts the post-present work, and the
+        // owner thread serving it (a cache batch) made the first call of this report wait for it
+        // (a lazily compiled fn: ~55 ms on a quiet machine) before the launcher saw the frame.
         report_first_present();
+        relax_first_present();
         print_first_present(presented_at);
         startup_trace("FIRST PRESENT ON GLASS");
         startup_trace_flush("cumulative at first present");
@@ -1364,13 +1396,14 @@ fn print_first_present(presented_at: f64) {
     let present_ms = (presented_at - startup_t0()).max(0.0) * 1000.0;
     let main_ms = std::env::var("MAKEPAD_RUN_MAIN_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
     let cache = std::env::var("MAKEPAD_RUN_CACHE_STATE").unwrap_or_else(|_| "off".to_string());
-    eprintln!("{}", first_present_line(&package, present_ms, main_ms, &cache));
+    let ahead = std::env::var("MAKEPAD_RUN_AHEAD").unwrap_or_else(|_| "balanced".to_string());
+    eprintln!("{}", first_present_line(&package, present_ms, main_ms, &cache, &ahead));
 }
 
-fn first_present_line(package: &str, present_ms: f64, main_ms: f64, cache: &str) -> String {
+fn first_present_line(package: &str, present_ms: f64, main_ms: f64, cache: &str, ahead: &str) -> String {
     format!(
-        "makepad: {} first frame at {:.2} s (main at {:.2} s, cache {})",
-        package, present_ms / 1000.0, main_ms / 1000.0, cache
+        "makepad: {} first frame at {:.2} s (main at {:.2} s, cache {}, ahead {})",
+        package, present_ms / 1000.0, main_ms / 1000.0, cache, ahead
     )
 }
 
@@ -1435,3 +1468,38 @@ pub(crate) fn relax_first_present() {
 
 #[cfg(not(any(unix, windows)))]
 pub(crate) fn relax_first_present() {}
+
+/// The app's shutdown starts (it quits, its last window closed, a remote `/quit`): under Relax the
+/// loader marks the quit (its quit-compile accounting, no settle swap from now on) and writes the
+/// disk cache while the app shuts down -- what a termination signal does, without reporting an
+/// abnormal end. Once per process; a rustc build has no such symbol.
+#[cfg(any(unix, windows))]
+pub(crate) fn relax_quit_started() {
+    static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if ONCE.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    let hook = relax_host_symbol(c"relax_quit_started");
+    if !hook.is_null() {
+        let hook = unsafe { std::mem::transmute::<*mut std::ffi::c_void, extern "C" fn()>(hook) };
+        hook();
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn relax_quit_started() {}
+
+/// Each frame the HAL finished, under Relax: the loader logs the frame gaps after the first
+/// present (its post-present responsiveness report). The symbol is looked up once.
+#[cfg(any(unix, windows))]
+pub(crate) fn relax_frame_done() {
+    static HOOK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let hook = *HOOK.get_or_init(|| relax_host_symbol(c"relax_frame_done") as usize);
+    if hook != 0 {
+        let hook = unsafe { std::mem::transmute::<usize, extern "C" fn()>(hook) };
+        hook();
+    }
+}
+
+#[cfg(not(any(unix, windows, target_arch = "wasm32")))]
+pub(crate) fn relax_frame_done() {}

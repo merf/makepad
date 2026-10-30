@@ -19,6 +19,35 @@ fn chain_fade_windows(threshold: f32, distance: f32) -> Option<(f32, f32)> {
     Some((1.0 + q * 256.0 + 255.0, 1.0 + q))
 }
 
+/// The model lanes' names for their draws ("model gen/mdl/valley-oak lod1 layer2", "impostor
+/// gen/mdl/valley-oak"), which the GPU profiler and frame captures show as the draws' owners.
+/// Asked only while owners are recorded (`Cx::draw_owners_armed`); each name is formatted and
+/// interned once, after that naming a draw is a lookup.
+#[derive(Default)]
+pub(super) struct DrawNames {
+    /// model id -> ((LOD, layer, stand-in) packed, label)
+    models: std::collections::HashMap<String, Vec<(u32, DrawLabel)>>,
+}
+
+impl DrawNames {
+    pub(super) fn model(&mut self, cx: &mut Cx, model: &str, lod: usize, layer: usize, stand_in: bool) -> DrawLabel {
+        let key = (lod as u32) << 16 | (layer as u32 & 0x7fff) << 1 | stand_in as u32;
+        if let Some((_, label)) = self.models.get(model).and_then(|v| v.iter().find(|(k, _)| *k == key)) {
+            return *label;
+        }
+        let mut name = format!("{} {model}", if stand_in { "impostor" } else { "model" });
+        if lod > 0 {
+            name.push_str(&format!(" lod{lod}"));
+        }
+        if layer > 0 && !stand_in {
+            name.push_str(&format!(" layer{layer}"));
+        }
+        let label = cx.draw_label(&name);
+        self.models.entry(model.to_string()).or_default().push((key, label));
+        label
+    }
+}
+
 /// One instance list's draw order for one frame: each copy's model slot and
 /// LOD, and the copies grouped by (model, LOD).
 #[derive(Default)]
@@ -277,11 +306,21 @@ impl Renderer {
             let stock = self.pbr_draw.as_ref().and_then(|d| d.skinned.draw_vars.draw_shader_id);
             let shader = if stock.is_some() { self.lane_shaders(cx.cx, variants::ModelLane::Pbr, stock).0 } else { None };
             self.pbr_ready = shader.is_some_and(|id| cx.cx.draw_shader_ready(id, hdr));
+            // Likewise shiny stock models leave the PBR lane for the
+            // engine's IBL program only once its variant for this frame's
+            // features can draw (renderer/stock_ibl.rs).
+            self.confirm_stock_ibl(cx.cx);
         }
         let custom_name = match &draw {
             ModelDraw::Custom(name, _) => Some((*name).to_string()),
             _ => None,
         };
+        // Shiny stock models under an environment leave the PBR lane for
+        // the engine's IBL program (renderer/stock_ibl.rs): decided in the
+        // diffuse pass above, read here by every lane so exactly one of
+        // them draws them.
+        let stock_ibl_on = self.stock_ibl_active();
+        let stock_ibl_lane = custom_name.as_deref() == Some(stock_ibl::STOCK_IBL_MATERIAL);
         self.bind_model_lane(cx, &mut draw, eye, fog, sun);
         // The lane draws through the shader variant for this frame's
         // features, and draws that cut no pixel through the one without
@@ -290,6 +329,7 @@ impl Renderer {
             ModelDraw::Diffuse(_) => Some(variants::ModelLane::Diffuse),
             ModelDraw::Pbr(_) => Some(variants::ModelLane::Pbr),
             ModelDraw::Foliage(_) => Some(variants::ModelLane::Foliage),
+            ModelDraw::Splat(_) => Some(variants::ModelLane::Splat),
             _ => None,
         };
         let opaque = match (&mut draw, model_lane) {
@@ -313,6 +353,24 @@ impl Renderer {
         // its shader is ready, and in no other.
         let foliage_lane = matches!(draw, ModelDraw::Foliage(_));
         let foliage_ready = self.foliage_ready && matches!(lane, WorldModelLane::Placed);
+        // Terrain tiles with paint draw in the splat lane once its shader is
+        // ready, and in no other; until then the PBR lane draws their main
+        // layer (their base texture).
+        let splat_lane = matches!(draw, ModelDraw::Splat(_));
+        let splat_ready = self.splat_ready && matches!(lane, WorldModelLane::Placed);
+        // A model's far stand-in draws through the impostor shader, which has
+        // the foliage/PBR lanes' layout: the lane swaps only the shader id
+        // for that layer. Without it (the diffuse lane, or before its
+        // pipeline exists) the model draws its own layers at every distance:
+        // the stand-in's quad is not a picture on its own.
+        let lane_shader = draw.base().draw_vars.draw_shader_id;
+        let impostor_shader = if matches!(draw, ModelDraw::Foliage(_) | ModelDraw::Pbr(_)) {
+            self.lane_shaders(cx.cx, variants::ModelLane::Impostor, None).0.filter(|id| cx.cx.draw_shader_ready(*id, self.hdr_output))
+        } else {
+            None
+        };
+        let impostor_scale = self.impostor_scale;
+        let terrain_blend_reach = self.terrain_blend_reach;
         let occluder_focus = self.occluder.focus();
         // Dynamic lights. STATICS share one transient-only block (their
         // lamp light is baked; only the dl_split prefix reaches them, so a
@@ -386,6 +444,14 @@ impl Renderer {
         // The models are read, not cloned, per copy: set aside for the walk
         // (nothing below reads them through `self`) and put back after it.
         let static_models = std::mem::take(&mut self.static_models);
+        // The layer material whose uniforms the draw holds now. Consecutive
+        // copies of one model layer (a forest, a row of props) share it, and
+        // `set_material` writes a dozen uniforms and up to four textures by
+        // name each time: on the flight island that was the hottest program
+        // code of the frame. A copy that changed the material's uniforms
+        // after it (an item's glow, a fur shell) forces the next write; the
+        // per-copy lamp gain is written for every copy anyway.
+        let mut held_material: *const LayerMaterial = std::ptr::null();
         layered.clear();
         for layer_pass in 0..layer_passes {
             let mut last: Option<(usize, usize)> = None;
@@ -409,6 +475,8 @@ impl Renderer {
                 let inv_height = 1.0 / root.max.y.max(0.5);
                 let sways = foliage_ready && std::iter::once(&root.material).chain(root.extra_draws.iter().map(|l| &l.4))
                     .any(|m| m.surface.as_ref().is_some_and(|s| s.definition.wind > 0.0));
+                let paints = splat_ready && std::iter::once(&root.material).chain(root.extra_draws.iter().map(|l| &l.4))
+                    .any(|m| m.surface.as_ref().is_some_and(|s| s.splat.is_some()));
                 let distance=distances[i];
                 let mut fur_budget = 12_000usize.min(96_000usize.saturating_sub(stats.fur_triangles));
                 let loaded=if lod_index==0{root}else{&root.lods[lod_index-1].1};
@@ -421,12 +489,31 @@ impl Renderer {
                     custom_name.as_deref() == Some(m.name.as_str())
                         || self.custom_draws.get(&m.name).is_some_and(|d| d.draw.draw_vars.draw_shader_id.is_some_and(|id| cx.cx.draw_shader_ready(id, self.hdr_output)))
                 });
+                // A shiny stock model with no material of its own, while an
+                // environment is registered: the stock IBL lane takes it and
+                // the PBR lane leaves it (renderer/stock_ibl.rs). A material
+                // it names is its own only while that one is installed: a
+                // name that is not draws through the stock lanes anyway.
+                let own_material = self.has_own_material(inst, custom_name.as_deref());
+                // A painted terrain tile stays with the splat lane (its layers).
+                let takes_stock_ibl = !paints && stock_ibl::takes_stock_ibl(stock_ibl_on, uses_pbr_lane, own_material, sways);
                 if let Some(name) = custom_name.as_deref() {
-                    if wanted_custom.map(|m| m.name.as_str()) != Some(name) { continue; }
-                    if let (ModelDraw::Custom(_, d), Some(material)) = (&mut draw, wanted_custom) {
-                        d.draw.set_params(cx.cx, material.params);
+                    if stock_ibl_lane {
+                        // Its own instances, plus any that name the program
+                        // outright (an engine name, but never a vanished model).
+                        if !(takes_stock_ibl || wanted_custom.map(|m| m.name.as_str()) == Some(name)) { continue; }
+                    } else {
+                        if wanted_custom.map(|m| m.name.as_str()) != Some(name) { continue; }
+                        if let (ModelDraw::Custom(_, d), Some(material)) = (&mut draw, wanted_custom) {
+                            d.draw.set_params(cx.cx, material.params);
+                        }
                     }
-                } else if wanted_custom.is_some() || sways != foliage_lane || (!foliage_lane && uses_pbr_lane != pbr_lane) {
+                } else if paints != splat_lane || if splat_lane {
+                    // A painted terrain tile draws in the splat lane only.
+                    wanted_custom.is_some() || takes_stock_ibl || sways
+                } else {
+                    stock_ibl::stock_lane_skips(wanted_custom.is_some(), takes_stock_ibl, sways, foliage_lane, uses_pbr_lane, pbr_lane)
+                } {
                     continue;
                 }
                 // Hoisted: `loaded` borrows self, and the per-instance light
@@ -435,6 +522,16 @@ impl Renderer {
                 // same `loaded` that picks the geometry and binds `morph_map`.
                 // The per-instance weights stay on the instance stream.
                 draw.base().draw_vars.set_uniform(cx.cx,live_id!(morph_ctl),&[0.0,0.0,0.0,0.0]);
+                // The host's element lookup, bound by name in whatever shader (lane, variant) this item draws
+                // through: a slot-index bind into a shader whose slot 6 is another map reads garbage.
+                if let Some((map, ctl)) = &self.element_lookup {
+                    if let Some(shader) = draw.base().draw_vars.draw_shader_id {
+                        if let Some(slot) = cx.draw_shaders[shader.index].mapping.textures.iter().position(|t| t.id == live_id!(elem_map)) {
+                            draw.base().draw_vars.set_texture(slot, map);
+                            draw.base().draw_vars.set_uniform(cx.cx, live_id!(elem_ctl), ctl);
+                        }
+                    }
+                }
                 if let Some(morph)=&loaded.morph{
                     let target=match lane{WorldModelLane::Placed=>ModelTarget::Instance(i),WorldModelLane::Attachment=>ModelTarget::Attachment(i)};
                     let weights=self.model_anim_state.morph_weights(&target,&inst.model,&morph.source);
@@ -524,7 +621,15 @@ impl Renderer {
                 // always inside the fade cone, which kept every ground tile
                 // on the discarding pipeline: hidden ground under a city
                 // then shaded in full (gpuperf lane, citydrive).
-                let ground = inst.model.starts_with("gen/surface/level-terrain") || inst.model.starts_with("gen/surface/level-road");
+                let terrain = inst.model.starts_with("gen/surface/level-terrain");
+                // A terrain tile's own distance: its vertices are in world
+                // space under an identity transform, so the copy's origin
+                // says nothing; the nearest point of its bounding sphere does.
+                let tile_distance = if terrain {
+                    let (center, radius) = variants::bounding_sphere(root.min, root.max, &inst.transform);
+                    ((center - eye).length() - radius).max(0.0)
+                } else { distance };
+                let ground = terrain || inst.model.starts_with("gen/surface/level-road");
                 let screen_clip = adjust.w > 0.5
                     || !ground && occluder_focus.is_some_and(|focus| {
                         let (center, radius) = variants::bounding_sphere(root.min, root.max, &inst.transform);
@@ -596,31 +701,53 @@ impl Renderer {
                     }
                 } }
                 // A model with a far stand-in (impostor.rs) draws that layer
-                // from its distance on and every other layer before it.
-                let impostor_at = layer_draws().filter_map(|l| l.4.surface.as_ref().map(|s| s.definition.impostor)).fold(0.0f32, f32::max);
+                // from its distance on (scaled by the quality tier) and every
+                // other layer before it, the two crossfading through
+                // complementary screen-door windows over the band before the
+                // switch (no pop). A copy already crossfading between chain
+                // levels keeps its own window and switches hard.
+                let impostor_at = impostor_shader.map_or(0.0, |_| layer_draws().filter_map(|l| l.4.surface.as_ref().map(|s| s.definition.impostor)).fold(0.0f32, f32::max) * impostor_scale);
                 for (geometry_id, texture, detail, dscale, material) in layer_draws().skip(layer_pass).take(1) {
+                    let stand_in = material.surface.as_ref().is_some_and(|s| s.definition.impostor > 0.0);
+                    let mut layer_window = 0.0f32;
                     if impostor_at > 0.0 {
-                        let stand_in = material.surface.as_ref().is_some_and(|s| s.definition.impostor > 0.0);
-                        if stand_in != (distance >= impostor_at) { continue; }
+                        match chain_fade_windows(impostor_at, distance).filter(|_| window <= 0.0) {
+                            Some((near, next)) => layer_window = if stand_in { next } else { near },
+                            None => if stand_in != (distance >= impostor_at) { continue; },
+                        }
+                    } else if stand_in {
+                        continue;
                     }
+                    draw.base().color_adjust_ctl.w = if layer_window > 0.0 { layer_window } else { adjust.w };
+                    draw.base().draw_vars.draw_shader_id = if stand_in { impostor_shader } else { lane_shader };
                     draw.base().draw_vars.geometry_id = Some(geometry_id);
                     draw.base().draw_vars.set_texture(0, texture);
+                    // A painted tile's slot 0 is its layers' albedo array; a
+                    // far one paints its heaviest layer only, beyond the
+                    // tier's reach.
+                    if let Some(p) = material.surface.as_ref().and_then(|s| s.splat.as_ref()).filter(|_| splat_lane) {
+                        draw.base().draw_vars.set_texture(0, &p.albedo);
+                        draw.base().draw_vars.set_uniform(cx.cx, live_id!(splat_blend), &[if tile_distance > terrain_blend_reach { 0.0 } else { 1.0 }]);
+                    }
                     draw.base().draw_vars.set_texture(5, detail);
                     draw.base().draw_vars.set_uniform(cx.cx, live_id!(detail_st), &[dscale[0], dscale[1]]);
                     // An IBL material reads its environment on the detail slot.
                     if let ModelDraw::Custom(_, m) = &mut draw { if let Some(t) = m.texture.clone() { m.draw.draw_vars.set_texture(5, &t); } else if let (true, Some(t)) = (m.ibl, self.ibl_texture()) { m.draw.draw_vars.set_texture(5, t); } }
                     draw.base().prelit = if prelit { 1.0 } else { 0.0 };
-                    draw.set_material(cx.cx, material);
+                    if !std::ptr::eq(held_material, material) || matches!(draw, ModelDraw::Custom(..)) {
+                        draw.set_material(cx.cx, material);
+                        held_material = material;
+                    }
+                    draw.light_lamp(cx.cx, material, inst.lamps, self.lamp_level);
                     // A world item's copy may glow on its own (items.rs).
                     if matches!(lane, WorldModelLane::Placed) {
                         if let Some(e) = i.checked_sub(instances.len().saturating_sub(self.items.appended)).and_then(|k| self.items.glow.get(k)).filter(|e| e.x + e.y + e.z > 0.0) {
                             draw.add_emission(cx.cx, *e);
+                            held_material = std::ptr::null();
                         }
                     }
-                    // A far stand-in's cards in the foliage lane skip the
-                    // cascade tap (tex_mag.y < 0: foliage.rs).
-                    if foliage_lane && material.surface.as_ref().is_some_and(|s| s.definition.impostor > 0.0) {
-                        draw.base().tex_mag.y = -1.0;
+                    if material.surface.as_ref().is_some_and(|s| s.definition.fur.is_some()) {
+                        held_material = std::ptr::null();
                     }
                     if let Some(s) = material.surface.as_ref().filter(|s| s.definition.wind > 0.0) {
                         // Sway in metres at the top at wind 1; leaves (cut-out
@@ -634,14 +761,23 @@ impl Renderer {
                             draw.base().morph_weights0 = vec4(d.wind * 0.35, inv_height, self.sky_time, flutter);
                         }
                     }
-                    let cut = screen_clip || match &material.surface {
+                    let cut = screen_clip || stand_in || layer_window > 0.0 || match &material.surface {
                         // Masked layers discard; blended ones need the stock
                         // pipeline too (the no-discard variant draws opaque).
                         Some(surface) if pbr_lane => surface.definition.alpha_mode != 0,
                         _ => material.cutout,
                     };
+                    let owner = if cx.draw_owners_armed() {
+                        let label = self.draw_names.model(cx.cx, &inst.model, lod_index, layer_pass, stand_in);
+                        cx.enter_draw_label(label)
+                    } else {
+                        0
+                    };
                     stats.fur_triangles += draw.submit_as(cx, distance, &mut fur_budget, opaque.filter(|_| !cut));
+                    cx.exit_draw_label(owner);
                 }
+                draw.base().draw_vars.draw_shader_id = lane_shader;
+                draw.base().color_adjust_ctl.w = adjust.w;
                 if layer_pass > 0 {
                     continue;
                 }
@@ -699,6 +835,12 @@ impl Renderer {
                     }));
                     parts
                 };
+                let owner = if cx.draw_owners_armed() && !parts.is_empty() {
+                    let label = self.draw_names.model(cx.cx, &inst.model, lod_index, 0, false);
+                    cx.enter_draw_label(label)
+                } else {
+                    0
+                };
                 for (pose, part_tris, part_draws) in &parts {
                     draw.base().transform = Mat4f::mul(&inst.transform, pose);
                     draw.base().lm_rect = Vec4f::default();
@@ -711,8 +853,10 @@ impl Renderer {
                         if let ModelDraw::Custom(_, m) = &mut draw { if let Some(t) = m.texture.clone() { m.draw.draw_vars.set_texture(5, &t); } else if let (true, Some(t)) = (m.ibl, self.ibl_texture()) { m.draw.draw_vars.set_texture(5, t); } }
                         draw.base().prelit = if prelit { 1.0 } else { 0.0 };
                         draw.set_material(cx.cx, material);
+                        draw.light_lamp(cx.cx, material, inst.lamps, self.lamp_level);
                         stats.fur_triangles += draw.submit(cx, distance, &mut fur_budget);
                     }
+                    held_material = std::ptr::null();
                     match lane {
                         WorldModelLane::Placed => stats.model_triangles += part_tris,
                         WorldModelLane::Attachment => {
@@ -720,6 +864,7 @@ impl Renderer {
                         }
                     }
                 }
+                cx.exit_draw_label(owner);
                 // A part opened its own draw item; the next instance of the same
                 // model must re-bind its own transform rather than accumulate
                 // into the part's.
@@ -748,6 +893,15 @@ impl Renderer {
         let pbr_lane = draw.is_pbr();
         self.clustered.bind(cx.cx, &mut draw.base().draw_vars, self.clustered_enabled);
         self.gi.bind(cx.cx, &mut draw.base().draw_vars);
+        // An IBL program's control of its two lookups: the lane's scale,
+        // and for the stock IBL program whether the fill comes from the
+        // map (renderer/stock_ibl.rs). After the GI: it reads the gi_on
+        // just bound.
+        if let ModelDraw::Custom(name, m) = draw {
+            if m.ibl {
+                self.bind_ibl_lane(cx.cx, name, &mut m.draw.draw_vars);
+            }
+        }
         // Sun, fog and the debug switches, once for the whole lane. They are
         // uniforms rather than instance lanes -- the vertex stage ran out of
         // D3D11 input registers -- which is also what they describe: one
@@ -890,6 +1044,16 @@ impl Renderer {
         let Some(mut draw) = self.pbr_draw.take() else {
             return;
         };
+        // Bound by name: a fixed slot index lands on another map when the shader's texture list
+        // changes (slot 6 is `ssao_map`: the lookup shaded the PBR lane and its rows moved parts).
+        let elem_slot = draw.skinned.draw_vars.draw_shader_id.and_then(|shader| cx.draw_shaders[shader.index].mapping.textures.iter().position(|t| t.id == live_id!(elem_map)));
+        match (&self.element_lookup, elem_slot) {
+            (Some((map, ctl)), Some(slot)) => {
+                draw.skinned.draw_vars.set_texture(slot, map);
+                draw.skinned.draw_vars.set_uniform(cx.cx, live_id!(elem_ctl), ctl);
+            }
+            _ => draw.skinned.draw_vars.set_uniform(cx.cx, live_id!(elem_ctl), &[0.0, 0.0, 0.0, 0.0]),
+        }
         self.draw_models_inner(
             cx,
             ModelDraw::Pbr(&mut draw),
@@ -1121,7 +1285,7 @@ impl Renderer {
         draw.lin = self.lin_ctl()[0];
         draw.sun_vis = self.view_model_sun;
         draw.fog_color = fog_color;
-        let stage_inv = self.stage.matrix().invert();
+        let stage_inv = self.draw_stage_matrix().invert();
         for inst in &self.view_models {
             let Some((_, loaded)) = self.static_models.iter().find(|(id, _)| *id == inst.model)
             else {

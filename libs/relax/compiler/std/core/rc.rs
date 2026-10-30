@@ -17,48 +17,24 @@ use crate::pin::PinSafePointer;
 
 // library/alloc/src/rcs/rc.rs:357,2604 @8d1a764
 impl<T: ?Sized + Unsize<U>, U: ?Sized> DispatchFromDyn<Rc<U>> for Rc<T> {}
+impl<T: ?Sized + Unsize<U>, U: ?Sized> crate::ops::CoerceUnsized<Rc<U>> for Rc<T> {}
+impl<T: ?Sized + Unsize<U>, U: ?Sized> crate::ops::CoerceUnsized<Weak<U>> for Weak<T> {}
 unsafe impl<T: ?Sized> PinSafePointer for Rc<T> {}
 use crate::ptr;
 
 // ---------------------------------------------------------------- raw blocks (shared with Arc)
 
-#[repr(C, align(16))]
-struct Chunk16 {
-    _b: [u8; 16],
-}
-
-#[repr(C, align(64))]
-struct Chunk64 {
-    _b: [u8; 64],
-}
-
-/// Allocates `size` bytes aligned to `align` (<= 64), never zero-sized.
+/// Allocates `size` bytes aligned to `align`, never zero-sized.
 pub(crate) fn block_alloc(size: usize, align: usize) -> *mut u8 {
-    if align <= 16 {
-        let n = (size + 15) / 16;
-        let mut v: Vec<Chunk16> = Vec::with_capacity(n);
-        let p = v.as_mut_ptr() as *mut u8;
-        crate::mem::forget(v);
-        p
-    } else if align <= 64 {
-        let n = (size + 63) / 64;
-        let mut v: Vec<Chunk64> = Vec::with_capacity(n);
-        let p = v.as_mut_ptr() as *mut u8;
-        crate::mem::forget(v);
-        p
-    } else {
-        crate::panicking::panic_str("Rc/Arc: alignment above 64 is not supported")
-    }
+    let layout = match crate::heap::Layout::from_size_align(size, align) {
+        Ok(l) => l,
+        Err(_) => crate::panicking::panic_str("Rc/Arc: capacity overflow"),
+    };
+    crate::heap::alloc_or_abort(layout)
 }
 
 pub(crate) unsafe fn block_free(p: *mut u8, size: usize, align: usize) {
-    if align <= 16 {
-        let n = (size + 15) / 16;
-        drop(Vec::from_raw_parts(p as *mut Chunk16, 0, n));
-    } else {
-        let n = (size + 63) / 64;
-        drop(Vec::from_raw_parts(p as *mut Chunk64, 0, n));
-    }
+    crate::heap::dealloc(p, crate::heap::Layout::from_size_align_unchecked(size, align));
 }
 
 /// Block header; `weak` counts the Weaks plus one for all strong pointers together.
@@ -113,9 +89,14 @@ pub(crate) unsafe fn free_block(h: *mut Header) {
 
 // ---------------------------------------------------------------- Rc
 
+#[rustc_insignificant_dtor]
 pub struct Rc<T: ?Sized> {
     ptr: crate::ptr::NonNull<T>,
+    _marker: crate::marker::PhantomData<T>,
 }
+
+// as std (alloc/src/sync.rs, rc.rs): the pointee is never moved through the pointer
+impl<T: ?Sized> crate::marker::Unpin for Rc<T> {}
 
 // library/alloc/src/rc.rs:330-338: the count is shared and non-atomic.
 impl<T: ?Sized> !Send for Rc<T> {}
@@ -126,7 +107,7 @@ impl<T> Rc<T> {
         let (_, p) = alloc_block(crate::mem::size_of::<T>(), crate::mem::align_of::<T>(), 1, 1);
         let p = p as *mut T;
         unsafe { ptr::write(p, value) };
-        Rc { ptr: unsafe { ptr::NonNull::new_unchecked(p) } }
+        Rc { ptr: unsafe { ptr::NonNull::new_unchecked(p) }, _marker: crate::marker::PhantomData }
     }
 
     pub fn new_cyclic<F: FnOnce(&Weak<T>) -> T>(data_fn: F) -> Rc<T> {
@@ -139,7 +120,7 @@ impl<T> Rc<T> {
             (*h).strong = 1;
         }
         crate::mem::forget(weak);
-        Rc { ptr: unsafe { ptr::NonNull::new_unchecked(p) } }
+        Rc { ptr: unsafe { ptr::NonNull::new_unchecked(p) }, _marker: crate::marker::PhantomData }
     }
 
     pub fn try_unwrap(this: Rc<T>) -> Result<T, Rc<T>> {
@@ -174,7 +155,7 @@ impl<T: ?Sized> Rc<T> {
     }
 
     pub unsafe fn from_raw(p: *const T) -> Rc<T> {
-        Rc { ptr: unsafe { ptr::NonNull::new_unchecked(p as *mut T) } }
+        Rc { ptr: unsafe { ptr::NonNull::new_unchecked(p as *mut T) }, _marker: crate::marker::PhantomData }
     }
 
     pub unsafe fn increment_strong_count(p: *const T) {
@@ -239,6 +220,7 @@ impl<T: Clone> Rc<T> {
 }
 
 impl<T: ?Sized> Rc<T> {
+    #[rustc_never_returns_null_ptr]
     pub fn as_ptr(this: &Rc<T>) -> *const T {
         this.ptr.as_ptr() as *const T
     }
@@ -273,7 +255,7 @@ impl<T: ?Sized> Rc<T> {
     /// An Rc for a value already placed at `ptr` inside block `header` (used by the
     /// unsized constructors).
     unsafe fn from_parts(ptr: *mut T) -> Rc<T> {
-        Rc { ptr: ptr::NonNull::new_unchecked(ptr) }
+        Rc { ptr: ptr::NonNull::new_unchecked(ptr), _marker: crate::marker::PhantomData }
     }
 }
 
@@ -283,7 +265,7 @@ impl Rc<dyn crate::any::Any> {
         if crate::any::Any::type_id(&*self) == crate::any::TypeId::of::<T>() {
             let p = self.ptr.as_ptr() as *mut T;
             crate::mem::forget(self);
-            Ok(Rc { ptr: unsafe { ptr::NonNull::new_unchecked(p) } })
+            Ok(Rc { ptr: unsafe { ptr::NonNull::new_unchecked(p) }, _marker: crate::marker::PhantomData })
         } else {
             Err(self)
         }
@@ -293,25 +275,38 @@ impl Rc<dyn crate::any::Any> {
 impl<T: ?Sized> Clone for Rc<T> {
     fn clone(&self) -> Rc<T> {
         unsafe { (*header_of(self.ptr.as_ptr())).strong += 1 };
-        Rc { ptr: self.ptr }
+        Rc { ptr: self.ptr, _marker: crate::marker::PhantomData }
     }
 }
 
-impl<T: ?Sized> Drop for Rc<T> {
-    fn drop(&mut self) {
+impl<T: ?Sized> Rc<T> {
+    // Non-inlined part of `drop` (real std's Rc::drop_slow): the value's drop glue stays out of
+    // every dropping caller, so the count decrement inlines there.
+    #[inline(never)]
+    unsafe fn drop_slow(&mut self) {
         unsafe {
-            (*header_of(self.ptr.as_ptr())).strong -= 1;
-            if (*header_of(self.ptr.as_ptr())).strong == 0 {
-                ptr::drop_in_place(self.ptr.as_ptr());
-                (*header_of(self.ptr.as_ptr())).weak -= 1;
-                if (*header_of(self.ptr.as_ptr())).weak == 0 {
-                    free_block(header_of(self.ptr.as_ptr()));
-                }
+            ptr::drop_in_place(self.ptr.as_ptr());
+            (*header_of(self.ptr.as_ptr())).weak -= 1;
+            if (*header_of(self.ptr.as_ptr())).weak == 0 {
+                free_block(header_of(self.ptr.as_ptr()));
             }
         }
     }
 }
 
+unsafe impl<#[may_dangle] T: ?Sized> Drop for Rc<T> {
+    #[inline]
+    fn drop(&mut self) {
+        unsafe {
+            (*header_of(self.ptr.as_ptr())).strong -= 1;
+            if (*header_of(self.ptr.as_ptr())).strong == 0 {
+                self.drop_slow();
+            }
+        }
+    }
+}
+
+impl<T: ?Sized> crate::ops::LegacyReceiver for Rc<T> {}
 impl<T: ?Sized> Deref for Rc<T> {
     type Target = T;
     fn deref(&self) -> &T {
@@ -424,6 +419,19 @@ impl<T, const N: usize> From<[T; N]> for Rc<[T]> {
     }
 }
 
+/// `Rc<[T]>` of exactly N elements as `Rc<[T; N]>`, else the pointer back (alloc/src/rc.rs).
+impl<T, const N: usize> crate::convert::TryFrom<Rc<[T]>> for Rc<[T; N]> {
+    type Error = Rc<[T]>;
+    fn try_from(boxed_slice: Rc<[T]>) -> Result<Rc<[T; N]>, Rc<[T]>> {
+        if boxed_slice.len() == N {
+            let ptr = Rc::into_raw(boxed_slice) as *mut [T; N];
+            Ok(unsafe { Rc::from_raw(ptr) })
+        } else {
+            Err(boxed_slice)
+        }
+    }
+}
+
 impl<T> From<Vec<T>> for Rc<[T]> {
     fn from(v: Vec<T>) -> Rc<[T]> {
         let mut v = v;
@@ -516,7 +524,7 @@ impl<T: ?Sized> Weak<T> {
                 None
             } else {
                 (*header_of(self.ptr.as_ptr())).strong += 1;
-                Some(Rc { ptr: self.ptr })
+                Some(Rc { ptr: self.ptr, _marker: crate::marker::PhantomData })
             }
         }
     }
@@ -546,6 +554,7 @@ impl<T: ?Sized> Weak<T> {
         self.ptr.as_ptr() as *const u8 == other.ptr.as_ptr() as *const u8
     }
 
+    #[rustc_never_returns_null_ptr]
     pub fn as_ptr(&self) -> *const T {
         self.ptr.as_ptr() as *const T
     }
@@ -560,7 +569,7 @@ impl<T: ?Sized> Clone for Weak<T> {
     }
 }
 
-impl<T: ?Sized> Drop for Weak<T> {
+unsafe impl<#[may_dangle] T: ?Sized> Drop for Weak<T> {
     fn drop(&mut self) {
         if is_dangling(self.ptr.as_ptr()) {
             return;
@@ -591,12 +600,12 @@ impl<T: ?Sized> fmt::Debug for Weak<T> {
 impl<T> Rc<T> {
     pub fn new_uninit() -> Rc<crate::mem::MaybeUninit<T>> {
         let (_, p) = alloc_block(crate::mem::size_of::<T>(), crate::mem::align_of::<T>(), 1, 1);
-        Rc { ptr: unsafe { ptr::NonNull::new_unchecked(p as *mut crate::mem::MaybeUninit<T>) } }
+        Rc { ptr: unsafe { ptr::NonNull::new_unchecked(p as *mut crate::mem::MaybeUninit<T>) }, _marker: crate::marker::PhantomData }
     }
     pub fn new_zeroed() -> Rc<crate::mem::MaybeUninit<T>> {
         let (_, p) = alloc_block(crate::mem::size_of::<T>(), crate::mem::align_of::<T>(), 1, 1);
         unsafe { ptr::write_bytes(p, 0, crate::mem::size_of::<T>()) };
-        Rc { ptr: unsafe { ptr::NonNull::new_unchecked(p as *mut crate::mem::MaybeUninit<T>) } }
+        Rc { ptr: unsafe { ptr::NonNull::new_unchecked(p as *mut crate::mem::MaybeUninit<T>) }, _marker: crate::marker::PhantomData }
     }
 }
 
@@ -608,7 +617,7 @@ impl<T> Rc<[T]> {
         };
         let (_, p) = alloc_block(size, crate::mem::align_of::<T>(), 1, 1);
         let s = ptr::slice_from_raw_parts_mut(p as *mut crate::mem::MaybeUninit<T>, len);
-        Rc { ptr: unsafe { ptr::NonNull::new_unchecked(s) } }
+        Rc { ptr: unsafe { ptr::NonNull::new_unchecked(s) }, _marker: crate::marker::PhantomData }
     }
     pub fn new_zeroed_slice(len: usize) -> Rc<[crate::mem::MaybeUninit<T>]> {
         let r = Rc::<[T]>::new_uninit_slice(len);
@@ -621,7 +630,7 @@ impl<T> Rc<crate::mem::MaybeUninit<T>> {
     pub unsafe fn assume_init(self) -> Rc<T> {
         let p = self.ptr.as_ptr() as *mut T;
         crate::mem::forget(self);
-        Rc { ptr: ptr::NonNull::new_unchecked(p) }
+        Rc { ptr: ptr::NonNull::new_unchecked(p), _marker: crate::marker::PhantomData }
     }
 }
 
@@ -629,7 +638,7 @@ impl<T> Rc<[crate::mem::MaybeUninit<T>]> {
     pub unsafe fn assume_init(self) -> Rc<[T]> {
         let p = self.ptr.as_ptr() as *mut [T];
         crate::mem::forget(self);
-        Rc { ptr: ptr::NonNull::new_unchecked(p) }
+        Rc { ptr: ptr::NonNull::new_unchecked(p), _marker: crate::marker::PhantomData }
     }
 }
 

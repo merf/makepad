@@ -131,13 +131,24 @@ hal_commands! {
     /// Centers the native window buttons `y_center` points below the window's top edge.
     /// AppKit retains the center across geometry changes; other backends ignore it.
     WindowButtonsCenter = 24, window_buttons_center { id: obj, y_center: f32 };
-    /// Session 0's opaque overlay panel, in window-local points. While enabled its
-    /// window frames update a separate surface, composited after the borrower's
-    /// passes; input goes to session 0. Disabling restores the retained app image.
-    WindowOverlay = 25, window_overlay { id: obj, on: bool, rect: rect };
+    /// Session 0 over a lent window. With `layer` NONE: an opaque panel, in window-local
+    /// points: while enabled session 0's window frames update a separate surface, composited
+    /// after the borrower's passes, and input goes to session 0. With `layer` a texture of
+    /// session 0 (BGRA8, the window's pixel size): the window layer -- the borrower's frames
+    /// go to the retained app image instead of the window, session 0's frame is the window
+    /// (it starts with the app image copied into `layer`, to sample) and input stays with the
+    /// borrower; `rect` is ignored. Needs `info_flags::WINDOW_LAYERS`; it may be enabled on an
+    /// adoptable window before it is lent (so no borrower frame reaches the window first).
+    /// Disabling restores the retained app image.
+    WindowOverlay = 25, window_overlay { id: obj, on: bool, rect: rect, layer: id };
 
     /// Whether the window draws its own caption, for an embedding parent.
     WindowChrome = 26, window_chrome { id: obj, own: bool };
+    /// The caption the app draws in the window: the strip's top and height (window points; height
+    /// zero: none), the window buttons in it (the app's own or the system's; zero: none), and
+    /// whether the caption is dark. Sent when they change. Session 0 places what it draws in a
+    /// lent window's caption (the JIT ring) by it; window systems ignore it.
+    WindowCaption = 27, window_caption { id: obj, top: f32, height: f32, buttons: rect, dark: bool };
 
     // ---- text input
     ImeShow = 30, ime_show { id: obj, area: rect, config: u32 };
@@ -149,8 +160,9 @@ hal_commands! {
     ClipSet = 40, clip_set { text: rng };
     /// The Linux primary selection.
     SelectionSet = 41, selection_set { text: rng };
-    /// `items`: `count` flat `DragItem`s.
-    DragStart = 42, drag_start { id: obj, count: u32, items: rng };
+    /// A drag out of the app from window `id`: `items` holds `count` flat `DragItem`s, then the
+    /// drag image, `image_w` x `image_h` RGBA8 rows (none when either is zero).
+    DragStart = 42, drag_start { id: obj, count: u32, image_w: u32, image_h: u32, items: rng };
     /// `items`: `count` flat `MenuItem`s.
     MenuSet = 43, menu_set { count: u32, items: rng };
     /// `filters`: `count` flat strings (u32 length + bytes), a description and the comma-separated
@@ -278,9 +290,6 @@ hal_commands! {
     Location = 126, location { op: u32 };
     /// `permission_op::*` for `permission_kind::*`; answered by a `Permission` event with `req`.
     Permission = 127, permission { op: u32, kind: u32, req: u32 };
-    /// A native view over a window (`view_kind | view_op`): the system browser, a camera preview.
-    /// `view` is the app's id of it, `area`/`extra`/`data` as `view_op` says.
-    ViewOp = 128, view_op { window: obj, op: flags, view: u64, area: rect, extra: u32, data: rng };
     /// The cameras the slots read: `inputs` is `media::pack_u64s` of (camera, format) id pairs, one
     /// per slot; `consumers` the slots whose frames the app wants (`CameraFrame` events carry them).
     VideoInput = 129, video_input { consumers: u32, inputs: rng };
@@ -308,7 +317,8 @@ hal_commands! {
     DirectDisplayMode = 135, direct_display_mode { req: u64, args: rng };
     /// Mouse or touchpad speed in hundredths; the host clamps it to the native preference range.
     DirectPointerSpeed = 136, direct_pointer_speed { touchpad: bool, hundredths: u32 };
-    DirectNaturalScroll = 137, direct_natural_scroll { on: bool };
+    /// Natural scrolling for touchpads or mouse wheels (direct backend).
+    DirectNaturalScroll = 137, direct_natural_scroll { touchpad: bool, on: bool };
     /// Touchpad tap to click (direct backend).
     DirectTapToClick = 149, direct_tap_to_click { on: bool };
 
@@ -353,4 +363,50 @@ hal_commands! {
     /// atlas is full the HAL takes back the least recently DRAWN slots first (a slot's own use
     /// time is otherwise only its delivery).
     GlyphTouch = 150, glyph_touch { count: u32, slots: rng };
+
+    // ---- system tray (status items)
+    /// Creates or updates (in place) the app's tray `tray` (the app's own id): a `w` x `h`
+    /// monochrome glyph, the `tooltip`, and its menu. `data` is `count` flat `MenuItem`s (all
+    /// `parent` 0, `cmd` the item's id, `menu_kind::CHECKABLE`/`CHECKED` for check marks) followed
+    /// by `w * h` alpha bytes (one per pixel, rows top-down). Chosen items answer as `TrayMenu`.
+    /// `flags` (`tray_flags`): `DROPDOWN` = a primary click answers `TrayClick` (the app opens its
+    /// dropdown window) and the menu opens on a secondary click.
+    TraySet = 151, tray_set { tray: u64, w: u32, h: u32, tooltip: sid, count: u32, flags: u32, data: rng };
+    /// Removes the app's tray `tray`.
+    TrayRemove = 152, tray_remove { tray: u64 };
+    /// The virtual display (`direct::VirtualDisplay`), packed strings: `WxH@Hz`
+    /// (`VirtualDisplay::mode_string`) and `mirror` or `off` (what the panels show); no strings = the panels' own
+    /// modes again. Answered by `DirectDisplayResult`.
+    DirectDisplayVirtual = 153, direct_display_virtual { req: u64, count: u32, args: rng };
+    /// Sizes window `id` (a `window_kind::DROPDOWN`) to `w` x `h` points, fitted into the visible
+    /// area of the screen with tray `tray`'s icon, places it there (under the macOS status item,
+    /// next to the Windows notification icon), shows it in front and gives it the focus. Its focus
+    /// loss (a click anywhere else) answers `PopupDismissed`.
+    WindowAtTray = 154, window_at_tray { id: obj, tray: u64, w: f32, h: f32 };
+    /// The eyes XR window `id`'s next frame shows with, when they are not its `XrFrame`'s (a
+    /// picture rendered elsewhere, for other eyes): `eyes` is two `XrEye` (`buffers::Wire`) and
+    /// the depth (metres along the view, f32 little-endian; 0 none) of what the frame shows
+    /// there. The shell gives them to the display (the runtime reprojects from them to the
+    /// display's pose, positionally at that depth).
+    XrFrameEyes = 155, xr_frame_eyes { id: obj, eyes: rng };
+    /// XR window `id`'s `XrFrame`s are located `lead_ns` past their display time (head, eyes,
+    /// hands, controllers): a picture rendered elsewhere from them shows that much later (a
+    /// stream's measured latency). 0: at the display time.
+    XrPoseLead = 156, xr_pose_lead { id: obj, lead_ns: u64 };
+    /// XR window `id`'s headset runs its display at the supported refresh rate nearest to
+    /// `millihertz` (0: the runtime's default).
+    XrRefreshRate = 157, xr_refresh_rate { id: obj, millihertz: u32 };
+
+    A11yUpdate = 158, a11y_update { id: obj, bytes: rng };
+    A11yActionDone = 159, a11y_action_done { req: u64, result: u32 };
+    /// Creates native content (`native_layer::kind`). WEB: UTF-8 initial URL; CAMERA_PREVIEW:
+    /// little-endian u64 input id followed by u64 format id. Placement comes from frame layers.
+    NativeLayerCreate = 160, native_layer_create { id: obj, kind: u32, params: rng };
+    /// Changes native content (`native_layer::op`); never changes its frame geometry.
+    NativeLayerOp = 161, native_layer_op { id: obj, op: u32, arg: u64, data: rng };
+    /// Releases the layer's content and its native resources.
+    NativeLayerDestroy = 162, native_layer_destroy { id: obj };
+    /// A buzz on XR window `id`'s controller `hand` (0 left, 1 right): `amplitude` 0..1 for
+    /// `duration_us`. Android XR; elsewhere nothing.
+    XrHaptic = 163, xr_haptic { id: obj, hand: u32, amplitude: f32, duration_us: u32 };
 }

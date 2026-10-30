@@ -345,6 +345,9 @@ pub struct DrawShaderInputs {
     /// Packed byte stride. Equals `total_slots * 4` whenever every input is F32xN.
     pub stride_bytes: usize,
     max_byte_align: usize,
+    /// Each input's index by id, built as the inputs are placed: a uniform write by id is one
+    /// probe, not a scan of every input (`find`).
+    by_id: LiveIdMap<LiveId, u32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -627,7 +630,20 @@ impl DrawShaderInputs {
             total_slots: 0,
             stride_bytes: 0,
             max_byte_align: 1,
+            by_id: LiveIdMap::default(),
         }
+    }
+
+    /// The input of this id (the first, if a layout repeats one).
+    #[inline]
+    pub fn find(&self, id: LiveId) -> Option<&DrawShaderInput> {
+        self.by_id.get(&id).and_then(|index| self.inputs.get(*index as usize))
+    }
+
+    /// Place an input whose offsets the caller computed.
+    pub fn push_placed(&mut self, input: DrawShaderInput) {
+        self.by_id.entry(input.id).or_insert(self.inputs.len() as u32);
+        self.inputs.push(input);
     }
 
     pub fn has_compact(&self) -> bool {
@@ -670,7 +686,7 @@ impl DrawShaderInputs {
         byte_offset: usize,
         byte_size: usize,
     ) {
-        self.inputs.push(DrawShaderInput {
+        self.push_placed(DrawShaderInput {
             id,
             offset,
             slots,
@@ -795,6 +811,14 @@ pub enum DrawShaderColorFormat {
     /// Blending disabled — simulation/data passes write whole texels.
     /// Declared as `color_format: @Rgba32F`.
     Rgba32F,
+    /// Single-channel 16-bit float (pairs with `TextureFormat::RenderRf16`):
+    /// a filterable data copy. Blending disabled. Declared as
+    /// `color_format: @Rf16`.
+    Rf16,
+    /// Single-channel 8-bit unorm (pairs with `TextureFormat::RenderRu8`):
+    /// small per-texel data such as slot ids written as `id / 255`.
+    /// Blending disabled. Declared as `color_format: @Ru8`.
+    Ru8,
 }
 
 /// How a blending pipeline combines a fragment with the target. Declared in
@@ -929,6 +953,9 @@ pub struct CxDrawShaderMapping {
     pub color_format: DrawShaderColorFormat,
     /// The blend operation of this shader's blending pipelines.
     pub blend_op: DrawShaderBlendOp,
+    /// `precise_math: true`: the pipeline is compiled without fast math and
+    /// its float ops are never contracted (bit-exact data passes).
+    pub precise_math: bool,
     /// Bit `i` set when the shader declares `fragment_output(i, …)`. In a
     /// pass with several color attachments (MRT) an attachment the shader
     /// does not write keeps its contents: its write mask is off.
@@ -1099,7 +1126,9 @@ impl CxDrawShaderMapping {
             vm.object_method(object, name).as_object().and_then(|f| vm.heap().fn_script_ip(f))
         }
         if cfg!(not(target_arch = "wasm32")) {
-            [id!(fragment), id!(pixel), id!(vertex)]
+            // `pixel` first: every DrawQuad derivative inherits DrawQuad's `fragment`, so its
+            // location named them all draw_quad.rs:62; the pixel fn is the shader's own code
+            [id!(pixel), id!(fragment), id!(vertex)]
                 .iter()
                 .find_map(|m| vm.ip_to_loc(fn_ip(vm, object, *m)?).map(|loc| loc.to_string()))
         } else {
@@ -1145,9 +1174,12 @@ impl CxDrawShaderMapping {
             Some(id) if id == id!(Rf32) => DrawShaderColorFormat::Rf32,
             Some(id) if id == id!(Rgba16F) => DrawShaderColorFormat::Rgba16F,
             Some(id) if id == id!(Rgba32F) => DrawShaderColorFormat::Rgba32F,
+            Some(id) if id == id!(Rf16) => DrawShaderColorFormat::Rf16,
+            Some(id) if id == id!(Ru8) => DrawShaderColorFormat::Ru8,
             Some(id) if id == id!(Bgra8NoBlend) => DrawShaderColorFormat::Bgra8NoBlend,
             _ => DrawShaderColorFormat::Bgra8Unorm,
         };
+        let precise_math = heap.value(source.as_object(), id!(precise_math).into(), NoTrap).as_bool() == Some(true);
         let blend_op = match heap.value(source.as_object(), id!(blend_op).into(), NoTrap).as_id() {
             Some(id) if id == id!(Max) => DrawShaderBlendOp::Max,
             _ => DrawShaderBlendOp::Over,
@@ -1483,6 +1515,7 @@ impl CxDrawShaderMapping {
             varying_total_slots: 0,
             color_format,
             blend_op,
+            precise_math,
             fragment_outputs,
             reflection: crate::draw_shader_layout::DrawShaderReflection::from_desc(desc),
             source_loc,
@@ -1644,7 +1677,7 @@ impl CxDrawShaderMapping {
                     }
                     instances.push(field.ident.0, ty, None);
                     if let LiveFieldKind::Live = live_field_kind {
-                        live_instances.inputs.push(instances.inputs.last().unwrap().clone());
+                        live_instances.push_placed(instances.inputs.last().unwrap().clone());
                     }
                 }
                 DrawShaderFieldKind::Uniform {block_ident, ..} => {

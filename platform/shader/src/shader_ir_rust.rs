@@ -456,7 +456,7 @@ impl<'a> RustPrinter<'a> {
                     _ => {
                         let method = if smp.method == id!(sample_nearest) {
                             "sample_nearest"
-                        } else if smp.method == id!(sample_repeat) {
+                        } else if smp.method == id!(sample_repeat) || smp.method == id!(sample_grad_repeat) {
                             "sample_repeat"
                         } else {
                             "sample"
@@ -546,6 +546,7 @@ impl<'a> RustPrinter<'a> {
                 IrIo::UniformBuffer => format!("rcx.unibuf_{}", n),
                 IrIo::Varying => format!("rcx.var_{}", n),
                 IrIo::FragmentOutput(i) => format!("rcx.frag_fb{}", i),
+                IrIo::FragmentDepth => "rcx.frag_depth".to_string(),
                 IrIo::Texture(_) => format!("rcx.tex_{}", n),
                 // Compute kernels print only to SPIR-V.
                 IrIo::Storage(_) | IrIo::Workgroup | IrIo::StorageImage => format!("rcx.kernel_{}", n),

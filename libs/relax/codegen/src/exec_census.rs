@@ -100,16 +100,16 @@ pub fn note(unit: usize, slot: u32, event: &str) {
 struct Frame { row: Row, tier: usize, reason: usize }
 #[derive(Default)]
 struct State { unit: usize, demand: bool, stack: Vec<Frame>, phase: usize, cpu: u64 }
-relax_session::gen_local! { static STATE: RefCell<State>; }
+relax_session::memo_local! { static STATE: RefCell<State>; }
 impl State {
     fn tick(&mut self) {
-        let now = crate::cpu_ns();
+        let now = relax_backend::cpu_ns();
         let phase = match self.phase { 1 => Some(0), 3 => Some(1), 4 => Some(2), 5 | 9 | 10 => Some(3), _ => None };
         if let (Some(p), Some(frame)) = (phase, self.stack.last()) {
             let mut f = frame.row.lock().unwrap();
             if active() { f.costs[frame.tier][p] += now.saturating_sub(self.cpu); }
         }
-        self.cpu = crate::cpu_ns();
+        self.cpu = relax_backend::cpu_ns();
     }
 }
 pub struct Context(Option<(usize, bool)>);

@@ -22,6 +22,7 @@ mod camera;
 mod game_input;
 mod midi;
 mod video;
+pub(crate) mod web_view_runtime;
 
 pub use video::can_play_type;
 
@@ -259,8 +260,7 @@ impl Media {
                 }
                 let access = sm.audio();
                 let slot = if dir == audio_dir::INPUT { &access.input_cb[index] } else { &access.output_cb[index] };
-                // SAFETY: a non-zero `entry` is the address of the `extern "C" fn` the app registered
-                let entry = (entry != 0).then(|| audio::Entry { f: unsafe { std::mem::transmute::<usize, crate::media::AudioFn>(entry as usize) }, ctx: ctx as usize });
+                let entry = audio::Entry::from_cmd(entry, ctx);
                 // waits for a block of the old entry that is running: when this returns the old
                 // entry is not called any more
                 *slot.lock().unwrap_or_else(|e| e.into_inner()) = entry;
@@ -303,11 +303,6 @@ impl Media {
                     }
                     _ => s.bad(),
                 }
-                true
-            }
-            HalCmd::ViewOp { .. } => {
-                // no native views (system browser, camera preview) on Windows
-                s.stats.media_unsupported += 1;
                 true
             }
             HalCmd::VideoInput { consumers, inputs } => {

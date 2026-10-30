@@ -10,9 +10,14 @@
 //! The socket speaks lines:
 //! - client `makepad-wm hello <wire>`; server `makepad-wm ok` or `makepad-wm mismatch <wire>`
 //!   (`<wire>`: the hosted protocol's fingerprint in hex). A probe ends here.
-//! - then client `adopt <pid> <crate>`; server `admitted <hub port> <client id>` or
-//!   `refused <reason>`: the WM made a window slot for the caller, which connects to the hub as
-//!   that client like an app the WM launched itself.
+//! - then client `adopt <pid> <crate>[ lane=<name>]`; server `admitted <hub port> <client id>`
+//!   or `refused <reason>`: the WM made a window slot for the caller, which connects to the hub
+//!   as that client like an app the WM launched itself. `lane=` marks a lane's test instance
+//!   (`MAKEPAD_TEST_LANE`, [`TEST_LANE_ENV`]): the WM badges it and never takes it for the
+//!   dock's own instance of the app.
+//! - or, instead of the hello, client `makepad-wm launch <app id>`; server `makepad-wm launched`
+//!   or `makepad-wm refused <reason>`: the WM opens its dock app (launch-or-focus), what devhub's
+//!   `show` and a shell ask for (`makepad_app_registry::machine::request_launch`).
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -22,6 +27,15 @@ use std::time::Duration;
 
 /// The variable a WM sets for its children: the path of its socket.
 pub const SOCKET_ENV: &str = "MAKEPAD_WM_SOCKET";
+/// The lane a test instance runs for (devhub's lease environment sets it for every lane run).
+pub const TEST_LANE_ENV: &str = "MAKEPAD_TEST_LANE";
+
+/// This process's test lane: `MAKEPAD_TEST_LANE`, as a name (letters, digits, `-_.`, at most 48).
+pub fn test_lane() -> Option<String> {
+    let lane = std::env::var(TEST_LANE_ENV).ok()?;
+    let lane: String = lane.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')).take(48).collect();
+    (!lane.is_empty()).then_some(lane)
+}
 const SOCKET_PREFIX: &str = "makepad-wm-";
 const GREETING: &str = "makepad-wm";
 /// How long either side waits for the other's line before giving up on it.
@@ -140,6 +154,28 @@ pub fn discovery_path() -> Option<PathBuf> {
     Some(socket_path(&runtime_dir()?, 0))
 }
 
+/// Every socket a detached process may find its next WM at: the one its old WM exported first
+/// (a restarted WM often claims another index, and the exported path then names a stale
+/// file), then each `makepad-wm-<n>` that exists in the runtime directory.
+pub fn reattach_paths() -> Vec<PathBuf> {
+    let exported = std::env::var_os(SOCKET_ENV).filter(|p| !p.is_empty()).map(PathBuf::from);
+    reattach_paths_in(exported, runtime_dir())
+}
+
+fn reattach_paths_in(exported: Option<PathBuf>, dir: Option<PathBuf>) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    paths.extend(exported);
+    if let Some(dir) = dir {
+        for index in 0..MAX_INDEX {
+            let path = socket_path(&dir, index);
+            if path.exists() && !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+    paths
+}
+
 fn connect(path: &Path) -> Result<UnixStream, Probe> {
     if !path.exists() {
         return Err(Probe::Absent);
@@ -206,7 +242,8 @@ pub fn adopt(path: &Path, wire: u64, pid: u32, crate_name: &str) -> Result<Admis
         other => return Err(other),
     }
     let name: String = crate_name.chars().filter(|c| !c.is_whitespace() && !c.is_control()).collect();
-    (&stream).write_all(format!("adopt {pid} {name}\n").as_bytes()).map_err(|e| Probe::Dead(e.to_string()))?;
+    let lane = test_lane().map_or(String::new(), |lane| format!(" lane={lane}"));
+    (&stream).write_all(format!("adopt {pid} {name}{lane}\n").as_bytes()).map_err(|e| Probe::Dead(e.to_string()))?;
     let line = read_line(&mut reader).map_err(|e| Probe::Dead(e.to_string()))?;
     let mut parts = line.split(' ');
     match (parts.next(), parts.next().and_then(|p| p.parse().ok()), parts.next().and_then(|c| c.parse().ok())) {
@@ -218,8 +255,10 @@ pub fn adopt(path: &Path, wire: u64, pid: u32, crate_name: &str) -> Result<Admis
 static CLIENT_NAME: OnceLock<String> = OnceLock::new();
 
 /// The name a process gives the WM when it asks to be hosted (the WM finds the app's label
-/// and icon by it): its package. A host running someone else's code (`makepad run`) names
-/// the app it runs before opening the HAL; otherwise the executable's name.
+/// and icon by it): its package. An app's `app_main` names its package
+/// (`discover_window_manager`) and a host running someone else's code (`makepad run`) names the
+/// app it runs, both before opening the HAL; only a process that does neither falls back to the
+/// executable's name.
 pub fn set_client_name(name: &str) {
     let _ = CLIENT_NAME.set(name.to_string());
 }
@@ -235,6 +274,8 @@ pub fn client_name() -> String {
 pub struct AdoptRequest {
     pub pid: u32,
     pub crate_name: String,
+    /// A lane's test instance (`lane=`): never the dock's instance of its app.
+    pub test_lane: Option<String>,
 }
 
 /// A WM's published socket: removed when dropped.
@@ -269,7 +310,13 @@ impl WmSocket {
 
     /// Serve one connection: the wire check, then (when the client asks) `admit`, which makes
     /// the window slot and answers the hub port and client id.
-    pub fn serve(stream: UnixStream, wire: u64, admit: impl FnOnce(&AdoptRequest) -> Result<Admission, String>) -> io::Result<Option<AdoptRequest>> {
+    /// `launch`: a `makepad-wm launch <id>` request (the WM opens its dock app `id`).
+    pub fn serve(
+        stream: UnixStream,
+        wire: u64,
+        admit: impl FnOnce(&AdoptRequest) -> Result<Admission, String>,
+        launch: impl FnOnce(&str) -> Result<(), String>,
+    ) -> io::Result<Option<AdoptRequest>> {
         stream.set_read_timeout(Some(LINE_TIMEOUT))?;
         stream.set_write_timeout(Some(LINE_TIMEOUT))?;
         let mut reader = BufReader::new(&stream);
@@ -279,6 +326,19 @@ impl WmSocket {
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e) => return Err(e),
         };
+        if let Some(id) = line.strip_prefix(GREETING).and_then(|r| r.trim().strip_prefix("launch ")) {
+            let id = id.trim();
+            let answer = if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')) {
+                format!("{GREETING} refused not an app id\n")
+            } else {
+                match launch(id) {
+                    Ok(()) => format!("{GREETING} launched\n"),
+                    Err(why) => format!("{GREETING} refused {}\n", why.chars().map(|c| if c.is_control() { ' ' } else { c }).collect::<String>()),
+                }
+            };
+            (&stream).write_all(answer.as_bytes())?;
+            return Ok(None);
+        }
         let theirs = line.strip_prefix(GREETING).and_then(|r| r.trim().strip_prefix("hello "))
             .and_then(|w| u64::from_str_radix(w.trim(), 16).ok());
         let Some(theirs) = theirs else {
@@ -295,9 +355,12 @@ impl WmSocket {
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e) => return Err(e),
         };
-        let mut parts = line.splitn(3, ' ');
+        let mut parts = line.split(' ');
         let request = match (parts.next(), parts.next().and_then(|p| p.parse().ok()), parts.next()) {
-            (Some("adopt"), Some(pid), Some(name)) if !name.is_empty() => AdoptRequest { pid, crate_name: name.to_string() },
+            (Some("adopt"), Some(pid), Some(name)) if !name.is_empty() => {
+                let test_lane = parts.find_map(|w| w.strip_prefix("lane=")).filter(|l| !l.is_empty()).map(str::to_string);
+                AdoptRequest { pid, crate_name: name.to_string(), test_lane }
+            }
             _ => {
                 (&stream).write_all(b"refused malformed request\n")?;
                 return Ok(None);
@@ -391,7 +454,7 @@ mod tests {
                 let got = WmSocket::serve(stream, wire, |req| {
                     assert_eq!(req.crate_name, "makepad-app-amp");
                     Ok(Admission { port: 8766, client: 1 << 32 })
-                }).unwrap();
+                }, |_| Err("no launches here".into())).unwrap();
                 adopted.extend(got);
             }
             adopted
@@ -400,7 +463,7 @@ mod tests {
         assert_eq!(probe(&path, wire ^ 1), Probe::Mismatch(wire));
         assert_eq!(adopt(&path, wire, 42, "makepad-app-amp"), Ok(Admission { port: 8766, client: 1 << 32 }));
         let adopted = server.join().unwrap();
-        assert_eq!(adopted, vec![AdoptRequest { pid: 42, crate_name: "makepad-app-amp".into() }]);
+        assert_eq!(adopted, vec![AdoptRequest { pid: 42, crate_name: "makepad-app-amp".into(), test_lane: None }]);
         // the socket file went with its WM: absent; a stale file nobody listens on: dead
         assert_eq!(probe(&path, wire), Probe::Absent);
         let stale = UnixListener::bind(&path).unwrap();
@@ -411,6 +474,28 @@ mod tests {
         assert_eq!(WmSocket::bind(&dir, 1).unwrap().path, socket_path(&dir, 1), "a hidden WM never takes index 0");
         assert_eq!(again.path, path);
         drop(again);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn reattach_finds_the_live_wm_when_the_exported_path_is_stale() {
+        let dir = temp_dir("reattach");
+        let wire = 7;
+        // the old WM sat at index 1 and left its file; the new one took index 0
+        let stale = socket_path(&dir, 1);
+        drop(UnixListener::bind(&stale).unwrap());
+        let live = WmSocket::bind(&dir, 0).unwrap();
+        assert_eq!(live.path, socket_path(&dir, 0));
+        let paths = reattach_paths_in(Some(stale.clone()), Some(dir.clone()));
+        assert_eq!(paths, vec![stale.clone(), socket_path(&dir, 0)]);
+        let server = thread::spawn(move || {
+            let (stream, _) = live.listener.accept().unwrap();
+            WmSocket::serve(stream, wire, |_| Ok(Admission { port: 1, client: 2 }), |_| Ok(())).unwrap();
+        });
+        let found = paths.iter().find_map(|p| adopt(p, wire, 9, "devhub").ok());
+        assert_eq!(found, Some(Admission { port: 1, client: 2 }));
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&stale);
         let _ = std::fs::remove_dir(&dir);
     }
 

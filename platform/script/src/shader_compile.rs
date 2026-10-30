@@ -324,7 +324,7 @@ impl CompiledShader {
     ) -> Option<ScriptObject> {
         self.state.find_vertex_buffer_object(vm, shader)
     }
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(all(target_arch = "wasm32", makepad_precompiled_shaders)))]
     pub(crate) fn reached_functions(&self) -> impl Iterator<Item = ScriptObject> + '_ {
         self.state
             .ir
@@ -346,6 +346,9 @@ pub fn shader_functions_hash(
         if let Some(v) = heap.value(obj, key.into(), crate::trap::NoTrap).as_id() {
             hash = hash.id_append(v);
         }
+    }
+    if heap.value(obj, id!(precise_math).into(), crate::trap::NoTrap).as_bool() == Some(true) {
+        hash = hash.id_append(id!(precise_math));
     }
     let mut current = Some(obj);
     while let Some(obj) = current {

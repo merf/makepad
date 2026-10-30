@@ -3,13 +3,14 @@
 //! Ported out of the window manager's tile widget (studio's
 //! DesktopRunView before it). The shared-GPU swapchain, the bootstrap
 //! messages, the presented frame, the `Tick`/`TickDone` pacing, the Linux
-//! aux channel, input forwarding and the widget-snapshot round trip live
+//! aux channel, input forwarding and semantic trees and actions live
 //! here; what a host draws or does with the frame does not. The owner
 //! (the WM's `MpRunView`, Stage's app layer) feeds the events it gets from
 //! the hub into the methods below, forwards `take_outgoing()` batches to
 //! the child's socket after every call, and reads the frame through
 //! `presented()` / `texture()`.
 
+#[cfg(target_os = "linux")]
 use std::collections::HashMap;
 
 use crate::hub::ClientId;
@@ -24,8 +25,7 @@ use makepad_platform::shared_framebuf::aux_chan::ExternalEndpointListener;
 use makepad_platform::*;
 use makepad_studio_protocol::{
     AppToStudio, MouseButton, PresentableDraw, RemoteKeyModifiers, RemoteMouseDown, RemoteMouseMove,
-    PinchPhase, RemoteMouseUp, RemotePinch, RemoteScroll, ScrollPhase, StudioToApp, StudioToAppVec, WidgetSnapshot, WidgetSnapshotRequest,
-    WidgetSnapshotResponse,
+    PinchPhase, RemoteMouseUp, RemotePinch, RemoteScroll, ScrollPhase, StudioToApp, StudioToAppVec,
 };
 use makepad_error_log::log;
 
@@ -152,6 +152,11 @@ pub struct HostedApp {
     /// When the last Tick went out: no two Ticks are closer than one frame
     /// ([`tick_gap_open`]), whether the beat or an acknowledgement sends.
     last_tick_at: Option<f64>,
+    /// An owner frame went by while the last Tick was out: the child is late, and its next Tick
+    /// goes out at its acknowledgement instead of waiting for yet another owner frame (a child
+    /// whose frame takes a little over one display period ran at half the rate: 9 ms at 120 Hz
+    /// was 60 fps, the WM compositing every other tick).
+    late: bool,
     /// The child has something to do: input is queued for it, it asked for
     /// a frame (`RequestAnimationFrame`) or its timer fell due (`WakeIn`).
     /// The beat ticks the child only while this holds; an idle child is not
@@ -192,6 +197,7 @@ pub struct HostedApp {
     pending_move: Option<RemoteMouseMove>,
     last_rect: Rect,
     last_dpi_factor: f64,
+    screen_origin: Option<Vec2d>,
     bootstrap_pending: bool,
     bootstrap_tick_count: u32,
     swapchain: Option<HostSwapchain>,
@@ -218,9 +224,8 @@ pub struct HostedApp {
     live_resize: bool,
     /// Batches for the child, serialized, oldest first.
     outgoing: Vec<(ClientId, Vec<u8>)>,
-    next_snapshot_id: u64,
-    snapshots_pending: Vec<u64>,
-    snapshots_done: HashMap<u64, Vec<WidgetSnapshot>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    a11y: crate::a11y::RemoteUi,
 
     /// The child's GPU descriptor channel: one per child process, shared by the views of its
     /// windows (its first window's view makes it; a later window's view borrows it).
@@ -256,6 +261,7 @@ impl HostedApp {
             tick_period: 0.008,
             tick_outstanding: None,
             last_tick_at: None,
+            late: false,
             tick_wanted: true,
             throttled: false,
             paces_ticks: true,
@@ -269,6 +275,7 @@ impl HostedApp {
             pending_move: None,
             last_rect: Rect::default(),
             last_dpi_factor: 0.0,
+            screen_origin: None,
             bootstrap_pending: false,
             bootstrap_tick_count: 0,
             swapchain: None,
@@ -283,9 +290,8 @@ impl HostedApp {
             target_size: None,
             live_resize: false,
             outgoing: Vec::new(),
-            next_snapshot_id: 1,
-            snapshots_pending: Vec::new(),
-            snapshots_done: HashMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            a11y: Default::default(),
             #[cfg(target_os = "linux")]
             outbox: None,
             #[cfg(target_os = "linux")]
@@ -333,6 +339,8 @@ impl HostedApp {
     /// as `StudioToAppVec` frames with the client they are for. The owner
     /// writes each to that client's socket after every call into this type.
     pub fn take_outgoing(&mut self) -> Vec<(ClientId, Vec<u8>)> {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.send(self.a11y.drain());
         std::mem::take(&mut self.outgoing)
     }
 
@@ -383,6 +391,7 @@ impl HostedApp {
         }
         self.paces_ticks = on;
         self.tick_outstanding = None;
+        self.late = false;
         self.tick_wanted = true;
         self.ensure_beat(cx);
     }
@@ -393,8 +402,27 @@ impl HostedApp {
         self.tick_wanted || self.pending_move.is_some()
     }
 
-    /// Place this window at `origin` in the child's window space (see
-    /// `window_origin`). Takes effect with the next geometry message.
+    /// The window's real desktop position, independent of pointer routing.
+    pub fn set_screen_origin(&mut self, origin: Option<Vec2d>) {
+        if self.screen_origin == origin { return; }
+        self.screen_origin = origin;
+        // A moving tile sends only placement. Re-exporting its swapchain here would
+        // turn a compositor animation into GPU handle churn in the hosted app.
+        if !self.bootstrap_pending {
+            if let Some(target) = self.current_target {
+                self.send(vec![StudioToApp::WindowGeomChange {
+                    window_id: target.window_id,
+                    screen_origin: origin.map(|p| (p.x, p.y)),
+                    dpi_factor: self.last_dpi_factor,
+                    left: self.window_origin.x, top: self.window_origin.y,
+                    width: self.last_rect.size.x, height: self.last_rect.size.y,
+                }]);
+            }
+        }
+    }
+
+    /// Place this window in the child's input space (see `window_origin`).
+    /// Takes effect with the next geometry message.
     pub fn set_window_origin(&mut self, origin: Vec2d) {
         if self.window_origin != origin {
             self.window_origin = origin;
@@ -418,6 +446,10 @@ impl HostedApp {
         self.aux_chan_listener.is_some()
             || self.inflight.is_some()
             || self.pending.is_some()
+            || self.outbox.as_ref().is_some_and(|o| {
+                let o = o.0.borrow();
+                !o.native.is_empty() || o.native_inflight != 0
+            })
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -494,6 +526,11 @@ impl HostedApp {
                 self.tick_timer = cx.start_timeout((at - self.now()).max(0.0));
             }
         }
+        // a Tick out: the owner's next frame tells whether the child is late (`late`)
+        if self.tick_outstanding.is_some() && !self.late && self.paces_ticks && !self.tick_frame_asked {
+            self.tick_frame = cx.new_next_frame();
+            self.tick_frame_asked = true;
+        }
     }
 
     /// When the host next has something to send the child. There is no fast
@@ -513,6 +550,9 @@ impl HostedApp {
         }
         if let Some(sent_at) = self.tick_outstanding {
             return Some(Beat::At(sent_at + self.tick_fallback()));
+        }
+        if self.late {
+            return Some(Beat::At(now));
         }
         Some(Beat::Frame)
     }
@@ -717,9 +757,11 @@ impl HostedApp {
     /// Route one `AppToStudio` message of this child to the state it
     /// belongs to. True when it was one of the protocol's own: a presented
     /// frame, `TickDone`, `RequestAnimationFrame`, the pacing and pointer
-    /// capability announcements, a widget snapshot. Everything else (window
+    /// capability announcements, semantic updates. Everything else (window
     /// creation, cursor, clipboard, relays) is the owner's.
     pub fn on_app_message(&mut self, cx: &mut Cx, msg: &AppToStudio) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.a11y.apply(msg) { return true; }
         match msg {
             AppToStudio::DrawCompleteAndFlip(pd) => {
                 self.set_presentable_draw(cx, *pd);
@@ -730,7 +772,6 @@ impl HostedApp {
             }
             AppToStudio::RequestAnimationFrame => self.request_tick(cx),
             AppToStudio::WakeIn(secs) => self.wake_in(cx, *secs),
-            AppToStudio::WidgetSnapshot(response) => self.on_snapshot_response(response.clone()),
             AppToStudio::Custom(json) => {
                 if let Some(caps) = makepad_platform::ime::HostedPointerCaps::parse(json) {
                     self.set_pointer_caps(caps);
@@ -749,29 +790,10 @@ impl HostedApp {
         self.status.as_ref()
     }
 
-    // ---- widget snapshots ---------------------------------------------
-
-    /// Ask the child for its widget tree. The answer is collected by
-    /// `on_app_message`; poll `take_snapshot` with the id returned here.
-    pub fn snapshot(&mut self) -> u64 {
-        let request_id = self.next_snapshot_id;
-        self.next_snapshot_id += 1;
-        self.snapshots_pending.push(request_id);
-        self.send(vec![StudioToApp::WidgetSnapshot(WidgetSnapshotRequest { request_id })]);
-        request_id
-    }
-
-    fn on_snapshot_response(&mut self, response: WidgetSnapshotResponse) {
-        if let Some(at) = self.snapshots_pending.iter().position(|id| *id == response.request_id) {
-            self.snapshots_pending.remove(at);
-            self.snapshots_done.insert(response.request_id, response.widgets);
-        }
-    }
-
-    /// The answer to `snapshot`, once it arrived (taken: asked for once).
-    pub fn take_snapshot(&mut self, request_id: u64) -> Option<Vec<WidgetSnapshot>> {
-        self.snapshots_done.remove(&request_id)
-    }
+    /// Clone for a remote worker. The worker answers `ui`; the owner continues handling
+    /// messages and draining `take_outgoing` on signals, without waiting on the UI thread.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn remote_ui(&self) -> crate::a11y::RemoteUi { self.a11y.clone() }
 
     // ---- tick pacing ---------------------------------------------------
 
@@ -798,6 +820,7 @@ impl HostedApp {
         }
         self.ticks_sent += 1;
         let now = self.now();
+        self.late = false;
         self.tick_outstanding = Some(now);
         self.last_tick_at = Some(now);
     }
@@ -850,6 +873,10 @@ impl HostedApp {
         let mut framed = false;
         if self.tick_frame_asked && self.tick_frame.is_event(event).is_some() {
             self.tick_frame_asked = false;
+            if self.tick_outstanding.is_some() {
+                // an owner frame passed and the child has not answered its Tick yet
+                self.late = true;
+            }
             framed = target.is_some() && self.beat_needed();
         }
         if beat || framed {
@@ -941,10 +968,14 @@ impl HostedApp {
         self.ticks_done = 0;
         #[cfg(target_os = "linux")]
         {
-            // Drop the outbox first: Drop shuts the aux endpoint before the
-            // client socket is replaced.
-            self.outbox = None;
-            self.aux_chan_listener = None;
+            // The descriptor channel is the client's, not its window's: another window of the
+            // same client (a service whose only window is a tray dropdown, with an id after its
+            // unmade main window's) keeps it. Drop the outbox first: Drop shuts the aux endpoint
+            // before the client socket is replaced.
+            if self.current_target.map(|target| target.client) != target.map(|target| target.client) {
+                self.outbox = None;
+                self.aux_chan_listener = None;
+            }
             self.inflight = None;
             self.pending = None;
             self.transport_error = None;
@@ -953,8 +984,11 @@ impl HostedApp {
         if self.current_target.map(|target| target.client) != target.map(|target| target.client) {
             self.status = None;
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        self.a11y.reset();
         self.current_target = target;
         self.tick_outstanding = None;
+        self.late = false;
         self.tick_wanted = true;
         if self.wake_timer.0 != 0 {
             cx.stop_timer(self.wake_timer);
@@ -1132,6 +1166,7 @@ impl HostedApp {
         }
         let mut outbound = vec![StudioToApp::WindowGeomChange {
             window_id: target.window_id,
+            screen_origin: self.screen_origin.map(|p| (p.x, p.y)),
             dpi_factor: self.last_dpi_factor,
             left: self.window_origin.x,
             top: self.window_origin.y,
@@ -1285,6 +1320,19 @@ impl HostedApp {
     /// the presented texture. True when it was applied; otherwise it is kept
     /// and retried by `retry_pending_draw`.
     pub fn set_presentable_draw(&mut self, cx: &mut Cx, presentable_draw: PresentableDraw) -> bool {
+        // MAKEPAD_TRACE=hosted: every frame a child hands over and whether it was taken (copied out of
+        // its shared image, which releases it) or waits; with the child's MAKEPAD_FRAME_STAMP log the
+        // sequence names the frame (wmsync-tools/stampcheck.py pairs them)
+        let trace = makepad_error_log::trace_enabled("hosted").then_some(presentable_draw);
+        let applied = self.set_presentable_draw_inner(cx, presentable_draw);
+        if let Some(pd) = trace {
+            log!("hosted c{} took img {:?} seq {} {}x{} {}", self.client().unwrap_or(0), pd.target_id, pd.sequence, pd.width, pd.height,
+                if applied { "applied" } else { "pending" });
+        }
+        applied
+    }
+
+    fn set_presentable_draw_inner(&mut self, cx: &mut Cx, presentable_draw: PresentableDraw) -> bool {
         if makepad_error_log::trace_enabled("pace") {
             log!("pace wm flip_rx={:.2} c{}", (self.clock.wall_now)() * 1000.0 % 1.0e6, self.client().unwrap_or(0));
         }
@@ -1442,9 +1490,18 @@ impl HostedApp {
         // in-flight tag when it sees it done. A view taking only its own batch let the
         // windows' messages overtake each other: the child dropped the other window's
         // descriptors as stale and stalled on them.
+        while let Some(batch) = outbox.native.pop_front() {
+            if let Err(batch) = outbox.sender.try_send_native(batch) {
+                outbox.native.push_front(batch);
+                break;
+            }
+            outbox.native_inflight += 1;
+        }
+        outbox.receive_native();
         for sent in outbox.sender.poll() {
-            outbox.done_tags.push(sent.tag);
-            msgs.push(StudioToApp::Swapchain(sent.swapchain));
+            if sent.tag != u64::MAX { outbox.done_tags.push(sent.tag); }
+            else { outbox.native_inflight -= 1; }
+            msgs.push(sent.message);
         }
         if let Some(tag) = self.inflight {
             if let Some(at) = outbox.done_tags.iter().position(|done| *done == tag) {
@@ -1474,6 +1531,19 @@ struct OutboxState {
     next_tag: u64,
     /// Completed batches (already sent to the child) whose view has not seen them yet.
     done_tags: Vec<u64>,
+    native: std::collections::VecDeque<makepad_platform::shared_framebuf::NativeDescriptors>,
+    native_inflight: usize,
+    received: HashMap<u64, std::os::fd::OwnedFd>,
+    discarded: std::collections::HashSet<u64>,
+}
+
+#[cfg(target_os = "linux")]
+impl OutboxState {
+    fn receive_native(&mut self) {
+        for (id, fd) in self.sender.receive() {
+            if !self.discarded.remove(&id.as_u64()) { self.received.insert(id.as_u64(), fd); }
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1486,7 +1556,7 @@ thread_local! {
 #[cfg(target_os = "linux")]
 impl SharedOutbox {
     fn new(client: ClientId, sender: LinuxSwapchainSender) -> SharedOutbox {
-        let shared = SharedOutbox(std::rc::Rc::new(std::cell::RefCell::new(OutboxState { sender, next_tag: 0, done_tags: Vec::new() })));
+        let shared = SharedOutbox(std::rc::Rc::new(std::cell::RefCell::new(OutboxState { sender, next_tag: 0, done_tags: Vec::new(), native: Default::default(), native_inflight: 0, received: Default::default(), discarded: Default::default() })));
         OUTBOXES.with(|o| {
             let mut o = o.borrow_mut();
             o.retain(|_, weak| weak.strong_count() > 0);
@@ -1559,6 +1629,31 @@ mod pacing_tests {
         assert_eq!(app.next_beat(), Some(Beat::Frame));
     }
 
+    /// A child that missed an owner frame (its Tick still out when the frame came) gets its
+    /// next Tick at its acknowledgement, not one more owner frame later: a 9 ms child at 120 Hz
+    /// draws about 110 frames a second, not 60. A Tick resets it.
+    #[test]
+    fn a_late_child_is_ticked_at_its_acknowledgement() {
+        at_ms(100.0);
+        let mut app = settled_app();
+        app.tick_wanted = true;
+        let mut msgs = Vec::new();
+        app.append_tick(app.current_target.unwrap(), &mut msgs);
+        app.tick_wanted = true;
+        // the owner's next frame comes while the Tick is out
+        at_ms(108.3);
+        app.late = app.tick_outstanding.is_some();
+        at_ms(109.0);
+        app.tick_done();
+        assert_eq!(app.next_beat(), Some(Beat::At(0.109)), "late: at once");
+        assert!(app.tick_gap_ok(), "a frame has passed since the last Tick");
+        app.append_tick(app.current_target.unwrap(), &mut msgs);
+        assert!(!app.late);
+        at_ms(112.0);
+        app.tick_done();
+        assert_eq!(app.next_beat(), Some(Beat::Frame), "on time: the owner's next frame");
+    }
+
     /// A live resize keeps frames that hold the new size and makes new ones with room to
     /// grow; at rest the frames are the window's exact size again.
     #[test]
@@ -1596,5 +1691,36 @@ mod pacing_tests {
         assert!(!app.beat_needed(), "nothing asked, nothing owed: no timer, no tick");
         app.tick_wanted = true;
         assert!(app.beat_needed());
+    }
+}
+
+/// Queue descriptors on the hosted child's existing ordered channel. False means its channel
+/// has not connected yet; the caller retains and retries the whole transaction.
+#[cfg(target_os = "linux")]
+pub fn native_descriptors(client: ClientId, batch: makepad_platform::shared_framebuf::NativeDescriptors)
+    -> Result<(), makepad_platform::shared_framebuf::NativeDescriptors> {
+    let Some(outbox) = SharedOutbox::of(client) else { return Err(batch); };
+    outbox.0.borrow_mut().native.push_back(batch);
+    // An idle child's view has no beat armed. Let its existing transport scheduler
+    // deliver this batch and its metadata even when neither window needs a redraw.
+    makepad_platform::thread::SignalToUI::set_ui_signal();
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub fn native_release_fence(client: ClientId, buffer: u64) -> Option<std::os::fd::OwnedFd> {
+    let outbox = SharedOutbox::of(client)?;
+    let mut outbox = outbox.0.borrow_mut();
+    outbox.receive_native();
+    outbox.received.remove(&buffer)
+}
+
+/// A layer closed while its release descriptor was in transit. Consume it without retaining it.
+#[cfg(target_os = "linux")]
+pub fn native_discard_release_fence(client: ClientId, buffer: u64) {
+    if let Some(outbox) = SharedOutbox::of(client) {
+        let mut outbox = outbox.0.borrow_mut();
+        outbox.receive_native();
+        if outbox.received.remove(&buffer).is_none() { outbox.discarded.insert(buffer); }
     }
 }

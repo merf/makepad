@@ -700,6 +700,7 @@ pub fn build_draw_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl
         let t = ir.pod_ty(types, output.io[*i].ty);
         outputs.push(IrEntryIo { name: format!("fb{}", index), ty: t, binding: IrIoBinding::Location(*index as u32) });
     }
+    let depth_out = push_frag_depth(output, &mut outputs, "frag_depth");
     let fragment_fn = ir.function_by_name("io_fragment");
     let mut b = Bld { f: IrFunction::new("fragment_main".to_string(), TY_VOID), m: ir };
     b.f.entry = Some(IrEntry { stage: IrStage::Fragment, inputs, outputs });
@@ -720,6 +721,7 @@ pub fn build_draw_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl
         b.assign(place, v);
     }
     copy_uniforms(&mut b, dyn_block, &dyn_ios, scope_block, &scope_ios, &io_globals);
+    init_frag_depth(&mut b, depth_out, &io_globals);
     if let Some(ff) = fragment_fn {
         let call = b.e(ExprKind::Call(ff, Vec::new()), TY_VOID);
         b.f.body.push(Stmt::Expr(call));
@@ -731,10 +733,50 @@ pub fn build_draw_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl
         let o = b.e(ExprKind::EntryOut(k as u32), ty);
         b.assign(o, v);
     }
+    write_frag_depth(&mut b, depth_out, &io_globals);
     b.f.body.push(Stmt::Return(NO_EXPR));
     let fragment_main = b.f;
     ir.functions.push(fragment_main);
     info
+}
+
+/// A shader that declares `fragment_depth(..)` gets one more fragment entry
+/// output: the FragDepth builtin (conservative where the declaration
+/// promises a direction). Returns (output index, io index).
+fn push_frag_depth(output: &ShaderOutput, outputs: &mut Vec<IrEntryIo>, name: &str) -> Option<(u32, usize)> {
+    let (io, mode) = output.io.iter().enumerate().find_map(|(i, io)| io.kind.fragment_depth().map(|m| (i, m)))?;
+    let bi = match mode {
+        FRAG_DEPTH_GREATER => IrBuiltinIo::FragDepthGreater,
+        FRAG_DEPTH_LESS => IrBuiltinIo::FragDepthLess,
+        _ => IrBuiltinIo::FragDepth,
+    };
+    let k = outputs.len() as u32;
+    outputs.push(IrEntryIo { name: name.to_string(), ty: TY_F32, binding: IrIoBinding::Builtin(bi) });
+    Some((k, io))
+}
+
+/// Before the fragment function: the depth output starts as the rasterised
+/// depth (the fragment position's z), so a path that does not write it
+/// behaves like an ordinary draw instead of writing 0.
+fn init_frag_depth(b: &mut Bld, depth_out: Option<(u32, usize)>, io_globals: &[Option<GlobalId>]) {
+    let Some((_, io)) = depth_out else { return };
+    let Some(g) = io_globals[io] else { return };
+    let entry = b.f.entry.as_ref().unwrap();
+    let Some(k) = entry.inputs.iter().position(|i| i.binding == IrIoBinding::Builtin(IrBuiltinIo::Position)) else { return };
+    let vec4 = entry.inputs[k].ty;
+    let pos = b.e(ExprKind::EntryIn(k as u32), vec4);
+    let z = b.lane(pos, 2);
+    let place = b.glob(g);
+    b.assign(place, z);
+}
+
+/// The entry's last act: the depth the fragment function wrote goes out.
+fn write_frag_depth(b: &mut Bld, depth_out: Option<(u32, usize)>, io_globals: &[Option<GlobalId>]) {
+    let Some((k, io)) = depth_out else { return };
+    let Some(g) = io_globals[io] else { return };
+    let v = b.glob(g);
+    let o = b.e(ExprKind::EntryOut(k), TY_F32);
+    b.assign(o, v);
 }
 
 fn copy_uniforms(b: &mut Bld, dyn_block: Option<GlobalId>, dyn_ios: &[usize], scope_block: Option<GlobalId>, scope_ios: &[usize], io_globals: &[Option<GlobalId>]) {
@@ -749,6 +791,41 @@ fn copy_uniforms(b: &mut Bld, dyn_block: Option<GlobalId>, dyn_ios: &[usize], sc
             b.assign(place, field);
         }
     }
+}
+
+/// The clip volume test at the top of `depth_clip`: discard the fragment when its world
+/// position lies outside the draw list's `xr_clip` box while `xr_clip_on` is set. A shader
+/// without the draw list uniforms (or a list struct without the fields) gets no test.
+fn xr_clip_volume(b: &mut Bld, world: u32, vec4: TyId, vec3: TyId, mat4: TyId) {
+    let mut list = None;
+    for (i, g) in b.m.globals.iter().enumerate() {
+        if g.kind == IrGlobalKind::Io(IrIo::UniformBuffer) && g.name == id!(draw_list) {
+            list = Some(i as GlobalId);
+        }
+    }
+    let Some(list) = list else { return };
+    let IrTy::Struct(si) = b.m.get(b.m.globals[list as usize].ty).clone() else { return };
+    let field = |name: LiveId| b.m.structs[si as usize].fields.iter().position(|f| f.name == name);
+    let (Some(on_k), Some(box_k)) = (field(id!(xr_clip_on)), field(id!(xr_clip))) else { return };
+    let blk = b.glob(list);
+    let on = b.e(ExprKind::Field(blk, on_k as u32), TY_F32);
+    let half = b.f32(0.5);
+    let enabled = b.bin(BinOp::Gt, on, half, TY_BOOL);
+    let blk = b.glob(list);
+    let m = b.e(ExprKind::Field(blk, box_k as u32), mat4);
+    let wv = b.e(ExprKind::Param(world), vec4);
+    let q = b.bin(BinOp::Mul, m, wv, vec4);
+    let xyz = b.e(ExprKind::Swizzle(q, [0, 1, 2, 0], 3), vec3);
+    let a = b.builtin(Builtin::Abs, vec![xyz], vec3);
+    let ax = b.lane(a, 0);
+    let ay = b.lane(a, 1);
+    let az = b.lane(a, 2);
+    let mxy = b.builtin(Builtin::Max, vec![ax, ay], TY_F32);
+    let mx = b.builtin(Builtin::Max, vec![mxy, az], TY_F32);
+    let one = b.f32(1.0);
+    let outside = b.bin(BinOp::Gt, mx, one, TY_BOOL);
+    let c = b.bin(BinOp::LogicAnd, enabled, outside, TY_BOOL);
+    b.f.body.push(Stmt::If(c, vec![Stmt::Discard], Vec::new()));
 }
 
 /// `depth_clip(world, color, clip)` as an IR function (the XR depth clip:
@@ -782,6 +859,11 @@ fn build_depth_clip(ir: &mut IrModule, xr: bool, xr_depth: GlobalId, view_id: Gl
         let c = b.e(ExprKind::Param(color), vec4);
         vec![Stmt::Return(c)]
     };
+    // The draw list's XR clip volume (`DrawListUniforms::xr_clip`) first, for every draw of the
+    // list whatever its `clip`: if (xr_clip_on > 0.5 && any(abs((xr_clip * world).xyz) > 1))
+    // discard. Both variants: an XR picture drawn side by side is two passes of the window
+    // variant. Off (every list but an XR box stage's) it is one uniform compare.
+    xr_clip_volume(&mut b, world, vec4, vec3, mat4);
     // if (clip < 0.5) return color
     let p = b.e(ExprKind::Param(clip), TY_F32);
     let half = b.f32(0.5);
@@ -918,6 +1000,7 @@ mod spirv_pick;
 
 fn draw_variant_spirv_with_pick(output: &ShaderOutput, types: &impl crate::shader_types::ShaderTypes, xr: bool, pick: bool) -> Result<IrDrawSpirv, String> {
     let mut ir = output.ir.clone();
+    crate::shader_ir_precise::lower_precise(&mut ir, true);
     let mut info = build_draw_entries(output, &mut ir, types, xr);
     if pick { spirv_pick::apply(output, &mut ir, &mut info)?; }
     let (Some(v), Some(f)) = (ir.function_by_name("vertex_main"), ir.function_by_name("fragment_main")) else {
@@ -1270,6 +1353,10 @@ pub fn build_gl_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl c
             outputs.push(IrEntryIo { name: format!("_mp_frag_{}", index), ty: t, binding: IrIoBinding::Location(index as u32) });
         }
     }
+    let depth_out = push_frag_depth(output, &mut outputs, "gl_FragDepth");
+    if depth_out.is_some() {
+        inputs.push(IrEntryIo { name: "gl_FragCoord".to_string(), ty: vec4, binding: IrIoBinding::Builtin(IrBuiltinIo::Position) });
+    }
     let fragment_fn = ir.function_by_name("io_fragment");
     let mut b = Bld { f: IrFunction::new("fragment_main".to_string(), TY_VOID), m: ir };
     b.f.entry = Some(IrEntry { stage: IrStage::Fragment, inputs, outputs });
@@ -1284,6 +1371,7 @@ pub fn build_gl_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl c
         let mut at = f.offset;
         gl_assign_reconstructed(&mut b, types, g, &inline, Source::Numeric, &var_lanes, &mut at);
     }
+    init_frag_depth(&mut b, depth_out, &io_globals);
     if let Some(ff) = fragment_fn {
         let call = b.e(ExprKind::Call(ff, Vec::new()), TY_VOID);
         b.f.body.push(Stmt::Expr(call));
@@ -1295,6 +1383,7 @@ pub fn build_gl_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl c
         let o = b.e(ExprKind::EntryOut(k as u32), ty);
         b.assign(o, v);
     }
+    write_frag_depth(&mut b, depth_out, &io_globals);
     let fragment_main = b.f;
     ir.functions.push(fragment_main);
     info
@@ -1641,6 +1730,7 @@ pub fn build_hlsl_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl
         let t = ir.pod_ty(types, output.io[*i].ty);
         outputs.push(IrEntryIo { name: format!("fb{}", index), ty: t, binding: IrIoBinding::Location(*index as u32) });
     }
+    let depth_out = push_frag_depth(output, &mut outputs, "frag_depth");
     let fragment_fn = ir.function_by_name("io_fragment");
     let mut b = Bld { f: IrFunction::new("fragment_main".to_string(), TY_VOID), m: ir };
     b.f.entry = Some(IrEntry { stage: IrStage::Fragment, inputs: frag_inputs, outputs });
@@ -1676,6 +1766,7 @@ pub fn build_hlsl_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl
             gl_assign_reconstructed(&mut b, types, g, &inline, Source::Word, &words, &mut at);
         }
     }
+    init_frag_depth(&mut b, depth_out, &io_globals);
     if let Some(ff) = fragment_fn {
         let call = b.e(ExprKind::Call(ff, Vec::new()), TY_VOID);
         b.f.body.push(Stmt::Expr(call));
@@ -1687,6 +1778,7 @@ pub fn build_hlsl_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl
         let o = b.e(ExprKind::EntryOut(k as u32), ty);
         b.assign(o, v);
     }
+    write_frag_depth(&mut b, depth_out, &io_globals);
     b.f.body.push(Stmt::Return(NO_EXPR));
     let fragment_main = b.f;
     ir.functions.push(fragment_main);
@@ -1974,6 +2066,7 @@ pub fn build_metal_entries(output: &ShaderOutput, ir: &mut IrModule, types: &imp
         let t = ir.pod_ty(types, output.io[*i].ty);
         outputs.push(IrEntryIo { name: format!("fb{}", index), ty: t, binding: IrIoBinding::Location(*index as u32) });
     }
+    let depth_out = push_frag_depth(output, &mut outputs, "frag_depth");
     let fragment_fn = ir.function_by_name("io_fragment");
     let mut b = Bld { f: IrFunction::new("fragment_main".to_string(), TY_VOID), m: ir };
     b.f.entry = Some(IrEntry { stage: IrStage::Fragment, inputs: frag_inputs, outputs });
@@ -2019,6 +2112,7 @@ pub fn build_metal_entries(output: &ShaderOutput, ir: &mut IrModule, types: &imp
             b.assign(place, v);
         }
     }
+    init_frag_depth(&mut b, depth_out, &io_globals);
     if let Some(ff) = fragment_fn {
         let call = b.e(ExprKind::Call(ff, Vec::new()), TY_VOID);
         b.f.body.push(Stmt::Expr(call));
@@ -2030,6 +2124,7 @@ pub fn build_metal_entries(output: &ShaderOutput, ir: &mut IrModule, types: &imp
         let o = b.e(ExprKind::EntryOut(k as u32), ty);
         b.assign(o, v);
     }
+    write_frag_depth(&mut b, depth_out, &io_globals);
     b.f.body.push(Stmt::Return(NO_EXPR));
     let fragment_main = b.f;
     ir.functions.push(fragment_main);

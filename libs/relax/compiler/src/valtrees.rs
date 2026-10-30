@@ -30,8 +30,10 @@ fn const_to_valtree_inner(u: &Unit, place: Place, nodes: &mut usize, visited: &m
         }
         TyKind::FnDef(..) => { *nodes += 1; Ok(ValTree::from_branches(tys, &[])) }
         TyKind::Ref(_, inner, _) => {
-            let ptr = scalar(addr, 8).to_bits(8) as u64;
-            let meta = match tys.kind(inner) { TyKind::Str | TyKind::Slice(_) => Some(scalar(addr + 8, 8).to_bits(8) as u64), _ => None };
+            // pointer-sized words (a wasm32 word holds the window offset: syms::read_ptr)
+            let pb = u.ptr_bytes() as u64;
+            let ptr = crate::syms::read_ptr(u, addr);
+            let meta = match tys.kind(inner) { TyKind::Str | TyKind::Slice(_) => Some(scalar(addr + pb, pb as u8).to_bits(pb as u8) as u64), _ => None };
             const_to_valtree_inner(u, (ptr, inner, meta), nodes, visited, settled)
         }
         TyKind::Array(..) | TyKind::Slice(_) | TyKind::Str => {
@@ -68,7 +70,7 @@ fn const_to_valtree_inner(u: &Unit, place: Place, nodes: &mut usize, visited: &m
             let variant = match layout.enc {
                 crate::layout::TagEnc::Single(v) => v as usize,
                 _ if adt.is_enum => {
-                    let (off, crate::rir::Mem::Int(size, _)) = layout.tag.ok_or(ValTreeCreationError::ErrorHandled("missing enum tag"))? else { return Err(ValTreeCreationError::NonSupportedType(ty)); };
+                    let (off, relax_backend::rir::Mem::Int(size, _)) = layout.tag.ok_or(ValTreeCreationError::ErrorHandled("missing enum tag"))? else { return Err(ValTreeCreationError::NonSupportedType(ty)); };
                     let disc = crate::lower::decode_tag_const(u, scalar(addr + off as u64, size).to_bits(size) as i128, layout, adt).ok_or(ValTreeCreationError::ErrorHandled("missing enum discriminant"))?;
                     adt.discriminants(&u.tcx, &u.prog).iter().position(|(_, v)| v.signed_value() == disc).ok_or(ValTreeCreationError::ErrorHandled("invalid enum tag"))?
                 }

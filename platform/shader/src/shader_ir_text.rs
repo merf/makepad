@@ -311,6 +311,7 @@ impl<'a> TextCx<'a> {
                 IrIo::UniformBuffer => format!("unibuf_{}", n),
                 IrIo::Varying => format!("var_{}", n),
                 IrIo::FragmentOutput(i) => format!("frag_fb{}", i),
+                IrIo::FragmentDepth => "frag_depth_out".to_string(),
                 IrIo::Texture(_) => format!("tex_{}", n),
                 // Compute kernels: SPIR-V and HLSL (shader_ir_hlsl::hlsl_compute).
                 IrIo::Storage(_) | IrIo::Workgroup | IrIo::StorageImage => format!("kernel_{}", n),
@@ -928,7 +929,8 @@ impl<'a> TextCx<'a> {
         let smp = format!("_s{}", s.sampler);
         let c = self.expr(f, s.coord);
         let arrayed = matches!(s.tex_type, TextureType::Texture2dArray | TextureType::TextureDepthArray | TextureType::Texture1dArray);
-        let coord = if arrayed { format!("({}).xy, i32(({}).z)", c, c) } else { c };
+        // the layer rounds to nearest, as GLSL, HLSL, Metal and SPIR-V take it
+        let coord = if arrayed { format!("({}).xy, i32(round(({}).z))", c, c) } else { c };
         let depth = matches!(s.tex_type, TextureType::TextureDepth | TextureType::TextureDepthArray);
         let r = match s.kind {
             SampleKind::Implicit => format!("textureSample({}, {}, {})", t, smp, coord),
@@ -1633,7 +1635,13 @@ impl<'a> TextCx<'a> {
                 Self::pad(out, indent);
                 let missing = *init == NO_EXPR || matches!(f.exprs[*init as usize].kind, ExprKind::Error);
                 if glsl {
-                    let decl = self.decl(local.ty, &name);
+                    let mut decl = self.decl(local.ty, &name);
+                    // precise math in HLSL: a `precise` value's ops never fuse or reassociate
+                    if self.hlsl() && self.m.precise
+                        && (matches!(self.m.get(local.ty), IrTy::Mat(..)) || matches!(self.m.get(local.ty), IrTy::Scalar(s) | IrTy::Vec(_, s) if s.is_float()))
+                    {
+                        decl.insert_str(0, "precise ");
+                    }
                     if missing {
                         let z = if self.hlsl() {
                             self.hlsl_zero_init(local.ty)

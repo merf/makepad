@@ -369,6 +369,24 @@ impl Renderer {
         self.gpu_baker.set_csm_far_reach(metres);
     }
 
+    /// Spend what `tier` allows (quality_tier.rs): impostor distances,
+    /// grass reach and density, the sun cascades. Screen-space occlusion and
+    /// the render scale are the host's passes: it reads them from the same
+    /// [`crate::quality_tier::TierBudget`].
+    pub fn set_graphics_tier(&mut self, tier: crate::quality_tier::GraphicsTier) {
+        let b = tier.budget();
+        self.graphics_tier = tier;
+        self.impostor_scale = b.impostor_scale;
+        self.grass_radius_scale = b.grass_radius;
+        self.grass_density = b.grass_density;
+        self.terrain_blend_reach = b.terrain_blend_reach;
+        self.set_csm_config(b.csm_resolution, b.csm_range);
+    }
+
+    pub fn graphics_tier(&self) -> crate::quality_tier::GraphicsTier {
+        self.graphics_tier
+    }
+
     pub fn set_csm_config(
         &mut self,
         tile_resolution: usize,
@@ -410,6 +428,13 @@ impl Renderer {
     /// PBR lane. This is presentation-only and defaults to `true`.
     pub fn set_pbr_materials_enabled(&mut self, enabled: bool) {
         self.pbr_materials_enabled = enabled;
+    }
+
+    /// The per-element lookup the static draw takes (`elem_map`, slot 6, and
+    /// `elem_ctl` = (width, height, texels per element: 1 or 4, enable)), applied to the PBR lane too
+    /// so hidden, offset and moved elements agree across lanes. `None` turns it off.
+    pub fn set_element_lookup(&mut self, lookup: Option<(Texture, [f32; 4])>) {
+        self.element_lookup = lookup;
     }
 
     pub fn pbr_materials_enabled(&self) -> bool {

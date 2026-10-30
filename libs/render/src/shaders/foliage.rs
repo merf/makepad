@@ -23,8 +23,11 @@ script_mod! {
         ..mod.draw.DrawScenePbr
 
         pixel: fn() {
+            // Chain levels and the mesh <-> stand-in switch dissolve.
+            self.door_window()
             let tex = self.base_texel()
-            if tex.w < 0.5 { self.clip() }
+            let cut = self.cut_coverage(tex.w, 0.5)
+            if cut <= 0.0 { self.clip() }
             let wp = self.v_csm.xyz
             let v = normalize(self.eye.xyz - wp)
             var n = normalize(self.v_csm_n)
@@ -32,11 +35,9 @@ script_mod! {
             if dot(n, v) < 0.0 { n = n * (0.0 - 1.0) }
             let l = normalize(self.light_dir)
             let ndl = dot(n, l)
-            // A far stand-in (tex_mag.y < 0) is lit without a shadow lookup:
-            // at impostor range a tree's own shading is its silhouette.
-            var vis = 1.0
-            if self.tex_mag.y > -0.5 { vis = self.csm_vis_fast(wp, n, max(ndl, 0.0)) }
-            let albedo = self.to_scene(tex.xyz) * self.to_lin(self.v_tint.xyz)
+            let vis = self.csm_vis_fast(wp, n, max(ndl, 0.0))
+            // The copy's own tint and adjust (a scatter varies its crowns).
+            let albedo = self.color_adjust(self.to_scene(tex.xyz) * self.to_lin(self.v_tint.xyz), self.tint, self.color_adjust_ctl)
             let ao = clamp(mix(self.v_tint.w, 1.0, self.surface_on), 0.0, 1.0)
             var sao = 1.0
             if self.ssao_ctl.x > 0.001 {
@@ -49,7 +50,7 @@ script_mod! {
             let ambient = mix(self.sun_ground, self.sun_sky, clamp(n.y * 0.5 + 0.5, 0.0, 1.0)) * (ao * sao)
             let lit = albedo * (ambient + self.sun_color * ((wrap + through) * vis * mix(1.0, ao, 0.5)))
                 + self.to_scene(self.emissive_map.sample_repeat(self.v_uv).xyz) * self.emissive
-            return self.csm_debug_view(vec4(self.scene_fogged(self.to_display(lit), self.v_fog, wp, self.fog_density), 1.0), wp, n)
+            return self.csm_debug_view(vec4(self.scene_fogged(self.to_display(lit), self.v_fog, wp, self.fog_density), self.cut_alpha(cut)), wp, n)
         }
 
         fragment: fn() {

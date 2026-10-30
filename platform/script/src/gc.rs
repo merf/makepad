@@ -1,3 +1,4 @@
+use makepad_relax::relax;
 use makepad_relax_api::relax_api;
 use crate::array::*;
 use crate::function::*;
@@ -401,6 +402,7 @@ impl ScriptHeap {
         count
     }
 
+    #[relax(keep_reachable)]
     pub fn mark(&mut self, threads: &ScriptThreads, code: &ScriptCode) {
         self.mark_vec.clear();
 
@@ -647,6 +649,7 @@ impl ScriptHeap {
         }
     }
 
+    #[relax(keep_reachable)]
     pub fn sweep(&mut self, log_stats: bool) {
         let start = crate::clock::monotonic_now();
 
@@ -834,7 +837,10 @@ impl ScriptHeap {
         // A collection is the one point where retained capacity can shrink;
         // re-derive the retained-heap cap's headroom from the swept state.
         self.reconcile_heap_bytes_if_limited();
-        crate::inspect_registry::gc_done(self, ((crate::clock::monotonic_now() - start) * 1e9) as u64);
+        let gc_ns = ((crate::clock::monotonic_now() - start) * 1e9) as u64;
+        // the flight recorder's trace of the script VM's collections (makepad run)
+        makepad_error_log::flight_mark!("script.gc", gc_ns, obj_removed + arr_removed + str_removed, "GC {} us: objects {} alive {} removed, arrays {} / {}, strings {} / {}", gc_ns / 1000, obj_alive, obj_removed, arr_alive, arr_removed, str_alive, str_removed);
+        crate::inspect_registry::gc_done(self, gc_ns);
     }
 
     /// Check if garbage collection should be triggered.
@@ -850,6 +856,9 @@ impl ScriptHeap {
     }
 
     pub(crate) fn needs_gc_impl(&self) -> bool {
+        if GC_STRESS.load(std::sync::atomic::Ordering::Relaxed) {
+            return true;
+        }
         // Minimum thresholds before GC can trigger (avoid thrashing on small heaps)
         const MIN_OBJECTS: usize = 1024;
         const MIN_STRINGS: usize = 256;
@@ -922,10 +931,29 @@ impl ScriptHeap {
     pub fn escape_value(&mut self, v: ScriptValue) {
         if let Some(obj) = v.as_object() {
             if self.objects.is_valid(obj) {
-                let tag = &mut self.objects[obj].tag;
-                if tag.is_alloced() {
-                    tag.set_reffed();
-                }
+                self.ref_object_chain(obj);
+            }
+        }
+    }
+
+    /// Tag `obj` REFFED, and its proto chain up to the first object that already is. Keeps the
+    /// invariant that a REFFED object's protos are all REFFED: a loop scope does not tag its proto
+    /// (the enclosing scope, `OBJ_NEW_LOOP_SCOPE`), so when a loop scope escapes (a closure made in
+    /// the loop body, `scope` stored as a value) the scopes it reads through are pinned with it
+    /// and no eager free at loop or call exit can take them. Stops at the first REFFED object: by
+    /// the invariant everything above it is REFFED already.
+    #[inline]
+    pub(crate) fn ref_object_chain(&mut self, obj: ScriptObject) {
+        let mut cur = obj;
+        while self.objects.is_valid(cur) {
+            let object = &mut self.objects[cur];
+            if !object.tag.is_alloced() || object.tag.is_reffed() {
+                return;
+            }
+            object.tag.set_reffed();
+            match object.proto.as_object() {
+                Some(proto) => cur = proto,
+                None => return,
             }
         }
     }
@@ -1042,4 +1070,20 @@ mod tests {
         let v: ScriptValue = from_a.into();
         assert_eq!(v.as_object(), Some(from_a));
     }
+}
+
+/// Stress mode (a trace host's run that must reach the collector's paths):
+/// every safepoint collects ([`set_gc_stress`]).
+static GC_STRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Collect at every safepoint from now on (`on`), or by the growth rule again.
+pub fn set_gc_stress(on: bool) {
+    GC_STRESS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The trace host's stress switch (`makepad-web-trace --stress`).
+#[cfg(target_arch = "wasm32")]
+#[no_mangle]
+pub extern "C" fn wasm_script_gc_stress(on: u32) {
+    set_gc_stress(on != 0);
 }

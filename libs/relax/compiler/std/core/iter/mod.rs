@@ -12,14 +12,15 @@ pub use adapters::{
 };
 pub use range::Step;
 pub use sources::{
-    empty, from_fn, once, once_with, repeat, repeat_n, repeat_with, successors, zip, Empty, FromFn, Once, OnceWith,
-    Repeat, RepeatN, RepeatWith, Successors,
+    chain, empty, from_fn, once, once_with, repeat, repeat_n, repeat_with, successors, zip, Empty, FromFn, Once,
+    OnceWith, Repeat, RepeatN, RepeatWith, Successors,
 };
 
 use crate::cmp::Ordering;
 use crate::ops::{Add, Mul};
 
 #[cfg_attr(not(relax_check), lang = "iterator")]
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 pub trait Iterator {
     type Item;
 
@@ -93,6 +94,7 @@ pub trait Iterator {
         Zip::new(self, other.into_iter())
     }
 
+    #[rustc_diagnostic_item = "IteratorMap"]
     fn map<B, F: FnMut(Self::Item) -> B>(self, f: F) -> Map<Self, F>
     where
         Self: Sized,
@@ -672,6 +674,7 @@ impl<'a, I: DoubleEndedIterator + ?Sized> DoubleEndedIterator for &'a mut I {
 }
 
 impl<'a, I: ExactSizeIterator + ?Sized> ExactSizeIterator for &'a mut I {}
+unsafe impl<'a, I: TrustedLen + ?Sized> TrustedLen for &'a mut I {}
 
 pub trait DoubleEndedIterator: Iterator {
     fn next_back(&mut self) -> Option<Self::Item>;
@@ -752,6 +755,7 @@ impl<I: Iterator> IntoIterator for I {
     }
 }
 
+#[rustc_diagnostic_item = "FromIterator"]
 pub trait FromIterator<A>: Sized {
     fn from_iter<T: IntoIterator<Item = A>>(iter: T) -> Self;
 }
@@ -784,6 +788,18 @@ impl<A, B, EA: Extend<A>, EB: Extend<B>> Extend<(A, B)> for (EA, EB) {
             Extend::<A>::extend_one(&mut self.0, a);
             Extend::<B>::extend_one(&mut self.1, b);
         }
+    }
+}
+
+impl<A, B, FromA, FromB> FromIterator<(A, B)> for (FromA, FromB)
+where
+    FromA: Default + Extend<A>,
+    FromB: Default + Extend<B>,
+{
+    fn from_iter<T: IntoIterator<Item = (A, B)>>(iter: T) -> (FromA, FromB) {
+        let mut res = (FromA::default(), FromB::default());
+        res.extend(iter);
+        res
     }
 }
 

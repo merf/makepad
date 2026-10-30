@@ -19,10 +19,10 @@ impl<T> BTreeSet<T> {
     pub fn iter(&self) -> Iter<'_, T> {
         Iter { iter: self.map.keys() }
     }
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.map.len()
     }
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
     pub fn clear(&mut self) {
@@ -473,5 +473,12 @@ impl<T: Ord, const N: usize> From<[T; N]> for BTreeSet<T> {
             set.insert(x);
         }
         set
+    }
+}
+
+// alloc/src/collections/btree/set.rs
+impl<T: fmt::Debug> fmt::Debug for Iter<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Iter").field(&self.iter.clone()).finish()
     }
 }

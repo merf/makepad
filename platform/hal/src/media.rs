@@ -121,6 +121,31 @@ pub struct AudioBlock {
 /// The realtime entry the app registers. `ctx` is the pointer it registered with.
 pub type AudioFn = extern "C" fn(ctx: *mut std::ffi::c_void, block: *mut AudioBlock);
 
+/// A registered realtime entry: the app's function, its `ctx`, and the scope its calls run in
+/// (`call_scope`: under a host that runs several apps in one process, the app that registered
+/// it, on whatever thread the device calls it).
+#[derive(Clone, Copy)]
+pub struct AudioEntry {
+    f: AudioFn,
+    ctx: usize,
+    scope: crate::call_scope::Scope,
+}
+
+impl AudioEntry {
+    /// The entry of an `AudioEntry` command, on the app's thread that submitted it (None: `entry`
+    /// 0, the slot is cleared).
+    pub fn from_cmd(entry: u64, ctx: u64) -> Option<AudioEntry> {
+        // SAFETY: a non-zero `entry` is the address of the `extern "C" fn` the app registered
+        (entry != 0).then(|| AudioEntry { f: unsafe { std::mem::transmute::<usize, AudioFn>(entry as usize) }, ctx: ctx as usize, scope: crate::call_scope::Scope::here() })
+    }
+
+    /// Calls the entry with `block` (the device's realtime thread).
+    #[inline]
+    pub fn call(&self, block: &mut AudioBlock) {
+        self.scope.call(|| (self.f)(self.ctx as *mut std::ffi::c_void, block))
+    }
+}
+
 /// One audio device as `AudioDevices` lists it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AudioDeviceInfo {
@@ -221,32 +246,6 @@ pub const fn name_hash(name: &str) -> u64 {
         i += 1;
     }
     x & 0x0000_3fff_ffff_ffff
-}
-
-/// `ViewOp::op` low byte: what to do to a native view; the high byte is the `view_kind`.
-pub mod view_op {
-    /// the view is made (a browser starts loading the url in the payload)
-    pub const CREATE: u16 = 0;
-    /// placed in the window: `area` is the view's rect in window points (y up from the window's
-    /// bottom), the payload the visible part of it (4 f32, a browser clips to it), `extra`
-    /// whether it shows
-    pub const UPDATE: u16 = 1;
-    /// taken out of the window, kept
-    pub const DETACH: u16 = 2;
-    /// load the url of the payload (`extra`: replace the history entry)
-    pub const SET_URL: u16 = 3;
-    /// go back or forward in the history by `extra` (an i32)
-    pub const HISTORY: u16 = 4;
-    /// the view is released
-    pub const CLOSE: u16 = 5;
-}
-
-/// What a `ViewOp` is about (`ViewOp::op` high byte).
-pub mod view_kind {
-    /// the system browser (a WKWebView)
-    pub const BROWSER: u16 = 1 << 8;
-    /// a camera preview of an open capture session
-    pub const CAMERA: u16 = 2 << 8;
 }
 
 /// How a camera format lays out its pixels (`VideoFormatInfo::pixel`); the names are those the
@@ -512,6 +511,50 @@ pub mod game {
         pub dpad_right: f32,
         pub left_stick: [f32; 2],
         pub right_stick: [f32; 2],
+        /// Presses per button since the device connected (wrapping), in [`gamepad_button`]
+        /// order. The state above is the latest sample; these count every press the backend
+        /// saw, so a tap shorter than the app's frame or tick survives any coalescing.
+        pub presses: [u16; gamepad_button::COUNT],
+    }
+
+    /// The digital buttons of a [`GamepadState`], as indexes into `presses`.
+    pub mod gamepad_button {
+        pub const A: usize = 0;
+        pub const B: usize = 1;
+        pub const X: usize = 2;
+        pub const Y: usize = 3;
+        pub const LEFT_SHOULDER: usize = 4;
+        pub const RIGHT_SHOULDER: usize = 5;
+        pub const LEFT_TRIGGER: usize = 6;
+        pub const RIGHT_TRIGGER: usize = 7;
+        pub const SELECT: usize = 8;
+        pub const START: usize = 9;
+        pub const HOME: usize = 10;
+        pub const LEFT_THUMB: usize = 11;
+        pub const RIGHT_THUMB: usize = 12;
+        pub const DPAD_UP: usize = 13;
+        pub const DPAD_DOWN: usize = 14;
+        pub const DPAD_LEFT: usize = 15;
+        pub const DPAD_RIGHT: usize = 16;
+        pub const COUNT: usize = 17;
+    }
+
+    impl GamepadState {
+        /// The buttons' values in [`gamepad_button`] order.
+        pub fn buttons(&self) -> [f32; gamepad_button::COUNT] {
+            [self.a, self.b, self.x, self.y, self.left_shoulder, self.right_shoulder, self.left_trigger, self.right_trigger,
+             self.select, self.start, self.home, self.left_thumb, self.right_thumb, self.dpad_up, self.dpad_down, self.dpad_left, self.dpad_right]
+        }
+
+        /// A backend saw this state follow `prev`: carry `prev`'s press counts and count each
+        /// button that went down (past half travel) between the two. Every backend calls this on
+        /// every state it observes (each evdev report, each GameController change, each poll).
+        pub fn count_presses_since(&mut self, prev: &GamepadState) {
+            let (was, now) = (prev.buttons(), self.buttons());
+            for b in 0..gamepad_button::COUNT {
+                self.presses[b] = prev.presses[b].wrapping_add((now[b] >= 0.5 && was[b] < 0.5) as u16);
+            }
+        }
     }
 
     #[derive(Clone, Debug, Default, PartialEq)]
@@ -612,6 +655,9 @@ pub mod game {
                         p.dpad_left, p.dpad_right, p.left_stick[0], p.left_stick[1], p.right_stick[0], p.right_stick[1],
                     ],
                 );
+                for n in p.presses {
+                    w.u32(n as u32);
+                }
             }
             GameState::Wheel(v) => {
                 w.u8(1);
@@ -657,6 +703,7 @@ pub mod game {
                     dpad_right: v[16],
                     left_stick: [v[17], v[18]],
                     right_stick: [v[19], v[20]],
+                    presses: std::array::from_fn(|_| r.u32() as u16),
                 })
             }
             1 => {

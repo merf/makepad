@@ -21,6 +21,8 @@ script_mod! {
             button_type: instance(DesktopButtonType.Fullscreen)
             hover: instance(0.0)
             down: instance(0.0)
+            window_focus: instance(1.0)
+            color_unfocused: uniform(#b5b5b5)
 
             color: uniform(theme.color_label_inner)
             color_hover: uniform(theme.color_label_inner_hover)
@@ -117,7 +119,7 @@ script_mod! {
                     // window manager in that style: the colour, the glyph on hover.
                     DesktopButtonType.MacClose => {
                         sdf.circle(c.x, c.y, 6.0)
-                        sdf.fill(#ff5f57.mix(#e0443e, self.down))
+                        sdf.fill(self.color_unfocused.mix(#ff5f57.mix(#e0443e, self.down), max(self.window_focus, self.hover)))
                         let g = 2.6
                         sdf.move_to(c.x - g, c.y - g)
                         sdf.line_to(c.x + g, c.y + g)
@@ -128,7 +130,7 @@ script_mod! {
                     }
                     DesktopButtonType.MacMin => {
                         sdf.circle(c.x, c.y, 6.0)
-                        sdf.fill(#febc2e.mix(#d9a020, self.down))
+                        sdf.fill(self.color_unfocused.mix(#febc2e.mix(#d9a020, self.down), max(self.window_focus, self.hover)))
                         sdf.move_to(c.x - 3.2, c.y)
                         sdf.line_to(c.x + 3.2, c.y)
                         sdf.stroke(#985700.mix(#98570000, 1.0 - self.hover), 1.1)
@@ -136,7 +138,7 @@ script_mod! {
                     }
                     DesktopButtonType.MacMax => {
                         sdf.circle(c.x, c.y, 6.0)
-                        sdf.fill(#28c840.mix(#1fa733, self.down))
+                        sdf.fill(self.color_unfocused.mix(#28c840.mix(#1fa733, self.down), max(self.window_focus, self.hover)))
                         sdf.move_to(c.x - 3.0, c.y)
                         sdf.line_to(c.x + 3.0, c.y)
                         sdf.move_to(c.x, c.y - 3.0)
@@ -222,6 +224,16 @@ pub struct DesktopButton {
 }
 
 impl Widget for DesktopButton {
+    fn semantics(&self, cx: &Cx, node: &mut a11y_tree::Node) {
+        let _ = cx;
+        node.role = a11y_tree::Role::Button;
+        makepad_platform::a11y::set_string(&mut node.name, &self.text());
+        node.states = a11y_tree::States::FOCUSABLE;
+        node.states
+            .set(a11y_tree::States::DISABLED, self.disabled(cx));
+        node.actions = a11y_tree::Actions::FOCUS | a11y_tree::Actions::PRESS;
+    }
+
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, _scope: &mut Scope) {
         if !self.visible && !matches!(event, Event::FingerCancel(_)) {
             return;
@@ -277,6 +289,12 @@ impl Widget for DesktopButton {
 }
 
 impl DesktopButtonRef {
+    pub fn set_window_focus(&self, cx: &Cx, focused: bool) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.draw_bg.draw_vars.set_dyn_instance(cx, id!(window_focus), &[if focused { 1.0 } else { 0.0 }]);
+        }
+    }
+
     pub fn clicked(&self, actions: &Actions) -> bool {
         if let Some(item) = actions.find_widget_action(self.widget_uid()) {
             matches!(item.cast(), ButtonAction::Clicked(_))

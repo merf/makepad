@@ -12,7 +12,7 @@ pub struct Map<I, F> {
 }
 
 impl<I, F> Map<I, F> {
-    pub(crate) fn new(iter: I, f: F) -> Map<I, F> {
+    pub(crate) const fn new(iter: I, f: F) -> Map<I, F> {
         Map { iter, f }
     }
 }
@@ -40,6 +40,7 @@ impl<B, I: DoubleEndedIterator, F: FnMut(I::Item) -> B> DoubleEndedIterator for 
 }
 
 impl<B, I: ExactSizeIterator, F: FnMut(I::Item) -> B> ExactSizeIterator for Map<I, F> {}
+unsafe impl<B, I: super::TrustedLen, F: FnMut(I::Item) -> B> super::TrustedLen for Map<I, F> {}
 impl<B, I: FusedIterator, F: FnMut(I::Item) -> B> FusedIterator for Map<I, F> {}
 
 // ---------------------------------------------------------------- Filter
@@ -51,7 +52,7 @@ pub struct Filter<I, P> {
 }
 
 impl<I, P> Filter<I, P> {
-    pub(crate) fn new(iter: I, predicate: P) -> Filter<I, P> {
+    pub(crate) const fn new(iter: I, predicate: P) -> Filter<I, P> {
         Filter { iter, predicate }
     }
 }
@@ -94,7 +95,7 @@ pub struct FilterMap<I, F> {
 }
 
 impl<I, F> FilterMap<I, F> {
-    pub(crate) fn new(iter: I, f: F) -> FilterMap<I, F> {
+    pub(crate) const fn new(iter: I, f: F) -> FilterMap<I, F> {
         FilterMap { iter, f }
     }
 }
@@ -135,7 +136,7 @@ pub struct Enumerate<I> {
 }
 
 impl<I> Enumerate<I> {
-    pub(crate) fn new(iter: I) -> Enumerate<I> {
+    pub(crate) const fn new(iter: I) -> Enumerate<I> {
         Enumerate { iter, count: 0 }
     }
 }
@@ -168,6 +169,7 @@ impl<I: ExactSizeIterator + DoubleEndedIterator> DoubleEndedIterator for Enumera
 }
 
 impl<I: ExactSizeIterator> ExactSizeIterator for Enumerate<I> {}
+unsafe impl<I: super::TrustedLen> super::TrustedLen for Enumerate<I> {}
 impl<I: FusedIterator> FusedIterator for Enumerate<I> {}
 
 // ---------------------------------------------------------------- Zip
@@ -229,6 +231,7 @@ where
 }
 
 impl<A: ExactSizeIterator, B: ExactSizeIterator> ExactSizeIterator for Zip<A, B> {}
+unsafe impl<A: super::TrustedLen, B: super::TrustedLen> super::TrustedLen for Zip<A, B> {}
 impl<A: FusedIterator, B: FusedIterator> FusedIterator for Zip<A, B> {}
 
 // ---------------------------------------------------------------- Rev
@@ -239,7 +242,7 @@ pub struct Rev<I> {
 }
 
 impl<I> Rev<I> {
-    pub(crate) fn new(iter: I) -> Rev<I> {
+    pub(crate) const fn new(iter: I) -> Rev<I> {
         Rev { iter }
     }
 }
@@ -267,6 +270,7 @@ impl<I: DoubleEndedIterator> DoubleEndedIterator for Rev<I> {
 }
 
 impl<I: DoubleEndedIterator + ExactSizeIterator> ExactSizeIterator for Rev<I> {}
+unsafe impl<I: super::TrustedLen + DoubleEndedIterator> super::TrustedLen for Rev<I> {}
 impl<I: DoubleEndedIterator + FusedIterator> FusedIterator for Rev<I> {}
 
 // ---------------------------------------------------------------- Take / Skip
@@ -278,7 +282,7 @@ pub struct Take<I> {
 }
 
 impl<I> Take<I> {
-    pub(crate) fn new(iter: I, n: usize) -> Take<I> {
+    pub(crate) const fn new(iter: I, n: usize) -> Take<I> {
         Take { iter, n }
     }
 }
@@ -332,6 +336,7 @@ impl<I: DoubleEndedIterator + ExactSizeIterator> DoubleEndedIterator for Take<I>
 }
 
 impl<I: ExactSizeIterator> ExactSizeIterator for Take<I> {}
+unsafe impl<I: super::TrustedLen> super::TrustedLen for Take<I> {}
 impl<I: FusedIterator> FusedIterator for Take<I> {}
 
 #[derive(Clone, Debug)]
@@ -341,7 +346,7 @@ pub struct Skip<I> {
 }
 
 impl<I> Skip<I> {
-    pub(crate) fn new(iter: I, n: usize) -> Skip<I> {
+    pub(crate) const fn new(iter: I, n: usize) -> Skip<I> {
         Skip { iter, n }
     }
 }
@@ -430,7 +435,7 @@ pub struct Chain<A, B> {
 }
 
 impl<A, B> Chain<A, B> {
-    pub(crate) fn new(a: A, b: B) -> Chain<A, B> {
+    pub(crate) const fn new(a: A, b: B) -> Chain<A, B> {
         Chain { a: Some(a), b: Some(b) }
     }
 }
@@ -483,6 +488,7 @@ impl<A: DoubleEndedIterator, B: DoubleEndedIterator<Item = A::Item>> DoubleEnded
 }
 
 impl<A: FusedIterator, B: FusedIterator<Item = A::Item>> FusedIterator for Chain<A, B> {}
+unsafe impl<A: super::TrustedLen, B: super::TrustedLen<Item = A::Item>> super::TrustedLen for Chain<A, B> {}
 
 // ---------------------------------------------------------------- Cloned / Copied
 
@@ -492,7 +498,7 @@ pub struct Cloned<I> {
 }
 
 impl<I> Cloned<I> {
-    pub(crate) fn new(it: I) -> Cloned<I> {
+    pub(crate) const fn new(it: I) -> Cloned<I> {
         Cloned { it }
     }
 }
@@ -514,6 +520,7 @@ impl<'a, T: 'a + Clone, I: DoubleEndedIterator<Item = &'a T>> DoubleEndedIterato
 }
 
 impl<'a, T: 'a + Clone, I: ExactSizeIterator<Item = &'a T>> ExactSizeIterator for Cloned<I> {}
+unsafe impl<'a, T: 'a + Clone, I: super::TrustedLen<Item = &'a T>> super::TrustedLen for Cloned<I> {}
 
 #[derive(Clone, Debug)]
 pub struct Copied<I> {
@@ -521,7 +528,7 @@ pub struct Copied<I> {
 }
 
 impl<I> Copied<I> {
-    pub(crate) fn new(it: I) -> Copied<I> {
+    pub(crate) const fn new(it: I) -> Copied<I> {
         Copied { it }
     }
 }
@@ -546,6 +553,7 @@ impl<'a, T: 'a + Copy, I: DoubleEndedIterator<Item = &'a T>> DoubleEndedIterator
 }
 
 impl<'a, T: 'a + Copy, I: ExactSizeIterator<Item = &'a T>> ExactSizeIterator for Copied<I> {}
+unsafe impl<'a, T: 'a + Copy, I: super::TrustedLen<Item = &'a T>> super::TrustedLen for Copied<I> {}
 
 // ---------------------------------------------------------------- Peekable
 
@@ -557,7 +565,7 @@ pub struct Peekable<I: Iterator> {
 }
 
 impl<I: Iterator> Peekable<I> {
-    pub(crate) fn new(iter: I) -> Peekable<I> {
+    pub(crate) const fn new(iter: I) -> Peekable<I> {
         Peekable { iter, peeked: None }
     }
     pub fn peek(&mut self) -> Option<&I::Item> {
@@ -677,7 +685,7 @@ pub struct SkipWhile<I, P> {
 }
 
 impl<I, P> SkipWhile<I, P> {
-    pub(crate) fn new(iter: I, predicate: P) -> SkipWhile<I, P> {
+    pub(crate) const fn new(iter: I, predicate: P) -> SkipWhile<I, P> {
         SkipWhile { iter, flag: false, predicate }
     }
 }
@@ -707,7 +715,7 @@ pub struct TakeWhile<I, P> {
 }
 
 impl<I, P> TakeWhile<I, P> {
-    pub(crate) fn new(iter: I, predicate: P) -> TakeWhile<I, P> {
+    pub(crate) const fn new(iter: I, predicate: P) -> TakeWhile<I, P> {
         TakeWhile { iter, flag: false, predicate }
     }
 }
@@ -743,7 +751,7 @@ pub struct MapWhile<I, P> {
 }
 
 impl<I, P> MapWhile<I, P> {
-    pub(crate) fn new(iter: I, predicate: P) -> MapWhile<I, P> {
+    pub(crate) const fn new(iter: I, predicate: P) -> MapWhile<I, P> {
         MapWhile { iter, predicate }
     }
 }
@@ -770,7 +778,7 @@ pub struct Scan<I, St, F> {
 }
 
 impl<I, St, F> Scan<I, St, F> {
-    pub(crate) fn new(iter: I, state: St, f: F) -> Scan<I, St, F> {
+    pub(crate) const fn new(iter: I, state: St, f: F) -> Scan<I, St, F> {
         Scan { iter, f, state }
     }
 }
@@ -1004,7 +1012,7 @@ pub struct Fuse<I> {
 }
 
 impl<I> Fuse<I> {
-    pub(crate) fn new(iter: I) -> Fuse<I> {
+    pub(crate) const fn new(iter: I) -> Fuse<I> {
         Fuse { iter: Some(iter) }
     }
 }
@@ -1056,7 +1064,7 @@ pub struct Inspect<I, F> {
 }
 
 impl<I, F> Inspect<I, F> {
-    pub(crate) fn new(iter: I, f: F) -> Inspect<I, F> {
+    pub(crate) const fn new(iter: I, f: F) -> Inspect<I, F> {
         Inspect { iter, f }
     }
 }

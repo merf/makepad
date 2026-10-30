@@ -13,26 +13,51 @@ pub struct RwLock<T: ?Sized> {
     data: UnsafeCell<T>,
 }
 
-unsafe impl<T: Send> Send for RwLock<T> {}
-unsafe impl<T: Send + Sync> Sync for RwLock<T> {}
+unsafe impl<T: ?Sized + Send> Send for RwLock<T> {}
+unsafe impl<T: ?Sized + Send + Sync> Sync for RwLock<T> {}
 
+#[rustc_diagnostic_item = "RwLockReadGuard"]
 pub struct RwLockReadGuard<'a, T: ?Sized + 'a> {
     lock: &'a RwLock<T>,
 }
 
+#[rustc_diagnostic_item = "RwLockWriteGuard"]
 pub struct RwLockWriteGuard<'a, T: ?Sized + 'a> {
     lock: &'a RwLock<T>,
     poison: poison::Guard,
 }
 
-unsafe impl<'a, T: Sync> Sync for RwLockReadGuard<'a, T> {}
-unsafe impl<'a, T: Sync> Sync for RwLockWriteGuard<'a, T> {}
+unsafe impl<'a, T: ?Sized + Sync> Sync for RwLockReadGuard<'a, T> {}
+unsafe impl<'a, T: ?Sized + Sync> Sync for RwLockWriteGuard<'a, T> {}
+// library/std/src/sync/poison/rwlock.rs:140,168
+impl<T: ?Sized> !Send for RwLockReadGuard<'_, T> {}
+impl<T: ?Sized> !Send for RwLockWriteGuard<'_, T> {}
 
 impl<T> RwLock<T> {
     pub const fn new(t: T) -> RwLock<T> {
         RwLock { inner: RawRwLock::new(), poison: poison::Flag::new(), data: UnsafeCell::new(t) }
     }
 
+    #[rustc_should_not_be_called_on_const_items]
+    pub fn replace(&self, value: T) -> LockResult<T> {
+        match self.write() {
+            Ok(mut g) => Ok(crate::mem::replace(&mut *g, value)),
+            Err(e) => {
+                let mut g = e.into_inner();
+                Err(PoisonError::new(crate::mem::replace(&mut *g, value)))
+            }
+        }
+    }
+
+    #[rustc_should_not_be_called_on_const_items]
+    pub fn set(&self, value: T) -> Result<(), PoisonError<T>> {
+        self.replace(value).map(drop)
+    }
+}
+
+// library/std/src/sync/poison/rwlock.rs: the locking methods are for unsized `T` too
+impl<T: ?Sized> RwLock<T> {
+    #[rustc_should_not_be_called_on_const_items]
     pub fn read(&self) -> LockResult<RwLockReadGuard<'_, T>> {
         self.inner.read();
         let g = RwLockReadGuard { lock: self };
@@ -43,6 +68,7 @@ impl<T> RwLock<T> {
         }
     }
 
+    #[rustc_should_not_be_called_on_const_items]
     pub fn try_read(&self) -> TryLockResult<RwLockReadGuard<'_, T>> {
         if self.inner.try_read() {
             let g = RwLockReadGuard { lock: self };
@@ -56,11 +82,13 @@ impl<T> RwLock<T> {
         }
     }
 
+    #[rustc_should_not_be_called_on_const_items]
     pub fn write(&self) -> LockResult<RwLockWriteGuard<'_, T>> {
         self.inner.write();
         poison::map_result(self.poison.guard(), |guard| RwLockWriteGuard { lock: self, poison: guard })
     }
 
+    #[rustc_should_not_be_called_on_const_items]
     pub fn try_write(&self) -> TryLockResult<RwLockWriteGuard<'_, T>> {
         if self.inner.try_write() {
             match poison::map_result(self.poison.guard(), |guard| RwLockWriteGuard { lock: self, poison: guard }) {
@@ -76,11 +104,12 @@ impl<T> RwLock<T> {
         self.poison.get()
     }
 
+    #[rustc_should_not_be_called_on_const_items]
     pub fn clear_poison(&self) {
         self.poison.clear();
     }
 
-    pub fn into_inner(self) -> LockResult<T> {
+    pub fn into_inner(self) -> LockResult<T> where T: Sized {
         let poisoned = self.poison.get();
         let data = self.data.into_inner();
         if poisoned {
@@ -113,7 +142,7 @@ impl<T> From<T> for RwLock<T> {
     }
 }
 
-impl<T: fmt::Debug> fmt::Debug for RwLock<T> {
+impl<T: ?Sized + fmt::Debug> fmt::Debug for RwLock<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let mut d = f.debug_struct("RwLock");
         match self.try_read() {
@@ -132,7 +161,7 @@ impl<T: fmt::Debug> fmt::Debug for RwLock<T> {
     }
 }
 
-impl<'a, T> Deref for RwLockReadGuard<'a, T> {
+impl<'a, T: ?Sized> Deref for RwLockReadGuard<'a, T> {
     type Target = T;
     fn deref(&self) -> &T {
         unsafe { &*self.lock.data.get() }
@@ -145,14 +174,24 @@ impl<'a, T: ?Sized> Drop for RwLockReadGuard<'a, T> {
     }
 }
 
-impl<'a, T> Deref for RwLockWriteGuard<'a, T> {
+impl<'rwlock, T: ?Sized> RwLockWriteGuard<'rwlock, T> {
+    pub fn downgrade(s: Self) -> RwLockReadGuard<'rwlock, T> {
+        let lock = s.lock;
+        lock.poison.done(&s.poison);
+        core::mem::forget(s);
+        unsafe { lock.inner.downgrade() };
+        RwLockReadGuard { lock }
+    }
+}
+
+impl<'a, T: ?Sized> Deref for RwLockWriteGuard<'a, T> {
     type Target = T;
     fn deref(&self) -> &T {
         unsafe { &*self.lock.data.get() }
     }
 }
 
-impl<'a, T> DerefMut for RwLockWriteGuard<'a, T> {
+impl<'a, T: ?Sized> DerefMut for RwLockWriteGuard<'a, T> {
     fn deref_mut(&mut self) -> &mut T {
         unsafe { &mut *self.lock.data.get() }
     }
@@ -165,22 +204,22 @@ impl<'a, T: ?Sized> Drop for RwLockWriteGuard<'a, T> {
     }
 }
 
-impl<'a, T: fmt::Debug> fmt::Debug for RwLockReadGuard<'a, T> {
+impl<'a, T: ?Sized + fmt::Debug> fmt::Debug for RwLockReadGuard<'a, T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         fmt::Debug::fmt(&**self, f)
     }
 }
-impl<'a, T: fmt::Display> fmt::Display for RwLockReadGuard<'a, T> {
+impl<'a, T: ?Sized + fmt::Display> fmt::Display for RwLockReadGuard<'a, T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         fmt::Display::fmt(&**self, f)
     }
 }
-impl<'a, T: fmt::Debug> fmt::Debug for RwLockWriteGuard<'a, T> {
+impl<'a, T: ?Sized + fmt::Debug> fmt::Debug for RwLockWriteGuard<'a, T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         fmt::Debug::fmt(&**self, f)
     }
 }
-impl<'a, T: fmt::Display> fmt::Display for RwLockWriteGuard<'a, T> {
+impl<'a, T: ?Sized + fmt::Display> fmt::Display for RwLockWriteGuard<'a, T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         fmt::Display::fmt(&**self, f)
     }

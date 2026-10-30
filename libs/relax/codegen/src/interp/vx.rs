@@ -4,7 +4,7 @@
 //! semantics on Arm.
 
 use super::{c, hist_note, Cx, COUNT, H};
-use crate::rir::{VW, VX};
+use relax_backend::rir::{VW, VX};
 use core::arch::aarch64::*;
 
 #[inline(always)]
@@ -131,6 +131,18 @@ unsafe fn vx2(op: VX, a: *const u64, b: *const u64, d: *mut u64) {
             let lo = vgetq_lane_u64::<0>(t).wrapping_mul(0x0102_0408_1020_4080) >> 56;
             let hi = vgetq_lane_u64::<1>(t).wrapping_mul(0x0102_0408_1020_4080) >> 56;
             *d = lo | hi << 8;
+            return;
+        }
+        VX::MoveMask(w) => {
+            // the top bit of each lane, lane i at bit i
+            let mut x = [0u8; 16];
+            vst1q_u8(x.as_mut_ptr(), ld(a));
+            let n = (w.bits() / 8) as usize;
+            let mut r = 0u64;
+            for lane in 0..16 / n {
+                r |= ((x[lane * n + n - 1] >> 7) as u64) << lane;
+            }
+            *d = r;
             return;
         }
         VX::AddAcross(w) => {
