@@ -136,6 +136,8 @@ fn desc_r(r: &mut R) -> Res<PipelineDesc> {
         instance_stride: r.u32()?,
         varyings: r.u32()?,
         outputs: r.u32()?,
+        // captures hold render pipelines only (a compute pass is not captured)
+        kind: crate::pipeline_kind::RENDER,
     })
 }
 

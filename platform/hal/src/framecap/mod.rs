@@ -405,6 +405,8 @@ fn record_packet(gpu: &mut dyn Gpu, s: &mut Session, sid: u32, p: &FramePacket, 
     let Some(passes) = range(p.passes, view.passes.len()) else { return Vec::new() };
     let first_pass = c.passes.len();
     for pass in &view.passes[passes] {
+        // a capture holds render passes: a compute pass's dispatches are not kept
+        if pass.is_compute() { continue; }
         let Some(dr) = range(pass.draws, view.draws.len()) else { continue };
         let pi = c.passes.len() as u32;
         let first = c.draws.len() as u32;

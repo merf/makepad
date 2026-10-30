@@ -296,6 +296,8 @@ impl KeptFrame {
             out
         };
         for pass in passes {
+            // a kept frame shows its picture again: its kernels do not run again
+            if pass.is_compute() { continue; }
             let r = within(pass.draws, view.draws.len())?;
             if r.start < draws_at.start || r.end > draws_at.end { return None; }
             let mut pass = *pass;
@@ -322,6 +324,7 @@ impl KeptFrame {
             passes: Range { off: 0, len: kept.passes.len() as u32 },
             draws: Range { off: 0, len: kept.draws.len() as u32 },
             layers: Range { off: 0, len: kept.layers.len() as u32 },
+            dispatches: Range::default(),
             ..p
         };
         Some(kept)
@@ -329,7 +332,7 @@ impl KeptFrame {
 
     /// The frame as a batch of one packet (packet 0).
     pub fn view(&self) -> crate::buffers::CmdView<'_> {
-        crate::buffers::CmdView { session: HOST, cmds: &[], arena: &self.arena, frames: std::slice::from_ref(&self.frame), passes: &self.passes, draws: &self.draws, layers: &self.layers }
+        crate::buffers::CmdView { session: HOST, cmds: &[], arena: &self.arena, frames: std::slice::from_ref(&self.frame), passes: &self.passes, draws: &self.draws, dispatches: &[], layers: &self.layers }
     }
 
     /// Whether the frame draws anything (none: the layer ends).

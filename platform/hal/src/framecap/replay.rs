@@ -149,7 +149,7 @@ impl Replayer {
             let id = Id::new(next_buf, 1);
             next_buf += 1;
             r.buf.insert(b.id, id);
-            w.buffer_create(id, b.kind, b.size, Attr::default());
+            w.buffer_create(id, b.kind, b.size, 0, Attr::default());
             if let Some(bytes) = &b.contents {
                 w.buffer_update(id, 0, &bytes[..bytes.len().min(b.size as usize)]);
             }
@@ -265,6 +265,7 @@ impl Replayer {
                     draws: Range::default(),
                     name: 0,
                     owner: 0,
+                    ..Default::default()
                 };
                 w.pass(pass);
                 let n = if pi == cut.pass { cut.draws.min(p.draws.len as usize) } else { p.draws.len as usize };

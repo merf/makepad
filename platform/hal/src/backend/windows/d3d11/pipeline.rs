@@ -328,7 +328,7 @@ fn build_kernel(dev: &Device, code: &HlslPipeline, desc: PipelineDesc, bindings:
         let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{key:016x}.hlsl")), hlsl);
     }
     let failed = |e: String| format!("compute shader `{name}`:\n{e}\n{}", numbered(hlsl));
-    let mut cs_bytes = stage_bytes(key, "_cs", "cs_5_0", "kernel_main", hlsl).map_err(failed)?;
+    let mut cs_bytes = stage_bytes(key, "_cs", "cs_5_0", "kernel_main", hlsl, false).map_err(failed)?;
     let create = |bytes: &[u8]| unsafe {
         let mut cs = None;
         dev.device.CreateComputeShader(bytes, None, Some(&mut cs)).map(|_| cs)
@@ -341,7 +341,7 @@ fn build_kernel(dev: &Device, code: &HlslPipeline, desc: PipelineDesc, bindings:
             if let Some(dir) = cache_dir() {
                 let _ = std::fs::remove_file(dir.join(format!("{key:016x}_cs.dxbc")));
             }
-            cs_bytes = compile_stage("cs_5_0", "kernel_main", hlsl).map_err(failed)?;
+            cs_bytes = compile_stage("cs_5_0", "kernel_main", hlsl, false).map_err(failed)?;
             create(&cs_bytes).map_err(|e| hr("CreateComputeShader of freshly compiled bytecode", e))?
         }
     };
