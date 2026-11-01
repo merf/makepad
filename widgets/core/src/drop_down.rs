@@ -171,19 +171,8 @@ script_mod! {
                 let mut color_stroke_down = self.border_color_down
                 let mut color_stroke_disabled = self.border_color_disabled
 
-                // lets draw a little triangle in the corner
-                let c = vec2(self.rect_size.x - /** arrow inset from right 4..24 step 0.5 */ 10.0, self.rect_size.y * 0.5)
-                let sz = /** arrow half size 1..8 step 0.25 */ 2.5
-                let offset = /** arrow vertical nudge -4..4 step 0.5 */ 1.
-                let offset_x = /** arrow horizontal nudge -6..6 step 0.5 */ 2.
-
-                sdf.move_to(c.x - sz - offset_x, c.y - sz + offset)
-                sdf.line_to(c.x + sz - offset_x, c.y - sz + offset)
-                sdf.line_to(c.x - offset_x, c.y + sz * /** arrow apex depth 0..1 step 0.05 */ 0.25 + offset)
-                sdf.close_path()
-
-                sdf.fill_keep(
-                    mix(
+                // The arrow's ink, drawn after the box so the box's fill does not cover it.
+                let arrow = mix(
                         mix(
                             mix(
                                 self.arrow_color
@@ -200,7 +189,6 @@ script_mod! {
                         self.arrow_color_disabled
                         self.disabled
                     )
-                )
 
                 let border_sz_uv = vec2(
                     self.border_size / self.rect_size.x
@@ -269,6 +257,15 @@ script_mod! {
 
                 sdf.fill_keep(fill)
                 sdf.stroke(stroke, self.border_size)
+
+                // A small downward triangle at the right: the face reads as a combo box.
+                let c = vec2(self.rect_size.x - /** arrow inset from right 4..24 step 0.5 */ 11.0, self.rect_size.y * 0.5)
+                let sz = /** arrow half width 1..8 step 0.25 */ 3.5
+                sdf.move_to(c.x - sz, c.y - sz * 0.5)
+                sdf.line_to(c.x + sz, c.y - sz * 0.5)
+                sdf.line_to(c.x, c.y + sz * 0.5)
+                sdf.close_path()
+                sdf.fill(arrow)
 
                 sdf.result
             }
