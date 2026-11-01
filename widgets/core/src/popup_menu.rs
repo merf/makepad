@@ -502,6 +502,10 @@ pub struct PopupMenu {
     /// That item's rect this draw, from the top of the scrolled content.
     #[rust]
     reveal_rect: Option<Rect>,
+    /// The item the keys moved to, brought into view on the next draw
+    /// without moving the place the menu opened at.
+    #[rust]
+    follow: Option<PopupMenuItemId>,
     /// The offset the menu opened at. A menu placed by one of its items
     /// (`end_at_item`) is placed as if still at this offset, so it stays
     /// where it opened while its items scroll.
@@ -820,6 +824,7 @@ impl PopupMenu {
         let past_opened = self.end_scroll(cx);
         self.draw_bg.end(cx);
         self.reveal = None;
+        self.follow = None;
         let shift = match item_pos {
             Some(item_pos) => shift - item_pos - dvec2(0.0, past_opened),
             None => shift,
@@ -929,7 +934,7 @@ impl PopupMenu {
         // Through the widget seam, so the item counts as its own nesting level
         // and the design tweaker's plane pick lands on it.
         item.draw_all(cx, &mut Scope::empty());
-        if self.scroll_content_start.is_some() && self.reveal == Some(item_id) {
+        if self.scroll_content_start.is_some() && self.reveal.or(self.follow) == Some(item_id) {
             let rect = item.area().rect(cx);
             let origin = cx.turtle().origin();
             self.reveal_rect = Some(Rect { pos: rect.pos - origin, size: rect.size });
@@ -947,6 +952,21 @@ impl PopupMenu {
         self.init_select_item = Some(which_id);
         self.reveal = Some(which_id);
         self.first_tap = true;
+    }
+
+    /// Light `which_id` as the keys' place in an open menu and bring it into
+    /// view, as the pointer's hover would.
+    /// The chosen item keeps its tick until another is chosen.
+    pub fn highlight_item(&mut self, cx: &mut Cx, which_id: PopupMenuItemId) {
+        for (id, item) in &mut *self.menu_items {
+            let Some(mut item) = item.borrow_mut::<PopupMenuItem>() else {
+                continue;
+            };
+            let on = *id == which_id && !item.disabled;
+            item.animator_cut(cx, if on { ids!(hover.on) } else { ids!(hover.off) });
+        }
+        self.follow = Some(which_id);
+        self.draw_list.redraw(cx);
     }
 
     fn select_item_state(&mut self, cx: &mut Cx, which_id: PopupMenuItemId) {

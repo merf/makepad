@@ -544,6 +544,11 @@ pub struct DropDown {
     #[rust]
     is_active: bool,
 
+    /// The item the arrow keys stand on while the list is open; Return or
+    /// Space chooses it.
+    #[rust]
+    highlight: usize,
+
     #[rust]
     popup_anchor_transform: Option<PopupAnchorTransform>,
 
@@ -802,6 +807,7 @@ impl DropDown {
         let lb = map.get_mut(&self.popup_menu_key()).unwrap();
         let node_id = LiveId(self.selected_item as u64).into();
         lb.init_select_item(node_id);
+        self.highlight = self.selected_item;
         cx.sweep_lock(self.draw_bg.area());
     }
 
@@ -1219,6 +1225,43 @@ impl Widget for DropDown {
             Hit::KeyFocus(_) => {
                 self.animator_play(cx, ids!(focus.on));
             }
+            // Open, the arrows walk the list and it stays open; Return or Space
+            // chooses, Escape closes.
+            Hit::KeyDown(ke) if !self.disabled(cx) && self.is_active => match ke.key_code {
+                KeyCode::ArrowUp | KeyCode::ArrowDown => {
+                    let next = if ke.key_code == KeyCode::ArrowUp {
+                        (0..self.highlight.min(self.labels.len())).rev().find(|&i| !self.item_is_disabled(i))
+                    } else {
+                        (self.highlight.saturating_add(1)..self.labels.len()).find(|&i| !self.item_is_disabled(i))
+                    };
+                    if let Some(index) = next {
+                        self.highlight = index;
+                        let global = cx.global::<PopupMenuGlobal>().clone();
+                        let mut map = global.map.borrow_mut();
+                        if let Some(menu) = map.get_mut(&self.popup_menu_key()) {
+                            menu.highlight_item(cx, LiveId(index as u64).into());
+                        }
+                    }
+                }
+                KeyCode::ReturnKey | KeyCode::NumpadEnter | KeyCode::Space => {
+                    if self.highlight < self.labels.len() && !self.item_is_disabled(self.highlight) {
+                        self.selected_item = self.highlight;
+                        cx.widget_action_with_data(
+                            &self.action_data,
+                            uid,
+                            DropDownAction::Select(self.selected_item),
+                        );
+                        self.emit_change(cx);
+                    }
+                    self.set_closed(cx);
+                    self.animator_play(cx, ids!(hover.off));
+                }
+                KeyCode::Escape => {
+                    self.set_closed(cx);
+                    self.animator_play(cx, ids!(hover.off));
+                }
+                _ => (),
+            },
             Hit::KeyDown(ke) if !self.disabled(cx) => match ke.key_code {
                 KeyCode::ArrowUp => {
                     if let Some(index) = (0..self.selected_item.min(self.labels.len()))
@@ -2018,8 +2061,13 @@ mod popup_scroll_tests {
             cx.action(());
             cx.handle_actions();
             let chosen = send(&mut cx, &root, &pick, &[key(KeyCode::ArrowDown)]);
-            assert_eq!(chosen, vec![81], "the arrow key chose the next row down");
-            assert!(!is_open(&pick), "the arrow key shut the list, as it always has");
+            assert!(chosen.is_empty(), "the arrow key in an open list chose {chosen:?}");
+            assert!(is_open(&pick), "the arrow key shut the open list");
+            target.draw(&mut cx, &root);
+            assert!(inside(row(&mut cx, &pick, 81), menu_rect(&mut cx, &pick)), "the arrow key's row is not in view");
+            let chosen = send(&mut cx, &root, &pick, &[key(KeyCode::ReturnKey)]);
+            assert_eq!(chosen, vec![81], "Return chose the arrow key's row");
+            assert!(!is_open(&pick), "Return shut the list");
             target.draw(&mut cx, &root);
 
             open(&mut cx, &root, &pick, &mut target);
