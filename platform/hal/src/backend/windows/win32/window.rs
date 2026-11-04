@@ -626,7 +626,9 @@ fn command(s: &'static Shared, sid: u32, cmd: OsCmd) {
                 unsafe {
                     let _ = ShowWindow(w.hwnd.get(), cmd);
                 }
-                if w.no_focus && !w.popup() && !matches!(state, window_state::MINIMIZE | window_state::HIDE) {
+                // Only a show goes behind: a window the user maximises or restores stays where
+                // that puts it.
+                if w.no_focus && !w.popup() && state == window_state::SHOW {
                     to_back(&w);
                 }
                 publish_geom(&w);
