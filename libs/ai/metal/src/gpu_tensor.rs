@@ -1,35 +1,39 @@
-//! Metal-backed GpuTensor ops for SAM3 / later Klein / RealESRGAN on macOS.
-//! Heavy GEMM / flash / conv / norm / elementwise go through the existing
-//! Metal try_* kernels. Small addressing ops stay on the host. No oracle;
-//! goal is a working Metal path we can then keep cutting copies.
+//! The `gpu_*` ops on macOS that are not Makepad kernels of their own (RationalVisions
+//! docs/cutie-metal.md §9), over the resident `GpuTensor`:
+//! - transfers and views, the seam's (`stream::upload`, `download`, `upload_into`, `slice_rows`,
+//!   `reshape`...); add and mul, the stream's kernels (`stream::tensor_ops`);
+//! - the legacy ops (SAM 3.1's, Body's, BiRefNet's): adapters around the shim's `try_*` kernels
+//!   or the host code they had, unchanged. Each reads its inputs on the host where they lie
+//!   (`data`, which waits for their writers only) and puts its result in a new tensor (`tensor`),
+//!   so their numerics are as before, known bugs included;
+//! - the host versions of the generic ops Cutie calls (`transpose`, `pool_area`, `scale_add`,
+//!   `layer_norm_pytorch`, the cross-attentions, `slice_cols`, `concat_cols`, `relu`,
+//!   `add_cols_broadcast`, `gather_cols`, `linear_f32_exact`), which models/common runs where
+//!   MAKEPAD_CUTIE_METAL_REF forces them.
 
-use crate::gpu_types::{fresh_tensor_id, GpuLinearPart, GpuTensor};
-use makepad_ai_loader::quant::GGML_TYPE_F32;
+use crate::gpu_types::{GpuLinearPart, GpuTensor};
 pub use crate::shim::{DecAttnRef, DecLinearRef, TwoWayLayerRef, VitLayerRef, VitLinearRef};
 use crate::shim::{
-    try_add_f32, try_conv2d_planar_f32, try_flash_attn_f32_packed, try_gelu_f32,
-    try_group_norm_planar_f32, try_layer_norm_mul_add_f32, try_matmul_nt_f32, try_mul_f32,
-    try_matmul_nt_ggml_bytes_keyed, try_silu_f32, try_two_way_layer_resident_f32,
+    try_conv2d_planar_f32, try_flash_attn_f32_packed, try_gelu_f32, try_group_norm_planar_f32,
+    try_layer_norm_mul_add_f32, try_matmul_nt_f32, try_silu_f32, try_two_way_layer_resident_f32,
     try_vit_backbone_resident_f32,
 };
-use std::cell::RefCell;
+use crate::stream::{self, tensor_ops, HostSlice};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-fn tensor(rows: usize, cols: usize, data: Vec<f32>) -> GpuTensor {
-    GpuTensor {
-        rows,
-        cols,
-        data: RefCell::new(data),
-        u32s: RefCell::new(Vec::new()),
-        id: std::cell::Cell::new(fresh_tensor_id()),
-    }
+/// What a host op names itself in errors.
+const HOST_OP: &str = "metal GpuTensor host op";
+
+/// A host op's result as a new tensor (written into a buffer no queued work uses).
+pub(crate) fn tensor(rows: usize, cols: usize, data: Vec<f32>) -> Result<GpuTensor, String> {
+    stream::upload_as(HOST_OP, &data, rows, cols)
 }
 
-fn data(t: &GpuTensor) -> Result<std::cell::Ref<'_, Vec<f32>>, String> {
-    t.data
-        .try_borrow()
-        .map_err(|_| "metal GpuTensor already borrowed".to_string())
+/// A host op's read of `t`, where it lies, once its writer has finished. Every host op reads
+/// through here, so each is `Err` inside `with_metal_stream`.
+fn data(t: &GpuTensor) -> Result<HostSlice<'_>, String> {
+    stream::host_slice(HOST_OP, t)
 }
 
 fn unpack_bf16(bytes: &[u8]) -> Vec<f32> {
@@ -120,102 +124,60 @@ pub fn available() -> bool {
 }
 
 pub fn upload(values: &[f32], rows: usize, cols: usize) -> Result<GpuTensor, String> {
-    if values.len() != rows * cols {
-        return Err(format!(
-            "metal upload len {} != {}x{}",
-            values.len(),
-            rows,
-            cols
-        ));
-    }
-    Ok(tensor(rows, cols, values.to_vec()))
+    stream::upload(values, rows, cols)
 }
 
+/// u32 words as `[len, 1]` (at least one row, as on CUDA), stored as f32 bits so the stream binds
+/// them like any tensor; `download_u32` reads them back unchanged.
 pub fn upload_u32(values: &[u32]) -> Result<GpuTensor, String> {
-    Ok(GpuTensor {
-        rows: values.len().max(1),
-        cols: 1,
-        data: RefCell::new(Vec::new()),
-        u32s: RefCell::new(values.to_vec()),
-        id: std::cell::Cell::new(fresh_tensor_id()),
-    })
+    stream::upload_u32(values)
 }
 
 pub fn download(t: &GpuTensor) -> Result<Vec<f32>, String> {
-    Ok(data(t)?.clone())
+    stream::download(t)
 }
 
 pub fn upload_into(t: &GpuTensor, values: &[f32]) -> Result<(), String> {
-    let mut slot = t
-        .data
-        .try_borrow_mut()
-        .map_err(|_| "metal upload_into borrow".to_string())?;
-    if values.len() != slot.len() && slot.len() != 0 {
-        if values.len() != t.rows * t.cols {
-            return Err("metal upload_into size mismatch".to_string());
-        }
-    }
-    *slot = values.to_vec();
-    t.id.set(fresh_tensor_id());
-    Ok(())
+    stream::upload_into(t, values)
 }
 
 pub fn copy_into(src: &GpuTensor, dst: &GpuTensor) -> Result<(), String> {
-    let src_data = data(src)?.clone();
-    let mut dst_data = dst
-        .data
-        .try_borrow_mut()
-        .map_err(|_| "metal copy_into borrow".to_string())?;
-    *dst_data = src_data;
-    dst.id.set(fresh_tensor_id());
-    Ok(())
+    stream::copy_into(src, dst)
 }
 
+/// An f32 tensor is already f32: a copy, word for word, on the GPU.
 pub fn to_f32(t: &GpuTensor) -> Result<GpuTensor, String> {
-    Ok(tensor(t.rows, t.cols, data(t)?.clone()))
+    tensor_ops::copy(t)
 }
 
+/// `a + b` elementwise, equal shapes (the stream's kernel; CUDA's `gpu_add`).
 pub fn add(a: &GpuTensor, b: &GpuTensor) -> Result<GpuTensor, String> {
-    let ad = data(a)?;
-    let bd = data(b)?;
-    let out = try_add_f32(&ad, &[a.rows, a.cols], &bd, &[b.rows, b.cols])
-        .unwrap_or_else(|| {
-            ad.iter()
-                .zip(bd.iter())
-                .map(|(x, y)| x + y)
-                .collect::<Vec<_>>()
-        });
-    Ok(tensor(a.rows, a.cols, out))
+    tensor_ops::add(a, b)
 }
 
-/// `out[r] = a[r] + bias` with a `cols`-wide bias broadcast over rows.
+/// `out[r] = a[r] + bias` with a `cols`-wide bias broadcast over rows, on the host: the reference
+/// for `generic_ops::add_cols_broadcast`, with CUDA's check.
 pub fn add_cols_broadcast(a: &GpuTensor, bias: &GpuTensor) -> Result<GpuTensor, String> {
     if bias.rows * bias.cols != a.cols {
         return Err(format!(
-            "metal add_cols_broadcast bias width {} != {} cols",
-            bias.rows * bias.cols,
-            a.cols
+            "gpu_add_cols_broadcast shape mismatch {}x{} half=false vs bias {}x{} half=false",
+            a.rows, a.cols, bias.rows, bias.cols
         ));
     }
     let ad = data(a)?;
     let bd = data(bias)?;
     let mut out = Vec::with_capacity(ad.len());
-    for row in ad.chunks_exact(a.cols) {
-        out.extend(row.iter().zip(bd.iter()).map(|(x, b)| x + b));
+    if a.cols > 0 {
+        for row in ad.chunks_exact(a.cols) {
+            out.extend(row.iter().zip(bd.iter()).map(|(x, b)| x + b));
+        }
     }
-    Ok(tensor(a.rows, a.cols, out))
+    tensor(a.rows, a.cols, out)
 }
 
+/// `a * b` elementwise, equal shapes (the stream's kernel; CUDA's `gpu_mul`).
 pub fn mul(a: &GpuTensor, b: &GpuTensor) -> Result<GpuTensor, String> {
-    let ad = data(a)?;
-    let bd = data(b)?;
-    let out = try_mul_f32(&ad, &[a.rows, a.cols], &bd, &[b.rows, b.cols]).unwrap_or_else(|| {
-        ad.iter()
-            .zip(bd.iter())
-            .map(|(x, y)| x * y)
-            .collect::<Vec<_>>()
-    });
-    Ok(tensor(a.rows, a.cols, out))
+    tensor_ops::mul(a, b)
 }
 
 pub fn silu(x: &GpuTensor) -> Result<GpuTensor, String> {
@@ -225,7 +187,7 @@ pub fn silu(x: &GpuTensor) -> Result<GpuTensor, String> {
             .map(|&v| v / (1.0 + (-v).exp()))
             .collect::<Vec<_>>()
     });
-    Ok(tensor(x.rows, x.cols, out))
+    tensor(x.rows, x.cols, out)
 }
 
 pub fn gelu(x: &GpuTensor) -> Result<GpuTensor, String> {
@@ -235,7 +197,7 @@ pub fn gelu(x: &GpuTensor) -> Result<GpuTensor, String> {
             .map(|&v| 0.5 * v * (1.0 + (0.79788456 * (v + 0.044715 * v * v * v)).tanh()))
             .collect()
     });
-    Ok(tensor(x.rows, x.cols, out))
+    tensor(x.rows, x.cols, out)
 }
 
 pub fn gelu_erf(x: &GpuTensor) -> Result<GpuTensor, String> {
@@ -243,19 +205,85 @@ pub fn gelu_erf(x: &GpuTensor) -> Result<GpuTensor, String> {
     gelu(x)
 }
 
+/// `max(x, 0)` on the host: the reference for the stream's ReLU kernel (`tensor_ops::relu`,
+/// CUDA's `fmaxf(x, 0)`), which `gpu_birefnet_relu` runs.
 pub fn relu(x: &GpuTensor) -> Result<GpuTensor, String> {
     let out = data(x)?.iter().map(|&v| v.max(0.0)).collect();
-    Ok(tensor(x.rows, x.cols, out))
+    tensor(x.rows, x.cols, out)
 }
 
-pub fn slice_rows(x: &GpuTensor, start: usize, count: usize) -> Result<GpuTensor, String> {
-    let xd = data(x)?;
-    let end = start.saturating_add(count);
-    if end > x.rows {
-        return Err("metal slice_rows oob".into());
+/// `base + scale * delta`, elementwise (CUDA's `gpu_realesrgan_scale_add`).
+pub fn scale_add(base: &GpuTensor, delta: &GpuTensor, scale: f32) -> Result<GpuTensor, String> {
+    if base.rows != delta.rows || base.cols != delta.cols {
+        return Err(format!("metal scale_add {}x{} vs {}x{}", base.rows, base.cols, delta.rows, delta.cols));
     }
-    let off = start * x.cols;
-    Ok(tensor(count, x.cols, xd[off..off + count * x.cols].to_vec()))
+    let out = data(base)?.iter().zip(data(delta)?.iter()).map(|(&b, &d)| b + scale * d).collect();
+    tensor(base.rows, base.cols, out)
+}
+
+/// `[rows, cols]` to `[cols, rows]`: planar `[C, HW]` and tokens `[HW, C]` (CUDA's
+/// `gpu_planar_tokens_transpose`).
+pub fn transpose(x: &GpuTensor) -> Result<GpuTensor, String> {
+    let xd = data(x)?;
+    let mut out = vec![0.0; x.rows * x.cols];
+    for r in 0..x.rows {
+        for c in 0..x.cols {
+            out[c * x.rows + r] = xd[r * x.cols + c];
+        }
+    }
+    tensor(x.cols, x.rows, out)
+}
+
+/// Adaptive average pooling of planar `[channels, height*width]` to `[channels, oh*ow]`, each
+/// output the mean of its window `[floor(i*in/out), ceil((i+1)*in/out))`, summed in row order
+/// (CUDA's `gpu_pixal_pool`, `pixal_pool_kernel`).
+pub fn pool_area(x: &GpuTensor, width: usize, height: usize, ow: usize, oh: usize) -> Result<GpuTensor, String> {
+    if width == 0 || height == 0 || ow == 0 || oh == 0 || width * height != x.cols {
+        return Err("metal pool_area shape mismatch".into());
+    }
+    let xd = data(x)?;
+    let mut out = vec![0.0f32; x.rows * ow * oh];
+    for c in 0..x.rows {
+        for py in 0..oh {
+            let (y0, y1) = (py * height / oh, ((py + 1) * height + oh - 1) / oh);
+            for px in 0..ow {
+                let (x0, x1) = (px * width / ow, ((px + 1) * width + ow - 1) / ow);
+                let mut sum = 0.0f32;
+                for y in y0..y1 {
+                    for xx in x0..x1 {
+                        sum += xd[(c * height + y) * width + xx];
+                    }
+                }
+                out[c * ow * oh + py * ow + px] = sum / ((x1 - x0) * (y1 - y0)) as f32;
+            }
+        }
+    }
+    tensor(x.rows, ow * oh, out)
+}
+
+/// nn.LayerNorm over each row: `(x - mean) * rsqrt(var + eps) * gamma + beta`, the biased
+/// variance. The moments are taken in f64 and rounded once, so within fp32 rounding of CUDA's
+/// `gpu_layer_norm_pytorch` (PyTorch's Welford order) rather than bit for bit.
+pub fn layer_norm_pytorch(x: &GpuTensor, gamma: &[f32], beta: &[f32], eps: f32) -> Result<GpuTensor, String> {
+    if gamma.len() != x.cols || beta.len() != x.cols || x.cols == 0 {
+        return Err("metal layer_norm_pytorch width mismatch".into());
+    }
+    let xd = data(x)?;
+    let mut out = vec![0.0f32; x.rows * x.cols];
+    for (row, dst) in xd.chunks_exact(x.cols).zip(out.chunks_exact_mut(x.cols)) {
+        let mean = row.iter().map(|&v| v as f64).sum::<f64>() / x.cols as f64;
+        let var = row.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / x.cols as f64;
+        let (mean, rstd) = (mean as f32, (1.0 / (var + eps as f64).sqrt()) as f32);
+        for (i, (&v, o)) in row.iter().zip(dst.iter_mut()).enumerate() {
+            *o = (v - mean) * rstd * gamma[i] + beta[i];
+        }
+    }
+    tensor(x.rows, x.cols, out)
+}
+
+/// Rows `start..start + count` of `x`: a view of its storage (CUDA's `gpu_slice_rows`).
+pub fn slice_rows(x: &GpuTensor, start: usize, count: usize) -> Result<GpuTensor, String> {
+    stream::slice_rows(x, start, count)
 }
 
 pub fn slice_cols(x: &GpuTensor, start: usize, count: usize) -> Result<GpuTensor, String> {
@@ -268,16 +296,7 @@ pub fn slice_cols(x: &GpuTensor, start: usize, count: usize) -> Result<GpuTensor
         let s = r * x.cols + start;
         out[r * count..(r + 1) * count].copy_from_slice(&xd[s..s + count]);
     }
-    Ok(tensor(x.rows, count, out))
-}
-
-pub fn concat_rows(a: &GpuTensor, b: &GpuTensor) -> Result<GpuTensor, String> {
-    if a.cols != b.cols {
-        return Err("metal concat_rows col mismatch".into());
-    }
-    let mut out = data(a)?.clone();
-    out.extend_from_slice(&data(b)?);
-    Ok(tensor(a.rows + b.rows, a.cols, out))
+    tensor(x.rows, count, out)
 }
 
 pub fn concat_cols(parts: &[&GpuTensor]) -> Result<GpuTensor, String> {
@@ -286,27 +305,33 @@ pub fn concat_cols(parts: &[&GpuTensor]) -> Result<GpuTensor, String> {
     }
     let rows = parts[0].rows;
     let cols: usize = parts.iter().map(|p| p.cols).sum();
+    let datas = parts.iter().map(|p| data(p)).collect::<Result<Vec<_>, String>>()?;
     let mut out = vec![0.0; rows * cols];
     for r in 0..rows {
         let mut c0 = 0;
-        for p in parts {
-            let pd = data(p)?;
+        for (p, pd) in parts.iter().zip(&datas) {
             let src = &pd[r * p.cols..(r + 1) * p.cols];
             out[r * cols + c0..r * cols + c0 + p.cols].copy_from_slice(src);
             c0 += p.cols;
         }
     }
-    Ok(tensor(rows, cols, out))
+    tensor(rows, cols, out)
 }
 
-pub fn reshape(x: &GpuTensor, rows: usize, cols: usize) -> Result<GpuTensor, String> {
-    if rows * cols != x.rows * x.cols {
-        return Err("metal reshape size".into());
-    }
-    Ok(tensor(rows, cols, data(x)?.clone()))
+/// `x` as `[rows, cols]`: the same storage and offset (CUDA's `gpu_reshape`).
+pub fn reshape(x: GpuTensor, rows: usize, cols: usize) -> Result<GpuTensor, String> {
+    stream::reshape(x, rows, cols)
 }
 
+/// Columns `indices` of `x`, in that order, on the host: the reference for
+/// `generic_ops::gather_cols`, with CUDA's checks (a table, every index inside the columns).
 pub fn gather_cols(x: &GpuTensor, indices: &[u32]) -> Result<GpuTensor, String> {
+    if indices.is_empty() {
+        return Err("gpu_gather_cols: empty index table".to_string());
+    }
+    if let Some(&index) = indices.iter().find(|&&index| index as usize >= x.cols) {
+        return Err(format!("gpu_gather_cols index {index} out of range (cols {})", x.cols));
+    }
     let xd = data(x)?;
     let mut out = vec![0.0; x.rows * indices.len()];
     for r in 0..x.rows {
@@ -314,7 +339,7 @@ pub fn gather_cols(x: &GpuTensor, indices: &[u32]) -> Result<GpuTensor, String> 
             out[r * indices.len() + j] = xd[r * x.cols + idx as usize];
         }
     }
-    Ok(tensor(x.rows, indices.len(), out))
+    tensor(x.rows, indices.len(), out)
 }
 
 pub fn gather_rows_colblock(
@@ -324,8 +349,11 @@ pub fn gather_rows_colblock(
     block_cols: usize,
 ) -> Result<GpuTensor, String> {
     let src_d = data(src)?;
-    let rows = row_idx.u32s.borrow();
-    let blocks = colblock_idx.map(|t| t.u32s.borrow());
+    let rows: Vec<u32> = data(row_idx)?.iter().map(|word| word.to_bits()).collect();
+    let blocks: Option<Vec<u32>> = match colblock_idx {
+        Some(t) => Some(data(t)?.iter().map(|word| word.to_bits()).collect()),
+        None => None,
+    };
     let out_rows = rows.len();
     let mut out = vec![0.0; out_rows * block_cols];
     let nblocks = src.cols / block_cols;
@@ -342,7 +370,7 @@ pub fn gather_rows_colblock(
         out[i * block_cols..(i + 1) * block_cols]
             .copy_from_slice(&src_d[src_off..src_off + block_cols]);
     }
-    Ok(tensor(out_rows, block_cols, out))
+    tensor(out_rows, block_cols, out)
 }
 
 pub fn layer_norm_mod(
@@ -378,7 +406,7 @@ pub fn layer_norm_mod(
         }
         out
     });
-    Ok(tensor(x.rows, x.cols, out))
+    tensor(x.rows, x.cols, out)
 }
 
 pub fn linear_nt(
@@ -406,54 +434,7 @@ pub fn linear_nt(
             }
         }
     }
-    Ok(tensor(x.rows, n, out))
-}
-
-/// Linear against a long-lived f32 weight: the weight goes to the device
-/// once, cached under the tensor's content identity (the CUDA contract keeps
-/// the weight resident too), so a per-frame call pays for the GEMM only.
-pub fn linear_f32_resident(
-    x: &GpuTensor,
-    w: &GpuTensor,
-    bias: Option<&GpuTensor>,
-) -> Result<GpuTensor, String> {
-    let xd = data(x)?;
-    let n = w.rows;
-    let k = w.cols;
-    if x.cols != k {
-        return Err(format!(
-            "metal resident linear k mismatch: x {}x{}, w {}x{}",
-            x.rows, x.cols, w.rows, w.cols
-        ));
-    }
-    let cache_key = format!("t{}", w.id.get());
-    let mut out = try_matmul_nt_ggml_bytes_keyed(
-        &xd,
-        GGML_TYPE_F32,
-        x.rows,
-        k,
-        n,
-        "resident_f32",
-        &cache_key,
-        || {
-            let wd = data(w)?;
-            let mut bytes = Vec::with_capacity(wd.len() * 4);
-            for value in wd.iter() {
-                bytes.extend_from_slice(&value.to_le_bytes());
-            }
-            Ok(bytes)
-        },
-    )
-    .ok_or_else(|| "metal resident matmul failed".to_string())?;
-    if let Some(bias) = bias {
-        let bd = data(bias)?;
-        for r in 0..x.rows {
-            for c in 0..n {
-                out[r * n + c] += bd[c];
-            }
-        }
-    }
-    Ok(tensor(x.rows, n, out))
+    tensor(x.rows, n, out)
 }
 
 pub fn attention_packed(
@@ -472,7 +453,45 @@ pub fn attention_packed(
     let vd = data(v)?;
     let out = try_flash_attn_f32_packed(&qd, &kd, &vd, q.rows, k.rows, heads, d, scale)
         .ok_or_else(|| "metal flash attn failed".to_string())?;
-    Ok(tensor(q.rows, q.cols, out))
+    tensor(q.rows, q.cols, out)
+}
+
+/// `x @ w^T + bias` in fp32 on the host (Accelerate's sgemm), the bias added after the product:
+/// the reference for `linear::linear_f32_resident` (the stream's fp32 GEMM), which both
+/// `gpu_linear_f32_resident` and Cutie's `gpu_cutie_linear` run.
+pub fn linear_f32_exact(x: &GpuTensor, w: &GpuTensor, bias: Option<&GpuTensor>) -> Result<GpuTensor, String> {
+    let (m, k, n) = (x.rows, x.cols, w.rows);
+    if w.cols != k {
+        return Err(format!("metal linear_f32_exact k mismatch: x {}x{}, w {}x{}", x.rows, x.cols, w.rows, w.cols));
+    }
+    extern "C" {
+        fn cblas_sgemm(
+            order: i32, trans_a: i32, trans_b: i32, m: i32, n: i32, k: i32, alpha: f32, a: *const f32, lda: i32,
+            b: *const f32, ldb: i32, beta: f32, c: *mut f32, ldc: i32,
+        );
+    }
+    const ROW_MAJOR: i32 = 101;
+    const NO_TRANS: i32 = 111;
+    const TRANS: i32 = 112;
+    let mut out = vec![0.0f32; m * n];
+    if m * n > 0 && k > 0 {
+        let (xd, wd) = (data(x)?, data(w)?);
+        unsafe {
+            cblas_sgemm(
+                ROW_MAJOR, NO_TRANS, TRANS, m as i32, n as i32, k as i32, 1.0, xd.as_ptr(), k as i32, wd.as_ptr(),
+                k as i32, 0.0, out.as_mut_ptr(), n as i32,
+            );
+        }
+    }
+    if let Some(bias) = bias {
+        let bd = data(bias)?;
+        for row in out.chunks_exact_mut(n) {
+            for (o, &b) in row.iter_mut().zip(bd.iter()) {
+                *o += b;
+            }
+        }
+    }
+    tensor(m, n, out)
 }
 
 pub fn attention_packed_cross_bias(
@@ -484,11 +503,35 @@ pub fn attention_packed_cross_bias(
     bias: &GpuTensor,
 ) -> Result<GpuTensor, String> {
     // Biased decoder path is small; stay on host so the additive RPB is exact.
+    let bd = data(bias)?;
+    attention_packed_cross_host(q, k, v, heads, scale, Some(&bd))
+}
+
+/// Cross-attention in f32 on the host, as `attention_packed_cross_bias` without the bias: the
+/// fp32 contract of CUDA's `gpu_attention_packed_cross_f32` (Cutie's object transformer), which
+/// the flash kernel's fast-math exp would not keep.
+pub fn attention_packed_cross_f32(
+    q: &GpuTensor,
+    k: &GpuTensor,
+    v: &GpuTensor,
+    heads: usize,
+    scale: f32,
+) -> Result<GpuTensor, String> {
+    attention_packed_cross_host(q, k, v, heads, scale, None)
+}
+
+fn attention_packed_cross_host(
+    q: &GpuTensor,
+    k: &GpuTensor,
+    v: &GpuTensor,
+    heads: usize,
+    scale: f32,
+    bd: Option<&[f32]>,
+) -> Result<GpuTensor, String> {
     let d = q.cols / heads;
     let qd = data(q)?;
     let kd = data(k)?;
     let vd = data(v)?;
-    let bd = data(bias)?;
     let q_len = q.rows;
     let kv_len = k.rows;
     let mut out = vec![0.0; q_len * q.cols];
@@ -501,7 +544,7 @@ pub fn attention_packed_cross_bias(
                 for c in 0..d {
                     dot += qd[qi * q.cols + h * d + c] * kd[ki * k.cols + h * d + c];
                 }
-                let s = dot * scale + bd[h * q_len * kv_len + qi * kv_len + ki];
+                let s = dot * scale + bd.map_or(0.0, |b| b[h * q_len * kv_len + qi * kv_len + ki]);
                 scores[ki] = s;
                 max = max.max(s);
             }
@@ -520,7 +563,7 @@ pub fn attention_packed_cross_bias(
             }
         }
     }
-    Ok(tensor(q_len, q.cols, out))
+    tensor(q_len, q.cols, out)
 }
 
 pub fn conv2d_planar(
@@ -550,7 +593,7 @@ pub fn conv2d_planar(
         pad_y,
     )
     .ok_or_else(|| "metal conv2d_planar failed".to_string())?;
-    Ok(tensor(out_channels, width * height, out))
+    tensor(out_channels, width * height, out)
 }
 
 pub fn image_to_patches(
@@ -587,21 +630,7 @@ pub fn image_to_patches(
         }
     }
     let _ = (patch_w, patch_h);
-    Ok(tensor(ch * gh * gw, dim, out))
-}
-
-pub fn tokens_to_planar(tokens: &GpuTensor) -> Result<GpuTensor, String> {
-    // [hw, c] -> [c, hw]
-    let td = data(tokens)?;
-    let hw = tokens.rows;
-    let c = tokens.cols;
-    let mut out = vec![0.0; c * hw];
-    for i in 0..hw {
-        for j in 0..c {
-            out[j * hw + i] = td[i * c + j];
-        }
-    }
-    Ok(tensor(c, hw, out))
+    tensor(ch * gh * gw, dim, out)
 }
 
 pub fn resize_bilinear(
@@ -677,7 +706,7 @@ pub fn resize_bilinear(
     }
     });
     crate::rife::prof_add(4, prof_t0);
-    Ok(tensor(ch, out_w * out_h, out))
+    tensor(ch, out_w * out_h, out)
 }
 
 pub fn pixel_shuffle(x: &GpuTensor, width: usize, height: usize, scale: usize) -> Result<GpuTensor, String> {
@@ -699,7 +728,7 @@ pub fn pixel_shuffle(x: &GpuTensor, width: usize, height: usize, scale: usize) -
             }
         }
     }
-    Ok(tensor(out_c, out_w * out_h, out))
+    tensor(out_c, out_w * out_h, out)
 }
 
 pub fn upsample_nearest2x(x: &GpuTensor, width: usize, height: usize) -> Result<GpuTensor, String> {
@@ -717,7 +746,7 @@ pub fn rope_interleaved(
     let sd = data(sin)?;
     let dim = x.cols / heads;
     let half = dim / 2;
-    let mut out = xd.clone();
+    let mut out = xd.to_vec();
     for r in 0..x.rows {
         for h in 0..heads {
             for i in 0..half {
@@ -731,7 +760,7 @@ pub fn rope_interleaved(
             }
         }
     }
-    Ok(tensor(x.rows, x.cols, out))
+    tensor(x.rows, x.cols, out)
 }
 
 /// Rotate-half rope (the DINOv3 / LLaMA layout): within each head the first
@@ -759,7 +788,7 @@ pub fn rope_half(
     let xd = data(x)?;
     let cd = data(cos)?;
     let sd = data(sin)?;
-    let mut out = xd.clone();
+    let mut out = xd.to_vec();
     for r in 0..x.rows {
         for h in 0..heads {
             let base = r * x.cols + h * dim;
@@ -773,7 +802,7 @@ pub fn rope_half(
             }
         }
     }
-    Ok(tensor(x.rows, x.cols, out))
+    tensor(x.rows, x.cols, out)
 }
 
 /// Per-row layer norm with an affine: `(x - mean) / sqrt(var + eps) * mul + add`
@@ -810,7 +839,7 @@ pub fn vit_backbone_resident(
         eps,
     )
     .ok_or_else(|| "metal resident vit backbone failed".to_string())?;
-    Ok(tensor(x.rows, x.cols, out))
+    tensor(x.rows, x.cols, out)
 }
 
 /// One two-way decoder layer device-resident (see `shim::TwoWayLayerRef`);
@@ -846,8 +875,8 @@ pub fn two_way_layer_resident(
     )
     .ok_or_else(|| "metal resident two-way layer failed".to_string())?;
     Ok((
-        tensor(hidden.rows, hidden.cols, out),
-        tensor(hidden.rows, hidden.cols, normed),
+        tensor(hidden.rows, hidden.cols, out)?,
+        tensor(hidden.rows, hidden.cols, normed)?,
     ))
 }
 
@@ -880,7 +909,7 @@ pub fn layer_norm_mul_add(
             }
             out
         });
-    Ok(tensor(x.rows, x.cols, out))
+    tensor(x.rows, x.cols, out)
 }
 
 pub fn rpb_expand(
@@ -906,7 +935,7 @@ pub fn rpb_expand(
             }
         }
     }
-    Ok(tensor(heads * q1, hw, out))
+    tensor(heads * q1, hw, out)
 }
 
 pub fn sam3_sine_embed(ref_points: &GpuTensor, num_pos_feats: usize) -> Result<GpuTensor, String> {
@@ -927,7 +956,7 @@ pub fn sam3_sine_embed(ref_points: &GpuTensor, num_pos_feats: usize) -> Result<G
             out[i * num_pos_feats * 2 + num_pos_feats + num_pos_feats / 2 + k] = xv.cos();
         }
     }
-    Ok(tensor(n, num_pos_feats * 2, out))
+    tensor(n, num_pos_feats * 2, out)
 }
 
 pub fn sam3_rpb_axial(
@@ -949,13 +978,13 @@ pub fn sam3_rpb_axial(
             dy[i * height + y] = (y as f32 + 0.5) / height as f32 - cy;
         }
     }
-    Ok((tensor(q, width, dx), tensor(q, height, dy)))
+    Ok((tensor(q, width, dx)?, tensor(q, height, dy)?))
 }
 
 pub fn sam3_refine_boxes(ref_points: &GpuTensor, delta: &GpuTensor) -> Result<GpuTensor, String> {
     let rp = data(ref_points)?;
     let d = data(delta)?;
-    let mut out = rp.clone();
+    let mut out = rp.to_vec();
     for i in 0..ref_points.rows {
         for c in 0..4 {
             let x = rp[i * 4 + c];
@@ -963,7 +992,7 @@ pub fn sam3_refine_boxes(ref_points: &GpuTensor, delta: &GpuTensor) -> Result<Gp
             out[i * 4 + c] = 1.0 / (1.0 + (-(logit + d[i * 4 + c])).exp());
         }
     }
-    Ok(tensor(ref_points.rows, 4, out))
+    tensor(ref_points.rows, 4, out)
 }
 
 pub fn group_norm_planar(
@@ -978,11 +1007,5 @@ pub fn group_norm_planar(
     let xd = data(x)?;
     let out = try_group_norm_planar_f32(&xd, width, height, x.rows, groups, gamma, beta, eps)
         .ok_or_else(|| "metal group_norm failed".to_string())?;
-    Ok(tensor(x.rows, width * height, out))
+    tensor(x.rows, width * height, out)
 }
-
-pub fn evict_prefix(_prefix: &str) -> Result<usize, String> {
-    Ok(0)
-}
-
-pub fn pool_clear() {}
