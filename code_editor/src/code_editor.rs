@@ -318,6 +318,13 @@ pub struct CodeEditor {
     viewport_rect: Rect,
     #[rust]
     unscrolled_rect: Rect,
+    /// Where the editor's area was when it was last drawn. A host laid out after a sibling that
+    /// fills (a side panel right of a canvas) is drawn first where it does not end up and moved
+    /// after; events then see the area where it is, and what was kept from drawing
+    /// (`viewport_rect`, `unscrolled_rect`, `gutter_rect`) is moved by the difference, or a press
+    /// lands in the wrong column.
+    #[rust]
+    drawn_origin: Option<DVec2>,
     #[rust]
     line_start: usize,
     #[rust]
@@ -992,6 +999,7 @@ impl CodeEditor {
         self.draw_cursor.end_many_instances(cx);
 
         self.scroll_bars.end(cx);
+        self.drawn_origin = Some(self.scroll_bars.area().rect(cx).pos);
 
         if !self.is_read_only() && cx.has_key_focus(self.scroll_bars.area()) {
             let area_rect = self.scroll_bars.area().clipped_rect(cx);
@@ -1274,6 +1282,17 @@ impl CodeEditor {
     ) -> Vec<CodeEditorAction> {
         let mut actions = Vec::new();
         self.document_read_only = session.document().is_read_only();
+        // What was kept from drawing follows the editor to where it ended up (`drawn_origin`).
+        if let Some(drawn) = self.drawn_origin {
+            let now = self.scroll_bars.area().rect(cx).pos;
+            let shift = now - drawn;
+            if shift.x != 0.0 || shift.y != 0.0 {
+                self.viewport_rect.pos += shift;
+                self.unscrolled_rect.pos += shift;
+                self.gutter_rect.pos += shift;
+                self.drawn_origin = Some(now);
+            }
+        }
 
         if self.is_read_only() || self.caret_policy == CaretPolicy::Steady {
             self.stop_blink_timers(cx);

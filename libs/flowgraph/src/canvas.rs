@@ -110,6 +110,15 @@ const CROSSING_COST: f64 = 400.0;
 const BEND_COST: f64 = 120.0;
 const LOOP_COST: f64 = 300.0;
 
+/// A port disc's size and the shape of its cable side (see `FlowCanvas::port_radius_x`).
+#[derive(Clone, Copy, Debug)]
+struct PortShape {
+    rx: f64,
+    ry: f64,
+    tip: f64,
+    dent: f64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct CardOutlineGeometry {
     outer_rect: Rect,
@@ -380,6 +389,18 @@ script_mod! {
         color_state_idle: theme.flow_state_idle
         color_port_label_connected: theme.flow_text_port_connected
         color_port_label_open: theme.flow_text_port_open
+
+        port_radius_x: 13.0
+        port_radius_y: 11.0
+        port_tip: 4.5
+        port_dent: 3.0
+        port_icons: true
+        card_radius: 16.0
+        header_band: 0.0
+        title_row: 0.0
+        title_inside: false
+        outputs_apart: false
+        header_text_color: theme.flow_text
 
         icon_check: KindIcon{ color: theme.flow_success svg: crate_resource("self:resources/icons/check.svg") }
         icon_alert: KindIcon{ color: theme.flow_error svg: crate_resource("self:resources/icons/alert.svg") }
@@ -1011,6 +1032,42 @@ pub struct FlowCanvas {
     draw_chip: DrawText,
     #[live]
     draw_error: DrawText,
+    /// A port's disc: half its width and half its height, how far an output's point reaches
+    /// past it and how deep an input's notch goes into it (both 0: a plain oval).
+    #[live]
+    port_radius_x: f64,
+    #[live]
+    port_radius_y: f64,
+    #[live]
+    port_tip: f64,
+    #[live]
+    port_dent: f64,
+    /// Whether each port shows its kind's icon inside its disc.
+    #[live]
+    port_icons: bool,
+    #[live]
+    card_radius: f32,
+    /// When above 0, the row of each card's title is a band this tall in its kind's colour,
+    /// joined to the card, the title written over it in `header_text_color`; taller than the
+    /// default row, the row grows to match.
+    #[live]
+    header_band: f64,
+    /// The height of the row of each card's title, when taller than the default.
+    #[live]
+    title_row: f64,
+    /// The title's row drawn inside the card, at its top under a hairline in
+    /// `card_edge_color`, rather than above it; a header band is not drawn.
+    #[live]
+    title_inside: bool,
+    /// Each output on a row of its own above the inputs, rather than beside the first, so long
+    /// input labels do not run into them.
+    #[live]
+    outputs_apart: bool,
+    #[live]
+    header_text_color: Vec4f,
+    /// Colours by node kind, set by the host, before the styles' and the built-in kinds'.
+    #[rust]
+    kind_colors: HashMap<String, Vec4f>,
     #[live]
     card_color: Vec4f,
     #[live]
@@ -1619,7 +1676,7 @@ impl FlowCanvas {
     fn geometry(&self, graph: &Graph, index: usize) -> NodeGeometry {
         let local = self.card_rect(graph, index);
         let node = &graph.nodes[index];
-        let content = card_content_rect(local, Self::full_bleed(node), Self::port_rows(node)).rect;
+        let content = card_content_rect(local, Self::full_bleed(node), self.port_rows(node)).rect;
         let origin = self.camera.origin();
         NodeGeometry {
             card: Rect {
@@ -1664,7 +1721,7 @@ impl FlowCanvas {
             }
             let card = self.geometry(graph, index).card;
             min.x = min.x.min(card.pos.x);
-            min.y = min.y.min(card.pos.y - LABEL_H);
+            min.y = min.y.min(card.pos.y - self.label_h());
             max.x = max.x.max(card.pos.x + card.size.x);
             max.y = max.y.max(card.pos.y + card.size.y);
         }
@@ -2181,6 +2238,16 @@ impl FlowCanvas {
         self.target_scale
     }
 
+    /// Colours nodes by kind (header bands, progress), ahead of the styles' colours.
+    pub fn set_kind_colors(&mut self, cx: &mut Cx, colors: HashMap<String, Vec4f>) {
+        self.kind_colors = colors;
+        self.redraw(cx);
+    }
+
+    fn port_shape(&self) -> PortShape {
+        PortShape { rx: self.port_radius_x, ry: self.port_radius_y, tip: self.port_tip, dent: self.port_dent }
+    }
+
     pub fn set_fit_insets(&mut self, insets: Inset) {
         self.fit_insets = insets;
     }
@@ -2230,7 +2297,7 @@ impl FlowCanvas {
             let (x, y) = node.at;
             let size = self.node_size(graph, index);
             min.x = min.x.min(x);
-            min.y = min.y.min(y - LABEL_H);
+            min.y = min.y.min(y - self.label_h());
             max.x = max.x.max(x + size.x);
             max.y = max.y.max(y + size.y);
         }
@@ -2325,7 +2392,7 @@ impl FlowCanvas {
 
     fn node_size(&self, graph: &Graph, index: usize) -> DVec2 {
         let node = &graph.nodes[index];
-        let min_height = min_card_height(Self::full_bleed(node), Self::port_rows(node));
+        let min_height = min_card_height(Self::full_bleed(node), self.port_rows(node));
         if let Some(Drag::Resize {
             index: resized,
             size,
@@ -2336,13 +2403,13 @@ impl FlowCanvas {
                 return clamp_card_size(
                     dvec2(size.0, size.1),
                     Self::full_bleed(node),
-                    Self::port_rows(node),
+                    self.port_rows(node),
                 );
             }
         }
         node
             .size
-            .map(|(w, h)| clamp_card_size(dvec2(w, h), Self::full_bleed(node), Self::port_rows(node)))
+            .map(|(w, h)| clamp_card_size(dvec2(w, h), Self::full_bleed(node), self.port_rows(node)))
             .unwrap_or_else(|| {
                 dvec2(
                     NODE_WIDTH,
@@ -2385,8 +2452,12 @@ impl FlowCanvas {
         }
     }
 
-    fn port_rows(node: &Node) -> usize {
-        node.inputs.len().max(node.outputs.len())
+    fn port_rows(&self, node: &Node) -> usize {
+        if self.outputs_apart {
+            node.inputs.len() + node.outputs.len()
+        } else {
+            node.inputs.len().max(node.outputs.len())
+        }
     }
 
     fn port_local_at_flip(
@@ -2402,7 +2473,8 @@ impl FlowCanvas {
             return self.boundary_socket(link);
         }
         let rect = self.card_rect(graph, index);
-        let y = rect.pos.y + CARD_HEADER_H + (port as f64 + 0.5) * PORT_ROW_H;
+        let row = if self.outputs_apart && !output { graph.nodes[index].outputs.len() + port } else { port };
+        let y = rect.pos.y + CARD_HEADER_H + (row as f64 + 0.5) * PORT_ROW_H;
         let side = if output { 1.0 - flip } else { flip };
         dvec2(rect.pos.x + rect.size.x * side, y)
     }
@@ -2429,9 +2501,9 @@ impl FlowCanvas {
             -1.0
         };
         let offset = if output {
-            direction * (PORT_RX + PORT_TIP)
+            direction * (self.port_radius_x + self.port_tip)
         } else {
-            -direction * (PORT_RX - PORT_DENT)
+            -direction * (self.port_radius_x - self.port_dent)
         };
         dvec2(p.x + offset, p.y)
     }
@@ -2508,8 +2580,8 @@ impl FlowCanvas {
                 }
             }
             let mut card = self.card_rect(graph, index);
-            card.pos.y -= LABEL_H;
-            card.size.y += LABEL_H;
+            card.pos.y -= self.label_h();
+            card.size.y += self.label_h();
             // Overlapping padded hit areas choose the closest socket, with
             // draw order breaking ties. The first actual card body still
             // occludes every lower card and boundary socket at this point.
@@ -2538,8 +2610,8 @@ impl FlowCanvas {
                 return None;
             }
             let mut rect = self.card_rect(graph, index);
-            rect.pos.y -= LABEL_H;
-            rect.size.y += LABEL_H;
+            rect.pos.y -= self.label_h();
+            rect.size.y += self.label_h();
             rect.contains(local).then_some(index)
         })
     }
@@ -2603,6 +2675,9 @@ impl FlowCanvas {
     }
 
     fn kind_color(&self, kind: &str) -> Vec4f {
+        if let Some(color) = self.kind_colors.get(kind) {
+            return *color;
+        }
         if let Some(color) = self.styles.node_color(kind) {
             return color;
         }
@@ -2695,14 +2770,14 @@ impl FlowCanvas {
     /// ends in a sharp `>` point, an input has a small `>` notch the point
     /// would fit into. `grow` widens the oval (hover, the selected halo);
     /// `direction` is the card's flow direction (+1 left-to-right).
-    fn shaped_port(v: &mut DrawVector, centre: Point, grow: f64, direction: f64, input: bool) {
-        let rx = PORT_RX + grow;
-        let ry = PORT_R + grow;
+    fn shaped_port(v: &mut DrawVector, shape: PortShape, centre: Point, grow: f64, direction: f64, input: bool) {
+        let rx = (shape.rx + grow).max(0.5);
+        let ry = (shape.ry + grow).max(0.5);
         let cable_side = if input { -direction } else { direction };
         let (apex_r, half_angle) = if input {
-            (rx - PORT_DENT, PORT_NOTCH_HALF_ANGLE)
+            (rx - shape.dent, if shape.dent > 0.0 { PORT_NOTCH_HALF_ANGLE } else { 0.0 })
         } else {
-            (rx + PORT_TIP, PORT_TIP_HALF_ANGLE)
+            (rx + shape.tip, if shape.tip > 0.0 { PORT_TIP_HALF_ANGLE } else { 0.0 })
         };
         let base = if cable_side < 0.0 {
             std::f64::consts::PI
@@ -3268,6 +3343,18 @@ impl FlowCanvas {
         lines
     }
 
+    /// The height of the row of each card's title: a header band or `title_row` taller than
+    /// the default makes it as tall, for a larger title.
+    fn label_h(&self) -> f64 {
+        LABEL_H.max(self.header_band).max(self.title_row)
+    }
+
+    /// How far below where it is drawn a line of `text` has its baseline, and its capitals' height.
+    fn text_baseline(&self, cx: &mut Cx2d, draw: &DrawText, text: &str) -> (f64, f64) {
+        let laid = draw.layout(cx, 0.0, 0.0, None, false, Align::default(), text);
+        laid.rows.first().map_or((0.0, 0.0), |row| (row.origin_in_lpxs.y as f64, row.cap_height_in_lpxs as f64))
+    }
+
     fn text_width(&self, cx: &mut Cx2d, draw: &DrawText, text: &str) -> f64 {
         draw.layout(cx, 0.0, 0.0, None, false, Align::default(), text)
             .size_in_lpxs
@@ -3700,7 +3787,7 @@ impl FlowCanvas {
                 self.card_edge_color
             };
             self.draw_card.border_size = if highlighted || waiting { 2.0 } else { 1.0 };
-            self.draw_card.border_radius = outline.radius;
+            self.draw_card.border_radius = outline.radius.min(self.card_radius);
             let outline_alpha = if selected == Some(node.id.as_str()) {
                 1.0
             } else if hover == Some(index) {
@@ -3719,7 +3806,32 @@ impl FlowCanvas {
             } else {
                 0.0
             };
-            self.draw_card.draw_abs(cx, rect);
+            if self.title_inside {
+                // One body holding the title's row, a hairline under the row.
+                let row = self.label_h();
+                self.draw_card.draw_abs(cx, Rect { pos: dvec2(rect.pos.x, rect.pos.y - row), size: dvec2(rect.size.x, rect.size.y + row) });
+                let line = 1.0 / self.camera.scale.max(0.01);
+                self.draw_card.color = self.card_edge_color;
+                self.draw_card.border_size = 0.0;
+                self.draw_card.border_radius = 0.0;
+                self.draw_card.outline_size = 0.0;
+                self.draw_card.shadow_radius = 0.0;
+                self.draw_card.draw_abs(cx, Rect { pos: dvec2(rect.pos.x + line, rect.pos.y - line), size: dvec2(rect.size.x - 2.0 * line, line) });
+                self.draw_card.shadow_radius = (12.0 / self.camera.scale.max(0.01)) as f32;
+            } else {
+                self.draw_card.draw_abs(cx, rect);
+            }
+            // The title's row as a band in the node's kind colour, joined to the card.
+            if self.header_band > 0.0 && !self.title_inside {
+                let band = self.header_band;
+                self.draw_card.color = self.kind_color(&node.kind);
+                self.draw_card.border_color = self.draw_card.color;
+                self.draw_card.border_size = 0.0;
+                self.draw_card.outline_size = 0.0;
+                self.draw_card.shadow_radius = 0.0;
+                self.draw_card.draw_abs(cx, Rect { pos: dvec2(rect.pos.x, rect.pos.y - band), size: dvec2(rect.size.x, band) });
+                self.draw_card.shadow_radius = (12.0 / self.camera.scale.max(0.01)) as f32;
+            }
         }
     }
 
@@ -3769,11 +3881,21 @@ impl FlowCanvas {
         for index in indices.iter().copied() {
             let node = &graph.nodes[index];
             let r = self.card_rect(graph, index);
-            let label_y = r.pos.y - LABEL_H;
-            // Kind icon + id (bold) + type (muted).
+            // A taller row than the default keeps its contents at the middle of it.
+            let label_y = r.pos.y - self.label_h() + (self.label_h() - LABEL_H) * 0.5;
+            // Inside the card, the row's contents clear of its rounded edge.
+            let inset = if self.title_inside { (self.card_radius as f64).max(8.0) } else { 0.0 };
+            // Kind icon + id (bold) + type (muted); in a taller row, the icon as tall as the title.
+            let icon_size = if self.label_h() > LABEL_H { (self.draw_title.text_style.font_size as f64 * 1.3).max(15.0) } else { 15.0 };
+            // In a taller row, the title's capitals at the row's middle, the icon centred on them
+            // and the type on the title's baseline.
+            let tall = self.label_h() > LABEL_H;
+            let (title_top, title_cap) = self.text_baseline(cx, &self.draw_title, &node.title);
+            let (meta_top, _) = self.text_baseline(cx, &self.draw_meta, &node.type_name);
+            let baseline = r.pos.y - self.label_h() * 0.5 + title_cap * 0.5;
             let icon_rect = Rect {
-                pos: dvec2(r.pos.x + 2.0, label_y + 5.0),
-                size: dvec2(15.0, 15.0),
+                pos: dvec2(r.pos.x + 2.0 + inset, if tall { baseline - title_cap * 0.5 - icon_size * 0.5 } else { label_y + 5.0 }),
+                size: dvec2(icon_size, icon_size),
             };
             if let Some(kind) = declared_output_kind(node) {
                 if let Some(icon) = self.port_icon(kind) {
@@ -3783,10 +3905,23 @@ impl FlowCanvas {
                 icon.draw_abs(cx, icon_rect);
             }
             let id_w = self.text_width(cx, &self.draw_title, &node.title);
+            // Over a header band, the title and type in the band's text colour.
+            let (title_color, meta_color) = (self.draw_title.color, self.draw_meta.color);
+            if self.header_band > 0.0 && !self.title_inside {
+                self.draw_title.color = self.header_text_color;
+                self.draw_meta.color = self.header_text_color;
+            }
+            let (title_y, meta_y) = if tall {
+                (baseline - title_top, baseline - meta_top)
+            } else {
+                (label_y + 6.0, label_y + 7.0)
+            };
             self.draw_title
-                .draw_abs(cx, dvec2(r.pos.x + 23.0, label_y + 6.0), &node.title);
+                .draw_abs(cx, dvec2(r.pos.x + 8.0 + icon_size + inset, title_y), &node.title);
             self.draw_meta
-                .draw_abs(cx, dvec2(r.pos.x + 29.0 + id_w, label_y + 7.0), &node.type_name);
+                .draw_abs(cx, dvec2(r.pos.x + 14.0 + icon_size + inset + id_w, meta_y), &node.type_name);
+            self.draw_title.color = title_color;
+            self.draw_meta.color = meta_color;
             // State chip at the right of the label row.
             if let Some(status) = self.statuses.get(&node.id) {
                 let state = status.state.as_str();
@@ -3830,8 +3965,8 @@ impl FlowCanvas {
                     };
                     let w = self.text_width(cx, &self.draw_port, &input.name);
                     let x = match self.port_side(graph, index, false) {
-                        PortSide::Left => p.x + PORT_RX + PORT_LABEL_GAP,
-                        PortSide::Right => p.x - PORT_RX - PORT_LABEL_GAP - w,
+                        PortSide::Left => p.x + self.port_radius_x + PORT_LABEL_GAP,
+                        PortSide::Right => p.x - self.port_radius_x - PORT_LABEL_GAP - w,
                     };
                     self.draw_port.draw_abs(cx, dvec2(x, p.y - 6.0), &input.name);
                 }
@@ -3840,8 +3975,8 @@ impl FlowCanvas {
                     let w = self.text_width(cx, &self.draw_port, &output.name);
                     self.draw_port.color = self.color_port_label_connected;
                     let x = match self.port_side(graph, index, true) {
-                        PortSide::Left => p.x + PORT_RX + PORT_LABEL_GAP,
-                        PortSide::Right => p.x - PORT_RX - PORT_LABEL_GAP - w,
+                        PortSide::Left => p.x + self.port_radius_x + PORT_LABEL_GAP,
+                        PortSide::Right => p.x - self.port_radius_x - PORT_LABEL_GAP - w,
                     };
                     self.draw_port.draw_abs(cx, dvec2(x, p.y - 6.0), &output.name);
                 }
@@ -3888,7 +4023,7 @@ impl FlowCanvas {
             let node = &graph.nodes[index];
             let r = self.card_rect(graph, index);
             let full_bleed = Self::full_bleed(node);
-            let content = card_content_rect(r, full_bleed, Self::port_rows(node));
+            let content = card_content_rect(r, full_bleed, self.port_rows(node));
             let error = self
                 .face_errors
                 .get(&node.id)
@@ -3962,7 +4097,7 @@ impl FlowCanvas {
             if error_rows > 0 {
                 height += 20.0 + ERROR_LINE_H * (error_rows - 1) as f64;
             }
-            let height = height.max(min_card_height(full_bleed, Self::port_rows(node)));
+            let height = height.max(min_card_height(full_bleed, self.port_rows(node)));
             let pending_face = scope.data_mut().get_mut::<NodeFacesScope>()
                 .is_some_and(|faces| faces.faces().face_measurement_pending(&node.id));
             if !pending_face && node.size.is_none() && (self.heights[index] - height).abs() > 0.5 {
@@ -3982,7 +4117,7 @@ impl FlowCanvas {
             let node = &graph.nodes[index];
             let card = self.card_rect(graph, index);
             let content =
-                card_content_rect(card, Self::full_bleed(node), Self::port_rows(node));
+                card_content_rect(card, Self::full_bleed(node), self.port_rows(node));
             self.draw_over.rounded_rect(
                 content.rect.pos.x as f32,
                 content.rect.pos.y as f32,
@@ -4066,6 +4201,7 @@ impl FlowCanvas {
             }
             // Ports: a dark disc with a ring in the port-type colour. The
             // disc's cable side is shaped: outputs point, inputs are dimpled.
+            let shape = self.port_shape();
             let direction = if self.port_side(graph, index, true) == PortSide::Right {
                 1.0
             } else {
@@ -4079,21 +4215,21 @@ impl FlowCanvas {
                 let grow = if hot { 3.0 } else { 0.0 };
                 if selected_edge.is_some_and(|edge| edge.to == index && edge.to_port == port) {
                     Self::set_color(&mut self.draw_over, self.accent_color, 1.0);
-                    Self::shaped_port(&mut self.draw_over, centre, 4.0, direction, true);
+                    Self::shaped_port(&mut self.draw_over, shape, centre, 4.0, direction, true);
                     self.draw_over.stroke(2.0);
                 }
                 Self::set_color(&mut self.draw_over, self.card_color, 1.0);
-                Self::shaped_port(&mut self.draw_over, centre, grow, direction, true);
+                Self::shaped_port(&mut self.draw_over, shape, centre, grow, direction, true);
                 self.draw_over.fill();
                 let color = self.port_color(Self::input_kind(node, port));
                 Self::set_color(&mut self.draw_over, color, if ok { 1.0 } else { 0.25 });
-                Self::shaped_port(&mut self.draw_over, centre, grow - 1.0, direction, true);
+                Self::shaped_port(&mut self.draw_over, shape, centre, grow - 1.0, direction, true);
                 self.draw_over.stroke(if hot { 3.0 } else { 2.0 });
                 if let Some((_, accent)) = boundary_links.iter().find(|(link, _)| {
                     !link.output && link.node == node.inputs[port].name
                 }) {
                     Self::set_color(&mut self.draw_over, *accent, if ok { 1.0 } else { 0.25 });
-                    Self::shaped_port(&mut self.draw_over, centre, grow - 3.5, direction, true);
+                    Self::shaped_port(&mut self.draw_over, shape, centre, grow - 3.5, direction, true);
                     self.draw_over.stroke(1.5);
                 }
             }
@@ -4102,28 +4238,29 @@ impl FlowCanvas {
                 let centre = Point::new(p.x, p.y);
                 if selected_edge.is_some_and(|edge| edge.from == index && edge.from_port == port) {
                     Self::set_color(&mut self.draw_over, self.accent_color, 1.0);
-                    Self::shaped_port(&mut self.draw_over, centre, 4.0, direction, false);
+                    Self::shaped_port(&mut self.draw_over, shape, centre, 4.0, direction, false);
                     self.draw_over.stroke(2.0);
                 }
                 Self::set_color(&mut self.draw_over, self.card_color, 1.0);
-                Self::shaped_port(&mut self.draw_over, centre, 0.0, direction, false);
+                Self::shaped_port(&mut self.draw_over, shape, centre, 0.0, direction, false);
                 self.draw_over.fill();
                 let color = self.port_color(&output.kind);
                 Self::set_color(&mut self.draw_over, color, 1.0);
-                Self::shaped_port(&mut self.draw_over, centre, -1.0, direction, false);
+                Self::shaped_port(&mut self.draw_over, shape, centre, -1.0, direction, false);
                 self.draw_over.stroke(2.0);
                 if let Some((_, accent)) = boundary_links.iter().find(|(link, _)| {
                     link.output && link.node == output.name
                 }) {
                     Self::set_color(&mut self.draw_over, *accent, 1.0);
-                    Self::shaped_port(&mut self.draw_over, centre, -3.5, direction, false);
+                    Self::shaped_port(&mut self.draw_over, shape, centre, -3.5, direction, false);
                     self.draw_over.stroke(1.5);
                 }
             }
         }
         self.draw_over.end(cx);
         // The port-type icons inside the discs.
-        for index in indices.iter().copied() {
+        let icons = self.port_icons;
+        for index in indices.iter().copied().filter(|_| icons) {
             let node = &graph.nodes[index];
             let direction = if self.port_side(graph, index, true) == PortSide::Right {
                 1.0
@@ -5085,7 +5222,7 @@ impl FlowCanvas {
                             .as_ref()
                             .and_then(|graph| graph.nodes.get(index))
                             .map(|node| {
-                                min_card_height(Self::full_bleed(node), Self::port_rows(node))
+                                min_card_height(Self::full_bleed(node), self.port_rows(node))
                             })
                             .unwrap_or(MIN_TEXT_LINE_H);
                         self.drag = Some(Drag::Resize {

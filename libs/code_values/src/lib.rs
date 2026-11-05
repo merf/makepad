@@ -459,6 +459,12 @@ pub struct CodeValues {
     /// Swatches drawn this frame: (rect, site, item).
     #[rust]
     strip_hits: Vec<(Rect, usize, usize)>,
+    /// Where the editor's area was when the controls were drawn. A host laid out after a
+    /// sibling that fills (a side panel right of a canvas) is drawn first where it does not
+    /// end up and moved after; events then see the area where it is, and what was kept from
+    /// drawing (`clip`, `hots`, `strip_hits`) is moved by the difference.
+    #[rust]
+    drawn_origin: Option<DVec2>,
     /// The 3D views' pass, picture and line renderer; what was drawn last.
     #[live]
     draw_tex: DrawCodeValueTex,
@@ -804,6 +810,7 @@ impl CodeValues {
         self.clip = clip;
         let Some(session) = view.session.as_ref() else { return };
         let origin = view.editor.area().rect(cx).pos;
+        self.drawn_origin = Some(origin);
         let metrics = view.editor.metrics(session);
         let column = metrics.column_advance.max(1.0);
         let line_h = metrics.line_advance.max(1.0);
@@ -1240,6 +1247,21 @@ impl CodeValues {
     /// `view`: the code the controls sit in (`None` when the host places
     /// them itself, [`Self::draw_placed`]).
     pub fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope, view: Option<&CodeView>) -> CodeValuesResponse {
+        // What was kept from drawing follows the editor to where it ended up (`drawn_origin`).
+        if let (Some(view), Some(drawn)) = (view, self.drawn_origin) {
+            let now = view.editor.area().rect(cx).pos;
+            let shift = now - drawn;
+            if shift.x != 0.0 || shift.y != 0.0 {
+                self.clip.pos += shift;
+                for (rect, _) in &mut self.hots {
+                    rect.pos += shift;
+                }
+                for (rect, _, _) in &mut self.strip_hits {
+                    rect.pos += shift;
+                }
+                self.drawn_origin = Some(now);
+            }
+        }
         // The release of a key a popup took is the popup's too.
         if let Event::KeyUp(k) = event {
             if self.swallow_up == Some(k.key_code) {
