@@ -1,0 +1,13 @@
+[package]
+name = "makepad-ai-cutie"
+version = "0.1.0"
+edition = "2021"
+description = "Cutie video object segmentation, native: cutie-base-mega on the makepad-ai-common gpu_* surface in fp32, Cutie's memory and per-frame step, checked against a PyTorch oracle (cutie-validate)."
+license = "MIT"
+
+[dependencies]
+makepad-ai-common = { path = "../common" }
+
+[[bin]]
+name = "cutie-validate"
+path = "src/bin/cutie_validate.rs"
