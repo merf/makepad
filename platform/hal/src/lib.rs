@@ -63,6 +63,7 @@ pub mod font;
 pub mod ledger;
 pub mod lease;
 pub use lease::hal_lease_release;
+pub mod gpu_debug;
 pub mod gpu_limits;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod gpu_prof;

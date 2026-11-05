@@ -581,7 +581,16 @@ fn capture_loop(stream: &Stream, device: u64, slot: &Slot, terminated: &dyn Fn()
     let ch = stream.channels;
     loop {
         if unsafe { !stream.wait() } {
-            return true;
+            // A loopback capture gets no period while nothing plays on its device, so a wait
+            // that times out is silence, not a device that went: the capture carries on, unless
+            // asking for the next packet says the device is gone.
+            if terminated() {
+                return false;
+            }
+            if unsafe { capture.GetNextPacketSize() }.is_err() {
+                return true;
+            }
+            continue;
         }
         if terminated() {
             return false;

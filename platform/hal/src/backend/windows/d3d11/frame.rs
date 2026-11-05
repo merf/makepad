@@ -425,6 +425,9 @@ impl D3d11 {
         if self.dev.check_lost() {
             return None;
         }
+        self.poll_gpu_capture();
+        // tools listening (PIX, RenderDoc, Nsight) see each pass as an event named after it
+        let annotating = self.dev.annotating();
         let Some(packet) = view.frames.get(packet as usize) else { s.bad(); return None };
         let (Some(pr), Some(dr)) = (slice(packet.passes, view.passes.len()), slice(packet.draws, view.draws.len())) else { s.bad(); return None };
         if view.passes[pr.clone()].iter().any(|p| slice(p.draws, view.draws.len()).is_none_or(|r| r.start < dr.start || r.end > dr.end)) {
@@ -523,6 +526,10 @@ impl D3d11 {
             if let (Some(q), Some(t)) = (stamps, &timer) {
                 unsafe { self.dev.ctx.End(t.stamp(q).as_ID3D11Asynchronous()) };
             }
+            let event = annotating && !pick && s.string(pass.name).is_some_and(|name| !name.is_empty());
+            if event {
+                self.dev.begin_event(s.string(pass.name).unwrap_or(""));
+            }
             let encoded = if pass.kind == crate::types::pass_kind::COMPUTE {
                 self.encode_compute(s, pass, view, timer.as_mut()).map(|_| None)
             } else if split_pass == Some(pass_index) {
@@ -530,6 +537,9 @@ impl D3d11 {
             } else {
                 self.encode_pass(s, target, is_window, pick, pass, draws, view, now, &mut deps)
             };
+            if event {
+                self.dev.end_event();
+            }
             if let (Some(q), Some(t)) = (stamps, &timer) {
                 unsafe { self.dev.ctx.End(t.stamp(q + 1).as_ID3D11Asynchronous()) };
             }
@@ -796,7 +806,12 @@ impl D3d11 {
             ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         }
         let mut shaders_bound: Option<*const Program> = None;
+        // with draw labels on, each draw is an event named after its shader
+        let draw_events = !pick && crate::gpu_debug::draw_labels() && self.dev.annotating();
         for p in &sc.prepared {
+            if draw_events {
+                self.dev.begin_event(&crate::gpu_debug::shader_label(s.string(p.program.desc.name).unwrap_or(""), s.string(p.program.desc.source).unwrap_or("")));
+            }
             unsafe {
                 if shaders_bound != Some(Arc::as_ptr(&p.program)) {
                     shaders_bound = Some(Arc::as_ptr(&p.program));
@@ -835,7 +850,9 @@ impl D3d11 {
                         Some(v) => Some(v.clone()),
                         None => self.word_arena.words.clone(),
                     };
-                    ctx.VSSetShaderResources(slot, Some(&[view]));
+                    // the pixel stage reads instance values from it too (no varyings)
+                    ctx.VSSetShaderResources(slot, Some(&[view.clone()]));
+                    ctx.PSSetShaderResources(slot, Some(&[view]));
                 }
                 for (slot, srv) in &p.storage {
                     ctx.VSSetShaderResources(*slot, Some(std::slice::from_ref(srv)));
@@ -847,6 +864,9 @@ impl D3d11 {
                     }
                     ctx.DrawIndexedInstanced(p.index_count, *count, p.index_first, 0, 0);
                 }
+            }
+            if draw_events {
+                self.dev.end_event();
             }
         }
         unsafe {
