@@ -31,8 +31,11 @@ use crate::makepad_script::mod_shader::SHADER_IO_VERTEX_BUFFER;
 pub const DRAW_CALL_MAX_UNIFORM_FLOATS: usize = 4096;
 // Combined bindings, not the fragment-stage limit. Full rigid PBR uses
 // 16 fragment textures plus one vertex-only morph texture with GI enabled.
-// WebGL2 guarantees 16 per stage and at least 32 combined units.
-pub const DRAW_CALL_TEXTURE_SLOTS: usize = 17;
+// WebGL2 guarantees 16 per stage and at least 32 combined units. This is only the capacity
+// of a draw's slot array: each draw binds as many as its shader declares (frame_build), so
+// room past what a shader uses costs nothing. Native targets go well past 16 per stage
+// (D3D11 128, Metal 31 or more), and a shader for them may declare more than WebGL allows.
+pub const DRAW_CALL_TEXTURE_SLOTS: usize = 24;
 pub const DRAW_CALL_UNIFORM_BUFFER_SLOTS: usize = 2;
 pub const DRAW_CALL_DYN_INSTANCES: usize = 32;
 
