@@ -1616,9 +1616,32 @@ pub fn build_hlsl_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl
     }
     info.instance_slots = record_end(&instance);
 
-    // The instance fields the pixel stage reads: their record words in
-    // nointerpolation integer varyings, as on Vulkan (`build_draw_entries`).
-    let (frag_instance, instance_words) = fragment_instance_fields(output, ir, &instance);
+    let fragment_reads = match ir.function_by_name("io_fragment") {
+        Some(f) => {
+            let funcs = ir.reachable(f);
+            ir.globals_used(&funcs)
+        }
+        None => vec![false; ir.globals.len()],
+    };
+    // The pixel stage reads the instance fields it uses from the instance
+    // buffer by the instance's record index (passed nointerpolation), as on
+    // Metal: shader model 5 allows 32 varyings, which instance values passed
+    // as varyings ran out of.
+    let mut frag_instance = Vec::new();
+    for f in &instance {
+        let io = &output.io[f.io];
+        let kind = match io.kind {
+            ShaderIoKind::DynInstance => IrGlobalKind::Io(IrIo::DynInstance),
+            _ => IrGlobalKind::Io(IrIo::RustInstance),
+        };
+        let read = match ir.find_global(kind, io.name) {
+            Some(g) => fragment_reads.get(g as usize).copied().unwrap_or(false),
+            None => false,
+        };
+        if read {
+            frag_instance.push(RecField { io: f.io, pod: f.pod, slots: f.slots, offset: f.offset });
+        }
+    }
     let mut varyings = Vec::new();
     let mut offset = 0;
     for (i, io) in output.io.iter().enumerate() {
@@ -1627,7 +1650,6 @@ pub fn build_hlsl_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl
         }
     }
     let varying_vec4s = (record_end(&varyings) + 3) / 4;
-    let instance_vec4s = instance_words.div_ceil(4);
 
     let mut io_globals = Vec::new();
     for i in 0..output.io.len() {
@@ -1699,10 +1721,10 @@ pub fn build_hlsl_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl
     for k in 0..varying_vec4s {
         outputs.push(IrEntryIo { name: format!("packed_varying_{}", k), ty: vec4, binding: IrIoBinding::Location(k as u32) });
     }
-    let uvec4 = ir.vec_ty(4, IrScalar::U32);
-    for k in 0..instance_vec4s {
-        outputs.push(IrEntryIo { name: format!("flat_instance_{}", k), ty: uvec4, binding: IrIoBinding::Location((varying_vec4s + k) as u32) });
-    }
+    let frag_record = (inst_buffer.is_some() && !frag_instance.is_empty()).then(|| {
+        outputs.push(IrEntryIo { name: "instance_record".to_string(), ty: TY_U32, binding: IrIoBinding::Location(varying_vec4s as u32) });
+        outputs.len() as u32 - 1
+    });
     let frag_inputs = outputs.clone();
     let vertex_fn = ir.function_by_name("io_vertex");
     let vertex_ret_vec4 = vertex_fn.map(|f| ir.functions[f as usize].ret == vec4).unwrap_or(false);
@@ -1712,6 +1734,13 @@ pub fn build_hlsl_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl
     let v = b.e(ExprKind::EntryIn(iid_in), TY_U32);
     let g = b.glob(iid);
     b.assign(g, v);
+    if let Some(out) = frag_record {
+        let iid_e = b.glob(iid);
+        let base_e = b.glob(inst_base.expect("instance base with the instance buffer"));
+        let record = b.bin(BinOp::Add, iid_e, base_e, TY_U32);
+        let o = b.e(ExprKind::EntryOut(out), TY_U32);
+        b.assign(o, record);
+    }
     for item in &geo {
         match *item {
             Geo::Whole(io, input) => {
@@ -1782,20 +1811,6 @@ pub fn build_hlsl_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl
             let mut at = f.offset;
             gl_assign_reconstructed(&mut b, types, g, &inline, Source::Word, &words, &mut at);
         }
-        // the pixel stage's instance fields: their record words, as they are
-        for (f, record_at) in &frag_instance {
-            for s in 0..f.slots {
-                let slot = f.offset + s;
-                let o = b.e(ExprKind::EntryOut(1 + (varying_vec4s + slot / 4) as u32), uvec4);
-                let dst = b.lane(o, (slot % 4) as u8);
-                let base = b.e(ExprKind::Local(ib), TY_U32);
-                let kk = b.u32((record_at + s) as u32);
-                let idx = b.bin(BinOp::Add, base, kk, TY_U32);
-                let arr = b.glob(buf);
-                let word = b.e(ExprKind::Index(arr, idx), TY_U32);
-                b.assign(dst, word);
-            }
-        }
     }
     let zero = b.f32(0.0);
     let one = b.f32(1.0);
@@ -1864,16 +1879,26 @@ pub fn build_hlsl_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl
         let mut at = f.offset;
         gl_assign_reconstructed(&mut b, types, g, &inline, Source::Numeric, &var_lanes, &mut at);
     }
-    let mut inst_lanes = Vec::new();
-    for i in 0..instance_vec4s * 4 {
-        let v = b.e(ExprKind::EntryIn(1 + (varying_vec4s + i / 4) as u32), uvec4);
-        inst_lanes.push(b.lane(v, (i % 4) as u8));
-    }
-    for (f, _) in &frag_instance {
-        let Some(g) = io_globals[f.io] else { continue };
-        let inline = ShaderTypeInline { id: f.pod, data: types.type_data(f.pod).clone() };
-        let mut at = f.offset;
-        gl_assign_reconstructed(&mut b, types, g, &inline, Source::Word, &inst_lanes, &mut at);
+    if let (Some(buf), Some(record_in)) = (inst_buffer, frag_record) {
+        let record = b.e(ExprKind::EntryIn(record_in), TY_U32);
+        let stride = b.u32(info.instance_slots as u32);
+        let ib_v = b.bin(BinOp::Mul, record, stride, TY_U32);
+        let ib = b.f.local(id!(_mp_ib), 0, TY_U32, false, LocalKind::Temp);
+        b.f.body.push(Stmt::Local(ib, ib_v));
+        let mut words = Vec::new();
+        for k in 0..info.instance_slots {
+            let base = b.e(ExprKind::Local(ib), TY_U32);
+            let kk = b.u32(k as u32);
+            let idx = b.bin(BinOp::Add, base, kk, TY_U32);
+            let arr = b.glob(buf);
+            words.push(b.e(ExprKind::Index(arr, idx), TY_U32));
+        }
+        for f in &frag_instance {
+            let Some(g) = io_globals[f.io] else { continue };
+            let inline = ShaderTypeInline { id: f.pod, data: types.type_data(f.pod).clone() };
+            let mut at = f.offset;
+            gl_assign_reconstructed(&mut b, types, g, &inline, Source::Word, &words, &mut at);
+        }
     }
     init_frag_depth(&mut b, depth_out, &io_globals);
     init_frag_position(&mut b, output, &io_globals, FragPositionFix::ReciprocalW);
