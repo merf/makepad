@@ -121,7 +121,8 @@ pub struct TextureReadback {
 
 /// Per-context limits. Admission reserves staging AND result capacity before
 /// returning a ticket. Keep/retry a rejected request after draining results.
-pub const TEXTURE_READBACK_MAX_BYTES: usize = 32 * 1024 * 1024;
+/// Room for a few 4K BGRA frames in flight (33 MB each), so video can be read back at 4K.
+pub const TEXTURE_READBACK_MAX_BYTES: usize = 128 * 1024 * 1024;
 pub const TEXTURE_READBACK_MAX_REQUESTS: usize = 256;
 
 #[derive(Clone, Copy, Debug, Default)]
